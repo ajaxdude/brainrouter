@@ -1,0 +1,2 @@
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/clang/21/include"

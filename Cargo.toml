@@ -1,0 +1,43 @@
+[package]
+name = "brainrouter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# HTTP server — raw hyper for minimal proxy overhead
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for cloud providers
+reqwest = { version = "0.12", features = ["stream", "json"] }
+
+# Streaming
+bytes = "1"
+futures-util = { version = "0.3", features = ["io"] }
+
+# Embedded LLM (Bonsai) — vulkan for AMD Radeon
+llama-cpp-2 = { version = "0.1", features = ["vulkan"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Utilities
+pin-project-lite = "0.2"
+http = "1"
+tokio-stream = "0.1"
