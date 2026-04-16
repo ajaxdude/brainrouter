@@ -1,73 +1,58 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Top-level brainrouter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainrouterConfig {
-    pub providers: HashMap<String, ProviderConfig>,
-    pub models: Vec<ModelConfig>,
+    pub manifest: ManifestConfig,
+    pub llama_swap: LlamaSwapConfig,
     pub bonsai: BonsaiConfig,
-    pub llama_swap: Option<LlamaSwapConfig>,
 }
 
+/// Configuration for the Manifest cloud LLM router.
+/// Manifest exposes an OpenAI-compatible endpoint; brainrouter delegates all
+/// cloud routing decisions to Manifest by sending requests with model="auto".
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    #[serde(rename = "type")]
-    pub provider_type: ProviderType,
-    pub base_url: Option<String>,
+pub struct ManifestConfig {
+    /// Base URL of the Manifest instance. Example: "http://localhost:3001".
+    pub base_url: String,
+
+    /// Name of the environment variable holding the Manifest API key (mnfst_*).
+    /// Optional for local deployments that don't require auth.
+    #[serde(default)]
     pub api_key_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderType {
-    Anthropic,
-    Google,
-    #[serde(rename = "openai-compatible")]
-    OpenAiCompatible,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub name: String,
-    pub providers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonsaiConfig {
-    pub model_path: PathBuf,
-    #[serde(default = "default_always_last_resort")]
-    pub always_last_resort: bool,
-}
-
-fn default_always_last_resort() -> bool {
-    true
-}
-
+/// Configuration for the local llama-swap server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlamaSwapConfig {
+    /// Base URL of llama-swap. Example: "http://localhost:8080".
     pub base_url: String,
-    #[serde(default = "default_health_poll_interval_secs")]
-    pub health_poll_interval_secs: u64,
-    #[serde(default = "default_restart_on_stuck")]
-    pub restart_on_stuck: bool,
-    #[serde(default = "default_stuck_threshold_secs")]
-    pub stuck_threshold_secs: u64,
+
+    /// The model key to use when falling back from Manifest, or when the user
+    /// sends model="auto" and Bonsai classifies the query as local without a
+    /// specific model hint. Must match an entry in the llama-swap config.
+    pub fallback_model: String,
 }
 
-fn default_health_poll_interval_secs() -> u64 {
-    10
+/// Configuration for the embedded Bonsai classifier model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BonsaiConfig {
+    /// Path to the Bonsai GGUF model file.
+    pub model_path: PathBuf,
 }
 
-fn default_restart_on_stuck() -> bool {
-    true
+impl BrainrouterConfig {
+    /// Resolve the Manifest API key from the configured environment variable.
+    /// Returns None if no env var is configured or it is unset.
+    pub fn resolve_manifest_api_key(&self) -> Option<String> {
+        let env_var = self.manifest.api_key_env.as_ref()?;
+        std::env::var(env_var).ok()
+    }
 }
 
-fn default_stuck_threshold_secs() -> u64 {
-    60
-}
-
+/// Load and validate the brainrouter configuration from a YAML file.
 pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -75,25 +60,28 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     let config: BrainrouterConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("Failed to parse YAML config: {}", path.display()))?;
 
-    // Validate at least one model
-    if config.models.is_empty() {
-        bail!("Configuration must define at least one model");
+    // Validate manifest.base_url
+    if config.manifest.base_url.is_empty() {
+        bail!("manifest.base_url must not be empty");
+    }
+    if !config.manifest.base_url.starts_with("http://")
+        && !config.manifest.base_url.starts_with("https://")
+    {
+        bail!(
+            "manifest.base_url must start with http:// or https://, got: {}",
+            config.manifest.base_url
+        );
     }
 
-    // Validate all model provider references exist
-    for model in &config.models {
-        for provider_ref in &model.providers {
-            if !config.providers.contains_key(provider_ref) {
-                bail!(
-                    "Model '{}' references unknown provider '{}'",
-                    model.name,
-                    provider_ref
-                );
-            }
-        }
+    // Validate llama_swap.base_url
+    if config.llama_swap.base_url.is_empty() {
+        bail!("llama_swap.base_url must not be empty");
+    }
+    if config.llama_swap.fallback_model.is_empty() {
+        bail!("llama_swap.fallback_model must not be empty");
     }
 
-    // Validate bonsai model path exists
+    // Validate bonsai.model_path exists
     if !config.bonsai.model_path.exists() {
         bail!(
             "Bonsai model path does not exist: {}",
@@ -102,12 +90,4 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     }
 
     Ok(config)
-}
-
-impl BrainrouterConfig {
-    pub fn resolve_api_key(&self, provider_name: &str) -> Option<String> {
-        let provider = self.providers.get(provider_name)?;
-        let env_var_name = provider.api_key_env.as_ref()?;
-        std::env::var(env_var_name).ok()
-    }
 }

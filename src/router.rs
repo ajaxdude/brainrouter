@@ -1,95 +1,169 @@
+//! Request router.
+//!
+//! The router is the core of brainrouter. For every incoming request it:
+//!   1. Asks Bonsai (via `Classifier`) whether the query should go to Cloud
+//!      (Manifest) or Local (llama-swap with a specific model).
+//!   2. Dispatches to the chosen backend.
+//!   3. On cloud failure / stall, falls through to llama-swap with the
+//!      configured fallback model.
+//!   4. Wraps the resulting stream in a TimeoutStream so a stalled provider
+//!      surfaces as an error instead of hanging the client.
+
 use crate::{
-    config::ModelConfig,
+    classifier::{Classifier, RoutingDecision},
     health::HealthTracker,
-    provider::{Provider, ProviderResponse},
+    provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     stream::TimeoutStream,
+    types::ChatCompletionRequest,
 };
 use anyhow::{anyhow, Result};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
+use tracing::{info, warn};
+
+/// Stream chunk inactivity threshold. If no chunk is received for this long,
+/// the stream is considered stalled and failed.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Provider health-tracker keys. Used for circuit breaking.
+const MANIFEST_KEY: &str = "manifest";
+const LLAMA_SWAP_KEY: &str = "llama-swap";
 
 pub struct Router {
-    providers: HashMap<String, Arc<dyn Provider>>,
-    failover_chain: Vec<String>, // Stores unique provider-model IDs
-    health_tracker: Arc<HealthTracker>,
+    classifier: Arc<Classifier>,
+    manifest: Arc<OpenAiProvider>,
+    llama_swap: Arc<OpenAiProvider>,
+    /// Model name passed to llama-swap when we fall back from Manifest,
+    /// or when the classifier picks Local but the user didn't request
+    /// a specific model.
+    fallback_model: String,
+    health: Arc<HealthTracker>,
 }
 
 impl Router {
     pub fn new(
-        providers: HashMap<String, Arc<dyn Provider>>,
-        ranked_models: Vec<String>,
-        model_configs: &[ModelConfig],
-        health_tracker: Arc<HealthTracker>,
+        classifier: Arc<Classifier>,
+        manifest: Arc<OpenAiProvider>,
+        llama_swap: Arc<OpenAiProvider>,
+        fallback_model: String,
+        health: Arc<HealthTracker>,
     ) -> Self {
-        let mut failover_chain = Vec::new();
-        let model_map: HashMap<_, _> = model_configs.iter().map(|m| (&m.name, m)).collect();
-
-        for model_name in &ranked_models {
-            if let Some(model_config) = model_map.get(model_name) {
-                for provider_name in &model_config.providers {
-                    // Unique ID for health tracking, e.g., "openai-claude-sonnet-4-6"
-                    let provider_id = format!("{}-{}", provider_name, model_name);
-                    failover_chain.push(provider_id);
-                }
-            }
-        }
-
-        // Add bonsai as the last resort if it exists
-        if providers.contains_key("embedded-bonsai") {
-            failover_chain.push("embedded-bonsai-bonsai".to_string());
-        }
-
-        tracing::info!("Built failover chain: {:?}", failover_chain);
-
         Self {
-            providers,
-            failover_chain,
-            health_tracker,
+            classifier,
+            manifest,
+            llama_swap,
+            fallback_model,
+            health,
         }
     }
 
     pub async fn route(
         &self,
-        mut request: crate::types::ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ProviderResponse> {
-        for provider_id in &self.failover_chain {
-            if !self.health_tracker.is_healthy(provider_id) {
-                tracing::warn!(%provider_id, "Skipping unhealthy provider");
-                continue;
-            }
+        let decision = self
+            .classifier
+            .classify_async(request.clone())
+            .await;
 
-            let (provider_name, model_name) = match provider_id.rsplit_once('-') {
-                Some(split) => split,
-                None => {
-                    tracing::error!(%provider_id, "Invalid provider_id format");
-                    continue;
-                }
-            };
-            
-            if let Some(provider) = self.providers.get(provider_name) {
-                tracing::info!(%provider_id, "Attempting provider");
-                request.model = model_name.to_string();
+        info!(?decision, "Bonsai routing decision");
 
-                // Clone the request for this attempt
-                let attempt_request = request.clone();
-                let response_future = provider.chat_completion(attempt_request);
-                
-                match response_future.await {
-                    Ok(ProviderResponse::Stream(stream)) => {
-                        self.health_tracker.report_success(provider_id);
-                        tracing::info!(%provider_id, "Provider succeeded");
-                        // Wrap the stream with a timeout for each chunk to detect stalls
-                        let timeout_stream = TimeoutStream::new(stream, Duration::from_secs(15));
-                        return Ok(ProviderResponse::Stream(Box::pin(timeout_stream)));
-                    }
-                    Err(e) => {
-                        tracing::error!(%provider_id, error = ?e, "Provider failed");
-                        self.health_tracker.report_failure(provider_id);
-                        continue; // Try next provider
-                    }
-                }
+        match decision {
+            RoutingDecision::Cloud => self.route_cloud(request).await,
+            RoutingDecision::Local { model } => {
+                request.model = model;
+                self.route_local(request).await
             }
         }
-
-        Err(anyhow!("All providers in the failover chain failed"))
     }
+
+    /// Cloud path: try Manifest first. On error/circuit-open, fall back to
+    /// llama-swap with the configured fallback model.
+    async fn route_cloud(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<ProviderResponse> {
+        // Manifest expects "auto" — it does its own model selection.
+        request.model = "auto".to_string();
+
+        if self.health.is_healthy(MANIFEST_KEY) {
+            info!(provider = MANIFEST_KEY, "Attempting Manifest");
+            match self.manifest.chat_completion(request.clone()).await {
+                Ok(ProviderResponse::Stream(stream)) => {
+                    self.health.report_success(MANIFEST_KEY);
+                    info!(provider = MANIFEST_KEY, "Manifest accepted request");
+                    return Ok(wrap_with_timeout(stream));
+                }
+                Err(e) => {
+                    warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back");
+                    self.health.report_failure(MANIFEST_KEY);
+                    // fall through to llama-swap
+                }
+            }
+        } else {
+            warn!(provider = MANIFEST_KEY, "Manifest circuit open, skipping");
+        }
+
+        // Cloud fallback → llama-swap with fallback_model
+        request.model = self.fallback_model.clone();
+        self.try_llama_swap(request, "cloud-fallback").await
+    }
+
+    /// Local path: go straight to llama-swap. On failure, retry once with the
+    /// fallback model if it differs from what was requested.
+    async fn route_local(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ProviderResponse> {
+        let requested = request.model.clone();
+        match self.try_llama_swap(request.clone(), "local-primary").await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                if requested == self.fallback_model {
+                    return Err(e);
+                }
+                warn!(
+                    requested = %requested,
+                    fallback = %self.fallback_model,
+                    error = %e,
+                    "Local model failed, retrying with fallback"
+                );
+                let mut fallback_req = request;
+                fallback_req.model = self.fallback_model.clone();
+                self.try_llama_swap(fallback_req, "local-fallback").await
+            }
+        }
+    }
+
+    async fn try_llama_swap(
+        &self,
+        request: ChatCompletionRequest,
+        stage: &'static str,
+    ) -> Result<ProviderResponse> {
+        if !self.health.is_healthy(LLAMA_SWAP_KEY) {
+            return Err(anyhow!(
+                "llama-swap circuit open, no backend available (stage={})",
+                stage
+            ));
+        }
+        info!(provider = LLAMA_SWAP_KEY, stage, model = %request.model, "Attempting llama-swap");
+        match self.llama_swap.chat_completion(request).await {
+            Ok(ProviderResponse::Stream(stream)) => {
+                self.health.report_success(LLAMA_SWAP_KEY);
+                info!(provider = LLAMA_SWAP_KEY, stage, "llama-swap accepted request");
+                Ok(wrap_with_timeout(stream))
+            }
+            Err(e) => {
+                warn!(provider = LLAMA_SWAP_KEY, stage, error = %e, "llama-swap failed");
+                self.health.report_failure(LLAMA_SWAP_KEY);
+                Err(e)
+            }
+        }
+    }
+}
+
+fn wrap_with_timeout(
+    stream: crate::provider::SseStream,
+) -> ProviderResponse {
+    let timeout_stream = TimeoutStream::new(stream, STREAM_STALL_TIMEOUT);
+    ProviderResponse::Stream(Box::pin(timeout_stream))
 }
