@@ -8,6 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod config;
 mod server;
 mod types;
+mod provider;
 
 #[derive(clap::Parser)]
 #[command(name = "brainrouter", about = "LLM failover proxy daemon")]
