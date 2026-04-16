@@ -12,6 +12,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
+    send_logs_to_tracing, LogOptions,
 };
 use std::{
     num::NonZeroU32,
@@ -52,6 +53,11 @@ impl Classifier {
     pub fn new(model_path: &Path, default_local_model: String) -> Result<Self> {
         let backend =
             LlamaBackend::init().context("Failed to initialize llama.cpp backend")?;
+
+        // Route llama.cpp output through tracing. Info-level chatter (tensor
+        // dump, metadata) is suppressed in normal operation. Warnings and
+        // errors still surface. Use RUST_LOG=debug to see full load detail.
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
 
         // Offload to GPU. AMD Strix Halo with Vulkan handles this fine.
         let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
