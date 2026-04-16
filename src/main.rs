@@ -11,12 +11,7 @@ use crate::provider::{
 use router::Router;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod config;
-mod server;
-mod types;
-mod provider;
-mod router;
-mod ranker;
+use brainrouter::{config, health, provider, ranker, router, server, stream, types};
 
 #[derive(clap::Parser)]
 #[command(name = "brainrouter", about = "LLM failover proxy daemon")]
@@ -130,8 +125,16 @@ async fn main() -> Result<()> {
     // Insert embedded provider into providers map
     providers.insert("embedded-bonsai".to_string(), Arc::new(embedded_provider));
 
+    // Create health tracker
+    let health_tracker = Arc::new(health::HealthTracker::new());
+
     // Create router with ranked models
-    let router = Arc::new(Router::new(providers, ranked_models, &config.models));
+    let router = Arc::new(Router::new(
+        providers,
+        ranked_models,
+        &config.models,
+        health_tracker.clone(),
+    ));
 
     // Create shared application state
     let state = Arc::new(server::AppState { router });

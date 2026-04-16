@@ -125,7 +125,7 @@ async fn handle_chat_completion(
     let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
 
     // Route the request to the appropriate provider
-    let provider_response = state.router.route(&request).await?;
+    let provider_response = state.router.route(request).await?;
 
     // Convert the provider response to an HTTP response
     match provider_response {
