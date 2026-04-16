@@ -1,14 +1,22 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
+use crate::provider::{
+    anthropic::AnthropicProvider, embedded::EmbeddedProvider, google::GoogleProvider,
+    openai::OpenAiProvider, Provider,
+};
+use router::Router;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod config;
 mod server;
 mod types;
 mod provider;
+mod router;
+mod ranker;
 
 #[derive(clap::Parser)]
 #[command(name = "brainrouter", about = "LLM failover proxy daemon")]
@@ -66,8 +74,67 @@ async fn main() -> Result<()> {
         "Starting brainrouter daemon"
     );
 
+    // Create providers
+    let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+
+    // Initialize configured providers
+    for (provider_name, provider_config) in &config.providers {
+        match provider_config.provider_type {
+            config::ProviderType::OpenAiCompatible => {
+                let base_url = provider_config.base_url.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("OpenAI-compatible provider '{}' requires base_url", provider_name))?;
+                let api_key = config.resolve_api_key(provider_name);
+                let provider = OpenAiProvider::new(
+                    provider_name.clone(),
+                    base_url.clone(),
+                    api_key,
+                );
+                providers.insert(provider_name.clone(), Arc::new(provider));
+                info!("Initialized OpenAI-compatible provider: {}", provider_name);
+            }
+            config::ProviderType::Anthropic => {
+                let api_key = config.resolve_api_key(provider_name)
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic provider '{}' requires api_key", provider_name))?;
+                let provider = AnthropicProvider::new(api_key);
+                providers.insert(provider_name.clone(), Arc::new(provider));
+                info!("Initialized Anthropic provider: {}", provider_name);
+            }
+            config::ProviderType::Google => {
+                let api_key = config.resolve_api_key(provider_name)
+                    .ok_or_else(|| anyhow::anyhow!("Google provider '{}' requires api_key", provider_name))?;
+                let provider = GoogleProvider::new(api_key);
+                providers.insert(provider_name.clone(), Arc::new(provider));
+                info!("Initialized Google provider: {}", provider_name);
+            }
+        }
+    }
+
+    // Initialize embedded Bonsai provider
+    info!("Initializing embedded Bonsai provider...");
+    let embedded_provider = provider::embedded::EmbeddedProvider::new(&config.bonsai.model_path)
+        .context("Failed to initialize embedded Bonsai provider")?;
+    info!("Initialized embedded Bonsai provider");
+
+    // Rank models using Bonsai
+    let ranked_models = match ranker::rank_models(&config.models, &embedded_provider) {
+        Ok(ranked) => {
+            info!("Successfully ranked {} models", ranked.len());
+            ranked
+        }
+        Err(e) => {
+            tracing::warn!("Model ranking failed: {}. Using config file order.", e);
+            config.models.iter().map(|m| m.name.clone()).collect()
+        }
+    };
+
+    // Insert embedded provider into providers map
+    providers.insert("embedded-bonsai".to_string(), Arc::new(embedded_provider));
+
+    // Create router with ranked models
+    let router = Arc::new(Router::new(providers, ranked_models, &config.models));
+
     // Create shared application state
-    let state = Arc::new(server::AppState {});
+    let state = Arc::new(server::AppState { router });
 
     // Start the server (handles both TCP and Unix socket listeners)
     server::run(tcp_addr, args.socket, state).await?;

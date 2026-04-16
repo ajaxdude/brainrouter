@@ -1,9 +1,10 @@
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::Full;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper::{body::Incoming, body::Frame, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::convert::Infallible;
@@ -13,10 +14,13 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, error, info};
 
+use crate::router::Router;
+use crate::types::ChatCompletionRequest;
+use crate::provider::ProviderResponse;
+
 /// Shared state passed to all request handlers
 pub struct AppState {
-    // Will hold router, config, etc. in later phases
-    // For now, empty
+    pub router: Arc<Router>,
 }
 
 #[derive(Serialize)]
@@ -60,8 +64,8 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<By
 /// Handle incoming HTTP requests
 async fn handle_request(
     req: Request<Incoming>,
-    _state: Arc<AppState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+    state: Arc<AppState>,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method();
     let path = req.uri().path();
 
@@ -69,34 +73,77 @@ async fn handle_request(
 
     let response = match (method.as_str(), path) {
         ("GET", "/health") => {
-            json_response(StatusCode::OK, &HealthResponse { status: "ok" })
+            let resp = json_response(StatusCode::OK, &HealthResponse { status: "ok" });
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
         ("GET", "/v1/models") => {
             let models = ModelListResponse {
                 object: "list",
                 data: vec![],
             };
-            json_response(StatusCode::OK, &models)
+            let resp = json_response(StatusCode::OK, &models);
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
         ("POST", "/v1/chat/completions") => {
-            json_response(
-                StatusCode::NOT_IMPLEMENTED,
-                &ErrorResponse {
-                    error: "not yet implemented".to_string(),
-                },
-            )
+            match handle_chat_completion(req, state).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Error handling chat completion: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: format!("Internal error: {}", e),
+                        },
+                    );
+                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                }
+            }
         }
         _ => {
-            json_response(
+            let resp = json_response(
                 StatusCode::NOT_FOUND,
                 &ErrorResponse {
                     error: format!("Not found: {} {}", method, path),
                 },
-            )
+            );
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
     };
 
     Ok(response)
+}
+
+/// Handle POST /v1/chat/completions
+async fn handle_chat_completion(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+    // Read the request body
+    let body_bytes = req.collect().await?.to_bytes();
+
+    // Deserialize the request
+    let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+
+    // Route the request to the appropriate provider
+    let provider_response = state.router.route(&request).await?;
+
+    // Convert the provider response to an HTTP response
+    match provider_response {
+        ProviderResponse::Stream(stream) => {
+            let stream_body = StreamBody::new(stream.map(|chunk| {
+                chunk.map(Frame::data)
+            }));
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(stream_body.boxed_unsync())?;
+
+            Ok(response)
+        }
+    }
 }
 
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)

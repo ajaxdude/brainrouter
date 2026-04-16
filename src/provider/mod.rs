@@ -29,6 +29,7 @@ pub trait Provider: Send + Sync {
 }
 
 pub mod anthropic;
+// TODO: embedded provider has thread safety issues and needs to be fixed
 pub mod embedded;
 pub mod google;
 pub mod openai;

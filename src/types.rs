@@ -55,6 +55,7 @@ pub struct ChunkChoice {
 
 /// Delta content in a streaming chunk
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
