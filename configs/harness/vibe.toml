@@ -1,0 +1,14 @@
+[[providers]]
+name = "brainrouter"
+api_base = "http://127.0.0.1:9099/v1"
+api_style = "openai"
+backend = "generic"
+
+[[models]]
+name = "brainrouter-auto"
+provider = "brainrouter"
+alias = "auto"
+
+mcp_servers = [
+  { name = "brainrouter", command = "/home/papa/ai/projects/brainrouter/target/release/brainrouter", args = ["mcp", "--socket", "/run/user/1000/brainrouter.sock"] },
+]

@@ -14,13 +14,19 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, error, info};
 
+use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
+use crate::escalation;
+use crate::review::ReviewService;
 use crate::router::Router;
+use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
 
 /// Shared state passed to all request handlers
 pub struct AppState {
     pub router: Arc<Router>,
+    pub session_manager: Arc<SessionManager>,
+    pub review_service: Arc<ReviewService>,
 }
 
 #[derive(Serialize)]
@@ -66,12 +72,18 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
-    let method = req.method();
+    let method = req.method().as_str();
     let path = req.uri().path();
 
     debug!("Request: {} {}", method, path);
 
-    let response = match (method.as_str(), path) {
+    // Route /review/* to the escalation module
+    if path.starts_with("/review") {
+        let result = escalation::handle_review_request(req, Arc::clone(&state.review_service)).await;
+        return result;
+    }
+
+    let response = match (method, path) {
         ("GET", "/health") => {
             let resp = json_response(StatusCode::OK, &HealthResponse { status: "ok" });
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
@@ -79,7 +91,12 @@ async fn handle_request(
         ("GET", "/v1/models") => {
             let models = ModelListResponse {
                 object: "list",
-                data: vec![],
+                data: vec![ModelObject {
+                    id: "auto".to_string(),
+                    object: "model",
+                    created: 0,
+                    owned_by: "brainrouter".to_string(),
+                }],
             };
             let resp = json_response(StatusCode::OK, &models);
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
@@ -89,6 +106,21 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: format!("Internal error: {}", e),
+                        },
+                    );
+                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                }
+            }
+        }
+        ("POST", "/v1/messages") => {
+            match handle_anthropic_messages(req, state).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Error handling Anthropic messages: {}", e);
                     let resp = json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse {
@@ -133,6 +165,41 @@ async fn handle_chat_completion(
             let stream_body = StreamBody::new(stream.map(|chunk| {
                 chunk.map(Frame::data)
             }));
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(stream_body.boxed_unsync())?;
+
+            Ok(response)
+        }
+    }
+}
+
+/// Handle POST /v1/messages (Anthropic Messages API)
+///
+/// Translates the Anthropic request to OpenAI format, routes through Bonsai,
+/// and translates the OpenAI SSE response back to Anthropic SSE events.
+async fn handle_anthropic_messages(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+    let body_bytes = req.collect().await?.to_bytes();
+    let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
+
+    // Capture model before consuming the request
+    let model = anthropic_req.model.clone();
+
+    // Translate to OpenAI format and route
+    let oai_request = anthropic_to_openai(anthropic_req);
+    let provider_response = state.router.route(oai_request).await?;
+
+    match provider_response {
+        ProviderResponse::Stream(stream) => {
+            let adapted = AnthropicSseAdapter::new(stream, model);
+            let stream_body = StreamBody::new(adapted.map(|chunk| chunk.map(Frame::data)));
 
             let response = Response::builder()
                 .status(StatusCode::OK)

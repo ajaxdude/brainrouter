@@ -1,0 +1,11 @@
+model = "auto"
+model_provider = "brainrouter"
+
+[model_providers.brainrouter]
+name = "Brainrouter"
+base_url = "http://127.0.0.1:9099/v1"
+env_key = "BRAINROUTER_API_KEY"
+
+[mcp_servers.brainrouter]
+command = "/home/papa/ai/projects/brainrouter/target/release/brainrouter"
+args = ["mcp", "--socket", "/run/user/1000/brainrouter.sock"]

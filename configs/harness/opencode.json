@@ -1,0 +1,13 @@
+{
+  "provider": {
+    "brainrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Brainrouter",
+      "options": { "baseURL": "http://127.0.0.1:9099/v1" },
+      "models": { "auto": { "model": "auto", "name": "Brainrouter (auto)" } }
+    }
+  },
+  "mcp": {
+    "brainrouter": { "type": "local", "command": ["/home/papa/ai/projects/brainrouter/target/release/brainrouter", "mcp", "--socket", "/run/user/1000/brainrouter.sock"] }
+  }
+}

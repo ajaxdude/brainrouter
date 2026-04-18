@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Review Session — Brainrouter</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; padding: 24px; max-width: 900px; }
+    h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 8px; color: #f0f6fc; }
+    .meta { font-size: 0.8rem; color: #8b949e; margin-bottom: 24px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+    .pending { background: #388bfd22; color: #388bfd; border: 1px solid #388bfd55; }
+    .approved { background: #3fb95022; color: #3fb950; border: 1px solid #3fb95055; }
+    .needs_revision { background: #d2992222; color: #d29922; border: 1px solid #d2992255; }
+    .escalated { background: #f8514922; color: #f85149; border: 1px solid #f8514955; }
+    section { margin-bottom: 24px; }
+    section h2 { font-size: 0.9rem; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; font-size: 0.875rem; }
+    .escalation-form textarea { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; padding: 12px; font-size: 0.875rem; font-family: inherit; resize: vertical; min-height: 100px; }
+    .escalation-form button { margin-top: 12px; padding: 8px 20px; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 0.875rem; font-weight: 600; cursor: pointer; }
+    .escalation-form button:hover { background: #2ea043; }
+    .back { display: inline-block; margin-bottom: 16px; color: #388bfd; text-decoration: none; font-size: 0.875rem; }
+    .back:hover { text-decoration: underline; }
+    #status-msg { margin-top: 12px; font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <a href="/review/" class="back">&larr; Back to Dashboard</a>
+  <h1 id="session-title">Loading session...</h1>
+  <p class="meta" id="session-meta"></p>
+
+  <section>
+    <h2>Status</h2>
+    <span class="badge" id="session-status"></span>
+  </section>
+
+  <section>
+    <h2>Summary</h2>
+    <div class="card" id="session-summary"></div>
+  </section>
+
+  <section id="details-section" style="display:none">
+    <h2>Details</h2>
+    <div class="card" id="session-details"></div>
+  </section>
+
+  <section id="llm-feedback-section" style="display:none">
+    <h2>LLM Feedback</h2>
+    <div class="card" id="session-llm-feedback"></div>
+  </section>
+
+  <section id="human-feedback-section" style="display:none">
+    <h2>Human Feedback</h2>
+    <div class="card" id="session-human-feedback"></div>
+  </section>
+
+  <section id="resolve-section">
+    <h2>Resolve (Human Review)</h2>
+    <div class="escalation-form">
+      <textarea id="feedback-input" placeholder="Enter your feedback. Start with 'ok', 'lgtm', or 'approved' to approve."></textarea>
+      <button onclick="submitFeedback()">Submit Feedback</button>
+      <div id="status-msg"></div>
+    </div>
+  </section>
+
+  <script>
+    const sessionId = location.pathname.split('/').pop();
+
+    async function load() {
+      const resp = await fetch(`/review/api/sessions/${sessionId}`);
+      if (!resp.ok) { document.getElementById('session-title').textContent = 'Session not found'; return; }
+      const s = await resp.json();
+
+      document.getElementById('session-title').textContent = `Session ${s.id.substring(0,8)}… — ${s.task_id}`;
+      document.getElementById('session-meta').textContent = `Created: ${s.created_at} | Updated: ${s.updated_at} | Iterations: ${s.iteration_count}`;
+
+      const badge = document.getElementById('session-status');
+      badge.className = `badge ${s.status}`;
+      badge.textContent = s.status;
+
+      document.getElementById('session-summary').textContent = s.summary;
+
+      if (s.details) {
+        document.getElementById('session-details').textContent = s.details;
+        document.getElementById('details-section').style.display = '';
+      }
+      if (s.llm_feedback) {
+        document.getElementById('session-llm-feedback').textContent = s.llm_feedback;
+        document.getElementById('llm-feedback-section').style.display = '';
+      }
+      if (s.human_feedback) {
+        document.getElementById('session-human-feedback').textContent = s.human_feedback;
+        document.getElementById('human-feedback-section').style.display = '';
+      }
+
+      // Hide resolve form if already resolved
+      if (s.status === 'approved' || s.status === 'needs_revision') {
+        if (s.reviewer_type === 'human') {
+          document.getElementById('resolve-section').style.display = 'none';
+        }
+      }
+    }
+
+    async function submitFeedback() {
+      const feedback = document.getElementById('feedback-input').value.trim();
+      if (!feedback) { alert('Please enter feedback.'); return; }
+
+      const msg = document.getElementById('status-msg');
+      msg.textContent = 'Submitting...';
+
+      const resp = await fetch(`/review/session/${sessionId}/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedback })
+      });
+
+      if (resp.ok) {
+        msg.textContent = 'Feedback submitted. Refreshing...';
+        setTimeout(load, 800);
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        msg.textContent = `Error: ${data.error || resp.statusText}`;
+      }
+    }
+
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

@@ -1,7 +1,6 @@
 use super::{Provider, ProviderResponse, SseStream};
 use crate::types::ChatCompletionRequest;
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use futures_util::StreamExt;
 use std::future::Future;
 use std::pin::Pin;

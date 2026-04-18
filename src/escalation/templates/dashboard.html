@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brainrouter — Review Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 24px; color: #f0f6fc; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+    .pending { background: #388bfd22; color: #388bfd; border: 1px solid #388bfd55; }
+    .approved { background: #3fb95022; color: #3fb950; border: 1px solid #3fb95055; }
+    .needs_revision { background: #d29922;22; color: #d29922; border: 1px solid #d2992255; }
+    .escalated { background: #f8514922; color: #f85149; border: 1px solid #f8514955; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 8px 12px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .05em; color: #8b949e; border-bottom: 1px solid #30363d; }
+    td { padding: 12px; border-bottom: 1px solid #21262d; font-size: 0.875rem; vertical-align: top; }
+    tr:hover td { background: #161b22; }
+    a { color: #388bfd; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .empty { text-align: center; padding: 48px; color: #8b949e; }
+    .refresh { float: right; font-size: 0.75rem; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <h1>Review Dashboard <span class="refresh">Auto-refreshes every 5s</span></h1>
+  <table id="sessions-table">
+    <thead>
+      <tr>
+        <th>Session ID</th>
+        <th>Task ID</th>
+        <th>Status</th>
+        <th>Summary</th>
+        <th>Iterations</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody id="sessions-body">
+      <tr><td colspan="6" class="empty">Loading sessions...</td></tr>
+    </tbody>
+  </table>
+
+  <script>
+    async function loadSessions() {
+      try {
+        const resp = await fetch('/review/api/sessions');
+        const data = await resp.json();
+        const tbody = document.getElementById('sessions-body');
+        if (!data.sessions || data.sessions.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="empty">No review sessions yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.sessions.map(s => `
+          <tr>
+            <td><a href="/review/session/${s.id}">${s.id.substring(0,8)}&hellip;</a></td>
+            <td>${escapeHtml(s.task_id)}</td>
+            <td><span class="badge ${s.status}">${s.status}</span></td>
+            <td>${escapeHtml(s.summary)}</td>
+            <td>${s.iteration_count}</td>
+            <td>${s.updated_at}</td>
+          </tr>
+        `).join('');
+      } catch (e) {
+        console.error('Failed to load sessions', e);
+      }
+    }
+    function escapeHtml(text) {
+      const d = document.createElement('div');
+      d.appendChild(document.createTextNode(text || ''));
+      return d.innerHTML;
+    }
+    loadSessions();
+    setInterval(loadSessions, 5000);
+  </script>
+</body>
+</html>

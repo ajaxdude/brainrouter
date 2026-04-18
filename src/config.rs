@@ -8,6 +8,8 @@ pub struct BrainrouterConfig {
     pub manifest: ManifestConfig,
     pub llama_swap: LlamaSwapConfig,
     pub bonsai: BonsaiConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 /// Configuration for the Manifest cloud LLM router.
@@ -41,6 +43,26 @@ pub struct LlamaSwapConfig {
 pub struct BonsaiConfig {
     /// Path to the Bonsai GGUF model file.
     pub model_path: PathBuf,
+}
+
+/// Configuration for the review service and escalation dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Maximum number of LLM review iterations before escalating to human.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+}
+
+fn default_max_iterations() -> u32 {
+    5
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        ReviewConfig {
+            max_iterations: default_max_iterations(),
+        }
+    }
 }
 
 impl BrainrouterConfig {

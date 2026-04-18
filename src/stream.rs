@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
-use tokio_stream::StreamMap;
 
 /// A stream that wraps another stream and applies a timeout to each item.
 #[pin_project::pin_project]
