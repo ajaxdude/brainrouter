@@ -2,8 +2,8 @@
   "mcpServers": {
     "brainrouter": {
       "type": "stdio",
-      "command": "/home/papa/ai/projects/brainrouter/target/release/brainrouter",
-      "args": ["mcp", "--socket", "/run/user/1000/brainrouter.sock"],
+      "command": "/path/to/brainrouter",
+      "args": ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"],
       "timeout": 300000
     }
   }

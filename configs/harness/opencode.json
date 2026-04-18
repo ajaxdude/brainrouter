@@ -8,6 +8,6 @@
     }
   },
   "mcp": {
-    "brainrouter": { "type": "local", "command": ["/home/papa/ai/projects/brainrouter/target/release/brainrouter", "mcp", "--socket", "/run/user/1000/brainrouter.sock"] }
+    "brainrouter": { "type": "local", "command": ["/path/to/brainrouter", "mcp", "--socket", "/run/user/$UID/brainrouter.sock"] }
   }
 }

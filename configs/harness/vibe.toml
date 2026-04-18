@@ -10,5 +10,5 @@ provider = "brainrouter"
 alias = "auto"
 
 mcp_servers = [
-  { name = "brainrouter", command = "/home/papa/ai/projects/brainrouter/target/release/brainrouter", args = ["mcp", "--socket", "/run/user/1000/brainrouter.sock"] },
+  { name = "brainrouter", command = "/path/to/brainrouter", args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"] },
 ]

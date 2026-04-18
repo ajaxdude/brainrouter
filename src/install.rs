@@ -99,7 +99,7 @@ provider = "brainrouter"
 alias = "auto"
 
 mcp_servers = [
-  { name = "brainrouter", command = "brainrouter", args = ["mcp", "--socket", "/run/user/1000/brainrouter.sock"] },
+  { name = "brainrouter", command = "brainrouter", args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"] },
 ]"#;
 
 // ─── OpenCode ─────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ env_key = "BRAINROUTER_API_KEY"
 
 [mcp_servers.brainrouter]
 command = "brainrouter"
-args = ["mcp", "--socket", "/run/user/1000/brainrouter.sock"]"#;
+args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"]"#;
 
 // ─── Droid ────────────────────────────────────────────────────────────────────
 

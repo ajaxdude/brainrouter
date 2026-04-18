@@ -2,3 +2,7 @@
 *.swp
 *.swo
 *~
+
+# Secrets and local config — never commit
+.env
+brainrouter.yaml

@@ -6,6 +6,6 @@
     "provider": "anthropic"
   }],
   "mcpServers": {
-    "brainrouter": { "type": "stdio", "command": "/home/papa/ai/projects/brainrouter/target/release/brainrouter", "args": ["mcp", "--socket", "/run/user/1000/brainrouter.sock"] }
+    "brainrouter": { "type": "stdio", "command": "/path/to/brainrouter", "args": ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"] }
   }
 }
