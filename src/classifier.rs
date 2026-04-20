@@ -41,7 +41,7 @@ pub struct Classifier {
 }
 
 /// Maximum tokens to generate during classification. We only need one word.
-const CLASSIFY_MAX_TOKENS: usize = 5;
+const CLASSIFY_MAX_TOKENS: usize = 10;
 /// Truncate the user message to this many characters before classifying.
 /// Keeps the prompt short so classification stays under ~200ms.
 const USER_MSG_TRUNCATE: usize = 800;
@@ -189,13 +189,15 @@ fn classify_blocking(
 ) -> Result<String> {
     let prompt = format!(
         "<|im_start|>system\n\
+/no_think\n\
 You are a routing classifier. Reply with exactly one word: \"cloud\" for complex \
 tasks (architecture, debugging large systems, multi-step reasoning, refactoring) \
 or \"local\" for simple tasks (short answers, simple questions, single-line code, \
 explanations). Output nothing else.<|im_end|>\n\
 <|im_start|>user\n\
 Classify this request: {}<|im_end|>\n\
-<|im_start|>assistant\n",
+<|im_start|>assistant\n\
+<think>\n</think>\n",
         user_message
     );
 

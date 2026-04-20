@@ -97,7 +97,7 @@ impl ReviewService {
             .get_session(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-        // Determine approval status from feedback text (mirrors pingpong logic)
+        // Determine approval status from feedback text
         let is_approval = {
             let lower = feedback.to_lowercase();
             lower.starts_with("ok")
@@ -120,6 +120,7 @@ impl ReviewService {
                 feedback: Some(feedback),
                 reviewer_type: Some(ReviewerType::Human),
                 escalation_reason: None,
+                review_model: None,
             },
         );
 

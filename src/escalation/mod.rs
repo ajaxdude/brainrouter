@@ -247,6 +247,7 @@ struct SessionSummary {
     summary: String,
     iteration_count: u32,
     updated_at: String,
+    review_model: Option<String>,
 }
 
 impl From<&Session> for SessionSummary {
@@ -258,6 +259,7 @@ impl From<&Session> for SessionSummary {
             summary: s.summary.clone(),
             iteration_count: s.iteration_count,
             updated_at: s.updated_at.clone(),
+            review_model: s.review_model.clone(),
         }
     }
 }

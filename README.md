@@ -96,7 +96,7 @@ All on `http://127.0.0.1:9099`.
 
 ## MCP tools
 
-Four tools, identical names to the original pingpong so existing agent prompts still work:
+Four tools exposed via MCP:
 
 | Tool | What it does |
 |---|---|

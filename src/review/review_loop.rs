@@ -72,8 +72,9 @@ pub async fn run_loop(
 
         let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
 
-        // Route through the same Router used by the HTTP proxy
-        let result = call_llm_for_review(router, prompt.clone()).await;
+        // Route through the same Router used by the HTTP proxy, tagging the event
+        // with this session_id so the dashboard can correlate review calls.
+        let result = call_llm_for_review(router, prompt.clone(), session_id).await;
 
         match result {
             Err(e) => {
@@ -89,11 +90,16 @@ pub async fn run_loop(
                         feedback: Some(feedback.clone()),
                         reviewer_type: Some(ReviewerType::Llm),
                         escalation_reason: Some(EscalationReason::LlmError),
+                        review_model: None,
                     },
                 );
                 break;
             }
-            Ok(raw_text) => {
+            Ok((raw_text, route_info)) => {
+                // Record which model handled this review (first iteration sets it; later
+                // iterations are no-ops because update_session only sets it once).
+                let review_model = route_info.display();
+
                 // Parse the JSON response from the LLM
                 match parse_llm_response(&raw_text) {
                     Ok(parsed) => {
@@ -104,6 +110,7 @@ pub async fn run_loop(
                             session_id,
                             iteration = iteration_count,
                             status = %status,
+                            review_model = %review_model,
                             "LLM returned review decision"
                         );
 
@@ -118,6 +125,7 @@ pub async fn run_loop(
                                 } else {
                                     None
                                 },
+                                review_model: Some(review_model),
                             },
                         );
 
@@ -148,6 +156,7 @@ pub async fn run_loop(
                                     feedback: Some(feedback.clone()),
                                     reviewer_type: Some(ReviewerType::Llm),
                                     escalation_reason: Some(EscalationReason::LlmError),
+                                    review_model: Some(review_model),
                                 },
                             );
                         } else {
@@ -174,6 +183,7 @@ pub async fn run_loop(
                 feedback: Some(feedback.clone()),
                 reviewer_type: Some(ReviewerType::Llm),
                 escalation_reason: Some(EscalationReason::MaxIterations),
+                review_model: None,
             },
         );
     }
@@ -188,8 +198,13 @@ pub async fn run_loop(
     })
 }
 
-/// Send the review prompt through the Router and collect the full response text.
-async fn call_llm_for_review(router: &Arc<Router>, prompt: String) -> Result<String> {
+/// Send the review prompt through the Router, tagged with the session_id.
+/// Returns the full collected text response and routing metadata.
+async fn call_llm_for_review(
+    router: &Arc<Router>,
+    prompt: String,
+    session_id: &str,
+) -> Result<(String, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
         model: "auto".to_string(),
         messages: vec![
@@ -218,7 +233,9 @@ async fn call_llm_for_review(router: &Arc<Router>, prompt: String) -> Result<Str
         extra: serde_json::Value::Object(serde_json::Map::new()),
     };
 
-    let provider_response = router.route(request).await?;
+    let (provider_response, route_info) = router
+        .route_tagged(request, Some(session_id.to_string()), String::new())
+        .await?;
 
     // Collect the SSE stream into a full text response
     use crate::provider::ProviderResponse;
@@ -252,7 +269,7 @@ async fn call_llm_for_review(router: &Arc<Router>, prompt: String) -> Result<Str
         }
     }
 
-    Ok(collected)
+    Ok((collected, route_info))
 }
 
 /// Extract JSON from LLM response text (may be wrapped in markdown code fences).

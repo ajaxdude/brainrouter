@@ -49,7 +49,8 @@ fn session_update_status_and_feedback() {
             feedback: Some("Add more tests".to_string()),
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: None,
-        },
+                        review_model: None,
+            },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -76,7 +77,8 @@ fn session_human_feedback_goes_to_correct_field() {
             feedback: Some("LGTM".to_string()),
             reviewer_type: Some(ReviewerType::Human),
             escalation_reason: None,
-        },
+                        review_model: None,
+            },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -103,7 +105,8 @@ fn session_escalation_reason_stored() {
             feedback: Some("Too many failures".to_string()),
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: Some(EscalationReason::MaxIterations),
-        },
+                        review_model: None,
+            },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -166,7 +169,8 @@ fn update_nonexistent_session_is_noop() {
             feedback: None,
             reviewer_type: None,
             escalation_reason: None,
-        },
+                        review_model: None,
+            },
     );
 }
 

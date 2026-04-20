@@ -68,6 +68,10 @@ pub async fn run(args: McpArgs) -> Result<()> {
         };
 
         let response = handle_message(&args.socket, msg).await;
+        // Notifications return Value::Null — skip writing a response for them.
+        if response.is_null() {
+            continue;
+        }
         let mut response_str = serde_json::to_string(&response)?;
         response_str.push('\n');
         writer.write_all(response_str.as_bytes()).await?;
@@ -88,9 +92,9 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
             "serverInfo": { "name": "brainrouter", "version": env!("CARGO_PKG_VERSION") }
         })),
 
-        "notifications/initialized" => {
-            // One-way notification — no response needed; return null to suppress output
-            json!({})
+        "notifications/initialized" | "notifications/cancelled" => {
+            // One-way notification — no response.
+            Value::Null
         }
 
         "tools/list" => json_result(id, json!({
@@ -214,10 +218,11 @@ async fn http_uds_request(socket_path: &PathBuf, path: &str, body: Value) -> Res
     if method == "POST" {
         tx.write_all(&body_bytes).await?;
     }
-    drop(tx);
-
+    // Keep tx alive until we finish reading — dropping it before read_to_end
+    // closes the underlying socket (sends FIN) which Hyper treats as a reset.
     let mut response_bytes = Vec::new();
     rx.read_to_end(&mut response_bytes).await?;
+    drop(tx);
 
     // Strip HTTP headers — find \r\n\r\n
     let response_str = String::from_utf8_lossy(&response_bytes);

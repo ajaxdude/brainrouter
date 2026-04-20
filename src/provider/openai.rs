@@ -1,11 +1,10 @@
-use super::{Provider, ProviderResponse, SseStream};
+use super::{Provider, ProviderError, ProviderResponse, SseStream};
 use crate::types::ChatCompletionRequest;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use futures_util::StreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
-
 /// OpenAI-compatible provider adapter.
 /// Handles OpenAI, GitHub Copilot, Mistral, llama-swap, and other OpenAI-compatible APIs.
 pub struct OpenAiProvider {
@@ -46,12 +45,11 @@ impl Provider for OpenAiProvider {
     fn chat_completion(
         &self,
         mut request: ChatCompletionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + '_>> {
         Box::pin(async move {
             // Force streaming mode
             request.stream = Some(true);
 
-            // Build the request URL
             let url = format!("{}/chat/completions", self.base_url);
 
             tracing::debug!(
@@ -61,47 +59,44 @@ impl Provider for OpenAiProvider {
                 "Sending chat completion request"
             );
 
-            // Build HTTP request
             let mut req_builder = self
                 .client
                 .post(&url)
                 .header("Content-Type", "application/json");
 
-            // Add authorization header if API key is present
             if let Some(ref api_key) = self.api_key {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
 
-            // Send the request
             let response = req_builder
                 .json(&request)
                 .send()
                 .await
-                .map_err(|e| anyhow!("Failed to send request to {}: {}", self.name, e))?;
+                .map_err(|e| ProviderError {
+                    message: format!("Failed to connect to {}: {}", self.name, e),
+                    is_backend_fault: true,
+                })?;
 
-            // Check response status
             let status = response.status();
             if !status.is_success() {
-                // Read error body for better error messages
                 let error_body = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "<failed to read error body>".to_string());
-
-                return Err(anyhow!(
-                    "{} returned error status {}: {}",
-                    self.name,
-                    status,
-                    error_body
-                ));
+                // 4xx = bad request (wrong message format, invalid params) — backend is
+                // healthy. 5xx = server error — treat as backend fault to trip circuit.
+                let is_backend_fault = status.is_server_error();
+                return Err(ProviderError {
+                    message: format!(
+                        "{} returned error status {}: {}",
+                        self.name, status, error_body
+                    ),
+                    is_backend_fault,
+                });
             }
 
-            tracing::debug!(
-                provider = %self.name,
-                "Received successful response, streaming chunks"
-            );
+            tracing::debug!(provider = %self.name, "Received successful response, streaming chunks");
 
-            // Convert response byte stream to our SseStream type
             let stream: SseStream = Box::pin(
                 response
                     .bytes_stream()

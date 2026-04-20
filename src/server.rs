@@ -16,17 +16,23 @@ use tracing::{debug, error, info};
 
 use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
 use crate::escalation;
+use crate::peer_cwd::peer_cwd;
 use crate::review::ReviewService;
 use crate::router::Router;
+use crate::routing_events::RoutingEvents;
 use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
+
+// Unified dashboard — embedded at compile time so the binary is self-contained.
+const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
 
 /// Shared state passed to all request handlers
 pub struct AppState {
     pub router: Arc<Router>,
     pub session_manager: Arc<SessionManager>,
     pub review_service: Arc<ReviewService>,
+    pub routing_events: Arc<RoutingEvents>,
 }
 
 #[derive(Serialize)]
@@ -67,10 +73,23 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<By
         .expect("Failed to build response")
 }
 
+fn html_ok(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(
+            Full::new(Bytes::from_static(html.as_bytes()))
+                .map_err(|_| unreachable!())
+                .boxed_unsync(),
+        )
+        .expect("Failed to build HTML response")
+}
+
 /// Handle incoming HTTP requests
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
+    cwd: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
     let path = req.uri().path();
@@ -88,6 +107,7 @@ async fn handle_request(
             let resp = json_response(StatusCode::OK, &HealthResponse { status: "ok" });
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
+
         ("GET", "/v1/models") => {
             let models = ModelListResponse {
                 object: "list",
@@ -101,42 +121,63 @@ async fn handle_request(
             let resp = json_response(StatusCode::OK, &models);
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
+
         ("POST", "/v1/chat/completions") => {
-            match handle_chat_completion(req, state).await {
+            match handle_chat_completion(req, state, cwd).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
                     let resp = json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse {
-                            error: format!("Internal error: {}", e),
-                        },
+                        &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
                     resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
                 }
             }
         }
+
         ("POST", "/v1/messages") => {
-            match handle_anthropic_messages(req, state).await {
+            match handle_anthropic_messages(req, state, cwd).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling Anthropic messages: {}", e);
                     let resp = json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse {
-                            error: format!("Internal error: {}", e),
-                        },
+                        &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
                     resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
                 }
             }
         }
+
+        // ── Root redirect → dashboard ──────────────────────────────────────────
+        ("GET", "/") => {
+            let resp = Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/dashboard")
+                .body(Full::new(Bytes::new()))
+                .expect("Failed to build redirect");
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        // ── Unified dashboard ──────────────────────────────────────────────────
+        ("GET", "/dashboard") => html_ok(MAIN_DASHBOARD_HTML),
+
+        // ── Routing events API ─────────────────────────────────────────────────
+        ("GET", "/api/routing-events") => {
+            let resp = json_response(StatusCode::OK, &state.routing_events.get_all_as_response());
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("GET", "/api/routing-stats") => {
+            let resp = json_response(StatusCode::OK, &state.routing_events.get_stats());
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
         _ => {
             let resp = json_response(
                 StatusCode::NOT_FOUND,
-                &ErrorResponse {
-                    error: format!("Not found: {} {}", method, path),
-                },
+                &ErrorResponse { error: format!("Not found: {} {}", method, path) },
             );
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
@@ -149,30 +190,21 @@ async fn handle_request(
 async fn handle_chat_completion(
     req: Request<Incoming>,
     state: Arc<AppState>,
+    cwd: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
-    // Read the request body
     let body_bytes = req.collect().await?.to_bytes();
-
-    // Deserialize the request
     let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    let provider_response = state.router.route_tagged(request, None, cwd).await?.0;
 
-    // Route the request to the appropriate provider
-    let provider_response = state.router.route(request).await?;
-
-    // Convert the provider response to an HTTP response
     match provider_response {
         ProviderResponse::Stream(stream) => {
-            let stream_body = StreamBody::new(stream.map(|chunk| {
-                chunk.map(Frame::data)
-            }));
-
+            let stream_body = StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)));
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
                 .body(stream_body.boxed_unsync())?;
-
             Ok(response)
         }
     }
@@ -185,29 +217,24 @@ async fn handle_chat_completion(
 async fn handle_anthropic_messages(
     req: Request<Incoming>,
     state: Arc<AppState>,
+    cwd: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
-
-    // Capture model before consuming the request
     let model = anthropic_req.model.clone();
-
-    // Translate to OpenAI format and route
     let oai_request = anthropic_to_openai(anthropic_req);
-    let provider_response = state.router.route(oai_request).await?;
+    let provider_response = state.router.route_tagged(oai_request, None, cwd).await?.0;
 
     match provider_response {
         ProviderResponse::Stream(stream) => {
             let adapted = AnthropicSseAdapter::new(stream, model);
             let stream_body = StreamBody::new(adapted.map(|chunk| chunk.map(Frame::data)));
-
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
                 .body(stream_body.boxed_unsync())?;
-
             Ok(response)
         }
     }
@@ -219,25 +246,20 @@ pub async fn run(
     uds_path: PathBuf,
     state: Arc<AppState>,
 ) -> Result<()> {
-    // Remove existing UDS socket if it exists
     if uds_path.exists() {
         info!("Removing existing Unix socket at {:?}", uds_path);
         std::fs::remove_file(&uds_path)?;
     }
 
-    // Bind TCP listener
     let tcp_listener = TcpListener::bind(tcp_addr).await?;
     info!("TCP listener bound to {}", tcp_addr);
 
-    // Bind Unix domain socket listener
     let uds_listener = UnixListener::bind(&uds_path)?;
     info!("Unix socket listener bound to {:?}", uds_path);
 
-    // Clone state for both tasks
     let tcp_state = state.clone();
     let uds_state = state;
 
-    // Spawn TCP listener task
     let tcp_task = tokio::spawn(async move {
         loop {
             match tcp_listener.accept().await {
@@ -245,27 +267,24 @@ pub async fn run(
                     info!("New TCP connection from {}", addr);
                     let io = TokioIo::new(stream);
                     let state = tcp_state.clone();
-
+                    // Resolve the cwd of the connecting OMP process once per
+                    // connection; all requests on this keep-alive connection
+                    // share the same process and thus the same cwd.
+                    let conn_cwd = peer_cwd(&addr).unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(move |req| handle_request(req, state.clone())),
-                            )
+                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone())))
                             .await
                         {
                             error!("Error serving TCP connection: {}", e);
                         }
                     });
                 }
-                Err(e) => {
-                    error!("Failed to accept TCP connection: {}", e);
-                }
+                Err(e) => error!("Failed to accept TCP connection: {}", e),
             }
         }
     });
 
-    // Spawn UDS listener task
     let uds_path_for_cleanup = uds_path.clone();
     let uds_task = tokio::spawn(async move {
         loop {
@@ -274,37 +293,27 @@ pub async fn run(
                     info!("New Unix socket connection");
                     let io = TokioIo::new(stream);
                     let state = uds_state.clone();
-
+                    // UDS connections have no peer address; cwd is unknown.
+                    let conn_cwd = String::new();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(move |req| handle_request(req, state.clone())),
-                            )
+                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone())))
                             .await
                         {
                             error!("Error serving Unix socket connection: {}", e);
                         }
                     });
                 }
-                Err(e) => {
-                    error!("Failed to accept Unix socket connection: {}", e);
-                }
+                Err(e) => error!("Failed to accept Unix socket connection: {}", e),
             }
         }
     });
 
-    // Wait for both tasks (they run forever unless cancelled)
     tokio::select! {
-        _ = tcp_task => {
-            info!("TCP listener task ended");
-        }
-        _ = uds_task => {
-            info!("Unix socket listener task ended");
-        }
+        _ = tcp_task => info!("TCP listener task ended"),
+        _ = uds_task => info!("Unix socket listener task ended"),
     }
 
-    // Clean up UDS socket on shutdown
     if uds_path_for_cleanup.exists() {
         info!("Cleaning up Unix socket at {:?}", uds_path_for_cleanup);
         let _ = std::fs::remove_file(&uds_path_for_cleanup);

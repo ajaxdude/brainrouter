@@ -17,6 +17,7 @@ use brainrouter::{
     provider::openai::OpenAiProvider,
     review::ReviewService,
     router::Router,
+    routing_events::RoutingEvents,
     server::{self, AppState},
     session::SessionManager,
 };
@@ -87,6 +88,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Health tracker (circuit breaker)
     let health = Arc::new(HealthTracker::new());
 
+    // Routing event ring buffer — shared between Router (writes) and HTTP API (reads)
+    let routing_events = Arc::new(RoutingEvents::new());
+
     // Router — shared between the proxy and the review service
     let router = Arc::new(Router::new(
         classifier,
@@ -94,6 +98,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         llama_swap,
         config.llama_swap.fallback_model.clone(),
         health,
+        Arc::clone(&routing_events),
     ));
 
     // Session manager (in-memory; ephemeral per process lifetime)
@@ -111,6 +116,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         router,
         session_manager,
         review_service,
+        routing_events,
     });
 
     // Server (TCP + UDS)

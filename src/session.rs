@@ -69,6 +69,8 @@ pub struct Session {
     pub escalation_reason: Option<EscalationReason>,
     pub iteration_count: u32,
     pub reviewer_type: Option<ReviewerType>,
+    /// Which model/provider handled the review LLM calls (e.g. "cloud via manifest").
+    pub review_model: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -88,6 +90,7 @@ impl Session {
             escalation_reason: None,
             iteration_count: 0,
             reviewer_type: None,
+            review_model: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -100,6 +103,8 @@ pub struct SessionUpdate {
     pub feedback: Option<String>,
     pub reviewer_type: Option<ReviewerType>,
     pub escalation_reason: Option<EscalationReason>,
+    /// Model/provider string to record on the session (set once on first review iteration).
+    pub review_model: Option<String>,
 }
 
 /// Thread-safe in-memory session store.
@@ -158,6 +163,12 @@ impl SessionManager {
         }
         if let Some(reason) = update.escalation_reason {
             session.escalation_reason = Some(reason);
+        }
+        // Only set review_model if provided and not already set (first iteration wins).
+        if let Some(rm) = update.review_model {
+            if session.review_model.is_none() {
+                session.review_model = Some(rm);
+            }
         }
         session.updated_at = chrono::Utc::now().to_rfc3339();
     }

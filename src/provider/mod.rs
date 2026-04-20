@@ -1,13 +1,3 @@
-//! Provider adapter trait and common types.
-//!
-//! brainrouter uses exactly two OpenAI-compatible backends:
-//! - Manifest (cloud router at localhost:3001)
-//! - llama-swap (local model runner at localhost:8080)
-//!
-//! Both are served by `OpenAiProvider`. The embedded Bonsai model is NOT a
-//! provider in the routing path — it's used by the `classifier` module to
-//! make the routing decision, and is not surfaced as an LLM backend itself.
-
 use crate::types::ChatCompletionRequest;
 use anyhow::Result;
 use bytes::Bytes;
@@ -23,12 +13,32 @@ pub enum ProviderResponse {
     Stream(SseStream),
 }
 
+/// Error returned by a provider.
+#[derive(Debug)]
+pub struct ProviderError {
+    /// Human-readable error message.
+    pub message: String,
+    /// True when the error is a backend infrastructure fault (connection refused,
+    /// timeout, 5xx server crash). False for 4xx/5xx responses caused by a bad
+    /// *request* (wrong message order, invalid JSON, oversized prompt) — these
+    /// mean the backend is healthy and should not trip the circuit breaker.
+    pub is_backend_fault: bool,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 /// Trait implemented by HTTP-based LLM provider adapters.
 pub trait Provider: Send + Sync {
     fn chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + '_>>;
 
     fn name(&self) -> &str;
 }

@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>brainrouter — Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg2: #161b22;
+      --bg3: #21262d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --border: #30363d;
+      --accent: #388bfd;
+      --green: #3fb950;
+      --orange: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+      --teal: #39d353;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 20px; }
+
+    /* ── Header ─────────────────────────────────────────── */
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+    .header h1 { font-size: 1.4rem; font-weight: 700; color: #f0f6fc; }
+    .header h1 span { color: var(--accent); }
+    .nav { display: flex; gap: 10px; }
+    .nav a { font-size: 0.8rem; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); text-decoration: none; transition: all 0.15s; }
+    .nav a:hover { border-color: var(--accent); color: var(--accent); }
+    .nav a.nav-active { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Live model flow ────────────────────────────────── */
+    .flow-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+    .flow-section h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 16px; }
+    .flow-row { display: flex; align-items: center; gap: 0; }
+    .flow-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 0; }
+    .flow-box .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+    .flow-box .value { font-size: 0.95rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .flow-arrow { color: var(--border); font-size: 1.4rem; padding: 0 10px; flex-shrink: 0; }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+    .flow-empty { color: var(--muted); font-size: 0.85rem; }
+
+    /* ── Stats row ──────────────────────────────────────── */
+    .stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+    .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; text-align: center; }
+    .stat-card .slabel { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
+    .stat-card .sval { font-size: 1.6rem; font-weight: 700; }
+    .sval.green { color: var(--green); }
+    .sval.orange { color: var(--orange); }
+    .sval.red { color: var(--red); }
+    .sval.accent { color: var(--accent); }
+    .sval.purple { color: var(--purple); }
+
+    /* ── Section titles ─────────────────────────────────── */
+    .section-title { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 24px 0 10px; }
+
+    /* ── Tables ─────────────────────────────────────────── */
+    .table-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-bottom: 28px; }
+    table { width: 100%; min-width: 700px; border-collapse: collapse; }
+    th { text-align: left; padding: 10px 14px; font-size: 0.7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--bg3); }
+    td { padding: 10px 14px; font-size: 0.83rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: rgba(255,255,255,.02); }
+
+    /* ── Badges ─────────────────────────────────────────── */
+    .badge { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+    .badge-cloud   { background: rgba(56,139,253,.18); color: var(--accent); border: 1px solid rgba(56,139,253,.4); }
+    .badge-local   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
+    .badge-manifest { background: rgba(57,211,83,.18); color: var(--teal); border: 1px solid rgba(57,211,83,.4); }
+    .badge-llama   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
+    .badge-fallback { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.4); }
+    .badge-ok      { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+    .badge-err     { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+    .badge-pending   { background: rgba(56,139,253,.18); color: var(--accent); border: 1px solid rgba(56,139,253,.4); }
+    .badge-approved  { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+    .badge-needs_revision { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.4); }
+    .badge-escalated { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+
+    .badge-folder { background: rgba(57,211,83,.1); color: var(--teal); border: 1px solid rgba(57,211,83,.25); font-size: 0.65rem; padding: 1px 6px; font-weight: 600; text-transform: none; letter-spacing: 0; margin-right: 5px; }
+    .badge-count { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid rgba(139,148,158,.3); font-size: 0.65rem; padding: 1px 5px; font-weight: 700; }
+    .muted { color: var(--muted); }
+    .truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .fast { color: var(--green); }
+    .medium { color: var(--orange); }
+    .slow { color: var(--red); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 0.85rem; }
+    .refresh-note { font-size: 0.7rem; color: var(--muted); float: right; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>brain<span>router</span></h1>
+    <div class="nav">
+      <a href="/dashboard" class="nav-active">Dashboard</a>
+      <a href="/review/">Review Sessions</a>
+      <a href="/review/api/sessions" target="_blank">Sessions API</a>
+      <a href="/api/routing-stats" target="_blank">Stats API</a>
+    </div>
+  </div>
+
+  <!-- Current model flow -->
+  <div class="flow-section">
+    <h2><span class="live-dot"></span>Live routing flow <span class="refresh-note">polling every 3s</span></h2>
+    <div id="flow-content" class="flow-empty">Waiting for first request...</div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-card"><div class="slabel">Total Requests</div><div class="sval accent" id="stat-total">—</div></div>
+    <div class="stat-card"><div class="slabel">Bonsai → Cloud</div><div class="sval green" id="stat-cloud">—</div></div>
+    <div class="stat-card"><div class="slabel">Bonsai → Local</div><div class="sval purple" id="stat-local">—</div></div>
+    <div class="stat-card"><div class="slabel">Fallbacks</div><div class="sval orange" id="stat-fallbacks">—</div></div>
+    <div class="stat-card"><div class="slabel">Avg Latency</div><div class="sval accent" id="stat-latency">—</div></div>
+  </div>
+
+  <!-- Route event feed -->
+  <div class="section-title">Route Event Feed</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:10%">Time</th>
+          <th style="width:28%">Prompt</th>
+          <th style="width:9%">Bonsai</th>
+          <th style="width:11%">Provider</th>
+          <th style="width:17%">Model</th>
+          <th style="width:8%">Latency</th>
+          <th style="width:8%">Status</th>
+          <th style="width:9%">Review?</th>
+        </tr>
+      </thead>
+      <tbody id="events-body">
+        <tr><td colspan="8" class="empty">No routing events yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Review sessions -->
+  <div class="section-title">Review Sessions</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:12%">Session</th>
+          <th style="width:20%">Task ID</th>
+          <th style="width:10%">Status</th>
+          <th style="width:28%">Review Model</th>
+          <th style="width:8%">Iters</th>
+          <th style="width:22%">Updated</th>
+        </tr>
+      </thead>
+      <tbody id="sessions-body">
+        <tr><td colspan="6" class="empty">No review sessions yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    let allEvents = [];
+    let prevModel = null;
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.appendChild(document.createTextNode(s || ''));
+      return d.innerHTML;
+    }
+
+    function fmtTime(iso) {
+      try {
+        const d = new Date(iso);
+        const now = new Date();
+        const diff = now - d;
+        if (diff < 60000) return Math.round(diff/1000) + 's ago';
+        if (diff < 3600000) return Math.round(diff/60000) + 'm ago';
+        return d.toLocaleTimeString();
+      } catch { return iso; }
+    }
+
+    function latClass(ms) {
+      if (ms < 500) return 'fast';
+      if (ms <= 2000) return 'medium';
+      return 'slow';
+    }
+
+    function modelDisplay(e) {
+      if (e.effective_provider === 'manifest') {
+        const name = e.model_key || 'auto';
+        return '<span class="badge badge-manifest">' + esc(name) + '</span>';
+      }
+      if (e.effective_provider === 'llama-swap') return '<span class="badge badge-llama">' + esc(e.model_key || 'llama-swap') + '</span>';
+      return '<span class="muted">—</span>';
+    }
+
+    function stageIsFallback(stage) {
+      return stage === 'cloud_fallback' || stage === 'local_fallback';
+    }
+
+    function renderFlow(events) {
+      if (!events.length) return;
+      const last = events[0]; // newest first
+      const bonsai = last.bonsai_decision || 'unknown';
+      let provider = '—';
+      let modelStr = '—';
+      if (last.effective_provider === 'manifest') {
+        provider = 'Manifest';
+        modelStr = last.model_key || 'auto';
+      } else if (last.effective_provider === 'llama-swap') {
+        provider = 'llama-swap';
+        modelStr = last.model_key || 'unknown';
+      }
+
+      const fallbackNote = stageIsFallback(last.stage)
+        ? ' <span class="badge badge-fallback">fallback</span>' : '';
+
+      // Track previous model for "was before" indicator
+      let prevNote = '';
+      if (prevModel && prevModel !== modelStr) {
+        prevNote = '<div style="margin-top:4px;font-size:0.7rem;color:var(--muted)">was: ' + esc(prevModel) + '</div>';
+      }
+      prevModel = modelStr;
+
+      document.getElementById('flow-content').innerHTML = `
+        <div class="flow-row">
+          <div class="flow-box">
+            <div class="label">Bonsai decision</div>
+            <div class="value">
+              <span class="badge badge-${bonsai}">${bonsai}</span>${fallbackNote}
+            </div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-box">
+            <div class="label">Provider</div>
+            <div class="value">${esc(provider)}</div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-box">
+            <div class="label">Model used${fallbackNote ? ' (fallback)' : ''}</div>
+            <div class="value">${esc(modelStr)}${prevNote}</div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-box">
+            <div class="label">Latency</div>
+            <div class="value ${latClass(last.latency_ms)}">${last.latency_ms} ms</div>
+          </div>
+        </div>`;
+    }
+
+    function renderStats(events) {
+      if (!events.length) return;
+      const total = events.length;
+      const cloud = events.filter(e => e.bonsai_decision === 'cloud').length;
+      const local = events.filter(e => e.bonsai_decision === 'local').length;
+      const fallbacks = events.filter(e => stageIsFallback(e.stage)).length;
+      const avgLat = Math.round(events.reduce((s, e) => s + (e.latency_ms || 0), 0) / total);
+
+      document.getElementById('stat-total').textContent = total;
+      document.getElementById('stat-cloud').textContent = cloud + ' (' + Math.round(cloud/total*100) + '%)';
+      document.getElementById('stat-local').textContent = local + ' (' + Math.round(local/total*100) + '%)';
+      document.getElementById('stat-fallbacks').textContent = fallbacks;
+      document.getElementById('stat-latency').textContent = avgLat + ' ms';
+    }
+
+    function renderEvents(events) {
+      const tbody = document.getElementById('events-body');
+      if (!events.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="empty">No routing events yet.</td></tr>';
+        return;
+      }
+
+      // Collapse consecutive events with the same prompt+provider+model into one row.
+      // A different route in between breaks the run so routing changes remain visible.
+      const deduped = [];
+      for (const e of events.slice(0, 200)) {
+        const key = (e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || '');
+        const last = deduped[deduped.length - 1];
+        if (last && last._key === key && e.success === last.success) {
+          last._count++;
+          // Events are newest-first; first item added is already the newest.
+        } else {
+          deduped.push({ ...e, _key: key, _count: 1 });
+        }
+        if (deduped.length >= 50) break;
+      }
+
+      tbody.innerHTML = deduped.map(e => {
+        const fallback = stageIsFallback(e.stage) ? ' <span class="badge badge-fallback">&#x21a9;</span>' : '';
+        const status = e.success
+          ? '<span class="badge badge-ok">ok</span>'
+          : '<span class="badge badge-err" title="' + esc(e.error) + '">err</span>';
+        const sessionTag = e.session_id
+          ? '<span class="badge badge-pending" title="' + esc(e.session_id) + '">review</span>'
+          : '<span class="muted">&mdash;</span>';
+        const folderBadge = e.cwd
+          ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(e.cwd.split('/').filter(Boolean).pop() || e.cwd) + '</span>'
+          : '';
+        const countBadge = e._count > 1
+          ? ' <span class="badge badge-count">&times;' + e._count + '</span>'
+          : '';
+        return `<tr>
+          <td class="muted">${fmtTime(e.timestamp)}</td>
+          <td>${folderBadge}<span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}</td>
+          <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
+          <td>${e.effective_provider ? esc(e.effective_provider) : '<span class="muted">&mdash;</span>'}</td>
+          <td>${modelDisplay(e)}</td>
+          <td class="${latClass(e.latency_ms)}">${e.latency_ms} ms</td>
+          <td>${status}</td>
+          <td>${sessionTag}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function renderSessions(sessions) {
+      const tbody = document.getElementById('sessions-body');
+      if (!sessions.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No review sessions yet.</td></tr>';
+        return;
+      }
+      // Sort newest first
+      const sorted = [...sessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      tbody.innerHTML = sorted.map(s => {
+        const cls = 'badge-' + s.status.replace('_','-');
+        const rm = s.review_model
+          ? '<span style="font-size:0.78rem">' + esc(s.review_model) + '</span>'
+          : '<span class="muted">—</span>';
+        return `<tr>
+          <td><a href="/review/session/${esc(s.id)}">${esc(s.id.substring(0,8))}&hellip;</a></td>
+          <td class="truncate" title="${esc(s.task_id)}">${esc(s.task_id)}</td>
+          <td><span class="badge ${cls}">${esc(s.status)}</span></td>
+          <td>${rm}</td>
+          <td class="muted">${s.iteration_count}</td>
+          <td class="muted">${fmtTime(s.updated_at)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function refresh() {
+      try {
+        const [evRes, sesRes] = await Promise.all([
+          fetch('/api/routing-events'),
+          fetch('/review/api/sessions'),
+        ]);
+        const evData = await evRes.json();
+        const sesData = await sesRes.json();
+
+        allEvents = evData.events || [];
+        renderFlow(allEvents);
+        renderStats(allEvents);
+        renderEvents(allEvents);
+        renderSessions(sesData.sessions || []);
+      } catch (err) {
+        console.error('Dashboard refresh failed', err);
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

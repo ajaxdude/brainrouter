@@ -13,11 +13,13 @@ use crate::{
     classifier::{Classifier, RoutingDecision},
     health::HealthTracker,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
+    routing_events::{RouteEvent, RoutingEvents, Stage},
     stream::TimeoutStream,
     types::ChatCompletionRequest,
 };
 use anyhow::{anyhow, Result};
-use std::{sync::Arc, time::Duration};
+use futures_util::{stream as fstream, StreamExt};
+use std::{sync::Arc, time::{Duration, Instant}};
 use tracing::{info, warn};
 
 /// Stream chunk inactivity threshold. If no chunk is received for this long,
@@ -28,6 +30,35 @@ const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 const MANIFEST_KEY: &str = "manifest";
 const LLAMA_SWAP_KEY: &str = "llama-swap";
 
+/// Summary of what actually happened during a route call.
+/// Returned alongside the response so callers (e.g. review loop) can
+/// record which model handled the request.
+pub struct RouteInfo {
+    /// "cloud" or "local" — the Bonsai classification.
+    pub bonsai_decision: &'static str,
+    /// The backend that served the response, or None on error.
+    pub effective_provider: Option<String>,
+    /// Model actually used. For Manifest routes this is extracted from the first SSE
+    /// response chunk (e.g. "claude-3-7-sonnet-20250219"); falls back to empty string
+    /// if the chunk cannot be parsed. For llama-swap this is the model key.
+    pub model_key: String,
+}
+
+impl RouteInfo {
+    /// Human-readable description for the dashboard / session review_model field.
+    pub fn display(&self) -> String {
+        match self.effective_provider.as_deref() {
+            Some("manifest") => {
+                let model = if self.model_key.is_empty() { "auto" } else { &self.model_key };
+                format!("{} → manifest ({})", self.bonsai_decision, model)
+            }
+            Some("llama-swap") => format!("{} → llama-swap ({})", self.bonsai_decision, self.model_key),
+            Some(other) => format!("{} → {}", self.bonsai_decision, other),
+            None => format!("{} → error", self.bonsai_decision),
+        }
+    }
+}
+
 pub struct Router {
     classifier: Arc<Classifier>,
     manifest: Arc<OpenAiProvider>,
@@ -37,6 +68,7 @@ pub struct Router {
     /// a specific model.
     fallback_model: String,
     health: Arc<HealthTracker>,
+    routing_events: Arc<RoutingEvents>,
 }
 
 impl Router {
@@ -46,6 +78,7 @@ impl Router {
         llama_swap: Arc<OpenAiProvider>,
         fallback_model: String,
         health: Arc<HealthTracker>,
+        routing_events: Arc<RoutingEvents>,
     ) -> Self {
         Self {
             classifier,
@@ -53,13 +86,32 @@ impl Router {
             llama_swap,
             fallback_model,
             health,
+            routing_events,
         }
     }
 
+    /// Route a request, returning only the response stream.
+    /// Convenience wrapper over `route_tagged` for callers that don't need RouteInfo.
     pub async fn route(
         &self,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
     ) -> Result<ProviderResponse> {
+        self.route_tagged(request, None, String::new()).await.map(|(resp, _)| resp)
+    }
+
+    /// Route a request, returning the response and metadata about the routing decision.
+    /// `session_id` tags the emitted RouteEvent (used by the review loop so events are
+    /// linkable to review sessions).
+    pub async fn route_tagged(
+        &self,
+        mut request: ChatCompletionRequest,
+        session_id: Option<String>,
+        cwd: String,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let start = Instant::now();
+        let requested_model = request.model.clone();
+        let prompt_excerpt = extract_prompt_excerpt(&request);
+
         let decision = self
             .classifier
             .classify_async(request.clone())
@@ -67,13 +119,59 @@ impl Router {
 
         info!(?decision, "Bonsai routing decision");
 
-        match decision {
-            RoutingDecision::Cloud => self.route_cloud(request).await,
+        let (bonsai_decision, result) = match decision {
+            RoutingDecision::Cloud => {
+                ("cloud", self.route_cloud(request).await)
+            }
             RoutingDecision::Local { model } => {
                 request.model = model;
-                self.route_local(request).await
+                ("local", self.route_local(request).await)
             }
-        }
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        let (response, info) = match result {
+            Ok((resp, mut info)) => {
+                info.bonsai_decision = bonsai_decision;
+                self.routing_events.emit(RouteEvent {
+                    id: 0, // overwritten by emit()
+                    timestamp: String::new(), // overwritten by emit()
+                    prompt_excerpt,
+                    requested_model,
+                    effective_provider: info.effective_provider.clone(),
+                    model_key: info.model_key.clone(),
+                    latency_ms,
+                    stage: provider_to_stage(&info.effective_provider, bonsai_decision),
+                    success: true,
+                    error: String::new(),
+                    bonsai_decision,
+                    cwd: cwd.clone(),
+                    session_id: session_id.clone(),
+                });
+                (resp, info)
+            }
+            Err(e) => {
+                self.routing_events.emit(RouteEvent {
+                    id: 0,
+                    timestamp: String::new(),
+                    prompt_excerpt,
+                    requested_model,
+                    effective_provider: None,
+                    model_key: String::new(),
+                    latency_ms,
+                    stage: if bonsai_decision == "cloud" { Stage::CloudPrimary } else { Stage::LocalPrimary },
+                    success: false,
+                    error: e.to_string(),
+                    bonsai_decision,
+                    cwd,
+                    session_id: session_id.clone(),
+                });
+                return Err(e);
+            }
+        };
+
+        Ok((response, info))
     }
 
     /// Cloud path: try Manifest first. On error/circuit-open, fall back to
@@ -81,7 +179,7 @@ impl Router {
     async fn route_cloud(
         &self,
         mut request: ChatCompletionRequest,
-    ) -> Result<ProviderResponse> {
+    ) -> Result<(ProviderResponse, RouteInfo)> {
         // Manifest expects "auto" — it does its own model selection.
         request.model = "auto".to_string();
 
@@ -91,11 +189,21 @@ impl Router {
                 Ok(ProviderResponse::Stream(stream)) => {
                     self.health.report_success(MANIFEST_KEY);
                     info!(provider = MANIFEST_KEY, "Manifest accepted request");
-                    return Ok(wrap_with_timeout(stream));
+                    let (stream, model_key) = peek_manifest_model(stream).await;
+                    return Ok((
+                        wrap_with_timeout(stream),
+                        RouteInfo {
+                            bonsai_decision: "cloud",
+                            effective_provider: Some("manifest".to_string()),
+                            model_key,
+                        },
+                    ));
                 }
                 Err(e) => {
                     warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back");
-                    self.health.report_failure(MANIFEST_KEY);
+                    if e.is_backend_fault {
+                        self.health.report_failure(MANIFEST_KEY);
+                    }
                     // fall through to llama-swap
                 }
             }
@@ -105,7 +213,16 @@ impl Router {
 
         // Cloud fallback → llama-swap with fallback_model
         request.model = self.fallback_model.clone();
-        self.try_llama_swap(request, "cloud-fallback").await
+        let model_key = self.fallback_model.clone();
+        let (resp, _) = self.try_llama_swap(request, Stage::CloudFallback).await?;
+        Ok((
+            resp,
+            RouteInfo {
+                bonsai_decision: "cloud",
+                effective_provider: Some("llama-swap".to_string()),
+                model_key,
+            },
+        ))
     }
 
     /// Local path: go straight to llama-swap. On failure, retry once with the
@@ -113,10 +230,17 @@ impl Router {
     async fn route_local(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ProviderResponse> {
+    ) -> Result<(ProviderResponse, RouteInfo)> {
         let requested = request.model.clone();
-        match self.try_llama_swap(request.clone(), "local-primary").await {
-            Ok(resp) => Ok(resp),
+        match self.try_llama_swap(request.clone(), Stage::LocalPrimary).await {
+            Ok((resp, model_key)) => Ok((
+                resp,
+                RouteInfo {
+                    bonsai_decision: "local",
+                    effective_provider: Some("llama-swap".to_string()),
+                    model_key,
+                },
+            )),
             Err(e) => {
                 if requested == self.fallback_model {
                     return Err(e);
@@ -129,41 +253,162 @@ impl Router {
                 );
                 let mut fallback_req = request;
                 fallback_req.model = self.fallback_model.clone();
-                self.try_llama_swap(fallback_req, "local-fallback").await
+                let (resp, model_key) = self.try_llama_swap(fallback_req, Stage::LocalFallback).await?;
+                Ok((
+                    resp,
+                    RouteInfo {
+                        bonsai_decision: "local",
+                        effective_provider: Some("llama-swap".to_string()),
+                        model_key,
+                    },
+                ))
             }
         }
     }
 
+    /// Attempt a llama-swap call. Returns the response and the model key used.
     async fn try_llama_swap(
         &self,
-        request: ChatCompletionRequest,
-        stage: &'static str,
-    ) -> Result<ProviderResponse> {
+        mut request: ChatCompletionRequest,
+        stage: Stage,
+    ) -> Result<(ProviderResponse, String)> {
         if !self.health.is_healthy(LLAMA_SWAP_KEY) {
             return Err(anyhow!(
-                "llama-swap circuit open, no backend available (stage={})",
+                "llama-swap circuit open, no backend available (stage={:?})",
                 stage
             ));
         }
-        info!(provider = LLAMA_SWAP_KEY, stage, model = %request.model, "Attempting llama-swap");
+        // Qwen3 (and some other chat templates) require the system message to be
+        // first. Clients don't always guarantee this, so reorder: pull all system
+        // messages to the front, preserving relative order within each group.
+        let (sys, rest): (Vec<_>, Vec<_>) = request
+            .messages
+            .into_iter()
+            .partition(|m| m.role == "system");
+        request.messages = sys.into_iter().chain(rest).collect();
+        let model_key = request.model.clone();
+        info!(provider = LLAMA_SWAP_KEY, ?stage, model = %model_key, "Attempting llama-swap");
         match self.llama_swap.chat_completion(request).await {
             Ok(ProviderResponse::Stream(stream)) => {
                 self.health.report_success(LLAMA_SWAP_KEY);
-                info!(provider = LLAMA_SWAP_KEY, stage, "llama-swap accepted request");
-                Ok(wrap_with_timeout(stream))
+                info!(provider = LLAMA_SWAP_KEY, ?stage, "llama-swap accepted request");
+                Ok((wrap_with_timeout(stream), model_key))
             }
             Err(e) => {
-                warn!(provider = LLAMA_SWAP_KEY, stage, error = %e, "llama-swap failed");
-                self.health.report_failure(LLAMA_SWAP_KEY);
-                Err(e)
+                warn!(provider = LLAMA_SWAP_KEY, ?stage, error = %e, "llama-swap failed");
+                // Only trip the circuit for backend faults (connection errors, server
+                // crashes). Application errors (bad request format, wrong message
+                // order) mean the backend is healthy — don't penalise it.
+                if e.is_backend_fault {
+                    self.health.report_failure(LLAMA_SWAP_KEY);
+                }
+                Err(e.into())
             }
         }
     }
 }
+
+/// Consume the first chunk of a Manifest SSE stream, extract the `model` field
+/// from the JSON payload, then reassemble the stream so the chunk is not lost.
+///
+/// Manifest's first SSE frame looks like:
+///   `data: {"id":"...","model":"claude-3-7-sonnet-20250219","choices":[...]}\n\n`
+///
+/// Returns the reassembled stream and the model name, falling back to
+/// `"manifest"` if the chunk is absent or the field cannot be parsed.
+async fn peek_manifest_model(
+    mut stream: crate::provider::SseStream,
+) -> (crate::provider::SseStream, String) {
+    let first = match stream.next().await {
+        Some(Ok(chunk)) => chunk,
+        // Stream ended before any chunk, or first chunk errored — pass through as-is.
+        Some(Err(e)) => {
+            let err_stream: crate::provider::SseStream =
+                Box::pin(fstream::once(async move { Err(e) }).chain(stream));
+            return (err_stream, "manifest".to_string());
+        }
+        None => return (Box::pin(fstream::empty()), "manifest".to_string()),
+    };
+
+    // Scan the chunk for a `data: {` line and attempt to pull out `model`.
+    let model = extract_model_from_sse_chunk(&first)
+        .unwrap_or_else(|| "manifest".to_string());
+
+    // Prepend the chunk back so downstream consumers see a complete stream.
+    let reassembled: crate::provider::SseStream = Box::pin(
+        fstream::once(async move { Ok(first) }).chain(stream),
+    );
+    (reassembled, model)
+}
+
+/// Scan raw SSE bytes for the first `data: {` line and extract the `model` field.
+/// Returns `None` if parsing fails for any reason.
+fn extract_model_from_sse_chunk(chunk: &bytes::Bytes) -> Option<String> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    for line in text.lines() {
+        let json_str = match line.strip_prefix("data: ") {
+            Some(s) if s.starts_with('{') => s,
+            _ => continue,
+        };
+        #[derive(serde::Deserialize)]
+        struct ModelOnly {
+            model: Option<String>,
+        }
+        if let Ok(parsed) = serde_json::from_str::<ModelOnly>(json_str) {
+            if let Some(m) = parsed.model.filter(|s| !s.is_empty()) {
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
 
 fn wrap_with_timeout(
     stream: crate::provider::SseStream,
 ) -> ProviderResponse {
     let timeout_stream = TimeoutStream::new(stream, STREAM_STALL_TIMEOUT);
     ProviderResponse::Stream(Box::pin(timeout_stream))
+}
+
+/// Derive the Stage from the effective provider and Bonsai decision.
+/// This is a best-effort reconstruction — the internal routing methods track
+/// stage precisely, but here we reconstruct for the error path.
+fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str) -> Stage {
+    match (bonsai_decision, effective_provider.as_deref()) {
+        ("cloud", Some("manifest")) => Stage::CloudPrimary,
+        ("cloud", Some("llama-swap")) => Stage::CloudFallback,
+        ("local", Some("llama-swap")) => Stage::LocalPrimary,
+        _ => Stage::LocalPrimary,
+    }
+}
+
+/// Extract the last user message from the request, truncated to 200 chars.
+/// Mirrors the logic in classifier.rs but with a shorter limit for the event log.
+fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
+    let last_user = request.messages.iter().rev().find(|m| m.role == "user");
+    let raw = match last_user {
+        Some(msg) => match &msg.content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+
+    const MAX: usize = 200;
+    if raw.len() > MAX {
+        let mut end = MAX;
+        while !raw.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        raw[..end].to_string()
+    } else {
+        raw
+    }
 }
