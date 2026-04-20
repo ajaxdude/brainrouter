@@ -23,8 +23,10 @@ use std::{sync::Arc, time::{Duration, Instant}};
 use tracing::{info, warn};
 
 /// Stream chunk inactivity threshold. If no chunk is received for this long,
-/// the stream is considered stalled and failed.
-const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// the stream is considered stalled and failed. Set high enough to cover cold
+/// model loads (35B+ models can take 20-30s before the first token after load)
+/// while still catching genuinely hung connections.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Provider health-tracker keys. Used for circuit breaking.
 const MANIFEST_KEY: &str = "manifest";
