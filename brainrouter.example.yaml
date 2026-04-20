@@ -1,0 +1,36 @@
+# brainrouter.example.yaml
+#
+# Copy this file to brainrouter.yaml and fill in your paths and URLs.
+# brainrouter.yaml is gitignored — it stays local.
+#
+# Flow:
+#   harness → brainrouter → Bonsai classifies query
+#     Cloud → Manifest (your local cloud LLM router)
+#     Local → llama-swap (your local model runner)
+#   Manifest failure → llama-swap fallback_model
+
+manifest:
+  # URL of your Manifest instance (docker compose, usually localhost:3001)
+  base_url: "http://localhost:3001/v1"
+  # Name of the env var holding your Manifest API key (mnfst_* format)
+  api_key_env: MANIFEST_API_KEY
+
+llama_swap:
+  # URL of your llama-swap instance
+  base_url: "http://localhost:8081/v1"
+  # Model key to use when Manifest fails, or when Bonsai picks Local
+  # without a specific model. Must match a key in your llama-swap config.
+  fallback_model: "your-local-model-key"
+
+bonsai:
+  # Absolute path to the Bonsai GGUF file (Q6_K_L recommended)
+  model_path: "/path/to/Bonsai-8B-Q6_K_L.gguf"
+
+# Review loop configuration (all fields optional — defaults shown)
+# review:
+#   max_iterations: 5
+#   retry_on_llm_error: true
+#   context:
+#     prd_paths: [docs/PRD.md, PRD.md, README.md]
+#     include_git_diff: true
+#     git_diff_max_bytes: 102400
