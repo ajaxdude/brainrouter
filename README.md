@@ -1,6 +1,12 @@
 # brainrouter
 
-A speed-first Rust daemon that sits between your coding harness and your LLMs. **Bonsai 8B classifies every query at request time** and routes it to either Manifest (cloud, for complex tasks) or llama-swap (local, for simple ones). If Manifest stalls, it falls back automatically. When you're done with a task, brainrouter runs the code review locally so you don't burn cloud tokens.
+A speed-first Rust daemon that sits between your coding harness and your LLMs. Three routing modes:
+
+- **auto** — Bonsai 8B classifies every query and routes to Manifest (cloud) or llama-swap (local)
+- **local** — Bypasses Bonsai, rewrites the system prompt for local LLMs (prevents tool loops), routes to llama-swap
+- **cloud** — Bypasses Bonsai, routes directly to Manifest
+
+If Manifest stalls, it falls back automatically. When you're done with a task, brainrouter runs the code review locally so you don't burn cloud tokens.
 
 ## What it does
 
@@ -10,10 +16,13 @@ coding harness (omp / vibe / claude / opencode / codex / droid)
          ▼
    brainrouter :9099
          │
-   Bonsai 8B classifies query
-         │
-    Cloud ─────────────── Manifest :3001 (smart cloud router)
-    Local ─────────────── llama-swap :8081 (local model runner)
+   ┌─────┼─────────────────────────────────────────────┐
+   │     ├─ model=auto  → Bonsai classifies query      │
+   │     │    Cloud ──── Manifest :3001                 │
+   │     │    Local ──── llama-swap :8081                │
+   │     ├─ model=local → rewrite prompt → llama-swap   │
+   │     └─ model=cloud → Manifest (direct)             │
+   └─────────────────────────────────────────────────────┘
          │
    on Manifest fail ───── llama-swap fallback_model
          │
@@ -21,8 +30,9 @@ coding harness (omp / vibe / claude / opencode / codex / droid)
 ```
 
 - **One socket for all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Claude Code, droid, vibe, opencode, codex, and omp all connect to the same `:9099`.
-- **Bonsai decides cloud vs local in <200ms**, embedded in-process via `llama-cpp-2` on Vulkan. No HTTP hop for the routing decision.
-- **Manifest handles cloud failover.** Manifest runs locally in Docker and does its own provider selection (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with automatic fallbacks. brainrouter just points at it.
+- **Three routing modes.** `auto` uses Bonsai classification (<200ms). `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest.
+- **Local mode rewrites system prompts.** OMP's 15-20K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
+- **Manifest handles cloud failover.** Manifest runs locally in Docker and does its own provider selection (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with automatic fallbacks.
 - **llama-swap handles local model management.** brainrouter points at it. Bonsai picks the right model for simple tasks.
 - **Review loop is local.** `mcp_brainrouter_request_review` triggers an iterative code review against a local LLM. No cloud tokens consumed. Escalates to a human web UI if the LLM can't reach a verdict.
 
@@ -79,8 +89,8 @@ All on `http://127.0.0.1:9099`.
 | Method | Path | Protocol | Notes |
 |---|---|---|---|
 | `GET` | `/health` | — | `{"status":"ok"}` |
-| `GET` | `/v1/models` | OpenAI | Returns `auto` model |
-| `POST` | `/v1/chat/completions` | OpenAI | Main routing endpoint. Use `model: "auto"` |
+| `GET` | `/v1/models` | OpenAI | Returns `auto`, `local`, `cloud` models |
+| `POST` | `/v1/chat/completions` | OpenAI | Main routing endpoint. `model: "auto"`, `"local"`, or `"cloud"` |
 | `POST` | `/v1/messages` | Anthropic | For Claude Code and droid. Same routing, different wire format |
 
 ### Review endpoints
@@ -117,6 +127,7 @@ manifest:
 llama_swap:
   base_url: "http://localhost:8081"
   fallback_model: "gemma-4-26b-a4b"   # used when Manifest fails or Bonsai picks local
+  # local_system_prompt: "/path/to/custom-prompt.md"  # optional: custom prompt for model=local
 
 bonsai:
   model_path: "/mnt/models/prism/prism-ml_Bonsai-8B-unpacked-Q6_K_L.gguf"
@@ -150,9 +161,14 @@ providers:
   brainrouter:
     baseUrl: http://127.0.0.1:9099/v1
     api: openai-completions
+    auth: none
     models:
       - id: auto
-        name: Brainrouter (Bonsai-routed)
+        name: Brainrouter (auto)
+      - id: local
+        name: Brainrouter (local)
+      - id: cloud
+        name: Brainrouter (cloud)
 ```
 
 ```json
@@ -274,6 +290,7 @@ src/
   server.rs          — hyper HTTP router; /v1/* and /review/* routes
   classifier.rs      — Bonsai 8B complexity classifier (Cloud/Local decision)
   router.rs          — routes to Manifest or llama-swap; circuit breaker; fallback
+  prompt_rewriter.rs — system prompt rewriter for local mode (strips OMP bloat)
   anthropic.rs       — Anthropic ↔ OpenAI protocol translation
   mcp_server.rs      — JSON-RPC stdio, forwards to daemon over UDS
   install.rs         — idempotent harness config merger

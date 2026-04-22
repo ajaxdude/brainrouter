@@ -12,6 +12,7 @@
 use crate::{
     classifier::{Classifier, RoutingDecision},
     health::HealthTracker,
+    prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{RouteEvent, RoutingEvents, Stage},
     stream::TimeoutStream,
@@ -65,12 +66,11 @@ pub struct Router {
     classifier: Arc<Classifier>,
     manifest: Arc<OpenAiProvider>,
     llama_swap: Arc<OpenAiProvider>,
-    /// Model name passed to llama-swap when we fall back from Manifest,
-    /// or when the classifier picks Local but the user didn't request
-    /// a specific model.
     fallback_model: String,
     health: Arc<HealthTracker>,
     routing_events: Arc<RoutingEvents>,
+    /// Optional custom system prompt for local routing mode.
+    local_system_prompt: Option<String>,
 }
 
 impl Router {
@@ -81,6 +81,7 @@ impl Router {
         fallback_model: String,
         health: Arc<HealthTracker>,
         routing_events: Arc<RoutingEvents>,
+        local_system_prompt: Option<String>,
     ) -> Self {
         Self {
             classifier,
@@ -89,6 +90,7 @@ impl Router {
             fallback_model,
             health,
             routing_events,
+            local_system_prompt,
         }
     }
 
@@ -114,20 +116,38 @@ impl Router {
         let requested_model = request.model.clone();
         let prompt_excerpt = extract_prompt_excerpt(&request);
 
-        let decision = self
-            .classifier
-            .classify_async(request.clone())
-            .await;
-
-        info!(?decision, "Bonsai routing decision");
-
-        let (bonsai_decision, result) = match decision {
-            RoutingDecision::Cloud => {
-                ("cloud", self.route_cloud(request).await)
+        let (bonsai_decision, result) = match requested_model.as_str() {
+            // Direct local: skip Bonsai, rewrite prompt, go to llama-swap
+            "local" | "brainrouter/local" => {
+                info!("Direct local mode — rewriting system prompt");
+                request.messages = prompt_rewriter::rewrite_for_local(
+                    request.messages,
+                    self.local_system_prompt.as_deref(),
+                );
+                request.model = self.fallback_model.clone();
+                ("local-direct", self.route_local(request).await)
             }
-            RoutingDecision::Local { model } => {
-                request.model = model;
-                ("local", self.route_local(request).await)
+            // Direct cloud: skip Bonsai, go straight to Manifest
+            "cloud" | "brainrouter/cloud" => {
+                info!("Direct cloud mode — routing to Manifest");
+                ("cloud-direct", self.route_cloud(request).await)
+            }
+            // Auto: existing Bonsai classification
+            _ => {
+                let decision = self
+                    .classifier
+                    .classify_async(request.clone())
+                    .await;
+                info!(?decision, "Bonsai routing decision");
+                match decision {
+                    RoutingDecision::Cloud => {
+                        ("cloud", self.route_cloud(request).await)
+                    }
+                    RoutingDecision::Local { model } => {
+                        request.model = model;
+                        ("local", self.route_local(request).await)
+                    }
+                }
             }
         };
 
@@ -378,9 +398,9 @@ fn wrap_with_timeout(
 /// stage precisely, but here we reconstruct for the error path.
 fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str) -> Stage {
     match (bonsai_decision, effective_provider.as_deref()) {
-        ("cloud", Some("manifest")) => Stage::CloudPrimary,
-        ("cloud", Some("llama-swap")) => Stage::CloudFallback,
-        ("local", Some("llama-swap")) => Stage::LocalPrimary,
+        ("cloud", Some("manifest")) | ("cloud-direct", Some("manifest")) => Stage::CloudPrimary,
+        ("cloud", Some("llama-swap")) | ("cloud-direct", Some("llama-swap")) => Stage::CloudFallback,
+        ("local-direct", Some("llama-swap")) | ("local", Some("llama-swap")) => Stage::LocalPrimary,
         _ => Stage::LocalPrimary,
     }
 }

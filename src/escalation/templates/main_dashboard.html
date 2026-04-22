@@ -44,7 +44,7 @@
     .flow-empty { color: var(--muted); font-size: 0.85rem; }
 
     /* ── Stats row ──────────────────────────────────────── */
-    .stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+    .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 20px; }
     .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; text-align: center; }
     .stat-card .slabel { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
     .stat-card .sval { font-size: 1.6rem; font-weight: 700; }
@@ -69,6 +69,8 @@
     .badge { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
     .badge-cloud   { background: rgba(56,139,253,.18); color: var(--accent); border: 1px solid rgba(56,139,253,.4); }
     .badge-local   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
+    .badge-local-direct { background: rgba(188,140,255,.30); color: #d4b8ff; border: 1px solid rgba(188,140,255,.6); }
+    .badge-cloud-direct { background: rgba(56,139,253,.30); color: #7db8ff; border: 1px solid rgba(56,139,253,.6); }
     .badge-manifest { background: rgba(57,211,83,.18); color: var(--teal); border: 1px solid rgba(57,211,83,.4); }
     .badge-llama   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
     .badge-fallback { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.4); }
@@ -111,9 +113,11 @@
 
   <!-- Stats -->
   <div class="stats-row">
-    <div class="stat-card"><div class="slabel">Total Requests</div><div class="sval accent" id="stat-total">—</div></div>
-    <div class="stat-card"><div class="slabel">Bonsai → Cloud</div><div class="sval green" id="stat-cloud">—</div></div>
-    <div class="stat-card"><div class="slabel">Bonsai → Local</div><div class="sval purple" id="stat-local">—</div></div>
+    <div class="stat-card"><div class="slabel">Total</div><div class="sval accent" id="stat-total">—</div></div>
+    <div class="stat-card"><div class="slabel">Cloud (auto)</div><div class="sval green" id="stat-cloud">—</div></div>
+    <div class="stat-card"><div class="slabel">Local (auto)</div><div class="sval purple" id="stat-local">—</div></div>
+    <div class="stat-card"><div class="slabel">Direct Local</div><div class="sval purple" id="stat-direct-local">—</div></div>
+    <div class="stat-card"><div class="slabel">Direct Cloud</div><div class="sval green" id="stat-direct-cloud">—</div></div>
     <div class="stat-card"><div class="slabel">Fallbacks</div><div class="sval orange" id="stat-fallbacks">—</div></div>
     <div class="stat-card"><div class="slabel">Avg Latency</div><div class="sval accent" id="stat-latency">—</div></div>
   </div>
@@ -126,7 +130,7 @@
         <tr>
           <th style="width:10%">Time</th>
           <th style="width:28%">Prompt</th>
-          <th style="width:9%">Bonsai</th>
+          <th style="width:9%">Route</th>
           <th style="width:11%">Provider</th>
           <th style="width:17%">Model</th>
           <th style="width:8%">Latency</th>
@@ -227,7 +231,7 @@
       document.getElementById('flow-content').innerHTML = `
         <div class="flow-row">
           <div class="flow-box">
-            <div class="label">Bonsai decision</div>
+            <div class="label">Route mode</div>
             <div class="value">
               <span class="badge badge-${bonsai}">${bonsai}</span>${fallbackNote}
             </div>
@@ -250,19 +254,17 @@
         </div>`;
     }
 
-    function renderStats(events) {
-      if (!events.length) return;
-      const total = events.length;
-      const cloud = events.filter(e => e.bonsai_decision === 'cloud').length;
-      const local = events.filter(e => e.bonsai_decision === 'local').length;
-      const fallbacks = events.filter(e => stageIsFallback(e.stage)).length;
-      const avgLat = Math.round(events.reduce((s, e) => s + (e.latency_ms || 0), 0) / total);
-
-      document.getElementById('stat-total').textContent = total;
-      document.getElementById('stat-cloud').textContent = cloud + ' (' + Math.round(cloud/total*100) + '%)';
-      document.getElementById('stat-local').textContent = local + ' (' + Math.round(local/total*100) + '%)';
-      document.getElementById('stat-fallbacks').textContent = fallbacks;
-      document.getElementById('stat-latency').textContent = avgLat + ' ms';
+    function renderStats(stats) {
+      if (!stats || !stats.total) return;
+      const t = stats.total;
+      const pct = n => Math.round(n / t * 100);
+      document.getElementById('stat-total').textContent = t;
+      document.getElementById('stat-cloud').textContent = (stats.cloud_count - (stats.direct_cloud_count || 0)) + ' (' + pct(stats.cloud_count - (stats.direct_cloud_count || 0)) + '%)';
+      document.getElementById('stat-local').textContent = (stats.local_count - (stats.direct_local_count || 0)) + ' (' + pct(stats.local_count - (stats.direct_local_count || 0)) + '%)';
+      document.getElementById('stat-direct-local').textContent = (stats.direct_local_count || 0) + ' (' + pct(stats.direct_local_count || 0) + '%)';
+      document.getElementById('stat-direct-cloud').textContent = (stats.direct_cloud_count || 0) + ' (' + pct(stats.direct_cloud_count || 0) + '%)';
+      document.getElementById('stat-fallbacks').textContent = stats.fallbacks;
+      document.getElementById('stat-latency').textContent = stats.avg_latency + ' ms';
     }
 
     function renderEvents(events) {
@@ -340,16 +342,18 @@
 
     async function refresh() {
       try {
-        const [evRes, sesRes] = await Promise.all([
+        const [evRes, sesRes, statsRes] = await Promise.all([
           fetch('/api/routing-events'),
           fetch('/review/api/sessions'),
+          fetch('/api/routing-stats'),
         ]);
         const evData = await evRes.json();
         const sesData = await sesRes.json();
+        const statsData = await statsRes.json();
 
         allEvents = evData.events || [];
         renderFlow(allEvents);
-        renderStats(allEvents);
+        renderStats(statsData);
         renderEvents(allEvents);
         renderSessions(sesData.sessions || []);
       } catch (err) {

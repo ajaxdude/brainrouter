@@ -111,12 +111,11 @@ async fn handle_request(
         ("GET", "/v1/models") => {
             let models = ModelListResponse {
                 object: "list",
-                data: vec![ModelObject {
-                    id: "auto".to_string(),
-                    object: "model",
-                    created: 0,
-                    owned_by: "brainrouter".to_string(),
-                }],
+                data: vec![
+                    ModelObject { id: "auto".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+                    ModelObject { id: "local".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+                    ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+                ],
             };
             let resp = json_response(StatusCode::OK, &models);
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))

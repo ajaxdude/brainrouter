@@ -20,11 +20,13 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 
 A single Rust daemon that:
 
-1. **Classifies** every incoming query using an embedded local LLM (Bonsai 8B) in <200ms.
-2. **Routes** complex queries to Manifest (a local cloud LLM router that handles failover across all providers) and simple queries directly to a local model via llama-swap.
-3. **Falls back** automatically when Manifest stalls or fails — no manual intervention.
-4. **Reviews code** locally using the same routing infrastructure, exposing an MCP tool that every harness can call.
-5. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
+1. **Routes in three modes:**
+   - `auto` — Bonsai 8B classifies every query in <200ms and routes to cloud or local.
+   - `local` — Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap.
+   - `cloud` — Bypasses Bonsai, routes directly to Manifest.
+2. **Falls back** automatically when Manifest stalls or fails — no manual intervention.
+3. **Reviews code** locally using the same routing infrastructure, exposing an MCP tool that every harness can call.
+4. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 
 ## Architecture decisions
 
@@ -72,6 +74,7 @@ Two independent circuit breakers: one for `manifest`, one for `llama-swap`. Thre
 | HTTP server | `src/server.rs` | Route `/v1/*` and `/review/*` |
 | Classifier | `src/classifier.rs` | Bonsai-based cloud/local decision |
 | Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
+| Prompt rewriter | `src/prompt_rewriter.rs` | System prompt rewriting for local mode (strips OMP bloat, injects anti-loop prompt) |
 | Anthropic shim | `src/anthropic.rs` | `/v1/messages` ↔ `/v1/chat/completions` translation |
 | MCP server | `src/mcp_server.rs` | JSON-RPC stdio; forwards to daemon over UDS |
 | Installer | `src/install.rs` | Idempotent harness config merger |
@@ -94,12 +97,16 @@ Incoming request (OpenAI or Anthropic format)
   │
   ▼ server.rs: deserialize, translate if Anthropic
   │
-  ▼ classifier.rs: spawn_blocking → Bonsai inference
+  ▼ router.rs: match on model field
   │
-  ├─ Cloud → router.rs → manifest (if healthy) → llama-swap fallback
+  ├─ model="auto"  → classifier.rs: Bonsai inference
+  │    ├─ Cloud → manifest (if healthy) → llama-swap fallback
+  │    └─ Local → llama-swap (Bonsai-chosen model)
   │
-  └─ Local → router.rs → llama-swap (Bonsai-chosen model or fallback_model)
-                          → llama-swap fallback_model on error
+  ├─ model="local" → prompt_rewriter.rs: rewrite system msgs
+  │                  → llama-swap (fallback_model)
+  │
+  └─ model="cloud" → manifest (direct) → llama-swap fallback
 ```
 
 ## Review flow
@@ -138,6 +145,7 @@ manifest:
 llama_swap:
   base_url: string        # URL of your llama-swap instance
   fallback_model: string  # model key to use when Manifest fails or Bonsai picks local
+  local_system_prompt: path?  # optional custom prompt for model=local; built-in lean prompt used if absent
 
 bonsai:
   model_path: path        # path to the Bonsai GGUF file

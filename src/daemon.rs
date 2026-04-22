@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::{path::PathBuf, sync::Arc};
-use tracing::info;
+use tracing::{info, warn};
 
 use brainrouter::{
     classifier::Classifier,
@@ -91,6 +91,22 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Routing event ring buffer — shared between Router (writes) and HTTP API (reads)
     let routing_events = Arc::new(RoutingEvents::new());
 
+    // Load optional custom local system prompt
+    let local_system_prompt = config
+        .llama_swap
+        .local_system_prompt
+        .as_ref()
+        .and_then(|path| match std::fs::read_to_string(path) {
+            Ok(content) => {
+                info!(path = %path, "Loaded custom local system prompt");
+                Some(content)
+            }
+            Err(e) => {
+                warn!(path = %path, error = %e, "Failed to load custom local system prompt, using built-in");
+                None
+            }
+        });
+
     // Router — shared between the proxy and the review service
     let router = Arc::new(Router::new(
         classifier,
@@ -99,6 +115,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         config.llama_swap.fallback_model.clone(),
         health,
         Arc::clone(&routing_events),
+        local_system_prompt,
     ));
 
     // Session manager (in-memory; ephemeral per process lifetime)

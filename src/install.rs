@@ -75,6 +75,19 @@ fn install_omp(bin: &PathBuf, yes: bool) -> Result<()> {
     let merged = merge_json(current, new_entry);
     write_json_with_preview(&mcp_path, &merged, yes)?;
     println!("OMP MCP configured. Restart OMP for changes to take effect.");
+    println!();
+    println!("Also add brainrouter models to ~/.omp/agent/models.yml:");
+    println!("  brainrouter:");
+    println!("    baseUrl: http://127.0.0.1:9099/v1");
+    println!("    api: openai-completions");
+    println!("    auth: none");
+    println!("    models:");
+    println!("      - id: auto");
+    println!("        name: Brainrouter (auto)");
+    println!("      - id: local");
+    println!("        name: Brainrouter (local)");
+    println!("      - id: cloud");
+    println!("        name: Brainrouter (cloud)");
     Ok(())
 }
 

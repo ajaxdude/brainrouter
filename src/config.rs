@@ -36,6 +36,11 @@ pub struct LlamaSwapConfig {
     /// sends model="auto" and Bonsai classifies the query as local without a
     /// specific model hint. Must match an entry in the llama-swap config.
     pub fallback_model: String,
+
+    /// Optional path to a custom system prompt file for local routing mode.
+    /// If absent, the built-in lean prompt is used.
+    #[serde(default)]
+    pub local_system_prompt: Option<String>,
 }
 
 /// Configuration for the embedded Bonsai classifier model.

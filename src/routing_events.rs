@@ -126,8 +126,10 @@ impl RoutingEvents {
             .sum::<u64>()
             .checked_div(total as u64)
             .unwrap_or(0);
-        let cloud_count: usize = events.iter().filter(|e| e.bonsai_decision == "cloud").count();
-        let local_count: usize = events.iter().filter(|e| e.bonsai_decision == "local").count();
+        let cloud_count: usize = events.iter().filter(|e| e.bonsai_decision == "cloud" || e.bonsai_decision == "cloud-direct").count();
+        let local_count: usize = events.iter().filter(|e| e.bonsai_decision == "local" || e.bonsai_decision == "local-direct").count();
+        let direct_local_count: usize = events.iter().filter(|e| e.bonsai_decision == "local-direct").count();
+        let direct_cloud_count: usize = events.iter().filter(|e| e.bonsai_decision == "cloud-direct").count();
         let manifest_count: usize = events
             .iter()
             .filter(|e| e.success && e.effective_provider.as_deref() == Some("manifest"))
@@ -145,6 +147,8 @@ impl RoutingEvents {
             avg_latency,
             cloud_count,
             local_count,
+            direct_local_count,
+            direct_cloud_count,
             manifest_count,
             llama_count,
         }
@@ -159,13 +163,13 @@ pub struct EventStats {
     pub failures: usize,
     pub fallbacks: usize,
     pub avg_latency: u64,
-    /// Requests where Bonsai chose Cloud.
     pub cloud_count: usize,
-    /// Requests where Bonsai chose Local.
     pub local_count: usize,
-    /// Requests successfully served by Manifest.
+    /// Requests routed via model="local" (direct, no Bonsai).
+    pub direct_local_count: usize,
+    /// Requests routed via model="cloud" (direct, no Bonsai).
+    pub direct_cloud_count: usize,
     pub manifest_count: usize,
-    /// Requests successfully served by llama-swap.
     pub llama_count: usize,
 }
 
@@ -179,6 +183,8 @@ impl Default for EventStats {
             avg_latency: 0,
             cloud_count: 0,
             local_count: 0,
+            direct_local_count: 0,
+            direct_cloud_count: 0,
             manifest_count: 0,
             llama_count: 0,
         }
