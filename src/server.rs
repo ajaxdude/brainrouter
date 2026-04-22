@@ -173,6 +173,17 @@ async fn handle_request(
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
+        // ── Service restart API ────────────────────────────────────────────────
+        ("POST", "/api/restart/llama-swap") => {
+            let resp = restart_service("llama-swap").await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("POST", "/api/restart/manifest") => {
+            let resp = restart_service("manifest").await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
         _ => {
             let resp = json_response(
                 StatusCode::NOT_FOUND,
@@ -235,6 +246,46 @@ async fn handle_anthropic_messages(
                 .header("connection", "keep-alive")
                 .body(stream_body.boxed_unsync())?;
             Ok(response)
+        }
+    }
+}
+
+/// Restart a systemd user service. Only allows a fixed set of service names.
+async fn restart_service(service: &str) -> Response<Full<Bytes>> {
+    const ALLOWED: &[&str] = &["llama-swap", "manifest"];
+    if !ALLOWED.contains(&service) {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: format!("Unknown service: {}", service),
+        });
+    }
+
+    info!(service, "Restarting systemd user service");
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", service])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!(service, "Service restarted successfully");
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "service": service,
+                "message": format!("{} restarted", service)
+            }))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(service, %stderr, "Service restart failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Restart failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(service, error = %e, "Failed to exec systemctl");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec systemctl: {}", e),
+            })
         }
     }
 }

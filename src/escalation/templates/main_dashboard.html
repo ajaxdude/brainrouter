@@ -30,6 +30,11 @@
     .nav a { font-size: 0.8rem; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); text-decoration: none; transition: all 0.15s; }
     .nav a:hover { border-color: var(--accent); color: var(--accent); }
     .nav a.nav-active { border-color: var(--accent); color: var(--accent); }
+    .nav button { font-size: 0.8rem; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); background: transparent; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+    .nav button:hover { border-color: var(--orange); color: var(--orange); }
+    .nav button.restarting { border-color: var(--orange); color: var(--orange); opacity: .6; cursor: wait; }
+    .nav button.restart-ok { border-color: var(--green); color: var(--green); }
+    .nav button.restart-err { border-color: var(--red); color: var(--red); }
 
     /* ── Live model flow ────────────────────────────────── */
     .flow-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
@@ -102,6 +107,8 @@
       <a href="/review/">Review Sessions</a>
       <a href="/review/api/sessions" target="_blank">Sessions API</a>
       <a href="/api/routing-stats" target="_blank">Stats API</a>
+      <button id="btn-restart-llama" onclick="restartService('llama-swap', this)">Restart llama-swap</button>
+      <button id="btn-restart-manifest" onclick="restartService('manifest', this)">Restart Manifest</button>
     </div>
   </div>
 
@@ -167,6 +174,30 @@
   <script>
     let allEvents = [];
     let prevModel = null;
+
+    async function restartService(name, btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Restarting…';
+      btn.className = 'restarting';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/restart/' + name, { method: 'POST' });
+        if (res.ok) {
+          btn.textContent = 'Restarted';
+          btn.className = 'restart-ok';
+        } else {
+          const data = await res.json().catch(() => ({}));
+          btn.textContent = 'Failed';
+          btn.className = 'restart-err';
+          btn.title = data.error || 'Unknown error';
+        }
+      } catch (e) {
+        btn.textContent = 'Error';
+        btn.className = 'restart-err';
+        btn.title = e.message;
+      }
+      setTimeout(() => { btn.textContent = label; btn.className = ''; btn.disabled = false; btn.title = ''; }, 3000);
+    }
 
     function esc(s) {
       const d = document.createElement('div');
