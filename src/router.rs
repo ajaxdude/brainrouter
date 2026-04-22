@@ -300,10 +300,11 @@ impl Router {
                 stage
             ));
         }
-        // Qwen3 (and other chat templates) require exactly one system message at
-        // position 0. Clients and the prompt rewriter can produce multiple system
-        // messages (lean prompt + tool schemas). Merge them into a single message
-        // so the chat template doesn't reject the request.
+        // Sanitize messages for local llama-server compatibility:
+        //  1. Merge system messages into one (Qwen3 requires single system msg at pos 0).
+        //  2. Ensure assistant messages have content (llama-server rejects assistant
+        //     messages with neither content nor tool_calls — OMP sends tool-only
+        //     assistant turns with content: null).
         let (sys, rest): (Vec<_>, Vec<_>) = request
             .messages
             .into_iter()
@@ -312,6 +313,7 @@ impl Router {
             .into_iter()
             .chain(rest)
             .collect();
+        sanitize_assistant_messages(&mut request.messages);
         let model_key = request.model.clone();
         info!(provider = LLAMA_SWAP_KEY, ?stage, model = %model_key, "Attempting llama-swap");
         match self.llama_swap.chat_completion(request).await {
@@ -361,6 +363,17 @@ fn merge_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         tool_calls: None,
         tool_call_id: None,
     }]
+}
+
+/// Ensure every assistant message has `content` set. llama-server rejects
+/// assistant messages with neither `content` nor `tool_calls`. OMP and other
+/// coding harnesses send tool-only assistant turns where content is null.
+fn sanitize_assistant_messages(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        if msg.role == "assistant" && msg.content.is_none() {
+            msg.content = Some(serde_json::Value::String(String::new()));
+        }
+    }
 }
 
 /// Consume the first chunk of a Manifest SSE stream, extract the `model` field
@@ -551,5 +564,33 @@ mod tests {
         assert_eq!(result.len(), 1);
         let text = result[0].content.as_ref().unwrap().as_str().unwrap();
         assert_eq!(text, "Prompt\n\nMore");
+    }
+
+    #[test]
+    fn sanitize_fills_empty_assistant_content() {
+        let mut msgs = vec![
+            sys("Prompt"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_calls: Some(vec![serde_json::json!({"id": "1", "function": {"name": "read"}})]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        sanitize_assistant_messages(&mut msgs);
+        // First assistant had None content → now empty string
+        assert_eq!(msgs[1].content.as_ref().unwrap().as_str().unwrap(), "");
+        // Second assistant already had content → unchanged
+        assert_eq!(msgs[2].content.as_ref().unwrap().as_str().unwrap(), "Hello");
+        // System message untouched
+        assert_eq!(msgs[0].role, "system");
     }
 }
