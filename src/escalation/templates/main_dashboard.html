@@ -89,7 +89,7 @@
     .badge-folder { background: rgba(57,211,83,.1); color: var(--teal); border: 1px solid rgba(57,211,83,.25); font-size: 0.65rem; padding: 1px 6px; font-weight: 600; text-transform: none; letter-spacing: 0; margin-right: 5px; }
     .badge-count { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid rgba(139,148,158,.3); font-size: 0.65rem; padding: 1px 5px; font-weight: 700; }
     .muted { color: var(--muted); }
-    .truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .truncate { max-width: 300px; overflow-wrap: break-word; word-break: break-word; white-space: normal; }
     .fast { color: var(--green); }
     .medium { color: var(--orange); }
     .slow { color: var(--red); }
@@ -107,8 +107,9 @@
       <a href="/review/">Review Sessions</a>
       <a href="/review/api/sessions" target="_blank">Sessions API</a>
       <a href="/api/routing-stats" target="_blank">Stats API</a>
-      <button id="btn-restart-llama" onclick="restartService('llama-swap', this)">Restart llama-swap</button>
-      <button id="btn-restart-manifest" onclick="restartService('manifest', this)">Restart Manifest</button>
+      <button onclick="restartService('llama-swap', this)">Restart llama-swap</button>
+      <button onclick="restartService('manifest', this)">Restart Manifest</button>
+      <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
     </div>
   </div>
 
@@ -135,18 +136,19 @@
     <table>
       <thead>
         <tr>
-          <th style="width:10%">Time</th>
-          <th style="width:28%">Prompt</th>
-          <th style="width:9%">Route</th>
-          <th style="width:11%">Provider</th>
-          <th style="width:17%">Model</th>
-          <th style="width:8%">Latency</th>
-          <th style="width:8%">Status</th>
-          <th style="width:9%">Review?</th>
+          <th style="width:9%">Time</th>
+          <th style="width:22%">Prompt</th>
+          <th style="width:8%">Route</th>
+          <th style="width:9%">Router</th>
+          <th style="width:10%">Provider</th>
+          <th style="width:15%">Model</th>
+          <th style="width:7%">Latency</th>
+          <th style="width:7%">Status</th>
+          <th style="width:7%">Review?</th>
         </tr>
       </thead>
       <tbody id="events-body">
-        <tr><td colspan="8" class="empty">No routing events yet.</td></tr>
+        <tr><td colspan="9" class="empty">No routing events yet.</td></tr>
       </tbody>
     </table>
   </div>
@@ -177,7 +179,7 @@
 
     async function restartService(name, btn) {
       const label = btn.textContent;
-      btn.textContent = 'Restarting…';
+      btn.textContent = 'Restarting\u2026';
       btn.className = 'restarting';
       btn.disabled = true;
       try {
@@ -192,6 +194,13 @@
           btn.title = data.error || 'Unknown error';
         }
       } catch (e) {
+        // brainrouter restarts itself — connection drops before response arrives
+        if (name === 'brainrouter') {
+          btn.textContent = 'Restarting\u2026';
+          btn.className = 'restart-ok';
+          setTimeout(() => location.reload(), 3000);
+          return;
+        }
         btn.textContent = 'Error';
         btn.className = 'restart-err';
         btn.title = e.message;
@@ -222,13 +231,41 @@
       return 'slow';
     }
 
+    function providerFromModel(modelKey) {
+      if (!modelKey) return null;
+      const m = modelKey.toLowerCase();
+      if (m.startsWith('claude')) return 'Anthropic';
+      if (m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return 'OpenAI';
+      if (m.startsWith('gemini') || m.startsWith('gemma')) return 'Google';
+      if (m.startsWith('copilot')) return 'GitHub Copilot';
+      if (m.startsWith('mistral') || m.startsWith('codestral')) return 'Mistral';
+      if (m.startsWith('deepseek')) return 'DeepSeek';
+      if (m.startsWith('command') || m.startsWith('c4ai')) return 'Cohere';
+      if (m.startsWith('llama') || m.startsWith('meta-llama')) return 'Meta';
+      return null;
+    }
+
+    function routerDisplay(e) {
+      if (e.effective_provider === 'manifest') return '<span class="badge badge-manifest">Manifest</span>';
+      if (e.effective_provider === 'llama-swap') return '<span class="badge badge-llama">llama-swap</span>';
+      return '<span class="muted">&mdash;</span>';
+    }
+
+    function providerDisplay(e) {
+      if (e.effective_provider === 'manifest') {
+        const p = providerFromModel(e.model_key);
+        return p ? '<span class="badge badge-manifest">' + esc(p) + '</span>' : '<span class="muted">&mdash;</span>';
+      }
+      return '<span class="muted">&mdash;</span>';
+    }
+
     function modelDisplay(e) {
       if (e.effective_provider === 'manifest') {
         const name = e.model_key || 'auto';
         return '<span class="badge badge-manifest">' + esc(name) + '</span>';
       }
       if (e.effective_provider === 'llama-swap') return '<span class="badge badge-llama">' + esc(e.model_key || 'llama-swap') + '</span>';
-      return '<span class="muted">—</span>';
+      return '<span class="muted">&mdash;</span>';
     }
 
     function stageIsFallback(stage) {
@@ -239,13 +276,15 @@
       if (!events.length) return;
       const last = events[0]; // newest first
       const bonsai = last.bonsai_decision || 'unknown';
-      let provider = '—';
-      let modelStr = '—';
+      let router = '\u2014';
+      let provider = '\u2014';
+      let modelStr = '\u2014';
       if (last.effective_provider === 'manifest') {
-        provider = 'Manifest';
+        router = 'Manifest';
+        provider = providerFromModel(last.model_key) || '\u2014';
         modelStr = last.model_key || 'auto';
       } else if (last.effective_provider === 'llama-swap') {
-        provider = 'llama-swap';
+        router = 'llama-swap';
         modelStr = last.model_key || 'unknown';
       }
 
@@ -267,17 +306,22 @@
               <span class="badge badge-${bonsai}">${bonsai}</span>${fallbackNote}
             </div>
           </div>
-          <div class="flow-arrow">→</div>
+          <div class="flow-arrow">\u2192</div>
+          <div class="flow-box">
+            <div class="label">Router</div>
+            <div class="value">${esc(router)}</div>
+          </div>
+          <div class="flow-arrow">\u2192</div>
           <div class="flow-box">
             <div class="label">Provider</div>
             <div class="value">${esc(provider)}</div>
           </div>
-          <div class="flow-arrow">→</div>
+          <div class="flow-arrow">\u2192</div>
           <div class="flow-box">
-            <div class="label">Model used${fallbackNote ? ' (fallback)' : ''}</div>
+            <div class="label">Model${fallbackNote ? ' (fallback)' : ''}</div>
             <div class="value">${esc(modelStr)}${prevNote}</div>
           </div>
-          <div class="flow-arrow">→</div>
+          <div class="flow-arrow">\u2192</div>
           <div class="flow-box">
             <div class="label">Latency</div>
             <div class="value ${latClass(last.latency_ms)}">${last.latency_ms} ms</div>
@@ -301,7 +345,7 @@
     function renderEvents(events) {
       const tbody = document.getElementById('events-body');
       if (!events.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty">No routing events yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No routing events yet.</td></tr>';
         return;
       }
 
@@ -338,7 +382,8 @@
           <td class="muted">${fmtTime(e.timestamp)}</td>
           <td>${folderBadge}<span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}</td>
           <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
-          <td>${e.effective_provider ? esc(e.effective_provider) : '<span class="muted">&mdash;</span>'}</td>
+          <td>${routerDisplay(e)}</td>
+          <td>${providerDisplay(e)}</td>
           <td>${modelDisplay(e)}</td>
           <td class="${latClass(e.latency_ms)}">${e.latency_ms} ms</td>
           <td>${status}</td>

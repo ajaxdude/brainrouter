@@ -184,6 +184,11 @@ async fn handle_request(
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
+        ("POST", "/api/restart/brainrouter") => {
+            let resp = restart_service("brainrouter").await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
         _ => {
             let resp = json_response(
                 StatusCode::NOT_FOUND,
@@ -252,7 +257,7 @@ async fn handle_anthropic_messages(
 
 /// Restart a systemd user service. Only allows a fixed set of service names.
 async fn restart_service(service: &str) -> Response<Full<Bytes>> {
-    const ALLOWED: &[&str] = &["llama-swap", "manifest"];
+    const ALLOWED: &[&str] = &["llama-swap", "manifest", "brainrouter"];
     if !ALLOWED.contains(&service) {
         return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
             error: format!("Unknown service: {}", service),
