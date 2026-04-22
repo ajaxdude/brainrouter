@@ -16,7 +16,7 @@ use crate::{
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{RouteEvent, RoutingEvents, Stage},
     stream::TimeoutStream,
-    types::ChatCompletionRequest,
+    types::{ChatCompletionRequest, ChatMessage},
 };
 use anyhow::{anyhow, Result};
 use futures_util::{stream as fstream, StreamExt};
@@ -300,14 +300,18 @@ impl Router {
                 stage
             ));
         }
-        // Qwen3 (and some other chat templates) require the system message to be
-        // first. Clients don't always guarantee this, so reorder: pull all system
-        // messages to the front, preserving relative order within each group.
+        // Qwen3 (and other chat templates) require exactly one system message at
+        // position 0. Clients and the prompt rewriter can produce multiple system
+        // messages (lean prompt + tool schemas). Merge them into a single message
+        // so the chat template doesn't reject the request.
         let (sys, rest): (Vec<_>, Vec<_>) = request
             .messages
             .into_iter()
             .partition(|m| m.role == "system");
-        request.messages = sys.into_iter().chain(rest).collect();
+        request.messages = merge_system_messages(sys)
+            .into_iter()
+            .chain(rest)
+            .collect();
         let model_key = request.model.clone();
         info!(provider = LLAMA_SWAP_KEY, ?stage, model = %model_key, "Attempting llama-swap");
         match self.llama_swap.chat_completion(request).await {
@@ -328,6 +332,35 @@ impl Router {
             }
         }
     }
+}
+
+/// Collapse multiple system messages into a single one by concatenating their
+/// text content with double newlines. Returns an empty vec if the input is
+/// empty, or a single-element vec with the merged message.
+///
+/// Non-string content (arrays, objects) is serialized to its JSON form so
+/// tool-schema payloads embedded in system messages are not silently dropped.
+fn merge_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if messages.len() <= 1 {
+        return messages;
+    }
+
+    let mut parts: Vec<String> = Vec::with_capacity(messages.len());
+    for msg in &messages {
+        match &msg.content {
+            Some(serde_json::Value::String(s)) => parts.push(s.clone()),
+            Some(other) => parts.push(other.to_string()),
+            None => {}
+        }
+    }
+
+    vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(serde_json::Value::String(parts.join("\n\n"))),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }]
 }
 
 /// Consume the first chunk of a Manifest SSE stream, extract the `model` field
@@ -432,5 +465,91 @@ fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
         raw[..end].to_string()
     } else {
         raw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sys(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "system".to_string(),
+            content: Some(serde_json::Value::String(content.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn merge_empty() {
+        let result = merge_system_messages(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn merge_single_passthrough() {
+        let msgs = vec![sys("You are helpful.")];
+        let result = merge_system_messages(msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].content.as_ref().unwrap().as_str().unwrap(),
+            "You are helpful."
+        );
+    }
+
+    #[test]
+    fn merge_multiple_concatenates() {
+        let msgs = vec![
+            sys("You are a coding assistant."),
+            sys("{\"type\":\"function\",\"function\":{\"name\":\"read\"}}"),
+            sys("Extra instructions."),
+        ];
+        let result = merge_system_messages(msgs);
+        assert_eq!(result.len(), 1);
+        let text = result[0].content.as_ref().unwrap().as_str().unwrap();
+        assert!(text.contains("coding assistant"));
+        assert!(text.contains("\"function\""));
+        assert!(text.contains("Extra instructions"));
+        // Sections separated by double newlines
+        assert!(text.contains("\n\n"));
+    }
+
+    #[test]
+    fn merge_preserves_non_string_content() {
+        let mut msgs = vec![sys("Prompt")];
+        msgs.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(serde_json::json!({"tool": "schema"})),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        let result = merge_system_messages(msgs);
+        assert_eq!(result.len(), 1);
+        let text = result[0].content.as_ref().unwrap().as_str().unwrap();
+        assert!(text.contains("Prompt"));
+        assert!(text.contains("tool"));
+        assert!(text.contains("schema"));
+    }
+
+    #[test]
+    fn merge_skips_none_content() {
+        let msgs = vec![
+            sys("Prompt"),
+            ChatMessage {
+                role: "system".to_string(),
+                content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            sys("More"),
+        ];
+        let result = merge_system_messages(msgs);
+        assert_eq!(result.len(), 1);
+        let text = result[0].content.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(text, "Prompt\n\nMore");
     }
 }
