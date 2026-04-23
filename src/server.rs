@@ -263,6 +263,41 @@ async fn handle_request(
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
+        // ── Review mode API ──────────────────────────────────────────────────
+        ("GET", "/api/review-config") => {
+            let config = &state.review_service.get_config();
+            let resp = json_response(StatusCode::OK, config);
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("POST", "/api/review-config") => {
+            match handle_update_review_config(req, &state.review_service).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Error updating review config: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Internal error: {}", e) },
+                    );
+                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                }
+            }
+        }
+
+        ("GET", "/api/models/llama-swap") => {
+            match handle_llama_swap_models(&state.llama_swap_url).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Error getting llama-swap models: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Internal error: {}", e) },
+                    );
+                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                }
+            }
+        }
+
         _ => {
             let resp = json_response(
                 StatusCode::NOT_FOUND,
@@ -640,6 +675,34 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
             })
         }
     }
+}
+
+async fn handle_update_review_config(
+    req: Request<Incoming>,
+    service: &ReviewService,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+    let body_bytes = req.collect().await?.to_bytes();
+    let update: crate::config::ReviewConfig = serde_json::from_slice(&body_bytes)?;
+    
+    service.update_config(update);
+    
+    let resp = json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" }));
+    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
+}
+
+async fn handle_llama_swap_models(
+    llama_swap_url: &str,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?;
+        
+    let url = format!("{}/v1/models", llama_swap_url);
+    let resp = client.get(&url).send().await?;
+    let data: serde_json::Value = resp.json().await?;
+    
+    let resp = json_response(StatusCode::OK, &data);
+    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
 }
 
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)

@@ -32,7 +32,7 @@ pub struct RequestReviewResult {
 pub struct ReviewService {
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
-    config: ReviewConfig,
+    config: std::sync::Mutex<ReviewConfig>,
 }
 
 impl ReviewService {
@@ -44,7 +44,7 @@ impl ReviewService {
         ReviewService {
             router,
             sessions,
-            config,
+            config: std::sync::Mutex::new(config),
         }
     }
 
@@ -70,6 +70,9 @@ impl ReviewService {
         );
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
 
+        // Clone current config snapshot for this review run
+        let config_snapshot = self.get_config();
+
         let result = run_loop(
             &session.id,
             &task_id,
@@ -77,7 +80,7 @@ impl ReviewService {
             details.as_deref(),
             &self.router,
             &self.sessions,
-            self.config.max_iterations,
+            &config_snapshot,
         )
         .await?;
 
@@ -88,6 +91,17 @@ impl ReviewService {
             iteration_count: result.iteration_count,
             reviewer_type: result.reviewer_type,
         })
+    }
+
+    /// Get a copy of the current review configuration.
+    pub fn get_config(&self) -> ReviewConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    /// Update the review configuration globally for new sessions.
+    pub fn update_config(&self, new_config: ReviewConfig) {
+        let mut config = self.config.lock().unwrap();
+        *config = new_config;
     }
 
     /// Resolve a session with human feedback (from the escalation UI).

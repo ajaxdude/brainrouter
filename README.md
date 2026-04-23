@@ -34,8 +34,9 @@ coding harness (omp / vibe / claude / opencode / codex / droid)
 - **Local mode rewrites system prompts.** OMP's 15-20K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
 - **Manifest handles cloud failover.** Manifest runs locally in Docker and does its own provider selection (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with automatic fallbacks.
 - **llama-swap handles local model management.** brainrouter points at it. Bonsai picks the right model for simple tasks.
-  - **Review loop is local.** `mcp_brainrouter_request_review` triggers an iterative code review against a local LLM. No cloud tokens consumed. Escalates to a human web UI if the LLM can't reach a verdict.
+  - **Reviews code locally (by default).** `mcp_brainrouter_request_review` triggers an iterative code review. While the default is `auto` (where Bonsai 8B decides between cloud and local based on task complexity), users can force reviews to be exclusively local or cloud via the dashboard toggle.
 - **System monitoring and management.** Dashboard tracks `llama-swap` and `llama.cpp` versions, checks for updates, and allows one-click upgrades and service restarts.
+- **Forced Routing.** The dashboard allows you to select a specific local model from llama-swap to handle all code reviews, bypassing Bonsai's decision logic entirely for that session.
 - **Security-hardened.** Localhost-only guards for destructive operations, CSRF protection, and sanitized working directory tracking.
 - **Robust protocol handling.** Industrial-grade SSE adapter guarantees protocol compliance for Anthropic clients even on empty or interrupted streams.
 
@@ -104,6 +105,9 @@ Destructive endpoints are restricted to `127.0.0.1` / `::1` or UDS connections w
 |---|---|---|
 | `GET` | `/api/versions` | Returns local `llama-swap` and toolbox versions |
 | `GET` | `/api/inference-status` | High-frequency polling for progress bars |
+| `GET` | `/api/review-config` | Get current forced review settings |
+| `POST` | `/api/review-config` | Update forced review mode and model |
+| `GET` | `/api/models/llama-swap` | Proxies `v1/models` from llama-swap for the UI |
 | `POST` | `/api/upgrade/llama-swap` | Pulls and builds latest binary + restarts service |
 | `POST` | `/api/restart/:service` | Restarts `llama-swap`, `manifest`, or `brainrouter` |
 | `POST` | `/api/restart/llama-cpp` | Refreshes the `llama.cpp` toolbox container |

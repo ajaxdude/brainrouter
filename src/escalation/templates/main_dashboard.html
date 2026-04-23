@@ -133,10 +133,33 @@
     </div>
   </div>
 
-  <!-- Route event feed -->
+  <!-- Current model flow -->
   <div class="flow-section">
-    <h2><span class="live-dot"></span>Live routing flow <span class="refresh-note">polling every 3s</span></h2>
-    <div id="flow-content" class="flow-empty">Waiting for first request...</div>
+    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+      <div style="flex: 1;">
+        <h2><span class="live-dot"></span>Live routing flow <span class="refresh-note">polling every 3s</span></h2>
+        <div id="flow-content" class="flow-empty">Waiting for first request...</div>
+      </div>
+      <div id="review-settings" class="stat-card" style="padding: 12px 16px; text-align: left; min-width: 280px; margin-bottom: 0; margin-left: 20px;">
+        <div class="slabel" style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+          Code Review Mode
+          <span id="review-mode-status" class="badge badge-auto">auto</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <select id="select-review-mode" onchange="updateReviewConfig()" style="background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 0.8rem;">
+            <option value="auto">Auto (Bonsai decided)</option>
+            <option value="cloud">Force Cloud (Manifest)</option>
+            <option value="local">Force Local (llama-swap)</option>
+          </select>
+          <div id="local-model-select-wrap" style="display: none; flex-direction: column; gap: 4px;">
+            <div class="slabel" style="font-size: 0.6rem;">Target Local Model</div>
+            <select id="select-review-model" onchange="updateReviewConfig()" style="background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 0.8rem;">
+              <option value="">(Loading models...)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Stats -->
@@ -482,12 +505,13 @@
 
     async function refresh() {
       try {
-        const [evRes, sesRes, statsRes, infRes, verRes] = await Promise.all([
+        const [evRes, sesRes, statsRes, infRes, verRes, revRes] = await Promise.all([
           fetch('/api/routing-events'),
           fetch('/review/api/sessions'),
           fetch('/api/routing-stats'),
           fetch('/api/inference-status'),
           fetch('/api/versions'),
+          fetch('/api/review-config'),
         ]);
 
         window.currentInferenceStatus = null;
@@ -497,6 +521,7 @@
         const sesData = await sesRes.json();
         const statsData = await statsRes.json();
         const verData = await verRes.json();
+        const revData = await revRes.json();
 
         allEvents = evData.events || [];
         renderFlow(allEvents);
@@ -504,8 +529,79 @@
         renderEvents(allEvents);
         renderSessions(sesData.sessions || []);
         renderVersions(verData);
+        syncReviewConfig(revData);
       } catch (err) {
         console.error('Dashboard refresh failed', err);
+      }
+    }
+
+    let currentReviewConfig = null;
+    let llamaSwapModels = [];
+
+    async function syncReviewConfig(config) {
+      if (!config) return;
+      currentReviewConfig = config;
+      
+      const modeSelect = document.getElementById('select-review-mode');
+      const statusBadge = document.getElementById('review-mode-status');
+      const localWrap = document.getElementById('local-model-select-wrap');
+      
+      if (modeSelect.value !== config.forced_mode) {
+        modeSelect.value = config.forced_mode;
+      }
+      
+      statusBadge.textContent = config.forced_mode;
+      statusBadge.className = 'badge badge-' + config.forced_mode;
+      
+      if (config.forced_mode === 'local') {
+        localWrap.style.display = 'flex';
+        if (llamaSwapModels.length === 0) {
+           await loadLlamaSwapModels();
+        }
+        const modelSelect = document.getElementById('select-review-model');
+        if (modelSelect.value !== (config.forced_model || '')) {
+           modelSelect.value = config.forced_model || '';
+        }
+      } else {
+        localWrap.style.display = 'none';
+      }
+    }
+
+    async function loadLlamaSwapModels() {
+      try {
+        const res = await fetch('/api/models/llama-swap');
+        const data = await res.json();
+        llamaSwapModels = data.data || [];
+        const select = document.getElementById('select-review-model');
+        select.innerHTML = llamaSwapModels.map(m => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
+        if (currentReviewConfig && currentReviewConfig.forced_model) {
+           select.value = currentReviewConfig.forced_model;
+        }
+      } catch (e) {
+        console.error('Failed to load llama-swap models', e);
+      }
+    }
+
+    async function updateReviewConfig() {
+      const mode = document.getElementById('select-review-mode').value;
+      const model = document.getElementById('select-review-model').value;
+      
+      const payload = {
+        max_iterations: currentReviewConfig ? currentReviewConfig.max_iterations : 5,
+        forced_mode: mode,
+        forced_model: mode === 'local' ? model : null
+      };
+      
+      try {
+        await fetch('/api/review-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        // Optimistic update
+        syncReviewConfig(payload);
+      } catch (e) {
+        console.error('Failed to update review config', e);
       }
     }
 

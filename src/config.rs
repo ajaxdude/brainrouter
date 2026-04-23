@@ -61,16 +61,30 @@ pub struct ReviewConfig {
     /// Maximum number of LLM review iterations before escalating to human.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+
+    /// Forced review mode: "auto", "cloud", or "local".
+    #[serde(default = "default_review_mode")]
+    pub forced_mode: String,
+
+    /// Forced model key (only used when forced_mode is "local").
+    #[serde(default)]
+    pub forced_model: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
     5
 }
 
+fn default_review_mode() -> String {
+    "auto".to_string()
+}
+
 impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig {
             max_iterations: default_max_iterations(),
+            forced_mode: default_review_mode(),
+            forced_model: None,
         }
     }
 }

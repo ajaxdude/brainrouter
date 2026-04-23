@@ -55,7 +55,7 @@ pub async fn run_loop(
     details: Option<&str>,
     router: &Arc<Router>,
     sessions: &Arc<SessionManager>,
-    max_iterations: u32,
+    config: &crate::config::ReviewConfig,
 ) -> Result<ReviewResult> {
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
@@ -63,18 +63,25 @@ pub async fn run_loop(
     let mut escalation_reason: Option<EscalationReason> = None;
     let mut session_history: Vec<String> = Vec::new();
 
-    while iteration_count < max_iterations {
+    while iteration_count < config.max_iterations {
         iteration_count += 1;
-        info!(session_id, iteration = iteration_count, max_iterations, "Review iteration");
+        info!(session_id, iteration = iteration_count, max_iterations = config.max_iterations, "Review iteration");
 
         // Gather context fresh each iteration (git diff may change)
         let ctx = context::gather();
 
         let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
 
+        // Determine the model for this review call
+        let requested_model = match config.forced_mode.as_str() {
+            "cloud" => "cloud".to_string(),
+            "local" => config.forced_model.clone().unwrap_or_else(|| "local".to_string()),
+            _ => "auto".to_string(),
+        };
+
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
-        let result = call_llm_for_review(router, prompt.clone(), session_id).await;
+        let result = call_llm_for_review(router, prompt.clone(), session_id, requested_model).await;
 
         match result {
             Err(e) => {
@@ -144,7 +151,7 @@ pub async fn run_loop(
                     Err(e) => {
                         warn!(session_id, error = %e, raw = %raw_text, "Failed to parse LLM review response");
                         // Treat parse failure as LLM error on last iteration, otherwise retry
-                        if iteration_count >= max_iterations {
+                        if iteration_count >= config.max_iterations {
                             status = ReviewStatus::Escalated;
                             escalation_reason = Some(EscalationReason::LlmError);
                             feedback = format!("Failed to parse LLM response: {}", e);
@@ -204,9 +211,10 @@ async fn call_llm_for_review(
     router: &Arc<Router>,
     prompt: String,
     session_id: &str,
+    model: String,
 ) -> Result<(String, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
-        model: "auto".to_string(),
+        model,
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -232,6 +240,7 @@ async fn call_llm_for_review(
         stop: None,
         extra: serde_json::Value::Object(serde_json::Map::new()),
     };
+
 
     let (provider_response, route_info) = router
         .route_tagged(request, Some(session_id.to_string()), String::new())

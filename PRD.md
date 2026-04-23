@@ -25,8 +25,9 @@ A single Rust daemon that:
    - `local` — Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap.
    - `cloud` — Bypasses Bonsai, routes directly to Manifest.
 2. **Falls back** automatically when Manifest stalls or fails — no manual intervention.
-- **Reviews code** locally using the same routing infrastructure, exposing an MCP tool that every harness can call.
+- **Reviews code locally (by default)** using the same routing infrastructure, exposing an MCP tool that every harness can call. Users can explicitly override Bonsai's routing via the dashboard to force local or cloud review.
 - **Manages system state** via the dashboard, allowing one-click upgrades of `llama-swap` and resets of the `llama.cpp` toolbox environment.
+- **Explicit Review Control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 8B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
 - **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 
 ## Architecture decisions
