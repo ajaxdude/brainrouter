@@ -27,6 +27,7 @@ use crate::stream::{SafeStream, StreamFormat};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
+const FAVICON_PNG: &[u8] = include_bytes!("escalation/templates/favicon.png");
 
 /// Shared state passed to all request handlers
 pub struct AppState {
@@ -204,6 +205,15 @@ async fn handle_request(
 
         // ── Unified dashboard ──────────────────────────────────────────────────
         ("GET", "/dashboard") => html_ok(MAIN_DASHBOARD_HTML),
+
+        ("GET", "/favicon.ico") | ("GET", "/favicon.png") => {
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "image/png")
+                .body(Full::new(Bytes::from(FAVICON_PNG)))
+                .expect("Failed to build favicon response");
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
 
         // ── Routing events API ─────────────────────────────────────────────────
         ("GET", "/api/routing-events") => {
@@ -584,26 +594,77 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     use tokio::process::Command;
 
     // 1. Get llama-swap version
+    // First try the --version flag
     let swap_out = Command::new("/home/papa/.local/bin/llama-swap")
         .arg("--version")
         .output()
         .await;
-    let swap_ver = match swap_out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().replace("version: ", ""),
-        Err(_) => "unknown".to_string(),
+    
+    let mut swap_ver = match swap_out {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().replace("version: ", "").to_string()
+        }
+        _ => String::new(),
     };
 
+    // If --version failed (common in newer builds that removed the flag), 
+    // try to extract version from build info via strings
+    if swap_ver.is_empty() {
+        let strings_out = Command::new("strings")
+            .arg("/home/papa/.local/bin/llama-swap")
+            .output()
+            .await;
+            
+        if let Ok(out) = strings_out {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // Look for version tag like v0.1.5
+            if let Some(line) = s.lines().find(|l| l.contains("github.com/mostlygeek/llama-swap") && (l.contains("v0.") || l.contains("v1."))) {
+                // Example: mod github.com/mostlygeek/llama-swap v0.1.5 h1:...
+                swap_ver = line.split_whitespace()
+                    .find(|part| part.starts_with('v') && part.contains('.'))
+                    .unwrap_or(line)
+                    .to_string();
+            }
+        }
+    }
+    
+    if swap_ver.is_empty() {
+        swap_ver = "unknown".to_string();
+    }
+
     // 2. Get llama-server version from toolbox
+    // Try primary container first, then a generic check if that fails.
+    // We search stdout and stderr for anything resembling a version number.
     let toolbox_out = Command::new("toolbox")
         .args(["run", "--container", "llama-vulkan-radv", "llama-server", "--version"])
         .output()
         .await;
+
     let toolbox_ver = match toolbox_out {
         Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            s.lines().next().unwrap_or("unknown").replace("version: ", "").to_string()
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{}{}", stdout, stderr);
+            
+            // Search for "version: X" or just "X (hash)" pattern
+            if let Some(line) = combined.lines().find(|l| l.contains("version:") || (l.contains('(') && l.contains(')'))) {
+                line.replace("version:", "")
+                    .replace("built with", "")
+                    .trim()
+                    .to_string()
+            } else {
+                // If no clear line, just take the first non-empty line as a fallback
+                combined.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("unknown")
+                    .trim()
+                    .to_string()
+            }
         }
-        Err(_) => "unknown".to_string(),
+        Err(e) => {
+            error!(error = %e, "Failed to execute toolbox run for version check");
+            "unknown".to_string()
+        }
     };
 
     let data = serde_json::json!({
@@ -630,19 +691,54 @@ async fn check_latest_llama_swap() -> Option<String> {
 async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
     info!("Upgrading llama-swap via go install...");
     
-    let output = tokio::process::Command::new("go")
+    // Find the go binary explicitly since it might not be in the daemon's PATH
+    let go_bin = if std::path::Path::new("/home/papa/go/bin/go").exists() {
+        "/home/papa/go/bin/go"
+    } else {
+        "go"
+    };
+
+    let target_bin = "/home/papa/.local/bin/llama-swap";
+    
+    // 1. Run go install to build the latest binary in GOPATH/bin
+    let output = tokio::process::Command::new(go_bin)
         .args(["install", "github.com/mostlygeek/llama-swap@latest"])
-        .env("GOBIN", "/home/papa/.local/bin")
+        .env("GOPATH", "/home/papa/go")
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
-            info!("llama-swap binary written and closed successfully. Triggering restart...");
+            info!("llama-swap built in GOPATH/bin successfully. Stopping service and installing...");
             
-            // Atomic sequential restart after successful upgrade
+            // 2. Stop the service first to avoid "Text file busy" error during overwrite
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "stop", "llama-swap"])
+                .output()
+                .await;
+            
+            // 3. Explicitly copy the newly built binary to the location used by systemd
+            // Use std::fs::remove_file first to break any existing links or locks
+            let _ = std::fs::remove_file(target_bin);
+            let copy_res = std::fs::copy("/home/papa/go/bin/llama-swap", target_bin);
+            
+            if let Err(e) = copy_res {
+                error!(error = %e, "Failed to copy llama-swap binary to {}", target_bin);
+                // Try to restart anyway so the service isn't left dead
+                let _ = tokio::process::Command::new("systemctl")
+                    .args(["--user", "start", "llama-swap"])
+                    .output()
+                    .await;
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                    error: format!("Build succeeded but failed to install to {}: {}", target_bin, e),
+                });
+            }
+
+            info!("llama-swap binary installed successfully to {}. Starting service...", target_bin);
+            
+            // 4. Start the service again
             let restart_output = tokio::process::Command::new("systemctl")
-                .args(["--user", "restart", "llama-swap"])
+                .args(["--user", "start", "llama-swap"])
                 .output()
                 .await;
                 
@@ -656,7 +752,7 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
                 _ => {
                     json_response(StatusCode::ACCEPTED, &serde_json::json!({
                         "status": "partial",
-                        "message": "llama-swap upgraded, but restart failed. Please restart manually."
+                        "message": "llama-swap upgraded, but restart failed. Please start manually."
                     }))
                 }
             }
