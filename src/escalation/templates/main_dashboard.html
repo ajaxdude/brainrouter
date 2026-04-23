@@ -160,19 +160,20 @@
     <table>
       <thead>
         <tr>
-          <th style="width:9%">Time</th>
-          <th style="width:22%">Prompt</th>
-          <th style="width:8%">Route</th>
-          <th style="width:9%">Router</th>
-          <th style="width:10%">Provider</th>
-          <th style="width:15%">Model</th>
-          <th style="width:7%">Latency</th>
-          <th style="width:7%">Status</th>
-          <th style="width:7%">Review?</th>
+          <th style="width:8%">Time</th>
+          <th style="width:9%">Folder</th>
+          <th style="width:18%">Prompt</th>
+          <th style="width:7%">Route</th>
+          <th style="width:8%">Router</th>
+          <th style="width:9%">Provider</th>
+          <th style="width:14%">Model</th>
+          <th style="width:6%">Latency</th>
+          <th style="width:5%">Status</th>
+          <th style="width:6%">Review?</th>
         </tr>
       </thead>
       <tbody id="events-body">
-        <tr><td colspan="9" class="empty">No routing events yet.</td></tr>
+        <tr><td colspan="10" class="empty">No routing events yet.</td></tr>
       </tbody>
     </table>
   </div>
@@ -369,7 +370,7 @@
     function renderEvents(events) {
       const tbody = document.getElementById('events-body');
       if (!events.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="empty">No routing events yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="empty">No routing events yet.</td></tr>';
         return;
       }
 
@@ -396,15 +397,14 @@
         const sessionTag = e.session_id
           ? '<span class="badge badge-pending" title="' + esc(e.session_id) + '">review</span>'
           : '<span class="muted">&mdash;</span>';
-        const folderBadge = e.cwd
-          ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(e.cwd.split('/').filter(Boolean).pop() || e.cwd) + '</span>'
-          : '';
+        const folderName = e.cwd ? e.cwd.split('/').filter(Boolean).pop() || e.cwd : '';
         const countBadge = e._count > 1
           ? ' <span class="badge badge-count">&times;' + e._count + '</span>'
           : '';
         return `<tr>
           <td class="muted">${fmtTime(e.timestamp)}</td>
-          <td>${folderBadge}<span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}</td>
+          <td>${folderName ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
+          <td><span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}</td>
           <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
           <td>${routerDisplay(e)}</td>
           <td>${providerDisplay(e)}</td>

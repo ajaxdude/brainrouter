@@ -59,8 +59,10 @@ fn find_cwd_for_inode(inode: u64) -> Option<String> {
 
     for entry in proc.flatten() {
         let name = entry.file_name();
-        let pid_str = name.to_str()?;
-        // Only numeric entries are PIDs.
+        let pid_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
         if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
