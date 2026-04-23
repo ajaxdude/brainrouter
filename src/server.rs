@@ -177,7 +177,7 @@ async fn handle_request(
 
         // ── Inference status API (polls llama-swap + llama-server) ────────────
         ("GET", "/api/inference-status") => {
-            let resp = inference_status(&state.llama_swap_url).await;
+            let resp = inference_status(&state.router.inference_tracker, &state.llama_swap_url).await;
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
@@ -265,98 +265,124 @@ async fn handle_anthropic_messages(
 
 /// Poll llama-swap and the active model's llama-server for inference status.
 /// Returns a combined view: which model is loaded, its state, and slot progress.
-async fn inference_status(llama_swap_url: &str) -> Response<Full<Bytes>> {
+async fn inference_status(
+    tracker: &crate::inference_state::InferenceTracker,
+    llama_swap_url: &str,
+) -> Response<Full<Bytes>> {
+    use crate::inference_state::Phase;
+
+    let snap = tracker.snapshot();
+
+    match snap.phase {
+        Phase::Idle => {
+            // No active request in brainrouter. Check if llama-swap has a model loaded.
+            let model_info = poll_llama_swap_running(llama_swap_url).await;
+            match model_info {
+                Some((name, display, swap_state)) if swap_state != "ready" => {
+                    json_response(StatusCode::OK, &serde_json::json!({
+                        "state": "loading",
+                        "model": name,
+                        "model_name": display,
+                        "elapsed_ms": 0,
+                    }))
+                }
+                Some((name, display, _)) => {
+                    json_response(StatusCode::OK, &serde_json::json!({
+                        "state": "ready",
+                        "model": name,
+                        "model_name": display,
+                    }))
+                }
+                None => json_response(StatusCode::OK, &serde_json::json!({
+                    "state": "idle"
+                })),
+            }
+        }
+        Phase::Classifying => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "state": "classifying",
+                "elapsed_ms": snap.elapsed_ms,
+            }))
+        }
+        Phase::CloudWaiting => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "state": "cloud_waiting",
+                "model": snap.model,
+                "provider": snap.provider,
+                "elapsed_ms": snap.elapsed_ms,
+            }))
+        }
+        Phase::CloudStreaming => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "state": "cloud_streaming",
+                "model": snap.model,
+                "provider": snap.provider,
+                "elapsed_ms": snap.elapsed_ms,
+            }))
+        }
+        Phase::LocalWaiting | Phase::LocalStreaming => {
+            // For local, enrich with llama-swap /slots data if available.
+            let slot_info = poll_llama_swap_slot(llama_swap_url).await;
+            let (sub_state, n_decoded) = match &slot_info {
+                Some((true, 0)) => ("local_processing", 0u64),
+                Some((true, n)) => ("local_generating", *n),
+                Some((false, _)) if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
+                Some((false, _)) => ("ready", 0),
+                // Slot poll failed (GPU busy, timeout) — infer from tracker phase.
+                None if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
+                None => ("local_processing", 0),
+            };
+            json_response(StatusCode::OK, &serde_json::json!({
+                "state": sub_state,
+                "model": snap.model,
+                "model_name": snap.model,
+                "provider": snap.provider,
+                "elapsed_ms": snap.elapsed_ms,
+                "n_decoded": n_decoded,
+            }))
+        }
+    }
+}
+
+/// Poll llama-swap /running for the active model's name, display name, and state.
+async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String, String)> {
+    let url = format!("{}/running", llama_swap_url);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .unwrap();
+        .build().ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let entry = data.get("running")?.as_array()?.first()?;
+    let name = entry.get("model")?.as_str()?.to_string();
+    let display = entry.get("name").and_then(|n| n.as_str()).unwrap_or(&name).to_string();
+    let state = entry.get("state").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+    Some((name, display, state))
+}
 
-    // 1. Ask llama-swap what's running
+/// Poll the active llama-server's /slots endpoint for processing state.
+/// Returns (is_processing, n_decoded) if reachable.
+async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build().ok()?;
+    // First get the proxy URL from /running
     let running_url = format!("{}/running", llama_swap_url);
-    let running = match client.get(&running_url).send().await {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => v,
-            Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
-                "state": "idle", "model": null
-            })),
-        },
-        Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
-            "state": "unavailable", "model": null
-        })),
-    };
-
-    // 2. Extract the first running model
-    let models = match running.get("running").and_then(|r| r.as_array()) {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => return json_response(StatusCode::OK, &serde_json::json!({
-            "state": "idle", "model": null
-        })),
-    };
-
-    let model_entry = &models[0];
-    let model_name = model_entry.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
-    let model_display = model_entry.get("name").and_then(|m| m.as_str()).unwrap_or(model_name);
-    let proxy_url = model_entry.get("proxy").and_then(|p| p.as_str());
-    let swap_state = model_entry.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
-
-    // If llama-swap says the model isn't ready, report loading
-    if swap_state != "ready" {
-        return json_response(StatusCode::OK, &serde_json::json!({
-            "state": "loading",
-            "model": model_name,
-            "model_name": model_display,
-        }));
-    }
-
-    // 3. Poll the llama-server's /slots for processing progress
-    let proxy = match proxy_url {
-        Some(url) => url,
-        None => return json_response(StatusCode::OK, &serde_json::json!({
-            "state": "ready",
-            "model": model_name,
-            "model_name": model_display,
-        })),
-    };
-
+    let resp = client.get(&running_url).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let entry = data.get("running")?.as_array()?.first()?;
+    let proxy = entry.get("proxy")?.as_str()?;
+    // Then poll /slots on the model's port
     let slots_url = format!("{}/slots", proxy);
-    let slot = match client.get(&slots_url).send().await {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(serde_json::Value::Array(arr)) if !arr.is_empty() => arr[0].clone(),
-            _ => return json_response(StatusCode::OK, &serde_json::json!({
-                "state": "ready",
-                "model": model_name,
-                "model_name": model_display,
-            })),
-        },
-        Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
-            "state": "ready",
-            "model": model_name,
-            "model_name": model_display,
-        })),
-    };
-
-    let is_processing = slot.get("is_processing").and_then(|v| v.as_bool()).unwrap_or(false);
+    let resp = client.get(&slots_url).send().await.ok()?;
+    let slots: serde_json::Value = resp.json().await.ok()?;
+    let slot = slots.as_array()?.first()?;
+    let is_proc = slot.get("is_processing")?.as_bool()?;
     let n_decoded = slot
         .get("next_token")
         .and_then(|nt| nt.get("n_decoded"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-
-    let state = if !is_processing {
-        "idle"
-    } else if n_decoded == 0 {
-        "processing" // prompt eval in progress
-    } else {
-        "generating" // token generation
-    };
-
-    json_response(StatusCode::OK, &serde_json::json!({
-        "state": state,
-        "model": model_name,
-        "model_name": model_display,
-        "is_processing": is_processing,
-        "n_decoded": n_decoded,
-    }))
+    Some((is_proc, n_decoded))
 }
 
 /// Restart a systemd user service. Only allows a fixed set of service names.

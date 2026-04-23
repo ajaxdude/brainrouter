@@ -12,6 +12,7 @@
 use crate::{
     classifier::{Classifier, RoutingDecision},
     health::HealthTracker,
+    inference_state::{InferenceTracker, Phase},
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{RouteEvent, RoutingEvents, Stage},
@@ -71,6 +72,8 @@ pub struct Router {
     routing_events: Arc<RoutingEvents>,
     /// Optional custom system prompt for local routing mode.
     local_system_prompt: Option<String>,
+    /// Dashboard inference progress tracker.
+    pub inference_tracker: Arc<InferenceTracker>,
 }
 
 impl Router {
@@ -82,6 +85,7 @@ impl Router {
         health: Arc<HealthTracker>,
         routing_events: Arc<RoutingEvents>,
         local_system_prompt: Option<String>,
+        inference_tracker: Arc<InferenceTracker>,
     ) -> Self {
         Self {
             classifier,
@@ -91,6 +95,7 @@ impl Router {
             health,
             routing_events,
             local_system_prompt,
+            inference_tracker,
         }
     }
 
@@ -116,10 +121,13 @@ impl Router {
         let requested_model = request.model.clone();
         let prompt_excerpt = extract_prompt_excerpt(&request);
 
+        let tracker = &self.inference_tracker;
+
         let (bonsai_decision, result) = match requested_model.as_str() {
             // Direct local: skip Bonsai, rewrite prompt, go to llama-swap
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
+                tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()));
                 request.messages = prompt_rewriter::rewrite_for_local(
                     request.messages,
                     self.local_system_prompt.as_deref(),
@@ -130,10 +138,12 @@ impl Router {
             // Direct cloud: skip Bonsai, go straight to Manifest
             "cloud" | "brainrouter/cloud" => {
                 info!("Direct cloud mode — routing to Manifest");
+                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
                 ("cloud-direct", self.route_cloud(request).await)
             }
             // Auto: existing Bonsai classification
             _ => {
+                tracker.set(Phase::Classifying, None, None);
                 let decision = self
                     .classifier
                     .classify_async(request.clone())
@@ -141,9 +151,11 @@ impl Router {
                 info!(?decision, "Bonsai routing decision");
                 match decision {
                     RoutingDecision::Cloud => {
+                        tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
                         ("cloud", self.route_cloud(request).await)
                     }
                     RoutingDecision::Local { model } => {
+                        tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
                         request.model = model;
                         ("local", self.route_local(request).await)
                     }
@@ -156,6 +168,13 @@ impl Router {
         let (response, info) = match result {
             Ok((resp, mut info)) => {
                 info.bonsai_decision = bonsai_decision;
+                // Transition tracker to streaming phase
+                let streaming_phase = if info.effective_provider.as_deref() == Some("manifest") {
+                    Phase::CloudStreaming
+                } else {
+                    Phase::LocalStreaming
+                };
+                tracker.set(streaming_phase, Some(info.model_key.clone()), None);
                 self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
@@ -171,9 +190,13 @@ impl Router {
                     cwd: cwd.clone(),
                     session_id: session_id.clone(),
                 });
+                // Wrap the stream to clear the tracker when it completes
+                let tracker_for_stream = Arc::clone(&self.inference_tracker);
+                let resp = wrap_with_tracker_clear(resp, tracker_for_stream);
                 (resp, info)
             }
             Err(e) => {
+                tracker.clear();
                 self.routing_events.emit(RouteEvent {
                     id: 0,
                     timestamp: String::new(),
@@ -451,6 +474,39 @@ fn wrap_with_timeout(
 ) -> ProviderResponse {
     let timeout_stream = TimeoutStream::new(stream, STREAM_STALL_TIMEOUT);
     ProviderResponse::Stream(Box::pin(timeout_stream))
+}
+
+/// Wrap a ProviderResponse stream so the inference tracker is cleared when
+/// the stream is dropped (completes, errors, or client disconnects).
+fn wrap_with_tracker_clear(
+    resp: ProviderResponse,
+    tracker: Arc<InferenceTracker>,
+) -> ProviderResponse {
+    let ProviderResponse::Stream(stream) = resp;
+    ProviderResponse::Stream(Box::pin(TrackerClearStream { stream, tracker }))
+}
+
+/// Stream wrapper that clears the inference tracker on drop.
+struct TrackerClearStream {
+    stream: crate::provider::SseStream,
+    tracker: Arc<InferenceTracker>,
+}
+
+impl futures_util::Stream for TrackerClearStream {
+    type Item = <crate::provider::SseStream as futures_util::Stream>::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for TrackerClearStream {
+    fn drop(&mut self) {
+        self.tracker.clear();
+    }
 }
 
 /// Derive the Stage from the effective provider and Bonsai decision.

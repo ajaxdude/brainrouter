@@ -14,6 +14,7 @@ use brainrouter::{
     classifier::Classifier,
     config,
     health::HealthTracker,
+    inference_state::InferenceTracker,
     provider::openai::OpenAiProvider,
     review::ReviewService,
     router::Router,
@@ -107,6 +108,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         });
 
+    // Inference state tracker — shared between Router (writes) and HTTP API (reads)
+    let inference_tracker = Arc::new(InferenceTracker::new());
+
     // Router — shared between the proxy and the review service
     let router = Arc::new(Router::new(
         classifier,
@@ -116,6 +120,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         health,
         Arc::clone(&routing_events),
         local_system_prompt,
+        Arc::clone(&inference_tracker),
     ));
 
     // Session manager (in-memory; ephemeral per process lifetime)

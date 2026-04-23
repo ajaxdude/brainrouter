@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod classifier;
 pub mod config;
 pub mod escalation;
+pub mod inference_state;
 pub mod health;
 pub mod peer_cwd;
 pub mod prompt_rewriter;

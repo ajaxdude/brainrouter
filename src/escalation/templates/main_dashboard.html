@@ -468,38 +468,88 @@
       const fill = document.getElementById('progress-fill');
       const pct = document.getElementById('progress-pct');
 
-      if (!data || data.state === 'idle' || data.state === 'unavailable' || data.state === 'ready') {
+      // Only hide when there's truly nothing (no model loaded, no request)
+      if (!data || data.state === 'idle') {
         wrap.classList.remove('active');
         return;
       }
 
       wrap.classList.add('active');
-      model.textContent = data.model_name || data.model || '\u2014';
+      model.textContent = data.model_name || data.model || '';
+      const elapsed = data.elapsed_ms ? (data.elapsed_ms / 1000).toFixed(1) + 's' : '';
 
-      if (data.state === 'loading') {
-        state.className = 'badge badge-fallback';
-        state.textContent = 'loading model';
-        fill.className = 'progress-fill loading';
-        fill.style.width = '';
-        pct.textContent = '';
-      } else if (data.state === 'processing') {
-        state.className = 'badge badge-pending';
-        state.textContent = 'prompt eval';
-        fill.className = 'progress-fill processing';
-        fill.style.width = '40%';
-        pct.textContent = 'processing\u2026';
-      } else if (data.state === 'generating') {
-        state.className = 'badge badge-ok';
-        state.textContent = 'generating';
-        fill.className = 'progress-fill generating';
-        fill.style.width = '100%';
-        pct.textContent = data.n_decoded + ' tokens';
-      } else {
-        state.className = 'badge badge-ok';
-        state.textContent = data.state;
-        fill.className = 'progress-fill generating';
-        fill.style.width = '100%';
-        pct.textContent = '';
+      switch (data.state) {
+        case 'ready':
+          state.className = 'badge badge-ok';
+          state.textContent = 'ready';
+          fill.className = 'progress-fill';
+          fill.style.width = '0%';
+          fill.style.background = 'var(--muted)';
+          pct.textContent = 'idle';
+          break;
+        case 'loading':
+          state.className = 'badge badge-fallback';
+          state.textContent = 'loading model';
+          fill.className = 'progress-fill loading';
+          fill.style.width = '';
+          fill.style.background = '';
+          pct.textContent = elapsed;
+          break;
+        case 'classifying':
+          state.className = 'badge badge-llama';
+          state.textContent = 'Bonsai classifying';
+          fill.className = 'progress-fill loading';
+          fill.style.width = '';
+          fill.style.background = 'var(--purple)';
+          pct.textContent = elapsed;
+          break;
+        case 'cloud_waiting':
+          state.className = 'badge badge-manifest';
+          state.textContent = 'cloud \u2014 waiting';
+          fill.className = 'progress-fill loading';
+          fill.style.width = '';
+          fill.style.background = 'var(--green)';
+          pct.textContent = elapsed;
+          break;
+        case 'cloud_streaming':
+          state.className = 'badge badge-manifest';
+          state.textContent = 'cloud \u2014 streaming';
+          fill.className = 'progress-fill generating';
+          fill.style.width = '100%';
+          fill.style.background = '';
+          pct.textContent = elapsed;
+          break;
+        case 'local_waiting':
+          state.className = 'badge badge-llama';
+          state.textContent = 'local \u2014 loading';
+          fill.className = 'progress-fill loading';
+          fill.style.width = '';
+          fill.style.background = '';
+          pct.textContent = elapsed;
+          break;
+        case 'local_processing':
+          state.className = 'badge badge-pending';
+          state.textContent = 'local \u2014 prompt eval';
+          fill.className = 'progress-fill processing';
+          fill.style.width = '60%';
+          fill.style.background = '';
+          pct.textContent = elapsed;
+          break;
+        case 'local_generating':
+          state.className = 'badge badge-ok';
+          state.textContent = 'local \u2014 generating';
+          fill.className = 'progress-fill generating';
+          fill.style.width = '100%';
+          fill.style.background = '';
+          pct.textContent = (data.n_decoded || 0) + ' tokens \u2014 ' + elapsed;
+          break;
+        default:
+          state.className = 'badge';
+          state.textContent = data.state;
+          fill.className = 'progress-fill';
+          fill.style.width = '0%';
+          fill.style.background = '';
+          pct.textContent = elapsed;
       }
     }
 
