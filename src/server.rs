@@ -33,6 +33,8 @@ pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     pub review_service: Arc<ReviewService>,
     pub routing_events: Arc<RoutingEvents>,
+    /// llama-swap root URL (without /v1 suffix) for status polling.
+    pub llama_swap_url: String,
 }
 
 #[derive(Serialize)]
@@ -173,6 +175,12 @@ async fn handle_request(
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
+        // ── Inference status API (polls llama-swap + llama-server) ────────────
+        ("GET", "/api/inference-status") => {
+            let resp = inference_status(&state.llama_swap_url).await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
         // ── Service restart API ────────────────────────────────────────────────
         ("POST", "/api/restart/llama-swap") => {
             let resp = restart_service("llama-swap").await;
@@ -253,6 +261,102 @@ async fn handle_anthropic_messages(
             Ok(response)
         }
     }
+}
+
+/// Poll llama-swap and the active model's llama-server for inference status.
+/// Returns a combined view: which model is loaded, its state, and slot progress.
+async fn inference_status(llama_swap_url: &str) -> Response<Full<Bytes>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    // 1. Ask llama-swap what's running
+    let running_url = format!("{}/running", llama_swap_url);
+    let running = match client.get(&running_url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
+                "state": "idle", "model": null
+            })),
+        },
+        Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
+            "state": "unavailable", "model": null
+        })),
+    };
+
+    // 2. Extract the first running model
+    let models = match running.get("running").and_then(|r| r.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return json_response(StatusCode::OK, &serde_json::json!({
+            "state": "idle", "model": null
+        })),
+    };
+
+    let model_entry = &models[0];
+    let model_name = model_entry.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+    let model_display = model_entry.get("name").and_then(|m| m.as_str()).unwrap_or(model_name);
+    let proxy_url = model_entry.get("proxy").and_then(|p| p.as_str());
+    let swap_state = model_entry.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
+
+    // If llama-swap says the model isn't ready, report loading
+    if swap_state != "ready" {
+        return json_response(StatusCode::OK, &serde_json::json!({
+            "state": "loading",
+            "model": model_name,
+            "model_name": model_display,
+        }));
+    }
+
+    // 3. Poll the llama-server's /slots for processing progress
+    let proxy = match proxy_url {
+        Some(url) => url,
+        None => return json_response(StatusCode::OK, &serde_json::json!({
+            "state": "ready",
+            "model": model_name,
+            "model_name": model_display,
+        })),
+    };
+
+    let slots_url = format!("{}/slots", proxy);
+    let slot = match client.get(&slots_url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(serde_json::Value::Array(arr)) if !arr.is_empty() => arr[0].clone(),
+            _ => return json_response(StatusCode::OK, &serde_json::json!({
+                "state": "ready",
+                "model": model_name,
+                "model_name": model_display,
+            })),
+        },
+        Err(_) => return json_response(StatusCode::OK, &serde_json::json!({
+            "state": "ready",
+            "model": model_name,
+            "model_name": model_display,
+        })),
+    };
+
+    let is_processing = slot.get("is_processing").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_decoded = slot
+        .get("next_token")
+        .and_then(|nt| nt.get("n_decoded"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+
+    let state = if !is_processing {
+        "idle"
+    } else if n_decoded == 0 {
+        "processing" // prompt eval in progress
+    } else {
+        "generating" // token generation
+    };
+
+    json_response(StatusCode::OK, &serde_json::json!({
+        "state": state,
+        "model": model_name,
+        "model_name": model_display,
+        "is_processing": is_processing,
+        "n_decoded": n_decoded,
+    }))
 }
 
 /// Restart a systemd user service. Only allows a fixed set of service names.

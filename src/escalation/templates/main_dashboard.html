@@ -97,6 +97,18 @@
     a:hover { text-decoration: underline; }
     .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 0.85rem; }
     .refresh-note { font-size: 0.7rem; color: var(--muted); float: right; }
+
+    /* ── Inference progress bar ──────────────────────── */
+    .progress-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: none; align-items: center; gap: 12px; }
+    .progress-wrap.active { display: flex; }
+    .progress-label { font-size: 0.8rem; color: var(--text); white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+    .progress-track { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; position: relative; }
+    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+    .progress-fill.loading { background: var(--orange); animation: progress-pulse 1.5s ease-in-out infinite; width: 100%; }
+    .progress-fill.processing { background: var(--accent); transition: width 0.8s ease; }
+    .progress-fill.generating { background: var(--green); width: 100%; }
+    .progress-pct { font-size: 0.75rem; color: var(--muted); min-width: 60px; text-align: right; white-space: nowrap; }
+    @keyframes progress-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
   </style>
 </head>
 <body>
@@ -111,6 +123,18 @@
       <button onclick="restartService('manifest', this)">Restart Manifest</button>
       <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
     </div>
+  </div>
+
+  <!-- Inference progress bar -->
+  <div id="progress-bar" class="progress-wrap">
+    <div class="progress-label">
+      <span id="progress-model">—</span>
+      <span id="progress-state" class="badge">—</span>
+    </div>
+    <div class="progress-track">
+      <div id="progress-fill" class="progress-fill"></div>
+    </div>
+    <div id="progress-pct" class="progress-pct"></div>
   </div>
 
   <!-- Current model flow -->
@@ -437,8 +461,60 @@
       }
     }
 
+    function renderProgress(data) {
+      const wrap = document.getElementById('progress-bar');
+      const model = document.getElementById('progress-model');
+      const state = document.getElementById('progress-state');
+      const fill = document.getElementById('progress-fill');
+      const pct = document.getElementById('progress-pct');
+
+      if (!data || data.state === 'idle' || data.state === 'unavailable' || data.state === 'ready') {
+        wrap.classList.remove('active');
+        return;
+      }
+
+      wrap.classList.add('active');
+      model.textContent = data.model_name || data.model || '\u2014';
+
+      if (data.state === 'loading') {
+        state.className = 'badge badge-fallback';
+        state.textContent = 'loading model';
+        fill.className = 'progress-fill loading';
+        fill.style.width = '';
+        pct.textContent = '';
+      } else if (data.state === 'processing') {
+        state.className = 'badge badge-pending';
+        state.textContent = 'prompt eval';
+        fill.className = 'progress-fill processing';
+        fill.style.width = '40%';
+        pct.textContent = 'processing\u2026';
+      } else if (data.state === 'generating') {
+        state.className = 'badge badge-ok';
+        state.textContent = 'generating';
+        fill.className = 'progress-fill generating';
+        fill.style.width = '100%';
+        pct.textContent = data.n_decoded + ' tokens';
+      } else {
+        state.className = 'badge badge-ok';
+        state.textContent = data.state;
+        fill.className = 'progress-fill generating';
+        fill.style.width = '100%';
+        pct.textContent = '';
+      }
+    }
+
+    async function refreshProgress() {
+      try {
+        const res = await fetch('/api/inference-status');
+        const data = await res.json();
+        renderProgress(data);
+      } catch { renderProgress(null); }
+    }
+
     refresh();
+    refreshProgress();
     setInterval(refresh, 3000);
+    setInterval(refreshProgress, 1000);
   </script>
 </body>
 </html>

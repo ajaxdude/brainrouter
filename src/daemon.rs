@@ -129,11 +129,18 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         review_config,
     ));
 
+    let llama_swap_url = config.llama_swap.base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1")
+        .unwrap_or(&config.llama_swap.base_url)
+        .to_string();
+
     let state = Arc::new(AppState {
         router,
         session_manager,
         review_service,
         routing_events,
+        llama_swap_url,
     });
 
     // Server (TCP + UDS)
