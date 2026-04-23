@@ -21,7 +21,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use futures_util::{stream as fstream, StreamExt};
 use std::{sync::Arc, time::{Duration, Instant}};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Stream chunk inactivity threshold. If no chunk is received for this long,
 /// the stream is considered stalled and failed. Set high enough to cover cold
@@ -301,10 +301,16 @@ impl Router {
             ));
         }
         // Sanitize messages for local llama-server compatibility:
-        //  1. Merge system messages into one (Qwen3 requires single system msg at pos 0).
-        //  2. Ensure assistant messages have content (llama-server rejects assistant
-        //     messages with neither content nor tool_calls — OMP sends tool-only
-        //     assistant turns with content: null).
+        //  1. Normalize 'developer' role → 'system' (OpenAI-style role that Qwen3
+        //     templates don't recognize).
+        //  2. Merge system messages into one (Qwen3 requires single system msg at pos 0).
+        //  3. Ensure assistant messages have content (llama-server rejects assistant
+        //     messages with neither content nor tool_calls).
+        for msg in &mut request.messages {
+            if msg.role == "developer" {
+                msg.role = "system".to_string();
+            }
+        }
         let (sys, rest): (Vec<_>, Vec<_>) = request
             .messages
             .into_iter()
@@ -315,6 +321,14 @@ impl Router {
             .collect();
         sanitize_assistant_messages(&mut request.messages);
         let model_key = request.model.clone();
+        debug!(
+            provider = LLAMA_SWAP_KEY,
+            ?stage,
+            model = %model_key,
+            msg_count = request.messages.len(),
+            roles = %request.messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>().join(","),
+            "Messages being sent to llama-swap"
+        );
         info!(provider = LLAMA_SWAP_KEY, ?stage, model = %model_key, "Attempting llama-swap");
         match self.llama_swap.chat_completion(request).await {
             Ok(ProviderResponse::Stream(stream)) => {
