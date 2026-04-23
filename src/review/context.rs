@@ -12,11 +12,16 @@ pub struct ReviewContext {
     pub agents_content: Option<String>,
 }
 
-/// Detect and read the PRD file from common paths relative to cwd.
-pub fn load_prd() -> Option<String> {
+/// Detect and read the PRD file from common paths relative to project_dir.
+pub fn load_prd(project_dir: &str) -> Option<String> {
     let candidates = ["docs/PRD.md", "PRD.md", "README.md"];
     for candidate in &candidates {
-        if let Ok(content) = std::fs::read_to_string(candidate) {
+        let path = if project_dir.is_empty() {
+            std::path::PathBuf::from(candidate)
+        } else {
+            std::path::Path::new(project_dir).join(candidate)
+        };
+        if let Ok(content) = std::fs::read_to_string(path) {
             return Some(truncate(content, MAX_FILE_SIZE));
         }
     }
@@ -25,8 +30,13 @@ pub fn load_prd() -> Option<String> {
 
 /// Run `git diff HEAD` to collect unstaged + staged changes.
 /// Returns empty string if not in a git repo or git is unavailable.
-pub fn load_git_diff() -> String {
-    let out = Command::new("git").args(["diff", "HEAD"]).output();
+pub fn load_git_diff(project_dir: &str) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "HEAD"]);
+    if !project_dir.is_empty() {
+        cmd.current_dir(project_dir);
+    }
+    let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -37,6 +47,9 @@ pub fn load_git_diff() -> String {
 }
 
 /// Load the agent contract from `~/.omp/agent/LLAMACPP.md`.
+/// 
+/// Note: This does not take project_dir because the agent contract is 
+/// user-wide configuration, not project-specific.
 pub fn load_agents() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{}/.omp/agent/LLAMACPP.md", home);
@@ -44,10 +57,10 @@ pub fn load_agents() -> Option<String> {
 }
 
 /// Gather all context in one call.
-pub fn gather() -> ReviewContext {
+pub fn gather(project_dir: &str) -> ReviewContext {
     ReviewContext {
-        prd: load_prd(),
-        git_diff: load_git_diff(),
+        prd: load_prd(project_dir),
+        git_diff: load_git_diff(project_dir),
         agents_content: load_agents(),
     }
 }

@@ -56,6 +56,7 @@ pub async fn run_loop(
     router: &Arc<Router>,
     sessions: &Arc<SessionManager>,
     config: &crate::config::ReviewConfig,
+    project_dir: &str,
 ) -> Result<ReviewResult> {
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
@@ -68,7 +69,7 @@ pub async fn run_loop(
         info!(session_id, iteration = iteration_count, max_iterations = config.max_iterations, "Review iteration");
 
         // Gather context fresh each iteration (git diff may change)
-        let ctx = context::gather();
+        let ctx = context::gather(project_dir);
 
         let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
 

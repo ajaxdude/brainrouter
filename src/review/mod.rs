@@ -66,7 +66,7 @@ impl ReviewService {
             summary.clone(),
             details.clone(),
             conversation_history,
-            cwd,
+            cwd.clone(), // clone needed: cwd is moved into Session, but also needed for run_loop below
         );
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
 
@@ -81,6 +81,7 @@ impl ReviewService {
             &self.router,
             &self.sessions,
             &config_snapshot,
+            &cwd,
         )
         .await?;
 
