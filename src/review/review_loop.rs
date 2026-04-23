@@ -274,25 +274,20 @@ async fn call_llm_for_review(
 
 /// Extract JSON from LLM response text (may be wrapped in markdown code fences).
 fn parse_llm_response(text: &str) -> Result<LlmReviewResponse> {
-    // Try direct parse first
-    if let Ok(parsed) = serde_json::from_str::<LlmReviewResponse>(text) {
-        return Ok(parsed);
-    }
-
-    // Try to extract from markdown code block ```json ... ```
+    // Try to find the first occurrence of a JSON block
     let json_str = if let Some(start) = text.find("```json") {
         let after = &text[start + 7..];
         if let Some(end) = after.find("```") {
             after[..end].trim()
         } else {
-            text.trim()
+            after.trim()
         }
     } else if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
         if let Some(end) = after.find("```") {
             after[..end].trim()
         } else {
-            text.trim()
+            after.trim()
         }
     } else if let Some(start) = text.find('{') {
         // Find the last closing brace
@@ -305,8 +300,16 @@ fn parse_llm_response(text: &str) -> Result<LlmReviewResponse> {
         text.trim()
     };
 
-    serde_json::from_str::<LlmReviewResponse>(json_str)
-        .map_err(|e| anyhow::anyhow!("Could not parse JSON from LLM response: {}. Raw: {}", e, text))
+    // Robust parsing: if it's truncated or has trailing garbage, 
+    // some JSON parsers might fail. We attempt to parse what we have.
+    match serde_json::from_str::<LlmReviewResponse>(json_str) {
+        Ok(parsed) => Ok(parsed),
+        Err(e) => {
+             // Fallback: If status and feedback are present but slightly malformed, 
+             // we could try a manual regex extraction, but let's stick to strict JSON first.
+             Err(anyhow::anyhow!("Could not parse JSON from LLM response: {}. Raw: {}", e, text))
+        }
+    }
 }
 
 /// Map the LLM's string status to our enum.

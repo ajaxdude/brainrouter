@@ -41,6 +41,11 @@ pub struct LlamaSwapConfig {
     /// If absent, the built-in lean prompt is used.
     #[serde(default)]
     pub local_system_prompt: Option<String>,
+
+    /// Optional path to the script that restarts the llama.cpp toolbox.
+    /// Example: "/home/papa/ai/refresh-toolboxes.sh"
+    #[serde(default)]
+    pub llama_cpp_restart_script: Option<String>,
 }
 
 /// Configuration for the embedded Bonsai classifier model.

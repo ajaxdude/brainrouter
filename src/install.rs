@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Arguments for the `install` subcommand.
 #[derive(Args)]
@@ -51,7 +51,7 @@ pub fn run(args: InstallArgs) -> Result<()> {
 
 // ─── OMP ──────────────────────────────────────────────────────────────────────
 
-fn install_omp(bin: &PathBuf, yes: bool) -> Result<()> {
+fn install_omp(bin: &Path, yes: bool) -> Result<()> {
     let mcp_path = home_path(".omp/agent/mcp.json");
 
     let new_entry = serde_json::json!({
@@ -117,7 +117,7 @@ mcp_servers = [
 
 // ─── OpenCode ─────────────────────────────────────────────────────────────────
 
-fn install_opencode(bin: &PathBuf, yes: bool) -> Result<()> {
+fn install_opencode(bin: &Path, yes: bool) -> Result<()> {
     let config_path = home_path(".config/opencode/config.json");
 
     let new_section = serde_json::json!({
@@ -167,7 +167,7 @@ args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"]"#;
 
 // ─── Droid ────────────────────────────────────────────────────────────────────
 
-fn install_droid(bin: &PathBuf, yes: bool) -> Result<()> {
+fn install_droid(bin: &Path, yes: bool) -> Result<()> {
     let mcp_path = home_path(".factory/mcp.json");
 
     let new_entry = serde_json::json!({
@@ -198,7 +198,7 @@ fn install_droid(bin: &PathBuf, yes: bool) -> Result<()> {
 
 // ─── Claude Code ──────────────────────────────────────────────────────────────
 
-fn install_claude(bin: &PathBuf, yes: bool, shell_rc: bool) -> Result<()> {
+fn install_claude(bin: &Path, yes: bool, shell_rc: bool) -> Result<()> {
     let mcp_json = serde_json::json!({
         "type": "stdio",
         "command": bin.to_str().unwrap_or("brainrouter"),

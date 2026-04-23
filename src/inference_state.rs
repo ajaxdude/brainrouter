@@ -54,6 +54,12 @@ struct Inner {
     started_at: Option<Instant>,
 }
 
+impl Default for InferenceTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InferenceTracker {
     pub fn new() -> Self {
         Self {

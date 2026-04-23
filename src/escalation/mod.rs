@@ -28,6 +28,7 @@ const SESSION_HTML: &str = include_str!("templates/session.html");
 pub async fn handle_review_request(
     req: Request<Incoming>,
     review_service: Arc<ReviewService>,
+    cwd: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
     let path = req.uri().path().to_string();
@@ -49,7 +50,7 @@ pub async fn handle_review_request(
 
         // JSON API — MCP: start review (long-running, blocks until loop completes)
         ("POST", "/review/api/request") => {
-            handle_request_review(req, review_service).await
+            handle_request_review(req, review_service, cwd).await
         }
 
         // JSON API — MCP: resolve a session with human feedback
@@ -83,9 +84,11 @@ pub async fn handle_review_request(
 async fn handle_request_review(
     req: Request<Incoming>,
     review_service: Arc<ReviewService>,
+    cwd: String,
 ) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     use http_body_util::BodyExt;
 
+    // Read body
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Failed to read body: {}", e)),
@@ -106,8 +109,29 @@ async fn handle_request_review(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)),
     };
 
+    // Security: Sanitize and validate cwd
+    let mut safe_cwd = cwd;
+    let limit = 4096;
+    if safe_cwd.len() > limit {
+        let boundary = (0..=limit).rev().find(|&i| safe_cwd.is_char_boundary(i)).unwrap_or(0);
+        safe_cwd.truncate(boundary);
+    }
+    
+    // Robust path traversal and security check.
+    // 1. Block null bytes.
+    // 2. Block non-absolute paths.
+    // 3. Block path traversal components (..).
+    let is_valid = !safe_cwd.contains('\0')
+        && !safe_cwd.is_empty() 
+        && safe_cwd.starts_with('/') 
+        && !std::path::Path::new(&safe_cwd).components().any(|c| matches!(c, std::path::Component::ParentDir));
+
+    if !is_valid {
+        safe_cwd = String::new();
+    }
+
     match review_service
-        .start_review(body.task_id, body.summary, body.details, body.conversation_history)
+        .start_review(body.task_id, body.summary, body.details, body.conversation_history, safe_cwd)
         .await
     {
         Ok(result) => json_ok(&serde_json::json!({
@@ -248,6 +272,7 @@ struct SessionSummary {
     iteration_count: u32,
     updated_at: String,
     review_model: Option<String>,
+    cwd: String,
 }
 
 impl From<&Session> for SessionSummary {
@@ -260,6 +285,7 @@ impl From<&Session> for SessionSummary {
             iteration_count: s.iteration_count,
             updated_at: s.updated_at.clone(),
             review_model: s.review_model.clone(),
+            cwd: s.cwd.clone(),
         }
     }
 }
@@ -278,6 +304,7 @@ struct SessionDetail {
     reviewer_type: Option<String>,
     created_at: String,
     updated_at: String,
+    cwd: String,
 }
 
 impl From<&Session> for SessionDetail {
@@ -298,6 +325,7 @@ impl From<&Session> for SessionDetail {
             reviewer_type: s.reviewer_type.as_ref().map(|r| format!("{:?}", r).to_lowercase()),
             created_at: s.created_at.clone(),
             updated_at: s.updated_at.clone(),
+            cwd: s.cwd.clone(),
         }
     }
 }

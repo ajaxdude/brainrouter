@@ -114,30 +114,26 @@
 <body>
   <div class="header">
     <h1>brain<span>router</span></h1>
+    <div id="version-header" style="font-size:0.75rem; color:var(--muted); display:flex; gap:15px; align-items:center;">
+      <div id="ver-llama-swap">llama-swap: &mdash;</div>
+      <div id="ver-llama-cpp">llama.cpp: &mdash;</div>
+      <div id="upgrade-area"></div>
+    </div>
     <div class="nav">
+      <!-- Unified navigation -->
       <a href="/dashboard" class="nav-active">Dashboard</a>
       <a href="/review/">Review Sessions</a>
-      <a href="/review/api/sessions" target="_blank">Sessions API</a>
-      <a href="/api/routing-stats" target="_blank">Stats API</a>
+      <!-- Debugging endpoints retained below for operators -->
+      <!-- <a href="/review/api/sessions">Sessions API</a> -->
+      <!-- <a href="/api/routing-stats">Stats API</a> -->
       <button onclick="restartService('llama-swap', this)">Restart llama-swap</button>
+      <button onclick="restartService('llama-cpp', this)">Restart llama.cpp</button>
       <button onclick="restartService('manifest', this)">Restart Manifest</button>
       <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
     </div>
   </div>
 
-  <!-- Inference progress bar -->
-  <div id="progress-bar" class="progress-wrap">
-    <div class="progress-label">
-      <span id="progress-model">—</span>
-      <span id="progress-state" class="badge">—</span>
-    </div>
-    <div class="progress-track">
-      <div id="progress-fill" class="progress-fill"></div>
-    </div>
-    <div id="progress-pct" class="progress-pct"></div>
-  </div>
-
-  <!-- Current model flow -->
+  <!-- Route event feed -->
   <div class="flow-section">
     <h2><span class="live-dot"></span>Live routing flow <span class="refresh-note">polling every 3s</span></h2>
     <div id="flow-content" class="flow-empty">Waiting for first request...</div>
@@ -185,15 +181,16 @@
       <thead>
         <tr>
           <th style="width:12%">Session</th>
+          <th style="width:9%">Folder</th>
           <th style="width:20%">Task ID</th>
           <th style="width:10%">Status</th>
           <th style="width:28%">Review Model</th>
           <th style="width:8%">Iters</th>
-          <th style="width:22%">Updated</th>
+          <th style="width:13%">Updated</th>
         </tr>
       </thead>
       <tbody id="sessions-body">
-        <tr><td colspan="6" class="empty">No review sessions yet.</td></tr>
+        <tr><td colspan="7" class="empty">No review sessions yet.</td></tr>
       </tbody>
     </table>
   </div>
@@ -374,20 +371,29 @@
         return;
       }
 
-      // Collapse consecutive events with the same prompt+provider+model into one row.
-      // A different route in between breaks the run so routing changes remain visible.
+      // Group identical prompts close together using linear scan for sliding window.
+      // Events are newest-first.
       const deduped = [];
-      for (const e of events.slice(0, 200)) {
+      const rawEvents = events.slice(0, 200);
+      
+      for (const e of rawEvents) {
         const key = (e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || '');
-        const last = deduped[deduped.length - 1];
-        if (last && last._key === key && e.success === last.success) {
-          last._count++;
-          // Events are newest-first; first item added is already the newest.
+        const time = new Date(e.timestamp).getTime();
+        
+        // Find existing match within 10s window (comparing against latest in bucket)
+        const existing = deduped.find(d => d._key === key && Math.abs(new Date(d._last_time).getTime() - time) < 10000 && e.success === d.success);
+        
+        if (existing) {
+           existing._count++;
+           // Events are processed newest-first, so 'existing' is newer than 'e'.
+           // Keep the newer event's data.
         } else {
-          deduped.push({ ...e, _key: key, _count: 1 });
+          deduped.push({ ...e, _key: key, _count: 1, _last_time: e.timestamp });
         }
         if (deduped.length >= 50) break;
       }
+
+      const activeStatus = window.currentInferenceStatus;
 
       tbody.innerHTML = deduped.map(e => {
         const fallback = stageIsFallback(e.stage) ? ' <span class="badge badge-fallback">&#x21a9;</span>' : '';
@@ -397,14 +403,38 @@
         const sessionTag = e.session_id
           ? '<span class="badge badge-pending" title="' + esc(e.session_id) + '">review</span>'
           : '<span class="muted">&mdash;</span>';
-        const folderName = e.cwd ? e.cwd.split('/').filter(Boolean).pop() || e.cwd : '';
+        const folderName = e.cwd ? (e.cwd.split('/').filter(Boolean).pop() || e.cwd) : '';
         const countBadge = e._count > 1
           ? ' <span class="badge badge-count">&times;' + e._count + '</span>'
           : '';
+
+        // Progress bar for active request
+        let progressHtml = '';
+        const isActive = activeStatus && activeStatus.state !== 'idle' && allEvents.length > 0 && e.id === allEvents[0].id;
+        if (isActive) {
+          const stateLabel = activeStatus.state.replace(/_/g, ' ');
+          const elapsed = activeStatus.elapsed_ms ? (activeStatus.elapsed_ms / 1000).toFixed(1) + 's' : '';
+          let fillClass = 'progress-fill';
+          let fillWidth = '0%';
+          if (activeStatus.state === 'loading') { fillClass += ' loading'; }
+          else if (activeStatus.state.includes('processing')) { fillClass += ' processing'; fillWidth = '40%'; }
+          else if (activeStatus.state.includes('streaming') || activeStatus.state.includes('generating')) { fillClass += ' generating'; fillWidth = '100%'; }
+
+          progressHtml = `
+            <div class="progress-track" style="margin-top:6px; height:4px;">
+              <div class="progress-fill ${fillClass}" style="width:${fillWidth}"></div>
+            </div>
+            <div style="font-size:0.65rem; color:var(--muted); margin-top:2px;">${stateLabel} ${elapsed}</div>
+          `;
+        }
+
         return `<tr>
           <td class="muted">${fmtTime(e.timestamp)}</td>
           <td>${folderName ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
-          <td><span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}</td>
+          <td>
+            <span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}
+            ${progressHtml}
+          </td>
           <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
           <td>${routerDisplay(e)}</td>
           <td>${providerDisplay(e)}</td>
@@ -419,18 +449,28 @@
     function renderSessions(sessions) {
       const tbody = document.getElementById('sessions-body');
       if (!sessions.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty">No review sessions yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">No review sessions yet.</td></tr>';
         return;
       }
       // Sort newest first
       const sorted = [...sessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
       tbody.innerHTML = sorted.map(s => {
         const cls = 'badge-' + s.status.replace('_','-');
-        const rm = s.review_model
-          ? '<span style="font-size:0.78rem">' + esc(s.review_model) + '</span>'
-          : '<span class="muted">—</span>';
+        let rm = '<span class="muted">—</span>';
+        if (s.review_model) {
+          // Robustly extract the content inside the last set of parentheses
+          const match = s.review_model.match(/\(([^)]+)\)$/);
+          const modelKey = match ? match[1] : s.review_model;
+          const provider = providerFromModel(modelKey);
+          rm = `<div style="font-size:0.78rem">${esc(s.review_model)}</div>`;
+          if (provider) {
+             rm += `<div class="muted" style="font-size:0.7rem">${esc(provider)}</div>`;
+          }
+        }
+        const folderName = s.cwd ? (s.cwd.split('/').filter(Boolean).pop() || s.cwd) : '';
         return `<tr>
           <td><a href="/review/session/${esc(s.id)}">${esc(s.id.substring(0,8))}&hellip;</a></td>
+          <td>${folderName ? '<span class="badge badge-folder" title="' + esc(s.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
           <td class="truncate" title="${esc(s.task_id)}">${esc(s.task_id)}</td>
           <td><span class="badge ${cls}">${esc(s.status)}</span></td>
           <td>${rm}</td>
@@ -442,129 +482,82 @@
 
     async function refresh() {
       try {
-        const [evRes, sesRes, statsRes] = await Promise.all([
+        const [evRes, sesRes, statsRes, infRes, verRes] = await Promise.all([
           fetch('/api/routing-events'),
           fetch('/review/api/sessions'),
           fetch('/api/routing-stats'),
+          fetch('/api/inference-status'),
+          fetch('/api/versions'),
         ]);
+
+        window.currentInferenceStatus = null;
+        try { window.currentInferenceStatus = await infRes.json(); } catch (_) {}
+
         const evData = await evRes.json();
         const sesData = await sesRes.json();
         const statsData = await statsRes.json();
+        const verData = await verRes.json();
 
         allEvents = evData.events || [];
         renderFlow(allEvents);
         renderStats(statsData);
         renderEvents(allEvents);
         renderSessions(sesData.sessions || []);
+        renderVersions(verData);
       } catch (err) {
         console.error('Dashboard refresh failed', err);
       }
     }
 
-    function renderProgress(data) {
-      const wrap = document.getElementById('progress-bar');
-      const model = document.getElementById('progress-model');
-      const state = document.getElementById('progress-state');
-      const fill = document.getElementById('progress-fill');
-      const pct = document.getElementById('progress-pct');
+    function renderVersions(data) {
+       if (!data) return;
+       const swapEl = document.getElementById('ver-llama-swap');
+       const cppEl = document.getElementById('ver-llama-cpp');
+       const upgradeArea = document.getElementById('upgrade-area');
+       
+       let currentSwap = '';
+       if (data.llama_swap) {
+         currentSwap = data.llama_swap.split(' ')[0];
+         swapEl.innerHTML = `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`;
+       }
+       if (data.llama_cpp) {
+         const current = data.llama_cpp.split(' ')[0];
+         cppEl.innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(current)}</span>`;
+       }
 
-      // Only hide when there's truly nothing (no model loaded, no request)
-      if (!data || data.state === 'idle') {
-        wrap.classList.remove('active');
-        return;
-      }
-
-      wrap.classList.add('active');
-      model.textContent = data.model_name || data.model || '';
-      const elapsed = data.elapsed_ms ? (data.elapsed_ms / 1000).toFixed(1) + 's' : '';
-
-      switch (data.state) {
-        case 'ready':
-          state.className = 'badge badge-ok';
-          state.textContent = 'ready';
-          fill.className = 'progress-fill';
-          fill.style.width = '0%';
-          fill.style.background = 'var(--muted)';
-          pct.textContent = 'idle';
-          break;
-        case 'loading':
-          state.className = 'badge badge-fallback';
-          state.textContent = 'loading model';
-          fill.className = 'progress-fill loading';
-          fill.style.width = '';
-          fill.style.background = '';
-          pct.textContent = elapsed;
-          break;
-        case 'classifying':
-          state.className = 'badge badge-llama';
-          state.textContent = 'Bonsai classifying';
-          fill.className = 'progress-fill loading';
-          fill.style.width = '';
-          fill.style.background = 'var(--purple)';
-          pct.textContent = elapsed;
-          break;
-        case 'cloud_waiting':
-          state.className = 'badge badge-manifest';
-          state.textContent = 'cloud \u2014 waiting';
-          fill.className = 'progress-fill loading';
-          fill.style.width = '';
-          fill.style.background = 'var(--green)';
-          pct.textContent = elapsed;
-          break;
-        case 'cloud_streaming':
-          state.className = 'badge badge-manifest';
-          state.textContent = 'cloud \u2014 streaming';
-          fill.className = 'progress-fill generating';
-          fill.style.width = '100%';
-          fill.style.background = '';
-          pct.textContent = elapsed;
-          break;
-        case 'local_waiting':
-          state.className = 'badge badge-llama';
-          state.textContent = 'local \u2014 loading';
-          fill.className = 'progress-fill loading';
-          fill.style.width = '';
-          fill.style.background = '';
-          pct.textContent = elapsed;
-          break;
-        case 'local_processing':
-          state.className = 'badge badge-pending';
-          state.textContent = 'local \u2014 prompt eval';
-          fill.className = 'progress-fill processing';
-          fill.style.width = '60%';
-          fill.style.background = '';
-          pct.textContent = elapsed;
-          break;
-        case 'local_generating':
-          state.className = 'badge badge-ok';
-          state.textContent = 'local \u2014 generating';
-          fill.className = 'progress-fill generating';
-          fill.style.width = '100%';
-          fill.style.background = '';
-          pct.textContent = (data.n_decoded || 0) + ' tokens \u2014 ' + elapsed;
-          break;
-        default:
-          state.className = 'badge';
-          state.textContent = data.state;
-          fill.className = 'progress-fill';
-          fill.style.width = '0%';
-          fill.style.background = '';
-          pct.textContent = elapsed;
-      }
+       if (data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
+         upgradeArea.innerHTML = `<button id="btn-upgrade" onclick="upgradeLlamaSwap(this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">UPGRADE TO v${esc(data.llama_swap_latest)}</button>`;
+       } else {
+         upgradeArea.innerHTML = '';
+       }
     }
 
-    async function refreshProgress() {
+    async function upgradeLlamaSwap(btn) {
+      if (!confirm('Upgrade llama-swap and restart? This will interrupt active inference.')) return;
+      const label = btn.textContent;
+      btn.textContent = 'UPGRADING...';
+      btn.disabled = true;
       try {
-        const res = await fetch('/api/inference-status');
+        const res = await fetch('/api/upgrade/llama-swap', { method: 'POST' });
         const data = await res.json();
-        renderProgress(data);
-      } catch { renderProgress(null); }
+        if (res.ok) {
+          btn.textContent = 'UPGRADED & RESTARTED';
+          btn.style.background = 'var(--green)';
+          setTimeout(() => refresh(), 2000);
+        } else {
+          btn.textContent = 'FAILED';
+          btn.title = esc(data.error || data.message || 'Unknown error');
+          setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 3000);
+        }
+      } catch (e) {
+        console.error('Upgrade failed', e);
+        btn.textContent = 'ERROR';
+        setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 3000);
+      }
     }
 
-    refresh();
-    refreshProgress();
     setInterval(refresh, 3000);
-    setInterval(refreshProgress, 1000);
+    refresh();
   </script>
 </body>
 </html>

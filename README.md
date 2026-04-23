@@ -34,7 +34,10 @@ coding harness (omp / vibe / claude / opencode / codex / droid)
 - **Local mode rewrites system prompts.** OMP's 15-20K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
 - **Manifest handles cloud failover.** Manifest runs locally in Docker and does its own provider selection (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with automatic fallbacks.
 - **llama-swap handles local model management.** brainrouter points at it. Bonsai picks the right model for simple tasks.
-- **Review loop is local.** `mcp_brainrouter_request_review` triggers an iterative code review against a local LLM. No cloud tokens consumed. Escalates to a human web UI if the LLM can't reach a verdict.
+  - **Review loop is local.** `mcp_brainrouter_request_review` triggers an iterative code review against a local LLM. No cloud tokens consumed. Escalates to a human web UI if the LLM can't reach a verdict.
+- **System monitoring and management.** Dashboard tracks `llama-swap` and `llama.cpp` versions, checks for updates, and allows one-click upgrades and service restarts.
+- **Security-hardened.** Localhost-only guards for destructive operations, CSRF protection, and sanitized working directory tracking.
+- **Robust protocol handling.** Industrial-grade SSE adapter guarantees protocol compliance for Anthropic clients even on empty or interrupted streams.
 
 ## Quick start
 
@@ -93,6 +96,18 @@ All on `http://127.0.0.1:9099`.
 | `POST` | `/v1/chat/completions` | OpenAI | Main routing endpoint. `model: "auto"`, `"local"`, or `"cloud"` |
 | `POST` | `/v1/messages` | Anthropic | For Claude Code and droid. Same routing, different wire format |
 
+### Management API
+
+Destructive endpoints are restricted to `127.0.0.1` / `::1` or UDS connections with CSRF protection.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/versions` | Returns local `llama-swap` and toolbox versions |
+| `GET` | `/api/inference-status` | High-frequency polling for progress bars |
+| `POST` | `/api/upgrade/llama-swap` | Pulls and builds latest binary + restarts service |
+| `POST` | `/api/restart/:service` | Restarts `llama-swap`, `manifest`, or `brainrouter` |
+| `POST` | `/api/restart/llama-cpp` | Refreshes the `llama.cpp` toolbox container |
+
 ### Review endpoints
 
 | Method | Path | Notes |
@@ -128,6 +143,7 @@ llama_swap:
   base_url: "http://localhost:8081"
   fallback_model: "gemma-4-26b-a4b"   # used when Manifest fails or Bonsai picks local
   # local_system_prompt: "/path/to/custom-prompt.md"  # optional: custom prompt for model=local
+  # llama_cpp_restart_script: "/path/to/refresh-toolboxes.sh" # optional: for toolbox restart button
 
 bonsai:
   model_path: "/mnt/models/prism/prism-ml_Bonsai-8B-unpacked-Q6_K_L.gguf"

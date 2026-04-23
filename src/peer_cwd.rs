@@ -8,7 +8,7 @@
 //! Only works on Linux (requires /proc/net/tcp and /proc/{pid}/fd).
 //! Returns None silently on any I/O error so callers degrade gracefully.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Given the TCP peer address of an accepted connection, return the cwd of
 /// the process that owns the client-side socket, or None if it cannot be
@@ -16,24 +16,31 @@ use std::net::SocketAddr;
 pub fn peer_cwd(peer_addr: &SocketAddr) -> Option<String> {
     let peer_port = peer_addr.port();
 
-    // /proc/net/tcp lists IPv4 TCP sockets.  Each row:
-    //   sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode
-    // Addresses are little-endian hex: AABBCCDD:PPPP
-    // We want the row where local_port == peer_port and rem_port == 9099 (our
-    // listen port), which is the client-side half of the connection.
-    let inode = find_inode_for_client_port(peer_port)?;
+    let inode = match peer_addr.ip() {
+        IpAddr::V4(_) => find_inode_for_client_port(peer_port, "/proc/net/tcp"),
+        IpAddr::V6(_) => find_inode_for_client_port(peer_port, "/proc/net/tcp6"),
+    }?;
     find_cwd_for_inode(inode)
 }
 
-/// Scan /proc/net/tcp for a row where local_port == client_port.
+/// Resolve the cwd of a process given its PID.
+pub fn cwd_from_pid(pid: i32) -> Option<String> {
+    let cwd_link = format!("/proc/{}/cwd", pid);
+    if let Ok(cwd) = std::fs::read_link(&cwd_link) {
+        return cwd.to_str().map(|s| s.to_string());
+    }
+    None
+}
+
+/// Scan /proc/net/tcp or /proc/net/tcp6 for a row where local_port == client_port.
 /// Returns the socket inode number.
-fn find_inode_for_client_port(client_port: u16) -> Option<u64> {
-    let data = std::fs::read_to_string("/proc/net/tcp").ok()?;
+fn find_inode_for_client_port(client_port: u16, path: &str) -> Option<u64> {
+    let data = std::fs::read_to_string(path).ok()?;
     for line in data.lines().skip(1) {
         // Fields are whitespace-separated; split_ascii_whitespace handles variable spacing.
         let mut cols = line.split_ascii_whitespace();
         let _sl = cols.next()?;
-        let local_addr = cols.next()?;  // "AABBCCDD:PPPP"
+        let local_addr = cols.next()?;  // "AABBCCDD:PPPP" or "AABBCCDDEEFF...:PPPP"
         let _rem_addr = cols.next()?;
 
         let local_port = local_addr

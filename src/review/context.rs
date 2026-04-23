@@ -58,8 +58,12 @@ pub fn truncate(text: String, max: usize) -> String {
         return text;
     }
     let original_kb = text.len() / 1024;
+    let mut new_len = max;
+    while !text.is_char_boundary(new_len) && new_len > 0 {
+        new_len -= 1;
+    }
     let mut out = text;
-    out.truncate(max);
+    out.truncate(new_len);
     out.push_str(&format!(
         "\n\n[WARNING: truncated to {}KB; original was {}KB]",
         max / 1024,

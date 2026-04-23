@@ -71,6 +71,12 @@ pub struct RoutingEventsResponse {
     pub events: Vec<RouteEvent>,
 }
 
+impl Default for RoutingEvents {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoutingEvents {
     pub fn new() -> Self {
         Self {
@@ -156,7 +162,7 @@ impl RoutingEvents {
 }
 
 /// Aggregated stats for the dashboard stat-cards row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Default, Debug, Clone, Serialize)]
 pub struct EventStats {
     pub total: usize,
     pub successes: usize,
@@ -173,20 +179,4 @@ pub struct EventStats {
     pub llama_count: usize,
 }
 
-impl Default for EventStats {
-    fn default() -> Self {
-        Self {
-            total: 0,
-            successes: 0,
-            failures: 0,
-            fallbacks: 0,
-            avg_latency: 0,
-            cloud_count: 0,
-            local_count: 0,
-            direct_local_count: 0,
-            direct_cloud_count: 0,
-            manifest_count: 0,
-            llama_count: 0,
-        }
-    }
-}
+

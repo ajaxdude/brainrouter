@@ -85,7 +85,8 @@ impl Provider for OpenAiProvider {
                     .unwrap_or_else(|_| "<failed to read error body>".to_string());
                 // 4xx = bad request (wrong message format, invalid params) — backend is
                 // healthy. 5xx = server error — treat as backend fault to trip circuit.
-                let is_backend_fault = status.is_server_error();
+                // 429 = Too Many Requests — also treat as backend fault to trip circuit.
+                let is_backend_fault = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                 return Err(ProviderError {
                     message: format!(
                         "{} returned error status {}: {}",

@@ -220,7 +220,7 @@ Classify this request: {}<|im_end|>\n\
 
     let mut batch = LlamaBatch::new(tokens.len().max(8), 1);
     let last_index = tokens.len() as i32 - 1;
-    for (i, token) in (0_i32..).zip(tokens.into_iter()) {
+    for (i, token) in (0_i32..).zip(tokens) {
         batch
             .add(token, i, &[0], i == last_index)
             .context("Failed to add token to batch")?;
@@ -228,11 +228,11 @@ Classify this request: {}<|im_end|>\n\
     ctx.decode(&mut batch)
         .context("Failed to decode classifier prompt")?;
 
-    let mut n_cur = batch.n_tokens();
     let mut sampler = LlamaSampler::greedy();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut out = String::new();
 
+    let mut n_cur = batch.n_tokens();
     for _ in 0..CLASSIFY_MAX_TOKENS {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);

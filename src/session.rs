@@ -73,10 +73,12 @@ pub struct Session {
     pub review_model: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Working directory of the process that started the review.
+    pub cwd: String,
 }
 
 impl Session {
-    fn new(task_id: String, summary: String, details: Option<String>, conversation_history: Vec<String>) -> Self {
+    fn new(task_id: String, summary: String, details: Option<String>, conversation_history: Vec<String>, cwd: String) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Session {
             id: Uuid::new_v4().to_string(),
@@ -93,6 +95,7 @@ impl Session {
             review_model: None,
             created_at: now.clone(),
             updated_at: now,
+            cwd,
         }
     }
 }
@@ -112,6 +115,12 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         SessionManager {
@@ -126,8 +135,9 @@ impl SessionManager {
         summary: String,
         details: Option<String>,
         conversation_history: Vec<String>,
+        cwd: String,
     ) -> Session {
-        let session = Session::new(task_id, summary, details, conversation_history);
+        let session = Session::new(task_id, summary, details, conversation_history, cwd);
         let mut map = self.sessions.lock().unwrap();
         map.insert(session.id.clone(), session.clone());
         session

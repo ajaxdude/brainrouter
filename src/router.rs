@@ -76,26 +76,28 @@ pub struct Router {
     pub inference_tracker: Arc<InferenceTracker>,
 }
 
+pub struct RouterArgs {
+    pub classifier: Arc<Classifier>,
+    pub manifest: Arc<OpenAiProvider>,
+    pub llama_swap: Arc<OpenAiProvider>,
+    pub fallback_model: String,
+    pub health: Arc<HealthTracker>,
+    pub routing_events: Arc<RoutingEvents>,
+    pub local_system_prompt: Option<String>,
+    pub inference_tracker: Arc<InferenceTracker>,
+}
+
 impl Router {
-    pub fn new(
-        classifier: Arc<Classifier>,
-        manifest: Arc<OpenAiProvider>,
-        llama_swap: Arc<OpenAiProvider>,
-        fallback_model: String,
-        health: Arc<HealthTracker>,
-        routing_events: Arc<RoutingEvents>,
-        local_system_prompt: Option<String>,
-        inference_tracker: Arc<InferenceTracker>,
-    ) -> Self {
+    pub fn new(args: RouterArgs) -> Self {
         Self {
-            classifier,
-            manifest,
-            llama_swap,
-            fallback_model,
-            health,
-            routing_events,
-            local_system_prompt,
-            inference_tracker,
+            classifier: args.classifier,
+            manifest: args.manifest,
+            llama_swap: args.llama_swap,
+            fallback_model: args.fallback_model,
+            health: args.health,
+            routing_events: args.routing_events,
+            local_system_prompt: args.local_system_prompt,
+            inference_tracker: args.inference_tracker,
         }
     }
 

@@ -233,7 +233,7 @@ async fn http_uds_request(socket_path: &PathBuf, path: &str, body: Value) -> Res
 
     let json_body = &response_bytes[body_start..];
     let result: Value = serde_json::from_slice(json_body)
-        .with_context(|| format!("Failed to parse daemon response as JSON"))?;
+        .with_context(|| "Failed to parse daemon response as JSON".to_string())?;
 
     Ok(result)
 }

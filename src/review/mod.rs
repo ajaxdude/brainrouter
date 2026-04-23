@@ -57,6 +57,7 @@ impl ReviewService {
         summary: String,
         details: Option<String>,
         conversation_history: Vec<String>,
+        cwd: String,
     ) -> Result<RequestReviewResult> {
         // Create the session first — the agent gets the ID in the response regardless
         // of whether the review loop succeeds or fails.
@@ -65,6 +66,7 @@ impl ReviewService {
             summary.clone(),
             details.clone(),
             conversation_history,
+            cwd,
         );
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
 

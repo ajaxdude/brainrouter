@@ -25,8 +25,9 @@ A single Rust daemon that:
    - `local` — Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap.
    - `cloud` — Bypasses Bonsai, routes directly to Manifest.
 2. **Falls back** automatically when Manifest stalls or fails — no manual intervention.
-3. **Reviews code** locally using the same routing infrastructure, exposing an MCP tool that every harness can call.
-4. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
+- **Reviews code** locally using the same routing infrastructure, exposing an MCP tool that every harness can call.
+- **Manages system state** via the dashboard, allowing one-click upgrades of `llama-swap` and resets of the `llama.cpp` toolbox environment.
+- **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 
 ## Architecture decisions
 
@@ -65,30 +66,42 @@ When an agent calls `request_review`, the review loop sends its LLM prompts thro
 
 Two independent circuit breakers: one for `manifest`, one for `llama-swap`. Three failures within a window open the breaker; 60-second cooldown before retry. This prevents hammering a degraded provider while allowing automatic recovery.
 
+### Robust Anthropic SSE Adapter
+
+The SSE adapter follows a strict state machine to guarantee protocol compliance. It ensures that mandatory frames (`message_start`, `content_block_start`, `content_block_stop`, `message_delta`, `message_stop`) are always emitted in the correct sequence, even for empty or interrupted upstream responses. It handles partial line buffering and flushes on EOF to prevent client hangs.
+
+### Security and Management
+
+- **Localhost-Only Access**: Destructive operations (upgrade, restart) are restricted to loopback interfaces (127.0.0.1, ::1) or Unix Domain Sockets.
+- **CSRF Protection**: Browser-originated requests to management endpoints are validated against `Origin`/`Referer` headers.
+- **Path Sanitization**: Working directory tracking for sessions includes absolute-path enforcement, null-byte rejection, and path-traversal component blocking.
+- **Startup Validation**: Optional management script paths are validated at startup for existence and execution permissions.
+
 ## Component map
 
 | Component | File | Responsibility |
 |---|---|---|
 | Entry point | `src/main.rs` | Clap subcommand dispatch |
-| Daemon startup | `src/daemon.rs` | Load config, create all services, start server |
-| HTTP server | `src/server.rs` | Route `/v1/*` and `/review/*` |
+| Daemon startup | `src/daemon.rs` | Load config, create all services, validate environment, start server |
+| HTTP server | `src/server.rs` | Route `/v1/*`, `/review/*`, and `/api/*` management |
 | Classifier | `src/classifier.rs` | Bonsai-based cloud/local decision |
 | Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
 | Prompt rewriter | `src/prompt_rewriter.rs` | System prompt rewriting for local mode (strips OMP bloat, injects anti-loop prompt) |
-| Anthropic shim | `src/anthropic.rs` | `/v1/messages` ↔ `/v1/chat/completions` translation |
+| Anthropic shim | `src/anthropic.rs` | `/v1/messages` ↔ `/v1/chat/completions` translation; robust SSE state machine |
 | MCP server | `src/mcp_server.rs` | JSON-RPC stdio; forwards to daemon over UDS |
 | Installer | `src/install.rs` | Idempotent harness config merger |
 | Session store | `src/session.rs` | In-memory `HashMap<id, Session>` behind `Mutex` |
 | Review service | `src/review/mod.rs` | `start_review`, `resolve_session` |
-| Review loop | `src/review/review_loop.rs` | Iterative LLM review, up to `max_iterations` |
-| Context gatherer | `src/review/context.rs` | PRD auto-detect, `git diff HEAD`, AGENTS.md |
+| Review loop | `src/review/review_loop.rs` | Iterative LLM review, robust JSON parsing |
+| Context gatherer | `src/review/context.rs` | PRD auto-detect, `git diff HEAD`, safe UTF-8 truncation |
 | Prompt builder | `src/review/prompt.rs` | Review prompt template |
-| Escalation UI | `src/escalation/mod.rs` | `/review/*` HTTP handlers + askama templates |
-| Provider adapter | `src/provider/openai.rs` | OpenAI-compatible HTTP client with pooling |
+| Escalation UI | `src/escalation/mod.rs` | `/review/*` HTTP handlers + askama templates; CWD sanitization |
+| Provider adapter | `src/provider/openai.rs` | OpenAI-compatible HTTP client with fault-aware circuit breaking (429/5xx) |
 | Health tracker | `src/health.rs` | Per-provider circuit breaker |
-| Stream wrapper | `src/stream.rs` | `TimeoutStream`: 15-second chunk stall detection |
+| Stream wrapper | `src/stream.rs` | `TimeoutStream`: 180-second chunk stall detection; `SafeStream`: Error-to-SSE converter |
 | Types | `src/types.rs` | OpenAI request/response structs |
 | Config | `src/config.rs` | YAML parsing + validation |
+| Peer CWD | `src/peer_cwd.rs` | Linux-native PID/Inode mapping for directory discovery (IPv4/IPv6/UDS) |
 
 ## Routing flow (request)
 

@@ -18,6 +18,12 @@ pub struct HealthTracker {
     states: Mutex<HashMap<String, HealthState>>,
 }
 
+impl Default for HealthTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthTracker {
     pub fn new() -> Self {
         Self {

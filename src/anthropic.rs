@@ -8,8 +8,8 @@
 //!   2. `openai_sse_to_anthropic_sse` — converts an OpenAI SSE stream
 //!      (`data: {choices:[{delta:{content:"..."}}]}`)
 //!      into the Anthropic SSE event sequence that the client expects:
-//!        message_start → content_block_start → content_block_delta* → content_block_stop
-//!        → message_delta (stop_reason) → message_stop
+//!      message_start → content_block_start → content_block_delta* → content_block_stop
+//!      → message_delta (stop_reason) → message_stop
 //!
 //! Neither function touches the Router; they are pure protocol adapters.
 //!
@@ -33,6 +33,7 @@ use serde_json::Value;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use uuid::Uuid;
+use tracing::warn;
 
 use crate::types::{ChatCompletionRequest, ChatMessage};
 
@@ -81,6 +82,16 @@ pub fn anthropic_to_openai(req: AnthropicMessagesRequest) -> ChatCompletionReque
     if let Some(system) = &req.system {
         let system_text = match system {
             Value::String(s) => s.clone(),
+            Value::Array(blocks) => {
+                blocks.iter().filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        block.get("text").and_then(Value::as_str).map(|s| s.to_string())
+                    } else {
+                        warn!(block_type = ?block.get("type"), "Dropping non-text block from system field");
+                        None
+                    }
+                }).collect::<Vec<_>>().join("\n")
+            }
             other => serde_json::to_string(other).unwrap_or_default(),
         };
         messages.push(ChatMessage {
@@ -198,7 +209,7 @@ fn map_tool_choice(tc: Value) -> Value {
 // ─── Response translation ─────────────────────────────────────────────────────
 
 /// State machine for the SSE adapter.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum AdapterState {
     Initial,
     MessageStarted,
@@ -363,28 +374,49 @@ impl Stream for AnthropicSseAdapter {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            // Flush pending frames first
+            // 1. Flush pending frames first
             if let Some(frame) = self.pending.pop_front() {
                 return Poll::Ready(Some(Ok(frame)));
             }
 
+            // 2. If we are already done, finish the stream
             if self.state == AdapterState::Done {
                 return Poll::Ready(None);
             }
 
-            // Pull from inner stream
+            // 3. Pull from inner stream
             match self.as_mut().project().inner.poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    // Stream ended without finish_reason — close gracefully
+                    // Inner stream ended — handle transition and closing logic once.
                     if self.state != AdapterState::Done {
-                        let frames = close_stream_gracefully(&mut self);
-                        for f in frames {
-                            self.pending.push_back(f);
+                        let mut extra_frames: Vec<Bytes> = Vec::new();
+                        
+                        // Flush any remaining data in line buffer before closing
+                        if !self.line_buf.is_empty() {
+                            let line = self.line_buf.trim().to_string();
+                            self.line_buf.clear();
+                            if let Some(json_str) = line.strip_prefix("data: ") {
+                                if let Ok(chunk_val) = serde_json::from_str::<Value>(json_str) {
+                                    extra_frames.extend(self.process_openai_chunk(&chunk_val));
+                                }
+                            }
                         }
+
+                        // Re-check state after potential process_openai_chunk transition.
+                        // Always close gracefully if we haven't reached Done yet.
+                        // This handles both empty responses (Initial) and interrupted streams.
+                        if self.state != AdapterState::Done {
+                            extra_frames.extend(close_stream_gracefully(&mut self));
+                        }
+                        
                         self.state = AdapterState::Done;
-                        continue; // flush the pending
+                        self.pending.extend(extra_frames);
+                        
+                        // Loop back once more to flush the newly added pending frames
+                        continue;
                     }
+                    
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -401,25 +433,21 @@ impl Stream for AnthropicSseAdapter {
                     self.line_buf.push_str(&text);
                     let mut new_frames: Vec<Bytes> = Vec::new();
 
-                    // Process complete SSE events (terminated by \n\n)
-                    loop {
-                        // Find a complete data line
-                        if let Some(newline_pos) = self.line_buf.find('\n') {
-                            let line = self.line_buf[..newline_pos].trim().to_string();
-                            self.line_buf.drain(..newline_pos + 1);
+                    // Process complete SSE events (terminated by \n)
+                    // The .trim() on the extracted line handles \r\n line endings correctly.
+                    while let Some(newline_pos) = self.line_buf.find('\n') {
+                        let line = self.line_buf[..newline_pos].trim().to_string();
+                        self.line_buf.drain(..newline_pos + 1);
 
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if json_str == "[DONE]" {
-                                    // Normal end — handled by finish_reason already
-                                    continue;
-                                }
-                                if let Ok(chunk_val) = serde_json::from_str::<Value>(json_str) {
-                                    let frames = self.process_openai_chunk(&chunk_val);
-                                    new_frames.extend(frames);
-                                }
+                        if let Some(json_str) = line.strip_prefix("data: ") {
+                            if json_str == "[DONE]" {
+                                // Normal end — handled by finish_reason already
+                                continue;
                             }
-                        } else {
-                            break;
+                            if let Ok(chunk_val) = serde_json::from_str::<Value>(json_str) {
+                                let frames = self.process_openai_chunk(&chunk_val);
+                                new_frames.extend(frames);
+                            }
                         }
                     }
 
@@ -437,26 +465,65 @@ impl Stream for AnthropicSseAdapter {
 fn close_stream_gracefully(adapter: &mut AnthropicSseAdapter) -> Vec<Bytes> {
     if matches!(
         adapter.state,
-        AdapterState::ContentBlockStarted | AdapterState::Streaming
+        AdapterState::Initial | AdapterState::MessageStarted | AdapterState::ContentBlockStarted | AdapterState::Streaming
     ) {
-        vec![
-            AnthropicSseAdapter::frame(
+        let mut frames = Vec::new();
+        
+        // Ensure protocol compliance: message_start -> content_block_start
+        if adapter.state == AdapterState::Initial {
+            frames.push(AnthropicSseAdapter::frame(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": adapter.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": adapter.model,
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                    }
+                }),
+            ));
+            frames.push(AnthropicSseAdapter::frame(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ));
+        } else if adapter.state == AdapterState::MessageStarted {
+             // We started the message but not the block.
+             frames.push(AnthropicSseAdapter::frame(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ));
+        }
+
+        frames.push(AnthropicSseAdapter::frame(
                 "content_block_stop",
                 serde_json::json!({ "type": "content_block_stop", "index": 0 }),
-            ),
-            AnthropicSseAdapter::frame(
+        ));
+        frames.push(AnthropicSseAdapter::frame(
                 "message_delta",
                 serde_json::json!({
                     "type": "message_delta",
                     "delta": { "stop_reason": "end_turn", "stop_sequence": null },
                     "usage": { "output_tokens": adapter.output_tokens }
                 }),
-            ),
-            AnthropicSseAdapter::frame(
+        ));
+        frames.push(AnthropicSseAdapter::frame(
                 "message_stop",
                 serde_json::json!({ "type": "message_stop" }),
-            ),
-        ]
+        ));
+        frames
     } else {
         vec![]
     }
@@ -467,6 +534,7 @@ fn close_stream_gracefully(adapter: &mut AnthropicSseAdapter) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     fn make_request(model: &str, messages: Vec<(&str, &str)>) -> AnthropicMessagesRequest {
         AnthropicMessagesRequest {
@@ -498,80 +566,260 @@ mod tests {
         assert_eq!(oai.model, "claude-3-5-sonnet");
         assert_eq!(oai.messages.len(), 1);
         assert_eq!(oai.messages[0].role, "user");
-        assert_eq!(
-            oai.messages[0].content,
-            Some(Value::String("Hello".to_string()))
-        );
+        assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "Hello");
         assert_eq!(oai.max_tokens, Some(1024));
     }
 
     #[test]
     fn system_message_prepended() {
-        let mut req = make_request("claude-3-5-sonnet", vec![("user", "Hi")]);
-        req.system = Some(Value::String("You are helpful.".to_string()));
+        let mut req = make_request("model", vec![("user", "Hello")]);
+        req.system = Some(Value::String("System instructions".to_string()));
         let oai = anthropic_to_openai(req);
 
         assert_eq!(oai.messages.len(), 2);
         assert_eq!(oai.messages[0].role, "system");
-        assert_eq!(
-            oai.messages[0].content,
-            Some(Value::String("You are helpful.".to_string()))
-        );
-        assert_eq!(oai.messages[1].role, "user");
+        assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "System instructions");
     }
 
     #[test]
-    fn stop_sequences_translated() {
-        let mut req = make_request("claude-3-5-sonnet", vec![("user", "hi")]);
-        req.stop_sequences = vec!["STOP".to_string(), "END".to_string()];
+    fn translate_model_and_messages() {
+        let req = make_request("claude-3", vec![("user", "hi"), ("assistant", "hello")]);
         let oai = anthropic_to_openai(req);
-
-        assert_eq!(oai.stop, Some(vec!["STOP".to_string(), "END".to_string()]));
+        assert_eq!(oai.model, "claude-3");
+        assert_eq!(oai.messages.len(), 2);
     }
 
     #[test]
-    fn tool_schema_translated() {
-        let mut req = make_request("claude-3-5-sonnet", vec![("user", "hi")]);
-        req.tools = vec![AnthropicTool {
-            name: "search".to_string(),
-            description: Some("Search the web".to_string()),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "query": { "type": "string" } }
-            }),
-        }];
-
+    fn translate_content_block_array() {
+        let req = AnthropicMessagesRequest {
+            model: "m".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: Value::Array(vec![
+                    serde_json::json!({"type": "text", "text": "block 1"}),
+                    serde_json::json!({"type": "text", "text": "block 2"}),
+                ]),
+            }],
+            system: None,
+            max_tokens: None,
+            stop_sequences: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: vec![],
+            tool_choice: None,
+            stream: false,
+        };
         let oai = anthropic_to_openai(req);
-        let tools = oai.extra.get("tools").and_then(Value::as_array).unwrap();
-        assert_eq!(tools.len(), 1);
-        let func = tools[0].get("function").unwrap();
-        assert_eq!(func.get("name").and_then(Value::as_str), Some("search"));
-        assert!(func.get("parameters").is_some());
+        assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "block 1\nblock 2");
+    }
+
+    #[test]
+    fn translate_stop_sequences() {
+        let mut req = make_request("m", vec![]);
+        req.stop_sequences = vec!["###".to_string()];
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.stop.unwrap(), vec!["###".to_string()]);
+    }
+
+    #[test]
+    fn translate_temperature_and_top_p() {
+        let mut req = make_request("m", vec![]);
+        req.temperature = Some(0.7);
+        req.top_p = Some(0.9);
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.temperature, Some(0.7));
+        assert_eq!(oai.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn translate_tools() {
+        let req = AnthropicMessagesRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            system: None,
+            max_tokens: None,
+            stop_sequences: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: vec![AnthropicTool {
+                name: "test_tool".to_string(),
+                description: Some("desc".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_choice: None,
+            stream: false,
+        };
+        let oai = anthropic_to_openai(req);
+        let extra = oai.extra.as_object().unwrap();
+        let tools = extra.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0]["function"]["name"], "test_tool");
+    }
+
+    #[test]
+    fn translate_tool_choice_auto() {
+        let mut req = make_request("m", vec![]);
+        req.tool_choice = Some(serde_json::json!({"type": "auto"}));
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.extra["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn translate_tool_choice_any_becomes_required() {
+        let mut req = make_request("m", vec![]);
+        req.tool_choice = Some(serde_json::json!({"type": "any"}));
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.extra["tool_choice"], "required");
     }
 
     #[test]
     fn map_stop_reason() {
-        // Test via the state machine logic indirectly
+        let mut adapter = AnthropicSseAdapter::new(Box::pin(futures_util::stream::empty()), "model".to_string());
+        
         let chunk = serde_json::json!({
-            "choices": [{ "delta": { "content": "" }, "finish_reason": "stop" }]
+            "choices": [{
+                "delta": {"content": "finished"},
+                "finish_reason": "stop"
+            }]
         });
+        
+        let frames = adapter.process_openai_chunk(&chunk);
+        
+        // Find message_delta frame and check stop_reason
+        let msg_delta_frame = frames.iter().find(|f| {
+            let s = String::from_utf8_lossy(f);
+            s.contains("message_delta")
+        }).expect("Should contain message_delta frame");
 
-        let mut adapter = AnthropicSseAdapter::new(
+        let frame_text = String::from_utf8_lossy(msg_delta_frame);
+        let json_part = frame_text.lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap()
+            .strip_prefix("data: ")
+            .unwrap();
+        let msg_delta: Value = serde_json::from_str(json_part).unwrap();
+        assert_eq!(msg_delta["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn empty_stream_emits_required_anthropic_frames() {
+        let adapter = AnthropicSseAdapter::new(
             Box::pin(futures_util::stream::empty()),
             "claude-3-5-sonnet".to_string(),
         );
-        // Force state past initial
-        adapter.state = AdapterState::ContentBlockStarted;
-        let frames = adapter.process_openai_chunk(&chunk);
-
-        // Should emit content_block_stop, message_delta, message_stop
-        assert_eq!(frames.len(), 3);
-        let frame_strs: Vec<_> = frames
-            .iter()
+        let frames: Vec<_> = adapter.collect().await;
+        let frame_texts: Vec<String> = frames.iter()
+            .filter_map(|r| r.as_ref().ok())
             .map(|b| String::from_utf8_lossy(b).to_string())
             .collect();
-        assert!(frame_strs[0].contains("content_block_stop"));
-        assert!(frame_strs[1].contains("end_turn"));
-        assert!(frame_strs[2].contains("message_stop"));
+            
+        // Check for specific events in correct order
+        let event_types: Vec<&str> = frame_texts.iter().filter_map(|t| {
+             t.lines().find(|l| l.starts_with("event: ")).map(|l| &l[7..])
+        }).collect();
+
+        assert_eq!(event_types, vec![
+            "message_start",
+            "content_block_start",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]);
+
+        let all_text = frame_texts.join("");
+        assert!(all_text.contains("end_turn"), "must emit end_turn for empty stream");
+    }
+
+    #[tokio::test]
+    async fn message_started_stream_emits_content_block_start() {
+        // Test state where message_start was emitted but nothing else
+        let mut adapter = AnthropicSseAdapter::new(
+            Box::pin(futures_util::stream::empty()),
+            "model".to_string(),
+        );
+        adapter.state = AdapterState::MessageStarted;
+        
+        // collect() will hit the Poll::Ready(None) branch
+        let frames: Vec<_> = adapter.collect().await;
+        let event_types: Vec<String> = frames.iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|b| {
+                let s = String::from_utf8_lossy(b);
+                s.lines().find(|l| l.starts_with("event: ")).map(|l| l[7..].to_string()).unwrap_or_default()
+            })
+            .collect();
+
+        // Must contain content_block_start to be valid protocol
+        assert!(event_types.contains(&"content_block_start".to_string()));
+        assert_eq!(*event_types.last().unwrap(), "message_stop".to_string());
+    }
+
+    #[test]
+    fn translate_system_field() {
+        let mut req = make_request("m", vec![("user", "hi")]);
+        req.system = Some(serde_json::json!([{"type": "text", "text": "sys"}]));
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.messages[0].role, "system");
+        assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "sys");
+    }
+
+    #[test]
+    fn tool_schema_translated() {
+        let req = AnthropicMessagesRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            system: None,
+            max_tokens: None,
+            stop_sequences: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: vec![AnthropicTool {
+                name: "read".to_string(),
+                description: Some("read file".to_string()),
+                input_schema: serde_json::json!({"properties": {"path": {"type": "string"}}}),
+            }],
+            tool_choice: None,
+            stream: false,
+        };
+        let oai = anthropic_to_openai(req);
+        let extra = oai.extra.as_object().unwrap();
+        let tools = extra.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn translate_content_block_mixed() {
+        let req = AnthropicMessagesRequest {
+            model: "m".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: Value::Array(vec![
+                    serde_json::json!({"type": "text", "text": "text content"}),
+                    serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}),
+                ]),
+            }],
+            system: None,
+            max_tokens: None,
+            stop_sequences: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: vec![],
+            tool_choice: None,
+            stream: false,
+        };
+        let oai = anthropic_to_openai(req);
+        // Image block should be dropped (not supported), text preserved.
+        assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "text content");
+    }
+
+    #[test]
+    fn stop_sequences_translated() {
+        let mut req = make_request("m", vec![]);
+        req.stop_sequences = vec!["\nUser:".to_string()];
+        let oai = anthropic_to_openai(req);
+        assert_eq!(oai.stop.unwrap()[0], "\nUser:");
     }
 }

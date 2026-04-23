@@ -17,6 +17,7 @@ fn session_create_and_retrieve() {
         "Implement feature X".to_string(),
         Some("Details here".to_string()),
         vec!["history line 1".to_string()],
+        "/home/papa/project".to_string(),
     );
 
     assert!(!session.id.is_empty());
@@ -25,6 +26,7 @@ fn session_create_and_retrieve() {
     assert_eq!(session.details.as_deref(), Some("Details here"));
     assert_eq!(session.status, ReviewStatus::Pending);
     assert_eq!(session.iteration_count, 0);
+    assert_eq!(session.cwd, "/home/papa/project");
 
     let retrieved = manager.get_session(&session.id).expect("session should exist");
     assert_eq!(retrieved.id, session.id);
@@ -40,6 +42,7 @@ fn session_update_status_and_feedback() {
         "Fix bug Y".to_string(),
         None,
         vec![],
+        String::new(),
     );
 
     manager.update_session(
@@ -49,8 +52,8 @@ fn session_update_status_and_feedback() {
             feedback: Some("Add more tests".to_string()),
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: None,
-                        review_model: None,
-            },
+            review_model: None,
+        },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -68,6 +71,7 @@ fn session_human_feedback_goes_to_correct_field() {
         "Deploy Z".to_string(),
         None,
         vec![],
+        String::new(),
     );
 
     manager.update_session(
@@ -77,8 +81,8 @@ fn session_human_feedback_goes_to_correct_field() {
             feedback: Some("LGTM".to_string()),
             reviewer_type: Some(ReviewerType::Human),
             escalation_reason: None,
-                        review_model: None,
-            },
+            review_model: None,
+        },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -96,6 +100,7 @@ fn session_escalation_reason_stored() {
         "Refactor".to_string(),
         None,
         vec![],
+        String::new(),
     );
 
     manager.update_session(
@@ -105,8 +110,8 @@ fn session_escalation_reason_stored() {
             feedback: Some("Too many failures".to_string()),
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: Some(EscalationReason::MaxIterations),
-                        review_model: None,
-            },
+            review_model: None,
+        },
     );
 
     let updated = manager.get_session(&session.id).unwrap();
@@ -126,6 +131,7 @@ fn increment_iteration_counter() {
         "Iterate".to_string(),
         None,
         vec![],
+        String::new(),
     );
 
     assert_eq!(session.iteration_count, 0);
@@ -141,8 +147,8 @@ fn increment_iteration_counter() {
 fn list_sessions_returns_all() {
     let manager = Arc::new(SessionManager::new());
 
-    let s1 = manager.create_session("t1".to_string(), "S1".to_string(), None, vec![]);
-    let s2 = manager.create_session("t2".to_string(), "S2".to_string(), None, vec![]);
+    let s1 = manager.create_session("t1".to_string(), "S1".to_string(), None, vec![], String::new());
+    let s2 = manager.create_session("t2".to_string(), "S2".to_string(), None, vec![], String::new());
 
     let sessions = manager.list_sessions();
     assert_eq!(sessions.len(), 2);
@@ -169,8 +175,8 @@ fn update_nonexistent_session_is_noop() {
             feedback: None,
             reviewer_type: None,
             escalation_reason: None,
-                        review_model: None,
-            },
+            review_model: None,
+        },
     );
 }
 
@@ -178,7 +184,7 @@ fn update_nonexistent_session_is_noop() {
 fn delete_session_removes_it() {
     let manager = SessionManager::new();
 
-    let session = manager.create_session("t".to_string(), "s".to_string(), None, vec![]);
+    let session = manager.create_session("t".to_string(), "s".to_string(), None, vec![], String::new());
     assert!(manager.get_session(&session.id).is_some());
 
     manager.delete_session(&session.id);

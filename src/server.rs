@@ -23,6 +23,7 @@ use crate::routing_events::RoutingEvents;
 use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
+use crate::stream::{SafeStream, StreamFormat};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
@@ -35,6 +36,8 @@ pub struct AppState {
     pub routing_events: Arc<RoutingEvents>,
     /// llama-swap root URL (without /v1 suffix) for status polling.
     pub llama_swap_url: String,
+    /// Path to the script that restarts the llama.cpp toolbox.
+    pub llama_cpp_restart_script: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -92,15 +95,53 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
     cwd: String,
+    peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
     let path = req.uri().path();
 
     debug!("Request: {} {}", method, path);
 
+    // Security: Only allow localhost (127.0.0.1 or ::1) for destructive APIs.
+    // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
+    let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
+    let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/");
+
+    if is_destructive {
+        if !is_local {
+            error!("Blocking destructive API request from non-local peer: {}", peer_addr);
+            let resp = json_response(
+                StatusCode::FORBIDDEN,
+                &ErrorResponse { error: "Destructive APIs only allowed from localhost".to_string() },
+            );
+            return Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))));
+        }
+        
+        // Anti-CSRF: Check Origin/Referer for browser-originated POSTs.
+        let has_allowed_origin = if let Some(origin) = req.headers().get("Origin") {
+            let s = origin.to_str().unwrap_or("");
+            s == "null" || s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
+        } else if let Some(referer) = req.headers().get("Referer") {
+            let s = referer.to_str().unwrap_or("");
+            s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
+        } else {
+            // Non-browser client (curl, MCP) doesn't send Origin usually.
+            true
+        };
+
+        if !has_allowed_origin {
+             error!("Blocking CSRF attempt on destructive API: Origin/Referer mismatch");
+             let resp = json_response(
+                StatusCode::FORBIDDEN,
+                &ErrorResponse { error: "CSRF protection: Invalid Origin/Referer".to_string() },
+            );
+            return Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))));
+        }
+    }
+
     // Route /review/* to the escalation module
     if path.starts_with("/review") {
-        let result = escalation::handle_review_request(req, Arc::clone(&state.review_service)).await;
+        let result = escalation::handle_review_request(req, Arc::clone(&state.review_service), cwd).await;
         return result;
     }
 
@@ -187,6 +228,11 @@ async fn handle_request(
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
+        ("POST", "/api/restart/llama-cpp") => {
+            let resp = restart_llama_cpp(state.llama_cpp_restart_script.as_deref()).await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
         ("POST", "/api/restart/manifest") => {
             let resp = restart_service("manifest").await;
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
@@ -194,6 +240,26 @@ async fn handle_request(
 
         ("POST", "/api/restart/brainrouter") => {
             let resp = restart_service("brainrouter").await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        // ── System versions API ───────────────────────────────────────────────
+        ("GET", "/api/versions") => {
+            match handle_versions().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Error getting versions: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Internal error: {}", e) },
+                    );
+                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                }
+            }
+        }
+
+        ("POST", "/api/upgrade/llama-swap") => {
+            let resp = upgrade_llama_swap().await;
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
@@ -221,7 +287,8 @@ async fn handle_chat_completion(
 
     match provider_response {
         ProviderResponse::Stream(stream) => {
-            let stream_body = StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)));
+            let safe_stream = SafeStream::new(stream, StreamFormat::OpenAi);
+            let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -251,7 +318,8 @@ async fn handle_anthropic_messages(
     match provider_response {
         ProviderResponse::Stream(stream) => {
             let adapted = AnthropicSseAdapter::new(stream, model);
-            let stream_body = StreamBody::new(adapted.map(|chunk| chunk.map(Frame::data)));
+            let safe_stream = SafeStream::new(adapted, StreamFormat::Anthropic);
+            let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
@@ -394,6 +462,48 @@ async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
     Some((is_proc, n_decoded))
 }
 
+/// Restart the llama.cpp toolbox container.
+async fn restart_llama_cpp(script_path: Option<&str>) -> Response<Full<Bytes>> {
+    let script_path = match script_path {
+        Some(p) => p,
+        None => {
+            return json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                &ErrorResponse { error: "llama_cpp_restart_script not configured in brainrouter.yaml".to_string() },
+            );
+        }
+    };
+    info!("Restarting llama-vulkan-radv toolbox via {}...", script_path);
+    let output = tokio::process::Command::new(script_path)
+        .arg("llama-vulkan-radv")
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!("Toolbox refreshed successfully");
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "service": "llama-cpp",
+                "message": "llama-vulkan-radv toolbox refreshed"
+            }))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "Toolbox refresh failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Refresh failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec refresh script");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec refresh script {}: {}", script_path, e),
+            })
+        }
+    }
+}
+
 /// Restart a systemd user service. Only allows a fixed set of service names.
 async fn restart_service(service: &str) -> Response<Full<Bytes>> {
     const ALLOWED: &[&str] = &["llama-swap", "manifest", "brainrouter"];
@@ -434,6 +544,104 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
     }
 }
 
+/// Get current versions of llama-swap and llama-server (toolbox).
+async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+    use tokio::process::Command;
+
+    // 1. Get llama-swap version
+    let swap_out = Command::new("/home/papa/.local/bin/llama-swap")
+        .arg("--version")
+        .output()
+        .await;
+    let swap_ver = match swap_out {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().replace("version: ", ""),
+        Err(_) => "unknown".to_string(),
+    };
+
+    // 2. Get llama-server version from toolbox
+    let toolbox_out = Command::new("toolbox")
+        .args(["run", "--container", "llama-vulkan-radv", "llama-server", "--version"])
+        .output()
+        .await;
+    let toolbox_ver = match toolbox_out {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.lines().next().unwrap_or("unknown").replace("version: ", "").to_string()
+        }
+        Err(_) => "unknown".to_string(),
+    };
+
+    let data = serde_json::json!({
+        "llama_swap": swap_ver,
+        "llama_cpp": toolbox_ver,
+        "llama_swap_latest": check_latest_llama_swap().await.unwrap_or_default(),
+    });
+
+    let resp = json_response(StatusCode::OK, &data);
+    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
+}
+
+async fn check_latest_llama_swap() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("brainrouter")
+        .timeout(std::time::Duration::from_secs(3))
+        .build().ok()?;
+    let resp = client.get("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
+        .send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    data.get("tag_name").and_then(|v| v.as_str()).map(|v| v.trim_start_matches('v').to_string())
+}
+
+async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
+    info!("Upgrading llama-swap via go install...");
+    
+    let output = tokio::process::Command::new("go")
+        .args(["install", "github.com/mostlygeek/llama-swap@latest"])
+        .env("GOBIN", "/home/papa/.local/bin")
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!("llama-swap binary written and closed successfully. Triggering restart...");
+            
+            // Atomic sequential restart after successful upgrade
+            let restart_output = tokio::process::Command::new("systemctl")
+                .args(["--user", "restart", "llama-swap"])
+                .output()
+                .await;
+                
+            match restart_output {
+                Ok(rout) if rout.status.success() => {
+                    json_response(StatusCode::OK, &serde_json::json!({
+                        "status": "ok",
+                        "message": "llama-swap upgraded and restarted successfully."
+                    }))
+                }
+                _ => {
+                    json_response(StatusCode::ACCEPTED, &serde_json::json!({
+                        "status": "partial",
+                        "message": "llama-swap upgraded, but restart failed. Please restart manually."
+                    }))
+                }
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "llama-swap upgrade failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Upgrade failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec go install");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec go install: {}. Is 'go' installed?", e),
+            })
+        }
+    }
+}
+
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)
 pub async fn run(
     tcp_addr: SocketAddr,
@@ -467,7 +675,7 @@ pub async fn run(
                     let conn_cwd = peer_cwd(&addr).unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone())))
+                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr)))
                             .await
                         {
                             error!("Error serving TCP connection: {}", e);
@@ -485,13 +693,18 @@ pub async fn run(
             match uds_listener.accept().await {
                 Ok((stream, _addr)) => {
                     info!("New Unix socket connection");
+                    // Resolve the cwd of the connecting process via UDS peer credentials.
+                    let conn_cwd = if let Ok(cred) = stream.peer_cred() {
+                        cred.pid().and_then(crate::peer_cwd::cwd_from_pid).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let io = TokioIo::new(stream);
                     let state = uds_state.clone();
-                    // UDS connections have no peer address; cwd is unknown.
-                    let conn_cwd = String::new();
+                    let dummy_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone())))
+                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), dummy_addr)))
                             .await
                         {
                             error!("Error serving Unix socket connection: {}", e);
