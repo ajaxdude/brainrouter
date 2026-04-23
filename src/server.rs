@@ -287,10 +287,19 @@ async fn inference_status(
                     }))
                 }
                 Some((name, display, _)) => {
+                    // Model is loaded and ready. Check /slots to detect activity
+                    // from clients hitting llama-swap directly (bypassing brainrouter).
+                    let slot_info = poll_llama_swap_slot(llama_swap_url).await;
+                    let (state, n_decoded) = match &slot_info {
+                        Some((true, 0)) => ("local_processing", 0u64),
+                        Some((true, n)) => ("local_generating", *n),
+                        _ => ("ready", 0),
+                    };
                     json_response(StatusCode::OK, &serde_json::json!({
-                        "state": "ready",
+                        "state": state,
                         "model": name,
                         "model_name": display,
+                        "n_decoded": n_decoded,
                     }))
                 }
                 None => json_response(StatusCode::OK, &serde_json::json!({
