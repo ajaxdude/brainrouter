@@ -678,11 +678,11 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         swap_ver = "unknown".to_string();
     }
 
-    // 2. Get llama.cpp version from toolbox container
-    // Try primary container first, then a generic check if that fails.
-    // We search stdout and stderr for anything resembling a version number.
-    let toolbox_out = Command::new("toolbox")
-        .args(["run", "--container", "llama-vulkan-radv", "llama-server", "--version"])
+    // 2. Get llama.cpp version from toolbox container image
+    // Using 'podman run' directly on the image is more reliable than 'toolbox run'
+    // which depends on a specific persistent container being in a startable state.
+    let toolbox_out = Command::new("podman")
+        .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
         .output()
         .await;
 
@@ -692,23 +692,31 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
             let stderr = String::from_utf8_lossy(&out.stderr);
             let combined = format!("{}{}", stdout, stderr);
             
-            // Search for "version: X" or just "X (hash)" pattern
-            if let Some(line) = combined.lines().find(|l| l.contains("version:") || (l.contains('(') && l.contains(')'))) {
+            // Note: podman run might exit with error if no GPU is found (ggml_vulkan error)
+            // but still output the version. We check for "version:" specifically.
+            if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
                 line.replace("version:", "")
                     .replace("built with", "")
                     .trim()
                     .to_string()
+            } else if out.status.success() {
+                 if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')')) {
+                    line.replace("built with", "").trim().to_string()
+                 } else {
+                    combined.lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            let l = l.trim();
+                            if l.len() > 64 { "unknown".to_string() } else { l.to_string() }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string())
+                 }
             } else {
-                // If no clear line, just take the first non-empty line as a fallback
-                combined.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("unknown")
-                    .trim()
-                    .to_string()
+                "unknown".to_string()
             }
         }
         Err(e) => {
-            error!(error = %e, "Failed to execute toolbox run for version check");
+            error!(error = %e, "Failed to execute podman run for version check");
             "unknown".to_string()
         }
     };

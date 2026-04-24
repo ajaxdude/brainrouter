@@ -117,12 +117,26 @@
 <body>
   <div class="header">
     <a href="/dashboard"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
-    <div id="version-header" style="font-size:0.75rem; color:var(--muted); display:flex; gap:15px; align-items:center;">
-      <div id="ver-llama-swap">llama-swap: &mdash;</div>
-      <div id="ver-llama-cpp">llama.cpp: &mdash;</div>
-      <div id="ver-manifest">Manifest: &mdash;</div>
-      <div id="ver-toolbox">toolbox: &mdash;</div>
-      <div id="upgrade-area" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+    <div id="version-header" style="font-size:0.7rem; color:var(--muted); display:flex; gap:10px; align-items:center; border:1px solid var(--border); border-radius:6px; padding:6px 12px; background:rgba(255,255,255,0.03);">
+      <div id="ver-llama-swap" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <div>llama-swap: &mdash;</div>
+        <div class="upgrade-btn" id="upgrade-llama-swap" style="display:flex; justify-content:center;"></div>
+      </div>
+      <div style="width:1px; height:24px; background:var(--border);"></div>
+      <div id="ver-llama-cpp" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <div>llama.cpp: &mdash;</div>
+        <div class="upgrade-btn" id="upgrade-llama-cpp" style="display:flex; justify-content:center;"></div>
+      </div>
+      <div style="width:1px; height:24px; background:var(--border);"></div>
+      <div id="ver-manifest" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <div>Manifest: &mdash;</div>
+        <div class="upgrade-btn" id="upgrade-manifest" style="display:flex; justify-content:center;"></div>
+      </div>
+      <div style="width:1px; height:24px; background:var(--border);"></div>
+      <div id="ver-toolbox" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <div>toolbox: &mdash;</div>
+        <div class="upgrade-btn" id="upgrade-toolbox" style="display:flex; justify-content:center;"></div>
+      </div>
     </div>
     <div class="nav">
       <!-- Unified navigation -->
@@ -657,51 +671,59 @@
        const cppEl       = document.getElementById('ver-llama-cpp');
        const manifestEl  = document.getElementById('ver-manifest');
        const toolboxEl   = document.getElementById('ver-toolbox');
-       const upgradeArea = document.getElementById('upgrade-area');
-       const upgradeBtns = [];
+       
+       const swapBtn      = document.getElementById('upgrade-llama-swap');
+       const cppBtn       = document.getElementById('upgrade-llama-cpp');
+       const manifestBtn  = document.getElementById('upgrade-manifest');
+       const toolboxBtn   = document.getElementById('upgrade-toolbox');
+       
+       swapBtn.innerHTML = '';
+       cppBtn.innerHTML = '';
+       manifestBtn.innerHTML = '';
+       toolboxBtn.innerHTML = '';
 
        // llama-swap
        let currentSwap = '';
        if (data.llama_swap) {
          currentSwap = data.llama_swap.split(' ')[0];
-         swapEl.innerHTML = `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`;
+         swapEl.querySelector('div:first-child').innerHTML = `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`;
        }
 
        // llama.cpp (inside toolbox container)
        if (data.llama_cpp) {
          const ver = data.llama_cpp.split(' ')[0];
-         cppEl.innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`;
+         cppEl.querySelector('div:first-child').innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`;
        }
 
        // Manifest
        if (data.manifest) {
-         manifestEl.innerHTML = `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`;
+         manifestEl.querySelector('div:first-child').innerHTML = `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`;
        }
 
        // toolbox container image
        if (data.toolbox_image_ver) {
-         toolboxEl.innerHTML = `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`;
+         toolboxEl.querySelector('div:first-child').innerHTML = `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`;
        }
 
-       // Upgrade buttons — labelled per component so it's clear what is being updated
+       // Upgrade buttons — placed under each component
+       const btnStyle = 'font-size:0.6rem; padding:1px 6px; border-radius:3px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;';
+       
        if (data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
-         upgradeBtns.push(`<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">llama-swap → v${esc(data.llama_swap_latest)}</button>`);
+         swapBtn.innerHTML = `<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="${btnStyle}">Upgrade → v${esc(data.llama_swap_latest)}</button>`;
        }
+       
        if (data.manifest_latest) {
-         // manifest runs :latest — compare the remote push date against the local image created date
          const localDate = data.manifest ? data.manifest.split(' ')[0] : '';
          if (data.manifest_latest !== localDate) {
-           upgradeBtns.push(`<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">Manifest → ${esc(data.manifest_latest)}</button>`);
+           manifestBtn.innerHTML = `<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="${btnStyle}">Upgrade → ${esc(data.manifest_latest)}</button>`;
          }
        }
+       
        if (data.toolbox_latest && data.toolbox_image_created) {
-         // toolbox_image_created is YYYY-MM-DD (local); toolbox_latest is YYYY-MM-DD (remote push).
-         // Show update button only if the remote push is strictly newer.
          if (data.toolbox_latest > data.toolbox_image_created) {
-           upgradeBtns.push(`<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">toolbox → ${esc(data.toolbox_latest)}</button>`);
+           toolboxBtn.innerHTML = `<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="${btnStyle}">Upgrade → ${esc(data.toolbox_latest)}</button>`;
          }
        }
-       upgradeArea.innerHTML = upgradeBtns.join('');
     }
 
     async function upgradeComponent(endpoint, label, btn) {
