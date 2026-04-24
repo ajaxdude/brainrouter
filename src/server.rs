@@ -834,88 +834,124 @@ async fn check_latest_toolbox() -> Option<String> {
 }
 
 async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
-    info!("Upgrading llama-swap via go install...");
+    info!("Upgrading llama-swap from GitHub releases...");
 
-    let home = home_dir();
-
-    // Prefer ~/go/bin/go; fall back to whatever is in PATH.
-    let go_bin = {
-        let candidate = format!("{home}/go/bin/go");
-        if std::path::Path::new(&candidate).exists() { candidate } else { "go".to_string() }
-    };
-    let gopath = format!("{home}/go");
     let target_bin = home_bin("llama-swap");
-    let built_bin  = format!("{gopath}/bin/llama-swap");
 
-    // 1. Run go install to build the latest binary in GOPATH/bin
-    let output = tokio::process::Command::new(&go_bin)
-        .args(["install", "github.com/mostlygeek/llama-swap@latest"])
-        .env("GOPATH", &gopath)
+    // 1. Fetch the latest release metadata from GitHub API
+    let client = reqwest::Client::builder()
+        .user_agent("brainrouter-upgrade/1.0")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    let release_url = "https://api.github.com/repos/mostlygeek/llama-swap/releases/latest";
+    let release: serde_json::Value = match client.get(release_url).send().await {
+        Ok(r) => match r.json().await {
+            Ok(j) => j,
+            Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to parse GitHub release JSON: {}", e),
+            }),
+        },
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("Failed to fetch latest release from GitHub: {}", e),
+        }),
+    };
+
+    let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+    // 2. Find the linux_amd64 asset
+    let download_url = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|assets| {
+            assets.iter().find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n.contains("linux_amd64") && n.ends_with(".tar.gz"))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    let download_url = match download_url {
+        Some(u) => u,
+        None => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: "No linux_amd64 asset found in latest GitHub release".to_string(),
+        }),
+    };
+
+    info!(tag, url = %download_url, "Downloading llama-swap");
+
+    // 3. Download the tarball
+    let tarball_bytes = match client.get(&download_url).send().await {
+        Ok(r) => match r.bytes().await {
+            Ok(b) => b,
+            Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to read tarball body: {}", e),
+            }),
+        },
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("Failed to download tarball: {}", e),
+        }),
+    };
+
+    // 4. Extract the binary from the tarball via spawn_blocking (CPU-bound, sync)
+    let target_bin_clone = target_bin.clone();
+    let extract_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::io::Read;
+        let cursor = std::io::Cursor::new(tarball_bytes.as_ref());
+        let gz = flate2::read::GzDecoder::new(cursor);
+        let mut archive = tar::Archive::new(gz);
+        for entry in archive.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path().map_err(|e| e.to_string())?;
+            if path.file_name().and_then(|n| n.to_str()) == Some("llama-swap") {
+                // Write to a temp file then atomically rename to avoid "Text file busy"
+                let tmp = format!("{}.tmp", target_bin_clone);
+                let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+                drop(file);
+                // Set executable bit
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| e.to_string())?;
+                std::fs::rename(&tmp, &target_bin_clone).map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+        Err("'llama-swap' binary not found inside tarball".to_string())
+    }).await;
+
+    match extract_result {
+        Err(join_err) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("Extract task panicked: {}", join_err),
+        }),
+        Ok(Err(e)) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("Failed to extract binary: {}", e),
+        }),
+        Ok(Ok(())) => {}
+    }
+
+    info!(tag, "llama-swap binary installed; restarting service");
+
+    // 5. Restart the service (binary replaced atomically above so no stop needed)
+    let restart = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", "llama-swap"])
         .output()
         .await;
 
-    match output {
-        Ok(out) if out.status.success() => {
-            info!("llama-swap built in GOPATH/bin successfully. Stopping service and installing...");
-
-            // 2. Stop the service first to avoid "Text file busy" error during overwrite
-            let _ = tokio::process::Command::new("systemctl")
-                .args(["--user", "stop", "llama-swap"])
-                .output()
-                .await;
-
-            // 3. Copy built binary to the install location used by systemd
-            let _ = std::fs::remove_file(&target_bin);
-            let copy_res = std::fs::copy(&built_bin, &target_bin);
-
-            if let Err(e) = copy_res {
-                error!(error = %e, "Failed to copy llama-swap binary to {}", target_bin);
-                // Try to restart anyway so the service isn't left dead
-                let _ = tokio::process::Command::new("systemctl")
-                    .args(["--user", "start", "llama-swap"])
-                    .output()
-                    .await;
-                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                    error: format!("Build succeeded but failed to install to {}: {}", target_bin, e),
-                });
-            }
-
-            info!("llama-swap binary installed to {}. Starting service...", target_bin);
-
-            // 4. Start the service again
-            let restart_output = tokio::process::Command::new("systemctl")
-                .args(["--user", "start", "llama-swap"])
-                .output()
-                .await;
-
-            match restart_output {
-                Ok(rout) if rout.status.success() => {
-                    json_response(StatusCode::OK, &serde_json::json!({
-                        "status": "ok",
-                        "message": "llama-swap upgraded and restarted successfully."
-                    }))
-                }
-                _ => {
-                    json_response(StatusCode::ACCEPTED, &serde_json::json!({
-                        "status": "partial",
-                        "message": "llama-swap upgraded, but restart failed. Please start manually."
-                    }))
-                }
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(%stderr, "llama-swap upgrade failed");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Upgrade failed: {}", stderr.trim()),
-            })
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to exec go install");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec go install: {}. Is 'go' installed?", e),
-            })
-        }
+    match restart {
+        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": format!("llama-swap upgraded to {} and restarted.", tag),
+        })),
+        _ => json_response(StatusCode::ACCEPTED, &serde_json::json!({
+            "status": "partial",
+            "message": format!("llama-swap upgraded to {} but restart failed — start manually.", tag),
+        })),
     }
 }
 
