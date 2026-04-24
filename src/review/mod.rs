@@ -8,8 +8,9 @@ pub mod prompt;
 pub mod review_loop;
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     config::ReviewConfig,
@@ -33,18 +34,49 @@ pub struct ReviewService {
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     config: std::sync::Mutex<ReviewConfig>,
+    state_path: PathBuf,
 }
 
 impl ReviewService {
     pub fn new(
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
-        config: ReviewConfig,
+        mut config: ReviewConfig,
     ) -> Self {
+        // Resolve state path: respect XDG_CONFIG_HOME, fallback to ~/.config/brainrouter/
+        let state_path = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".config"))
+                    .unwrap_or_else(|_| {
+                        warn!("$HOME not set, falling back to current directory for state");
+                        PathBuf::from(".")
+                    })
+            })
+            .join("brainrouter/review_state.json");
+
+        // Load existing state if available
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            match serde_json::from_str::<ReviewConfig>(&content) {
+                Ok(saved) => {
+                    info!(path = %state_path.display(), "Loaded saved review configuration");
+                    // Intentional partial restore: only UI-driven overrides (forced_mode,
+                    // forced_model) are persisted and reloaded. max_iterations is always
+                    // taken from brainrouter.yaml; persisting it would let a runtime
+                    // change silently shadow the config file value across restarts.
+                    config.forced_mode = saved.forced_mode;
+                    config.forced_model = saved.forced_model;
+                }
+                Err(e) => warn!(error = %e, path = %state_path.display(), "Failed to parse saved review configuration, using defaults"),
+            }
+        }
+
         ReviewService {
             router,
             sessions,
             config: std::sync::Mutex::new(config),
+            state_path,
         }
     }
 
@@ -99,10 +131,40 @@ impl ReviewService {
         self.config.lock().unwrap().clone()
     }
 
-    /// Update the review configuration globally for new sessions.
-    pub fn update_config(&self, new_config: ReviewConfig) {
-        let mut config = self.config.lock().unwrap();
-        *config = new_config;
+    /// Update the review configuration globally for new sessions and persist to disk.
+    pub async fn update_config(&self, new_config: ReviewConfig) {
+        {
+            let mut config = self.config.lock().unwrap();
+            *config = new_config.clone();
+        }
+        
+        // Persist to disk asynchronously to avoid blocking the executor
+        let state_path = self.state_path.clone();
+        // Fire-and-forget: the JoinHandle is intentionally dropped. The task
+        // is detached and continues to completion. Panics inside the closure
+        // are swallowed by Tokio's default panic handler (logged, not fatal).
+        // This is acceptable for a best-effort disk persist — in-memory config
+        // is already updated above and that is the authoritative state.
+        let _handle = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = state_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            
+            match serde_json::to_string_pretty(&new_config) {
+                Ok(json) => {
+                    // Atomic write: write to temp then rename
+                    let tmp_path = state_path.with_extension("json.tmp");
+                    if let Err(e) = std::fs::write(&tmp_path, json) {
+                        warn!(error = %e, path = %tmp_path.display(), "Failed to write temporary review configuration");
+                        return;
+                    }
+                    if let Err(e) = std::fs::rename(&tmp_path, &state_path) {
+                        warn!(error = %e, from = %tmp_path.display(), to = %state_path.display(), "Failed to rename temporary review configuration");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to serialize review configuration"),
+            }
+        });
     }
 
     /// Resolve a session with human feedback (from the escalation UI).

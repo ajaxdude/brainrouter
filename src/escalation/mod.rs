@@ -102,6 +102,8 @@ async fn handle_request_review(
         details: Option<String>,
         #[serde(rename = "conversationHistory", default)]
         conversation_history: Vec<String>,
+        /// Explicit project directory from the agent; overrides peer-cred-resolved cwd.
+        cwd: Option<String>,
     }
 
     let body: ReviewRequest = match serde_json::from_slice(&body_bytes) {
@@ -109,8 +111,15 @@ async fn handle_request_review(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)),
     };
 
+    // Determine project directory: prefer the explicitly-provided cwd from the
+    // agent payload (which knows the actual project dir) over the peer-cred-
+    // resolved cwd (which is the brainrouter mcp subprocess's own cwd and is
+    // typically wrong or empty when the MCP client is a sub-process launched
+    // from a fixed location).
+    let candidate_cwd = body.cwd.unwrap_or(cwd);
+
     // Security: Sanitize and validate cwd
-    let mut safe_cwd = cwd;
+    let mut safe_cwd = candidate_cwd;
     let limit = 4096;
     if safe_cwd.len() > limit {
         let boundary = (0..=limit).rev().find(|&i| safe_cwd.is_char_boundary(i)).unwrap_or(0);

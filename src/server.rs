@@ -1,3 +1,29 @@
+// ── Runtime home-dir helpers ─────────────────────────────────────────────────
+//
+// The daemon may run under any user. Never hardcode /home/<user>.
+// These helpers resolve paths relative to $HOME at runtime.
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+}
+
+/// Resolve a binary name relative to ~/.local/bin, falling back to PATH.
+fn home_bin(name: &str) -> String {
+    let candidate = format!("{HOME}/.local/bin/{name}", HOME = home_dir());
+    if std::path::Path::new(&candidate).exists() {
+        candidate
+    } else {
+        name.to_string()
+    }
+}
+
+/// Resolve a path relative to $HOME.
+fn home_path(rel: &str) -> String {
+    format!("{}/{}", home_dir(), rel)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -280,6 +306,16 @@ async fn handle_request(
 
         ("POST", "/api/upgrade/llama-swap") => {
             let resp = upgrade_llama_swap().await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("POST", "/api/upgrade/manifest") => {
+            let resp = upgrade_manifest().await;
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("POST", "/api/upgrade/toolbox") => {
+            let resp = upgrade_toolbox().await;
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 
@@ -605,8 +641,8 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
 
     // 1. Get llama-swap version
     // First try the --version flag
-    let swap_out = Command::new("/home/papa/.local/bin/llama-swap")
-        .arg("--version")
+    let swap_out = Command::new(home_bin("llama-swap"))
+            .arg("--version")
         .output()
         .await;
     
@@ -621,7 +657,7 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     // try to extract version from build info via strings
     if swap_ver.is_empty() {
         let strings_out = Command::new("strings")
-            .arg("/home/papa/.local/bin/llama-swap")
+                    .arg(home_bin("llama-swap"))
             .output()
             .await;
             
@@ -642,7 +678,7 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         swap_ver = "unknown".to_string();
     }
 
-    // 2. Get llama-server version from toolbox
+    // 2. Get llama.cpp version from toolbox container
     // Try primary container first, then a generic check if that fails.
     // We search stdout and stderr for anything resembling a version number.
     let toolbox_out = Command::new("toolbox")
@@ -677,10 +713,71 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         }
     };
 
+    // 3. Get toolbox container image version (OCI label, e.g. "43") and created date
+    let (toolbox_image_ver, toolbox_image_created) = {
+        let ver_out = Command::new("podman")
+            .args(["image", "inspect",
+                   "--format", "{{index .Labels \"org.opencontainers.image.version\"}}\t{{.Created}}",
+                   "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"])
+            .output()
+            .await;
+        match ver_out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some((ver, created)) = s.split_once('\t') {
+                    // created looks like "2026-04-23 21:07:32.123 +0000 UTC" — take first 10 chars
+                    let date = created.trim().get(..10).unwrap_or("").to_string();
+                    (ver.trim().to_string(), date)
+                } else {
+                    (s, String::new())
+                }
+            }
+            Err(_) => (String::new(), String::new()),
+        }
+    };
+
+    // 4. Get locally running Manifest image digest (short SHA256)
+    let manifest_ver = {
+        let out = Command::new("docker")
+            .args(["inspect", "--format",
+                   "{{index .Config.Labels \"org.opencontainers.image.created\"}} {{slice .Id 7 19}}",
+                   // slice .Id 7 19: full ID is "sha256:<hex>"; skip the 7-char prefix
+                   // to get a 12-char short hash, e.g. "abc123456789"
+                   "manifest-manifest-1"])
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // Format: "2026-04-15T22:47:22.44554494Z abc123456789"
+                // Show as "Apr 15 · abc123"
+                if let Some((date_part, hash)) = s.split_once(' ') {
+                    let date = date_part.get(..10).unwrap_or(date_part);
+                    format!("{} · {}", date, hash)
+                } else {
+                    s
+                }
+            }
+            _ => "unknown".to_string(),
+        }
+    };
+
+    // 5. Get remote Manifest digest to compare for update notification
+    let (llama_swap_latest, manifest_latest, toolbox_latest) = tokio::join!(
+        check_latest_llama_swap(),
+        check_latest_manifest(),
+        check_latest_toolbox(),
+    );
+
     let data = serde_json::json!({
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
-        "llama_swap_latest": check_latest_llama_swap().await.unwrap_or_default(),
+        "toolbox_image_ver": toolbox_image_ver,
+        "toolbox_image_created": toolbox_image_created,
+        "manifest": manifest_ver,
+        "llama_swap_latest": llama_swap_latest.unwrap_or_default(),
+        "manifest_latest": manifest_latest.unwrap_or_default(),
+        "toolbox_latest": toolbox_latest.unwrap_or_default(),
     });
 
     let resp = json_response(StatusCode::OK, &data);
@@ -698,40 +795,71 @@ async fn check_latest_llama_swap() -> Option<String> {
     data.get("tag_name").and_then(|v| v.as_str()).map(|v| v.trim_start_matches('v').to_string())
 }
 
+/// Fetch the remote manifest Docker Hub tag's last-pushed date (used as a proxy for
+/// "new version available"). Returns the ISO date string (first 10 chars) or None.
+async fn check_latest_manifest() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("brainrouter")
+        .timeout(std::time::Duration::from_secs(3))
+        .build().ok()?;
+    let resp = client.get("https://hub.docker.com/v2/repositories/manifestdotbuild/manifest/tags/latest")
+        .send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    // tag_last_pushed looks like "2026-04-23T23:27:27.60508Z"
+    data.get("tag_last_pushed")
+        .and_then(|v| v.as_str())
+        .map(|s| s.get(..10).unwrap_or(s).to_string())
+}
+
+/// Fetch the remote toolbox image tag's last-pushed date.
+async fn check_latest_toolbox() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("brainrouter")
+        .timeout(std::time::Duration::from_secs(3))
+        .build().ok()?;
+    let resp = client.get("https://hub.docker.com/v2/repositories/kyuz0/amd-strix-halo-toolboxes/tags/vulkan-radv")
+        .send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    data.get("tag_last_pushed")
+        .and_then(|v| v.as_str())
+        .map(|s| s.get(..10).unwrap_or(s).to_string())
+}
+
 async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
     info!("Upgrading llama-swap via go install...");
-    
-    // Find the go binary explicitly since it might not be in the daemon's PATH
-    let go_bin = if std::path::Path::new("/home/papa/go/bin/go").exists() {
-        "/home/papa/go/bin/go"
-    } else {
-        "go"
-    };
 
-    let target_bin = "/home/papa/.local/bin/llama-swap";
-    
+    let home = home_dir();
+
+    // Prefer ~/go/bin/go; fall back to whatever is in PATH.
+    let go_bin = {
+        let candidate = format!("{home}/go/bin/go");
+        if std::path::Path::new(&candidate).exists() { candidate } else { "go".to_string() }
+    };
+    let gopath = format!("{home}/go");
+    let target_bin = home_bin("llama-swap");
+    let built_bin  = format!("{gopath}/bin/llama-swap");
+
     // 1. Run go install to build the latest binary in GOPATH/bin
-    let output = tokio::process::Command::new(go_bin)
+    let output = tokio::process::Command::new(&go_bin)
         .args(["install", "github.com/mostlygeek/llama-swap@latest"])
-        .env("GOPATH", "/home/papa/go")
+        .env("GOPATH", &gopath)
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
             info!("llama-swap built in GOPATH/bin successfully. Stopping service and installing...");
-            
+
             // 2. Stop the service first to avoid "Text file busy" error during overwrite
             let _ = tokio::process::Command::new("systemctl")
                 .args(["--user", "stop", "llama-swap"])
                 .output()
                 .await;
-            
-            // 3. Explicitly copy the newly built binary to the location used by systemd
-            // Use std::fs::remove_file first to break any existing links or locks
-            let _ = std::fs::remove_file(target_bin);
-            let copy_res = std::fs::copy("/home/papa/go/bin/llama-swap", target_bin);
-            
+
+            // 3. Copy built binary to the install location used by systemd
+            let _ = std::fs::remove_file(&target_bin);
+            let copy_res = std::fs::copy(&built_bin, &target_bin);
+
             if let Err(e) = copy_res {
                 error!(error = %e, "Failed to copy llama-swap binary to {}", target_bin);
                 // Try to restart anyway so the service isn't left dead
@@ -744,14 +872,14 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
                 });
             }
 
-            info!("llama-swap binary installed successfully to {}. Starting service...", target_bin);
-            
+            info!("llama-swap binary installed to {}. Starting service...", target_bin);
+
             // 4. Start the service again
             let restart_output = tokio::process::Command::new("systemctl")
                 .args(["--user", "start", "llama-swap"])
                 .output()
                 .await;
-                
+
             match restart_output {
                 Ok(rout) if rout.status.success() => {
                     json_response(StatusCode::OK, &serde_json::json!({
@@ -783,6 +911,129 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
     }
 }
 
+async fn upgrade_manifest() -> Response<Full<Bytes>> {
+    info!("Upgrading Manifest via docker compose pull + up -d...");
+    // Compose project lives at ~/ai/stack/manifest by convention.
+    // Override with BRAINROUTER_MANIFEST_DIR env var if needed.
+    let compose_dir = std::env::var("BRAINROUTER_MANIFEST_DIR")
+        .unwrap_or_else(|_| home_path("ai/stack/manifest"));
+
+    // Pull the latest image
+    let pull = tokio::process::Command::new("docker")
+        .args(["compose", "pull", "manifest"])
+        .current_dir(&compose_dir)
+        .output()
+        .await;
+
+    match pull {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "docker compose pull failed");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("docker compose pull failed: {}", stderr.trim()),
+            });
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec docker compose pull");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec docker: {}", e),
+            });
+        }
+    }
+
+    // Recreate the container with the new image
+    let up = tokio::process::Command::new("docker")
+        .args(["compose", "up", "-d", "--force-recreate", "manifest"])
+        .current_dir(&compose_dir)
+        .output()
+        .await;
+
+    match up {
+        Ok(out) if out.status.success() => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "Manifest upgraded and restarted successfully."
+            }))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "docker compose up failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Pull succeeded but compose up failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec docker compose up");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec docker: {}", e),
+            })
+        }
+    }
+}
+
+async fn upgrade_toolbox() -> Response<Full<Bytes>> {
+    info!("Upgrading llama-vulkan-radv toolbox container...");
+    let image = "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv";
+    let container = "llama-vulkan-radv";
+
+    // 1. Pull the new image
+    let pull = tokio::process::Command::new("podman")
+        .args(["pull", image])
+        .output()
+        .await;
+
+    match pull {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "podman pull failed");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("podman pull failed: {}", stderr.trim()),
+            });
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec podman pull");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec podman: {}", e),
+            });
+        }
+    }
+
+    // 2. Remove the existing toolbox container (force, it may be running)
+    let _ = tokio::process::Command::new("toolbox")
+        .args(["rm", "--force", container])
+        .output()
+        .await;
+
+    // 3. Recreate the toolbox container from the fresh image
+    let create = tokio::process::Command::new("toolbox")
+        .args(["create", "--image", image, container])
+        .output()
+        .await;
+
+    match create {
+        Ok(out) if out.status.success() => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "Toolbox container recreated with latest image."
+            }))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, "toolbox create failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Pull succeeded but toolbox create failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to exec toolbox create");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec toolbox: {}", e),
+            })
+        }
+    }
+}
 async fn handle_update_review_config(
     req: Request<Incoming>,
     service: &ReviewService,
@@ -790,7 +1041,7 @@ async fn handle_update_review_config(
     let body_bytes = req.collect().await?.to_bytes();
     let update: crate::config::ReviewConfig = serde_json::from_slice(&body_bytes)?;
     
-    service.update_config(update);
+    service.update_config(update).await;
     
     let resp = json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" }));
     Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))

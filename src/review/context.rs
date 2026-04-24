@@ -2,8 +2,8 @@
 
 use std::process::Command;
 
-const MAX_FILE_SIZE: usize = 100 * 1024; // 100 KB
-const MAX_SECTION_SIZE: usize = 25 * 1024; // 25 KB per section
+const MAX_FILE_SIZE: usize = 200 * 1024; // 200 KB
+const MAX_SECTION_SIZE: usize = 150 * 1024; // 150 KB per section (enough for a large diff)
 
 /// Gathered context for a single review pass.
 pub struct ReviewContext {
@@ -32,7 +32,9 @@ pub fn load_prd(project_dir: &str) -> Option<String> {
 /// Returns empty string if not in a git repo or git is unavailable.
 pub fn load_git_diff(project_dir: &str) -> String {
     let mut cmd = Command::new("git");
-    cmd.args(["diff", "HEAD"]);
+    // Collect unstaged + staged changes. Exclude README.md because it is often large and 
+    // crowds out actual code changes in the review prompt.
+    cmd.args(["diff", "HEAD", "--", ".", ":(exclude)README.md"]);
     if !project_dir.is_empty() {
         cmd.current_dir(project_dir);
     }

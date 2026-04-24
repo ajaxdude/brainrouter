@@ -108,7 +108,8 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
                             "taskId": { "type": "string", "description": "The task ID to review" },
                             "summary": { "type": "string", "description": "Brief summary of the task" },
                             "details": { "type": "string", "description": "Additional details about the task" },
-                            "conversationHistory": { "type": "array", "items": { "type": "string" }, "description": "Conversation history as context" }
+                            "conversationHistory": { "type": "array", "items": { "type": "string" }, "description": "Conversation history as context" },
+                            "cwd": { "type": "string", "description": "Absolute path to the project directory being reviewed. Optional but strongly recommended for accurate git diff collection; falls back to peer-cred-resolved cwd if omitted." }
                         },
                         "required": ["taskId", "summary"]
                     }

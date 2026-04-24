@@ -7,9 +7,9 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <style>
     :root {
-      --bg: #0d1117;
-      --bg2: #161b22;
-      --bg3: #21262d;
+      --bg: #0a0e17;
+      --bg2: #141b26;
+      --bg3: #1c2533;
       --text: #c9d1d9;
       --muted: #8b949e;
       --border: #30363d;
@@ -116,11 +116,13 @@
 </head>
 <body>
   <div class="header">
-    <a href="/dashboard"><img src="/logo.svg" alt="brainrouter" style="height: 48px; width: auto; display: block;"></a>
+    <a href="/dashboard"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
     <div id="version-header" style="font-size:0.75rem; color:var(--muted); display:flex; gap:15px; align-items:center;">
       <div id="ver-llama-swap">llama-swap: &mdash;</div>
       <div id="ver-llama-cpp">llama.cpp: &mdash;</div>
-      <div id="upgrade-area"></div>
+      <div id="ver-manifest">Manifest: &mdash;</div>
+      <div id="ver-toolbox">toolbox: &mdash;</div>
+      <div id="upgrade-area" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
     </div>
     <div class="nav">
       <!-- Unified navigation -->
@@ -392,6 +394,8 @@
 
     function renderEvents(events) {
       const tbody = document.getElementById('events-body');
+      // Prevent refresh from blowing away user selection while they are trying to copy.
+      if (!window.getSelection().isCollapsed && tbody.contains(window.getSelection().anchorNode)) return;
       if (!events.length) {
         tbody.innerHTML = '<tr><td colspan="10" class="empty">No routing events yet.</td></tr>';
         return;
@@ -403,21 +407,28 @@
       const rawEvents = events.slice(0, 200);
       
       for (const e of rawEvents) {
-        const key = (e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || '');
+        // For review calls, key by session_id (prompt changes every iteration — dedup by session).
+        // For regular calls, key by prompt content so identical user messages collapse.
+        const key = e.session_id
+          ? (e.session_id + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''))
+          : ((e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''));
         const time = new Date(e.timestamp).getTime();
         
-        // Find existing match within 10s window (comparing against latest in bucket)
-        const existing = deduped.find(d => d._key === key && Math.abs(new Date(d._last_time).getTime() - time) < 10000 && e.success === d.success);
+        // Use a larger window (10 minutes) for reviews, and 30s for regular chat.
+        const window = e.session_id ? 600000 : 30000;
+        
+        // Find existing match within window (comparing against latest in bucket)
+        const existing = deduped.find(d => d._key === key && Math.abs(new Date(d._last_time).getTime() - time) < window && e.success === d.success);
         
         if (existing) {
            existing._count++;
-           // Events are processed newest-first, so 'existing' is newer than 'e'.
-           // Keep the newer event's data.
+           existing._total_latency = (existing._total_latency || existing.latency_ms) + e.latency_ms;
         } else {
-          deduped.push({ ...e, _key: key, _count: 1, _last_time: e.timestamp });
+          deduped.push({ ...e, _key: key, _count: 1, _last_time: e.timestamp, _total_latency: e.latency_ms });
         }
         if (deduped.length >= 50) break;
       }
+
 
       const activeStatus = window.currentInferenceStatus;
 
@@ -429,9 +440,13 @@
         const sessionTag = e.session_id
           ? '<span class="badge badge-pending" title="' + esc(e.session_id) + '">review</span>'
           : '<span class="muted">&mdash;</span>';
+        // Show a concise label for review iterations instead of dumping the PRD text.
+        const promptDisplay = e.session_id
+          ? '<span class="muted" style="font-size:0.78rem">review&nbsp;/&nbsp;' + esc(e.session_id.substring(0, 8)) + '&hellip;</span>'
+          : esc(e.prompt_excerpt || '\u2014');
         const folderName = e.cwd ? (e.cwd.split('/').filter(Boolean).pop() || e.cwd) : '';
         const countBadge = e._count > 1
-          ? ' <span class="badge badge-count">&times;' + e._count + '</span>'
+          ? ' <span class="badge badge-count">' + (e.session_id ? 'iter ' : '&times;') + e._count + '</span>'
           : '';
 
         // Progress bar for active request
@@ -458,14 +473,17 @@
           <td class="muted">${fmtTime(e.timestamp)}</td>
           <td>${folderName ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
           <td>
-            <span class="truncate" title="${esc(e.prompt_excerpt)}">${esc(e.prompt_excerpt || '&mdash;')}</span>${countBadge}
+            <span class="truncate" title="${esc(e.prompt_excerpt)}">${promptDisplay}</span>${countBadge}
             ${progressHtml}
           </td>
           <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
           <td>${routerDisplay(e)}</td>
           <td>${providerDisplay(e)}</td>
           <td>${modelDisplay(e)}</td>
-          <td class="${latClass(e.latency_ms)}">${e.latency_ms} ms</td>
+          <td class="${latClass(e.latency_ms)}">
+            ${e.latency_ms} ms
+            ${e._count > 1 ? '<div class="muted" style="font-size:0.65rem">total: ' + e._total_latency + ' ms</div>' : ''}
+          </td>
           <td>${status}</td>
           <td>${sessionTag}</td>
         </tr>`;
@@ -474,6 +492,8 @@
 
     function renderSessions(sessions) {
       const tbody = document.getElementById('sessions-body');
+      // Prevent refresh from blowing away user selection while they are trying to copy.
+      if (!window.getSelection().isCollapsed && tbody.contains(window.getSelection().anchorNode)) return;
       if (!sessions.length) {
         tbody.innerHTML = '<tr><td colspan="7" class="empty">No review sessions yet.</td></tr>';
         return;
@@ -540,9 +560,10 @@
 
     let currentReviewConfig = null;
     let llamaSwapModels = [];
+    let isUpdatingConfig = false;
 
     async function syncReviewConfig(config) {
-      if (!config) return;
+      if (!config || isUpdatingConfig) return;
       currentReviewConfig = config;
       
       const modeSelect = document.getElementById('select-review-mode');
@@ -586,76 +607,137 @@
     }
 
     async function updateReviewConfig() {
-      const mode = document.getElementById('select-review-mode').value;
-      const model = document.getElementById('select-review-model').value;
+      const modeSelect = document.getElementById('select-review-mode');
+      const modelSelect = document.getElementById('select-review-model');
+      const mode = modeSelect.value;
+      const model = modelSelect.value;
       
       const payload = {
         max_iterations: currentReviewConfig ? currentReviewConfig.max_iterations : 5,
         forced_mode: mode,
         forced_model: mode === 'local' ? model : null
       };
+
+      // Prevent polling from overwriting our local UI state during the update
+      isUpdatingConfig = true;
+      
+      // Immediate UI feedback
+      const statusBadge = document.getElementById('review-mode-status');
+      const prevText = statusBadge.textContent;
+      statusBadge.textContent = mode + '...';
       
       try {
-        await fetch('/api/review-config', {
+        const res = await fetch('/api/review-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        // Optimistic update
-        syncReviewConfig(payload);
+        if (res.ok) {
+           currentReviewConfig = payload;
+           syncReviewConfig(payload);
+        } else {
+           const data = await res.json().catch(() => ({}));
+           console.error('Failed to update review config', data.error);
+           statusBadge.textContent = 'error';
+           setTimeout(() => syncReviewConfig(currentReviewConfig), 2000);
+        }
       } catch (e) {
         console.error('Failed to update review config', e);
+        statusBadge.textContent = 'error';
+        setTimeout(() => syncReviewConfig(currentReviewConfig), 2000);
+      } finally {
+        // Wait a bit before allowing polling to resume to ensure the server state has settled
+        setTimeout(() => { isUpdatingConfig = false; }, 1000);
       }
     }
 
     function renderVersions(data) {
        if (!data) return;
-       const swapEl = document.getElementById('ver-llama-swap');
-       const cppEl = document.getElementById('ver-llama-cpp');
+       const swapEl      = document.getElementById('ver-llama-swap');
+       const cppEl       = document.getElementById('ver-llama-cpp');
+       const manifestEl  = document.getElementById('ver-manifest');
+       const toolboxEl   = document.getElementById('ver-toolbox');
        const upgradeArea = document.getElementById('upgrade-area');
-       
+       const upgradeBtns = [];
+
+       // llama-swap
        let currentSwap = '';
        if (data.llama_swap) {
          currentSwap = data.llama_swap.split(' ')[0];
          swapEl.innerHTML = `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`;
        }
+
+       // llama.cpp (inside toolbox container)
        if (data.llama_cpp) {
-         const current = data.llama_cpp.split(' ')[0];
-         cppEl.innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(current)}</span>`;
+         const ver = data.llama_cpp.split(' ')[0];
+         cppEl.innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`;
        }
 
-       if (data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
-         upgradeArea.innerHTML = `<button id="btn-upgrade" onclick="upgradeLlamaSwap(this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">UPGRADE TO v${esc(data.llama_swap_latest)}</button>`;
-       } else {
-         upgradeArea.innerHTML = '';
+       // Manifest
+       if (data.manifest) {
+         manifestEl.innerHTML = `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`;
        }
+
+       // toolbox container image
+       if (data.toolbox_image_ver) {
+         toolboxEl.innerHTML = `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`;
+       }
+
+       // Upgrade buttons — labelled per component so it's clear what is being updated
+       if (data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
+         upgradeBtns.push(`<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">llama-swap → v${esc(data.llama_swap_latest)}</button>`);
+       }
+       if (data.manifest_latest) {
+         // manifest runs :latest — compare the remote push date against the local image created date
+         const localDate = data.manifest ? data.manifest.split(' ')[0] : '';
+         if (data.manifest_latest !== localDate) {
+           upgradeBtns.push(`<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">Manifest → ${esc(data.manifest_latest)}</button>`);
+         }
+       }
+       if (data.toolbox_latest && data.toolbox_image_created) {
+         // toolbox_image_created is YYYY-MM-DD (local); toolbox_latest is YYYY-MM-DD (remote push).
+         // Show update button only if the remote push is strictly newer.
+         if (data.toolbox_latest > data.toolbox_image_created) {
+           upgradeBtns.push(`<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="font-size:0.65rem; padding:2px 8px; border-radius:4px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;">toolbox → ${esc(data.toolbox_latest)}</button>`);
+         }
+       }
+       upgradeArea.innerHTML = upgradeBtns.join('');
     }
 
-    async function upgradeLlamaSwap(btn) {
-      if (!confirm('Upgrade llama-swap and restart? This will interrupt active inference.')) return;
-      const label = btn.textContent;
-      btn.textContent = 'UPGRADING...';
+    async function upgradeComponent(endpoint, label, btn) {
+      const confirmMsg = endpoint === 'manifest'
+        ? `Pull latest Manifest image and recreate container? This will briefly interrupt the Manifest service.`
+        : endpoint === 'toolbox'
+          ? `Pull latest toolbox image and recreate the llama-vulkan-radv container? This will interrupt active inference.`
+          : `Upgrade ${label} and restart? This will interrupt active inference.`;
+      if (!confirm(confirmMsg)) return;
+      const origText = btn.textContent;
+      btn.textContent = 'UPGRADING…';
       btn.disabled = true;
       try {
-        const res = await fetch('/api/upgrade/llama-swap', { method: 'POST' });
+        const res = await fetch(`/api/upgrade/${endpoint}`, { method: 'POST' });
         const data = await res.json();
         if (res.ok) {
-          btn.textContent = 'UPGRADED & RESTARTED';
+          btn.textContent = 'DONE ✓';
           btn.style.background = 'var(--green)';
-          setTimeout(() => refresh(), 2000);
+          setTimeout(() => refresh(), 2500);
         } else {
           btn.textContent = 'FAILED';
-          btn.title = esc(data.error || data.message || 'Unknown error');
-          setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 3000);
+          btn.title = data.error || data.message || 'Unknown error';
+          setTimeout(() => { btn.textContent = origText; btn.disabled = false; btn.title = ''; }, 4000);
         }
       } catch (e) {
         console.error('Upgrade failed', e);
         btn.textContent = 'ERROR';
-        setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 3000);
+        setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
       }
     }
 
-    setInterval(refresh, 3000);
+
+    setInterval(() => {
+      if (!window.getSelection().isCollapsed) return; // Pause if user is selecting text
+      refresh();
+    }, 3000);
     refresh();
   </script>
 </body>

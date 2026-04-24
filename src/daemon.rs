@@ -127,6 +127,22 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         }
     }
 
+    // Warn if $HOME is unset — upgrade and version-check paths fall back to /root.
+    if std::env::var("HOME").is_err() {
+        warn!("$HOME is not set; upgrade paths will fall back to /root. Set HOME in the service environment if running as a non-root system user.");
+    }
+
+    // Validate BRAINROUTER_MANIFEST_DIR if the operator set it, so misconfiguration
+    // fails fast at startup rather than producing a confusing error at upgrade time.
+    if let Ok(dir) = std::env::var("BRAINROUTER_MANIFEST_DIR") {
+        let p = std::path::Path::new(&dir);
+        if !p.exists() {
+            warn!(path = %dir, "BRAINROUTER_MANIFEST_DIR does not exist; Manifest upgrade will fail");
+        } else if !p.join("docker-compose.yml").exists() && !p.join("docker-compose.yaml").exists() {
+            warn!(path = %dir, "BRAINROUTER_MANIFEST_DIR has no docker-compose.yml; Manifest upgrade will fail");
+        }
+    }
+
     // Inference state tracker — shared between Router (writes) and HTTP API (reads)
     let inference_tracker = Arc::new(InferenceTracker::new());
 

@@ -43,7 +43,7 @@ pub struct LlamaSwapConfig {
     pub local_system_prompt: Option<String>,
 
     /// Optional path to the script that restarts the llama.cpp toolbox.
-    /// Example: "/home/papa/ai/refresh-toolboxes.sh"
+    /// Example: "~/.local/bin/refresh-toolboxes.sh"
     #[serde(default)]
     pub llama_cpp_restart_script: Option<String>,
 }
