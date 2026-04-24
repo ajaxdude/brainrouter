@@ -681,37 +681,43 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     // 2. Get llama.cpp version from toolbox container image.
     // Using 'podman run' directly on the image is more reliable than 'toolbox run'
     // which depends on a specific persistent container being in a startable state.
-    // Timeout after 15s — podman startup can be slow but should never hang forever.
-    let toolbox_ver = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        Command::new("podman")
+    //
+    // IMPORTANT: use spawn() + kill_on_drop(true) rather than output() so that if
+    // the 15-second timeout fires, the podman/conmon child processes are killed
+    // immediately instead of becoming orphans attached to the service cgroup.
+    const PODMAN_VERSION_TIMEOUT_SECS: u64 = 15;
+    let toolbox_ver = {
+        let child = Command::new("podman")
             .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
-            .output()
-    ).await {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{}{}", stdout, stderr);
-            // Note: podman run may exit non-zero if no GPU is found (ggml_vulkan error)
-            // but still output the version on stdout/stderr.
-            if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
-                line.replace("version:", "")
-                    .replace("built with", "")
-                    .trim()
-                    .to_string()
-            } else if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')') && !l.contains("Error")) {
-                line.replace("built with", "").trim().to_string()
-            } else {
+            .kill_on_drop(true)  // ensures child is killed if the future is dropped on timeout
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS), child).await {
+            Ok(Ok(out)) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+                // Note: podman run may exit non-zero if no GPU is found (ggml_vulkan error)
+                // but still output the version on stdout/stderr.
+                if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
+                    line.replace("version:", "")
+                        .replace("built with", "")
+                        .trim()
+                        .to_string()
+                } else if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')') && !l.contains("Error")) {
+                    line.replace("built with", "").trim().to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            }
+            Ok(Err(e)) => {
+                error!(error = %e, "Failed to execute podman run for version check");
                 "unknown".to_string()
             }
-        }
-        Ok(Err(e)) => {
-            error!(error = %e, "Failed to execute podman run for version check");
-            "unknown".to_string()
-        }
-        Err(_) => {
-            warn!("podman run timed out during version check");
-            "unknown".to_string()
+            Err(_elapsed) => {
+                // kill_on_drop(true) above ensures the child is killed when this future is dropped.
+                warn!(timeout_secs = PODMAN_VERSION_TIMEOUT_SECS, "podman run timed out during llama.cpp version check");
+                "unknown".to_string()
+            }
         }
     };
 
