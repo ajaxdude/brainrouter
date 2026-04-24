@@ -541,35 +541,36 @@
     }
 
     async function refresh() {
-      try {
-        const [evRes, sesRes, statsRes, infRes, verRes, revRes] = await Promise.all([
-          fetch('/api/routing-events'),
-          fetch('/review/api/sessions'),
-          fetch('/api/routing-stats'),
-          fetch('/api/inference-status'),
-          fetch('/api/versions'),
-          fetch('/api/review-config'),
-        ]);
+      // Fetch all endpoints independently so one failure never blanks the page.
+      // Each fetch returns its parsed JSON or null on any error.
+      async function safeFetch(url) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) return null;
+          return await res.json();
+        } catch (_) { return null; }
+      }
 
-        window.currentInferenceStatus = null;
-        try { window.currentInferenceStatus = await infRes.json(); } catch (_) {}
+      const [evData, sesData, statsData, infData, verData, revData] = await Promise.all([
+        safeFetch('/api/routing-events'),
+        safeFetch('/review/api/sessions'),
+        safeFetch('/api/routing-stats'),
+        safeFetch('/api/inference-status'),
+        safeFetch('/api/versions'),
+        safeFetch('/api/review-config'),
+      ]);
 
-        const evData = await evRes.json();
-        const sesData = await sesRes.json();
-        const statsData = await statsRes.json();
-        const verData = await verRes.json();
-        const revData = await revRes.json();
+      window.currentInferenceStatus = infData;
 
+      if (evData) {
         allEvents = evData.events || [];
         renderFlow(allEvents);
-        renderStats(statsData);
         renderEvents(allEvents);
-        renderSessions(sesData.sessions || []);
-        renderVersions(verData);
-        syncReviewConfig(revData);
-      } catch (err) {
-        console.error('Dashboard refresh failed', err);
       }
+      if (statsData) renderStats(statsData);
+      if (sesData) renderSessions(sesData.sessions || []);
+      if (verData) renderVersions(verData);
+      if (revData) syncReviewConfig(revData);
     }
 
     let currentReviewConfig = null;
