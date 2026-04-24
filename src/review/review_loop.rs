@@ -68,8 +68,12 @@ pub async fn run_loop(
         iteration_count += 1;
         info!(session_id, iteration = iteration_count, max_iterations = config.max_iterations, "Review iteration");
 
-        // Gather context fresh each iteration (git diff may change)
-        let ctx = context::gather(project_dir);
+        // Gather context fresh each iteration (git diff may change).
+        // context::gather runs blocking I/O (git diff, fs reads); run off the async executor.
+        let project_dir_owned = project_dir.to_string();
+        let ctx = tokio::task::spawn_blocking(move || context::gather(&project_dir_owned))
+            .await
+            .unwrap_or_else(|_| context::ReviewContext { prd: None, git_diff: String::new(), agents_content: None });
 
         let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
 

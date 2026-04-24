@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
 use crate::escalation;
@@ -678,45 +678,39 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         swap_ver = "unknown".to_string();
     }
 
-    // 2. Get llama.cpp version from toolbox container image
+    // 2. Get llama.cpp version from toolbox container image.
     // Using 'podman run' directly on the image is more reliable than 'toolbox run'
     // which depends on a specific persistent container being in a startable state.
-    let toolbox_out = Command::new("podman")
-        .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
-        .output()
-        .await;
-
-    let toolbox_ver = match toolbox_out {
-        Ok(out) => {
+    // Timeout after 15s — podman startup can be slow but should never hang forever.
+    let toolbox_ver = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        Command::new("podman")
+            .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
+            .output()
+    ).await {
+        Ok(Ok(out)) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             let combined = format!("{}{}", stdout, stderr);
-            
-            // Note: podman run might exit with error if no GPU is found (ggml_vulkan error)
-            // but still output the version. We check for "version:" specifically.
+            // Note: podman run may exit non-zero if no GPU is found (ggml_vulkan error)
+            // but still output the version on stdout/stderr.
             if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
                 line.replace("version:", "")
                     .replace("built with", "")
                     .trim()
                     .to_string()
-            } else if out.status.success() {
-                 if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')')) {
-                    line.replace("built with", "").trim().to_string()
-                 } else {
-                    combined.lines()
-                        .find(|l| !l.trim().is_empty())
-                        .map(|l| {
-                            let l = l.trim();
-                            if l.len() > 64 { "unknown".to_string() } else { l.to_string() }
-                        })
-                        .unwrap_or_else(|| "unknown".to_string())
-                 }
+            } else if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')') && !l.contains("Error")) {
+                line.replace("built with", "").trim().to_string()
             } else {
                 "unknown".to_string()
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!(error = %e, "Failed to execute podman run for version check");
+            "unknown".to_string()
+        }
+        Err(_) => {
+            warn!("podman run timed out during version check");
             "unknown".to_string()
         }
     };
@@ -1100,7 +1094,8 @@ pub async fn run(
                     // Resolve the cwd of the connecting OMP process once per
                     // connection; all requests on this keep-alive connection
                     // share the same process and thus the same cwd.
-                    let conn_cwd = peer_cwd(&addr).unwrap_or_default();
+                    // Runs in spawn_blocking because peer_cwd scans /proc synchronously.
+                    let conn_cwd = tokio::task::spawn_blocking(move || peer_cwd(&addr).unwrap_or_default()).await.unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
                             .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr)))
@@ -1122,8 +1117,15 @@ pub async fn run(
                 Ok((stream, _addr)) => {
                     info!("New Unix socket connection");
                     // Resolve the cwd of the connecting process via UDS peer credentials.
+                    // cwd_from_pid is a blocking readlink; run it off the async executor.
                     let conn_cwd = if let Ok(cred) = stream.peer_cred() {
-                        cred.pid().and_then(crate::peer_cwd::cwd_from_pid).unwrap_or_default()
+                        if let Some(pid) = cred.pid() {
+                            tokio::task::spawn_blocking(move || crate::peer_cwd::cwd_from_pid(pid).unwrap_or_default())
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
                     } else {
                         String::new()
                     };

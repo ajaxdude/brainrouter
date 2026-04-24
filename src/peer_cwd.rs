@@ -27,7 +27,7 @@ pub fn peer_cwd(peer_addr: &SocketAddr) -> Option<String> {
 pub fn cwd_from_pid(pid: i32) -> Option<String> {
     let cwd_link = format!("/proc/{}/cwd", pid);
     if let Ok(cwd) = std::fs::read_link(&cwd_link) {
-        return cwd.to_str().map(|s| s.to_string());
+        return cwd.to_str().map(|s| s.trim_end_matches(" (deleted)").to_string());
     }
     None
 }
@@ -86,7 +86,7 @@ fn find_cwd_for_inode(inode: u64) -> Option<String> {
                     // Found the process. Read its cwd.
                     let cwd_link = format!("/proc/{}/cwd", pid_str);
                     if let Ok(cwd) = std::fs::read_link(&cwd_link) {
-                        return cwd.to_str().map(|s| s.to_string());
+                        return cwd.to_str().map(|s| s.trim_end_matches(" (deleted)").to_string());
                     }
                 }
                 _ => {}
