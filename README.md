@@ -1,5 +1,9 @@
 # brainrouter
 
+<p align="center">
+  <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
+</p>
+
 A speed-first Rust daemon that sits between your coding harness and your LLMs. Three routing modes:
 
 - **auto** — Bonsai 8B classifies every query and routes to Manifest (cloud) or llama-swap (local)

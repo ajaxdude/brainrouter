@@ -27,7 +27,8 @@ use crate::stream::{SafeStream, StreamFormat};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
-const FAVICON_PNG: &[u8] = include_bytes!("escalation/templates/favicon.png");
+const FAVICON_SVG: &[u8] = include_bytes!("escalation/templates/favicon.svg");
+const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
 
 /// Shared state passed to all request handlers
 pub struct AppState {
@@ -206,12 +207,21 @@ async fn handle_request(
         // ── Unified dashboard ──────────────────────────────────────────────────
         ("GET", "/dashboard") => html_ok(MAIN_DASHBOARD_HTML),
 
-        ("GET", "/favicon.ico") | ("GET", "/favicon.png") => {
+        ("GET", "/favicon.ico") | ("GET", "/favicon.svg") | ("GET", "/favicon.png") => {
             let resp = Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", "image/png")
-                .body(Full::new(Bytes::from(FAVICON_PNG)))
+                .header("content-type", "image/svg+xml")
+                .body(Full::new(Bytes::from_static(FAVICON_SVG)))
                 .expect("Failed to build favicon response");
+            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+        }
+
+        ("GET", "/logo.svg") => {
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "image/svg+xml")
+                .body(Full::new(Bytes::from_static(LOGO_SVG)))
+                .expect("Failed to build logo response");
             resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
         }
 

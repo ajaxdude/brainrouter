@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
+  <defs>
+    <radialGradient id="bmc-bg" cx="50%" cy="35%" r="80%">
+      <stop offset="0%" stop-color="#1b2a44"></stop>
+      <stop offset="100%" stop-color="#070b15"></stop>
+    </radialGradient>
+    <radialGradient id="bm-brain-fill" cx="50%" cy="38%" r="70%">
+      <stop offset="0%" stop-color="#ffd8dd"></stop>
+      <stop offset="55%" stop-color="#f5a3ad"></stop>
+      <stop offset="100%" stop-color="#c9727d"></stop>
+    </radialGradient>
+    <radialGradient id="bm-face-shadow" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#a8525d" stop-opacity="0.55"></stop>
+      <stop offset="100%" stop-color="#a8525d" stop-opacity="0"></stop>
+    </radialGradient>
+    <radialGradient id="bm-sheen" cx="30%" cy="20%" r="35%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.7"></stop>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"></stop>
+    </radialGradient>
+    <clipPath id="bm-body-clip">
+      <path d="M120 28 C 162 28, 196 54, 200 94 C 214 100, 214 122, 200 128 C 206 156, 184 180, 156 184 C 150 198, 132 204, 120 200 C 108 204, 90 198, 84 184 C 56 180, 34 156, 40 128 C 26 122, 26 100, 40 94 C 44 54, 78 28, 120 28 Z"></path>
+    </clipPath>
+    <clipPath id="bmc-circle">
+      <circle cx="120" cy="120" r="116"></circle>
+    </clipPath>
+  </defs>
+
+  
+  <circle cx="120" cy="120" r="118" fill="url(#bmc-bg)"></circle>
+  <circle cx="120" cy="120" r="114" fill="none" stroke="#388BFD" stroke-width="3" opacity="0.9"></circle>
+
+  
+  <g clip-path="url(#bmc-circle)" transform="translate(120 120) scale(0.92) translate(-120 -124)">
+    
+    <path d="M120 28 C 162 28, 196 54, 200 94 C 214 100, 214 122, 200 128 C 206 156, 184 180, 156 184 C 150 198, 132 204, 120 200 C 108 204, 90 198, 84 184 C 56 180, 34 156, 40 128 C 26 122, 26 100, 40 94 C 44 54, 78 28, 120 28 Z" fill="url(#bm-brain-fill)" stroke="#7a2f3a" stroke-width="2.5"></path>
+    <path d="M120 28 C 162 28, 196 54, 200 94 C 214 100, 214 122, 200 128 C 206 156, 184 180, 156 184 C 150 198, 132 204, 120 200 C 108 204, 90 198, 84 184 C 56 180, 34 156, 40 128 C 26 122, 26 100, 40 94 C 44 54, 78 28, 120 28 Z" fill="url(#bm-sheen)"></path>
+
+    
+    <g clip-path="url(#bm-body-clip)" stroke="#7a2f3a" stroke-width="2" fill="none" stroke-linecap="round">
+      <path d="M120 30 C 118 60, 122 86, 120 110"></path>
+      <path d="M90 50 C 78 64, 76 82, 86 96"></path>
+      <path d="M60 78 C 54 92, 56 108, 68 118"></path>
+      <path d="M74 104 C 66 116, 66 130, 78 140"></path>
+      <path d="M96 78 C 92 92, 98 104, 108 108"></path>
+      <path d="M150 50 C 162 64, 164 82, 154 96"></path>
+      <path d="M180 78 C 186 92, 184 108, 172 118"></path>
+      <path d="M166 104 C 174 116, 174 130, 162 140"></path>
+      <path d="M144 78 C 148 92, 142 104, 132 108"></path>
+      <path d="M100 140 C 108 146, 116 146, 122 142"></path>
+      <path d="M140 140 C 132 146, 126 146, 122 142"></path>
+    </g>
+
+    <ellipse cx="120" cy="150" rx="44" ry="22" fill="url(#bm-face-shadow)"></ellipse>
+
+    
+    <g fill="#2a1418">
+      <path d="M92 134 C 104 128, 116 134, 118 144 C 112 140, 102 140, 94 142 Z"></path>
+      <path d="M148 134 C 136 128, 124 134, 122 144 C 128 140, 138 140, 146 142 Z"></path>
+    </g>
+
+    
+    <ellipse cx="106" cy="152" rx="7.5" ry="5.5" fill="#fff6f0"></ellipse>
+    <circle cx="107.5" cy="153" r="3.2" fill="#2a1418"></circle>
+    <circle cx="108.3" cy="152.2" r="1" fill="#ffffff"></circle>
+    <ellipse cx="134" cy="152" rx="7.5" ry="5.5" fill="#fff6f0"></ellipse>
+    <circle cx="132.5" cy="153" r="3.2" fill="#2a1418"></circle>
+    <circle cx="133.3" cy="152.2" r="1" fill="#ffffff"></circle>
+
+    
+    <g fill="none" stroke="#3a1218" stroke-width="2.5" stroke-linecap="round">
+      <path d="M108 172 C 114 168, 126 168, 132 172"></path>
+      <path d="M116 171 L 116 175" stroke-width="1.8"></path>
+      <path d="M124 171 L 124 175" stroke-width="1.8"></path>
+    </g>
+
+    
+    <ellipse cx="94" cy="166" rx="6" ry="3" fill="#ef7f8c" opacity="0.55"></ellipse>
+    <ellipse cx="146" cy="166" rx="6" ry="3" fill="#ef7f8c" opacity="0.55"></ellipse>
+  </g>
+</svg>
