@@ -82,7 +82,7 @@ pub async fn run_loop(
 
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
-        let result = call_llm_for_review(router, prompt.clone(), session_id, requested_model).await;
+        let result = call_llm_for_review(router, prompt.clone(), session_id, requested_model, project_dir).await;
 
         match result {
             Err(e) => {
@@ -213,6 +213,7 @@ async fn call_llm_for_review(
     prompt: String,
     session_id: &str,
     model: String,
+    project_dir: &str,
 ) -> Result<(String, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
         model,
@@ -244,7 +245,7 @@ async fn call_llm_for_review(
 
 
     let (provider_response, route_info) = router
-        .route_tagged(request, Some(session_id.to_string()), String::new())
+        .route_tagged(request, Some(session_id.to_string()), project_dir.to_string())
         .await?;
 
     // Collect the SSE stream into a full text response
