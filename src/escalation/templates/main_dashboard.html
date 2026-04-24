@@ -539,28 +539,23 @@
       }).join('');
     }
 
-    async function refresh() {
-      // Fetch all endpoints independently so one failure never blanks the page.
-      // Each fetch returns its parsed JSON or null on any error.
-      async function safeFetch(url) {
-        try {
-          const res = await fetch(url);
-          if (!res.ok) return null;
-          return await res.json();
-        } catch (_) { return null; }
-      }
+    async function safeFetch(url) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        return await res.json();
+      } catch (_) { return null; }
+    }
 
-      const [evData, sesData, statsData, infData, verData, revData] = await Promise.all([
+    // Fast refresh: events, sessions, stats, inference status — near-realtime.
+    async function refresh() {
+      const [evData, sesData, statsData, infData] = await Promise.all([
         safeFetch('/api/routing-events'),
         safeFetch('/review/api/sessions'),
         safeFetch('/api/routing-stats'),
         safeFetch('/api/inference-status'),
-        safeFetch('/api/versions'),
-        safeFetch('/api/review-config'),
       ]);
-
       window.currentInferenceStatus = infData;
-
       if (evData) {
         allEvents = evData.events || [];
         renderFlow(allEvents);
@@ -568,6 +563,14 @@
       }
       if (statsData) renderStats(statsData);
       if (sesData) renderSessions(sesData.sessions || []);
+    }
+
+    // Slow refresh: versions (runs podman) and review config — less frequent.
+    async function refreshSlow() {
+      const [verData, revData] = await Promise.all([
+        safeFetch('/api/versions'),
+        safeFetch('/api/review-config'),
+      ]);
       if (verData) renderVersions(verData);
       if (revData) syncReviewConfig(revData);
     }
@@ -756,11 +759,10 @@
     }
 
 
-    setInterval(() => {
-      if (!window.getSelection().isCollapsed) return; // Pause if user is selecting text
-      refresh();
-    }, 3000);
+    setInterval(refresh, 500);
+    setInterval(refreshSlow, 30000);
     refresh();
+    refreshSlow();
   </script>
 </body>
 </html>
