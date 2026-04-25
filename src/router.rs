@@ -225,17 +225,26 @@ impl Router {
             info!(provider = MANIFEST_KEY, "Attempting Manifest");
             match self.manifest.chat_completion(request.clone()).await {
                 Ok(ProviderResponse::Stream(stream)) => {
-                    self.health.report_success(MANIFEST_KEY);
-                    info!(provider = MANIFEST_KEY, "Manifest accepted request");
                     let (stream, model_key) = peek_manifest_model(stream).await;
-                    return Ok((
-                        wrap_with_timeout(stream),
-                        RouteInfo {
-                            bonsai_decision: "cloud",
-                            effective_provider: Some("manifest".to_string()),
-                            model_key,
-                        },
-                    ));
+                    // Manifest returns HTTP 200 even for errors (credits exhausted,
+                    // missing auth) — it sends a single SSE chunk with model="manifest"
+                    // and an error message as content. Detect this and fall through
+                    // to llama-swap instead of forwarding the error to the client.
+                    if model_key == "manifest" {
+                        warn!(provider = MANIFEST_KEY, "Manifest returned pseudo-success (model=manifest) — likely credits exhausted or auth error, falling back");
+                        // Don't report health failure — Manifest is reachable, just can't fulfill.
+                    } else {
+                        self.health.report_success(MANIFEST_KEY);
+                        info!(provider = MANIFEST_KEY, model = %model_key, "Manifest accepted request");
+                        return Ok((
+                            wrap_with_timeout(stream),
+                            RouteInfo {
+                                bonsai_decision: "cloud",
+                                effective_provider: Some("manifest".to_string()),
+                                model_key,
+                            },
+                        ));
+                    }
                 }
                 Err(e) => {
                     warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back to llama-swap");
