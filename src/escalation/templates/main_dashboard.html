@@ -116,7 +116,16 @@
     .health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-bottom: 2px; background: var(--muted); transition: background 0.3s; }
     .health-dot.healthy { background: var(--green); }
     .health-dot.unhealthy { background: var(--red); }
+    .health-dot.idle { background: var(--muted); }
+    .health-dot.loading { background: var(--orange); animation: pulse 1.5s infinite; }
     .health-dot.unknown { background: var(--muted); }
+
+    /* ── Notification banner ──────────────────────────── */
+    .notify-banner { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.35); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: none; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--orange); }
+    .notify-banner.visible { display: flex; }
+    .notify-banner .notify-text { flex: 1; }
+    .notify-banner .notify-dismiss { background: none; border: 1px solid rgba(210,153,34,.4); color: var(--orange); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 0.7rem; font-family: inherit; }
+    .notify-banner .notify-dismiss:hover { background: rgba(210,153,34,.2); }
   </style>
 </head>
 <body>
@@ -148,16 +157,17 @@
       </div>
     </div>
     <div class="nav">
-      <!-- Unified navigation -->
       <a href="/review/">Review Sessions</a>
-      <!-- Debugging endpoints retained below for operators -->
-      <!-- <a href="/review/api/sessions">Sessions API</a> -->
-      <!-- <a href="/api/routing-stats">Stats API</a> -->
-      <button onclick="restartService('llama-swap', this)">Restart llama-swap</button>
-      <button onclick="restartService('llama-cpp', this)">Restart llama.cpp</button>
+      <button onclick="restartService('llama-swap', this)">Restart Local Stack</button>
       <button onclick="restartService('manifest', this)">Restart Manifest</button>
       <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
     </div>
+  </div>
+
+  <!-- Notification banner (shown when cloud falls back to local) -->
+  <div id="notify-banner" class="notify-banner">
+    <span class="notify-text" id="notify-text"></span>
+    <button class="notify-dismiss" onclick="dismissNotify()">dismiss</button>
   </div>
 
   <!-- Current model flow -->
@@ -767,11 +777,26 @@
 
 
     // ── Service health dots ───────────────────────────────────────────────────────
-    function setHealthDot(id, healthy) {
+    const healthTitles = {
+      healthy: 'healthy',
+      unhealthy: 'unreachable or unhealthy',
+      idle: 'service up, no model loaded',
+      loading: 'model is loading',
+      unknown: 'checking...',
+    };
+
+    function setHealthDot(id, state) {
       const dot = document.getElementById(id);
       if (!dot) return;
-      dot.className = 'health-dot ' + (healthy ? 'healthy' : 'unhealthy');
-      dot.title = healthy ? 'healthy' : 'unreachable or unhealthy';
+      const cls = state === true ? 'healthy' : state === false ? 'unhealthy' : (state || 'unknown');
+      dot.className = 'health-dot ' + cls;
+      dot.title = healthTitles[cls] || cls;
+    }
+
+    let notifyDismissed = false;
+    function dismissNotify() {
+      notifyDismissed = true;
+      document.getElementById('notify-banner').classList.remove('visible');
     }
 
     async function refreshHealth() {
@@ -781,6 +806,17 @@
       setHealthDot('health-llama-cpp', data.llama_cpp);
       setHealthDot('health-toolbox', data.toolbox);
       setHealthDot('health-manifest', data.manifest);
+
+      // Cloud fallback notification
+      const banner = document.getElementById('notify-banner');
+      if (data.cloud_fallback && !notifyDismissed) {
+        document.getElementById('notify-text').textContent =
+          'Cloud requests are falling back to local. Manifest may be out of provider credits or unreachable. Check your Manifest dashboard for details.';
+        banner.classList.add('visible');
+      } else if (!data.cloud_fallback) {
+        banner.classList.remove('visible');
+        notifyDismissed = false; // reset dismiss when the issue clears
+      }
     }
 
     setInterval(refreshHealth, 10000);

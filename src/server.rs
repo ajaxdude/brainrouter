@@ -287,7 +287,7 @@ async fn handle_request(
 
         // ── Service health API ────────────────────────────────────────────────
         ("GET", "/api/service-health") => {
-            let resp = service_health(&state.llama_swap_url, &state.manifest_url).await;
+            let resp = service_health(&state.llama_swap_url, &state.manifest_url, &state.routing_events).await;
             into_unsync(resp)
         }
 
@@ -537,11 +537,19 @@ async fn inference_status(
 
 /// Probe all four services and return their health status.
 /// Called by the dashboard every 10s to render status dots.
-async fn service_health(llama_swap_url: &str, manifest_url: &str) -> Response<Full<Bytes>> {
+/// Probe all four services and return their health status.
+/// States: "healthy", "unhealthy", "idle" (service up but no model loaded),
+/// "loading" (model is loading).
+/// Also reports whether the last cloud request fell back to local.
+async fn service_health(
+    llama_swap_url: &str,
+    manifest_url: &str,
+    routing_events: &RoutingEvents,
+) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
-    // Probe all four in parallel
-    let (swap_res, manifest_res, llama_cpp_res) = tokio::join!(
+    // Probe all services in parallel
+    let (swap_ok, manifest_ok, llama_cpp_state) = tokio::join!(
         // llama-swap: GET /running
         async {
             VERSION_CLIENT.get(format!("{}/running", llama_swap_url))
@@ -554,7 +562,6 @@ async fn service_health(llama_swap_url: &str, manifest_url: &str) -> Response<Fu
             let url = format!("{}/api/v1/health", manifest_url);
             match VERSION_CLIENT.get(&url).timeout(timeout).send().await {
                 Ok(r) if r.status().is_success() => {
-                    // Parse the body to check {"status":"healthy"}
                     r.json::<serde_json::Value>().await
                         .map(|v| v.get("status").and_then(|s| s.as_str()) == Some("healthy"))
                         .unwrap_or(false)
@@ -562,39 +569,66 @@ async fn service_health(llama_swap_url: &str, manifest_url: &str) -> Response<Fu
                 _ => false,
             }
         },
-        // llama.cpp (toolbox): check if llama-server is reachable via llama-swap proxy
+        // llama.cpp (toolbox): tri-state check via llama-swap proxy
         async {
             let running_url = format!("{}/running", llama_swap_url);
             let resp = match VERSION_CLIENT.get(&running_url).timeout(timeout).send().await {
                 Ok(r) => r,
-                Err(_) => return false,
+                Err(_) => return "unhealthy",
             };
             let data: serde_json::Value = match resp.json().await {
                 Ok(v) => v,
-                Err(_) => return false,
+                Err(_) => return "unhealthy",
             };
-            let proxy = data.get("running")
-                .and_then(|r| r.as_array())
-                .and_then(|a| a.first())
-                .and_then(|e| e.get("proxy"))
-                .and_then(|p| p.as_str());
-            match proxy {
-                Some(proxy_url) => {
-                    let health_url = format!("{}/health", proxy_url);
-                    VERSION_CLIENT.get(&health_url).timeout(timeout).send().await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false)
+            let entries = data.get("running")
+                .and_then(|r| r.as_array());
+            match entries {
+                Some(arr) if arr.is_empty() => "idle",
+                Some(arr) => {
+                    let proxy = arr.first()
+                        .and_then(|e| e.get("proxy"))
+                        .and_then(|p| p.as_str());
+                    match proxy {
+                        Some(proxy_url) => {
+                            let health_url = format!("{}/health", proxy_url);
+                            if VERSION_CLIENT.get(&health_url).timeout(timeout).send().await
+                                .map(|r| r.status().is_success()).unwrap_or(false)
+                            {
+                                "healthy"
+                            } else {
+                                let state = arr.first()
+                                    .and_then(|e| e.get("state"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                if state == "loading" { "loading" } else { "unhealthy" }
+                            }
+                        }
+                        None => "unhealthy",
+                    }
                 }
-                None => false, // no model loaded = not running
+                None => "unhealthy",
             }
         },
     );
 
+    // Check if the most recent cloud request fell back to local
+    let cloud_fallback = {
+        let events = routing_events.get_all();
+        events.iter()
+            .find(|e| e.bonsai_decision == "cloud" || e.bonsai_decision == "cloud-direct")
+            .map(|e| {
+                e.effective_provider.as_deref() == Some("llama-swap")
+                    || !e.success
+            })
+            .unwrap_or(false)
+    };
+
     json_response(StatusCode::OK, &serde_json::json!({
-        "llama_swap": swap_res,
-        "manifest": manifest_res,
-        "llama_cpp": llama_cpp_res,
-        "toolbox": llama_cpp_res,
+        "llama_swap": if swap_ok { "healthy" } else { "unhealthy" },
+        "manifest": if manifest_ok { "healthy" } else { "unhealthy" },
+        "llama_cpp": llama_cpp_state,
+        "toolbox": llama_cpp_state,
+        "cloud_fallback": cloud_fallback,
     }))
 }
 
