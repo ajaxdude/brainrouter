@@ -79,6 +79,8 @@ pub struct AppState {
     pub llama_swap_url: String,
     /// Path to the script that restarts the llama.cpp toolbox.
     pub llama_cpp_restart_script: Option<String>,
+    /// Manifest base URL for health checking.
+    pub manifest_url: String,
 }
 
 #[derive(Serialize)]
@@ -282,6 +284,12 @@ async fn handle_request(
         // ── Inference status API (polls llama-swap + llama-server) ────────────
         ("GET", "/api/inference-status") => {
             let resp = inference_status(&state.router.inference_tracker, &state.llama_swap_url).await;
+            into_unsync(resp)
+        }
+
+        // ── Service health API ────────────────────────────────────────────────
+        ("GET", "/api/service-health") => {
+            let resp = service_health(&state.llama_swap_url, &state.manifest_url).await;
             into_unsync(resp)
         }
 
@@ -527,6 +535,69 @@ async fn inference_status(
             }))
         }
     }
+}
+
+/// Probe all four services and return their health status.
+/// Called by the dashboard every 10s to render status dots.
+async fn service_health(llama_swap_url: &str, manifest_url: &str) -> Response<Full<Bytes>> {
+    let timeout = std::time::Duration::from_secs(3);
+
+    // Probe all four in parallel
+    let (swap_res, manifest_res, llama_cpp_res) = tokio::join!(
+        // llama-swap: GET /running
+        async {
+            VERSION_CLIENT.get(format!("{}/running", llama_swap_url))
+                .timeout(timeout).send().await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        },
+        // Manifest: GET /api/v1/health
+        async {
+            let url = format!("{}/api/v1/health", manifest_url);
+            match VERSION_CLIENT.get(&url).timeout(timeout).send().await {
+                Ok(r) if r.status().is_success() => {
+                    // Parse the body to check {"status":"healthy"}
+                    r.json::<serde_json::Value>().await
+                        .map(|v| v.get("status").and_then(|s| s.as_str()) == Some("healthy"))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        },
+        // llama.cpp (toolbox): check if llama-server is reachable via llama-swap proxy
+        async {
+            let running_url = format!("{}/running", llama_swap_url);
+            let resp = match VERSION_CLIENT.get(&running_url).timeout(timeout).send().await {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            let data: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let proxy = data.get("running")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("proxy"))
+                .and_then(|p| p.as_str());
+            match proxy {
+                Some(proxy_url) => {
+                    let health_url = format!("{}/health", proxy_url);
+                    VERSION_CLIENT.get(&health_url).timeout(timeout).send().await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
+                }
+                None => false, // no model loaded = not running
+            }
+        },
+    );
+
+    json_response(StatusCode::OK, &serde_json::json!({
+        "llama_swap": swap_res,
+        "manifest": manifest_res,
+        "llama_cpp": llama_cpp_res,
+        "toolbox": llama_cpp_res,
+    }))
 }
 
 /// Poll llama-swap /running for the active model's name, display name, and state.

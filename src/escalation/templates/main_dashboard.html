@@ -112,6 +112,11 @@
     .progress-fill.generating { background: var(--green); width: 100%; }
     .progress-pct { font-size: 0.75rem; color: var(--muted); min-width: 60px; text-align: right; white-space: nowrap; }
     @keyframes progress-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+    /* ── Health status dots ───────────────────────────── */
+    .health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-bottom: 2px; background: var(--muted); transition: background 0.3s; }
+    .health-dot.healthy { background: var(--green); }
+    .health-dot.unhealthy { background: var(--red); }
+    .health-dot.unknown { background: var(--muted); }
   </style>
 </head>
 <body>
@@ -119,23 +124,27 @@
     <a href="/dashboard"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
     <div id="version-header" style="font-size:0.7rem; color:var(--muted); display:flex; gap:10px; align-items:center; border:1px solid var(--border); border-radius:6px; padding:6px 12px; background:rgba(255,255,255,0.03);">
       <div id="ver-llama-swap" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <span id="health-llama-swap" class="health-dot unknown" title="checking..."></span>
         <div>llama-swap: &mdash;</div>
         <div class="upgrade-btn" id="upgrade-llama-swap" style="display:flex; justify-content:center;"></div>
       </div>
       <div style="width:1px; height:24px; background:var(--border);"></div>
       <div id="ver-llama-cpp" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <span id="health-llama-cpp" class="health-dot unknown" title="checking..."></span>
         <div>llama.cpp: &mdash;</div>
         <div class="upgrade-btn" id="upgrade-llama-cpp" style="display:flex; justify-content:center;"></div>
       </div>
       <div style="width:1px; height:24px; background:var(--border);"></div>
-      <div id="ver-manifest" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
-        <div>Manifest: &mdash;</div>
-        <div class="upgrade-btn" id="upgrade-manifest" style="display:flex; justify-content:center;"></div>
-      </div>
-      <div style="width:1px; height:24px; background:var(--border);"></div>
       <div id="ver-toolbox" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <span id="health-toolbox" class="health-dot unknown" title="checking..."></span>
         <div>toolbox: &mdash;</div>
         <div class="upgrade-btn" id="upgrade-toolbox" style="display:flex; justify-content:center;"></div>
+      </div>
+      <div style="width:1px; height:24px; background:var(--border);"></div>
+      <div id="ver-manifest" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
+        <span id="health-manifest" class="health-dot unknown" title="checking..."></span>
+        <div>Manifest: &mdash;</div>
+        <div class="upgrade-btn" id="upgrade-manifest" style="display:flex; justify-content:center;"></div>
       </div>
     </div>
     <div class="nav">
@@ -756,6 +765,26 @@
       }
     }
 
+
+    // ── Service health dots ───────────────────────────────────────────────────────
+    function setHealthDot(id, healthy) {
+      const dot = document.getElementById(id);
+      if (!dot) return;
+      dot.className = 'health-dot ' + (healthy ? 'healthy' : 'unhealthy');
+      dot.title = healthy ? 'healthy' : 'unreachable or unhealthy';
+    }
+
+    async function refreshHealth() {
+      const data = await safeFetch('/api/service-health');
+      if (!data) return;
+      setHealthDot('health-llama-swap', data.llama_swap);
+      setHealthDot('health-llama-cpp', data.llama_cpp);
+      setHealthDot('health-toolbox', data.toolbox);
+      setHealthDot('health-manifest', data.manifest);
+    }
+
+    setInterval(refreshHealth, 10000);
+    refreshHealth();
 
     setInterval(refresh, 500);
     setInterval(refreshSlow, 30000);
