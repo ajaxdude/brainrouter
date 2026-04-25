@@ -3,7 +3,7 @@
 //! Builds the full prompt from gathered context sections joined by separators.
 //! All string manipulation; no templating engine needed here.
 
-use super::context::{truncate, section_max, ReviewContext};
+use super::context::{truncate, MAX_SECTION_SIZE, ReviewContext};
 
 /// Separator between sections.
 const SEP: &str = "\n\n============================================================\n\n";
@@ -20,20 +20,20 @@ pub fn build_review_prompt(
 
     // 1. PRD
     if let Some(prd) = &ctx.prd {
-        let body = truncate(prd.clone(), section_max());
+        let body = truncate(prd.clone(), MAX_SECTION_SIZE);
         sections.push(format!("# PROJECT REQUIREMENTS DOCUMENT (PRD)\n\n{}", body));
     }
 
     // 2. Git diff
     let diff = ctx.git_diff.trim();
     if !diff.is_empty() {
-        let body = truncate(diff.to_string(), section_max());
+        let body = truncate(diff.to_string(), MAX_SECTION_SIZE);
         sections.push(format!("# GIT DIFF\n\n{}", body));
     }
 
     // 3. Agent contract
     if let Some(agents) = &ctx.agents_content {
-        let body = truncate(agents.clone(), section_max());
+        let body = truncate(agents.clone(), MAX_SECTION_SIZE);
         sections.push(format!("# AGENT CONTRACT (LLAMACPP.md)\n\n{}", body));
     }
 
@@ -52,7 +52,7 @@ pub fn build_review_prompt(
     // 5. Session history
     if !session_history.is_empty() {
         let history = session_history.join("\n\n");
-        let body = truncate(history, section_max());
+        let body = truncate(history, MAX_SECTION_SIZE);
         sections.push(format!("# SESSION HISTORY\n\n{}", body));
     }
 

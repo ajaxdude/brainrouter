@@ -101,15 +101,6 @@ impl Router {
         }
     }
 
-    /// Route a request, returning only the response stream.
-    /// Convenience wrapper over `route_tagged` for callers that don't need RouteInfo.
-    pub async fn route(
-        &self,
-        request: ChatCompletionRequest,
-    ) -> Result<ProviderResponse> {
-        self.route_tagged(request, None, String::new()).await.map(|(resp, _)| resp)
-    }
-
     /// Route a request, returning the response and metadata about the routing decision.
     /// `session_id` tags the emitted RouteEvent (used by the review loop so events are
     /// linkable to review sessions).
@@ -247,11 +238,11 @@ impl Router {
                     ));
                 }
                 Err(e) => {
-                    warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back");
+                    warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back to llama-swap");
                     if e.is_backend_fault {
                         self.health.report_failure(MANIFEST_KEY);
                     }
-                    // fall through to llama-swap
+                    // Always fall through to llama-swap — PRD guarantees automatic fallback.
                 }
             }
         } else {
@@ -426,15 +417,21 @@ fn sanitize_assistant_messages(messages: &mut [ChatMessage]) {
 async fn peek_manifest_model(
     mut stream: crate::provider::SseStream,
 ) -> (crate::provider::SseStream, String) {
-    let first = match stream.next().await {
-        Some(Ok(chunk)) => chunk,
-        // Stream ended before any chunk, or first chunk errored — pass through as-is.
-        Some(Err(e)) => {
+    let first = match tokio::time::timeout(STREAM_STALL_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(chunk))) => chunk,
+        Ok(Some(Err(e))) => {
             let err_stream: crate::provider::SseStream =
                 Box::pin(fstream::once(async move { Err(e) }).chain(stream));
             return (err_stream, "manifest".to_string());
         }
-        None => return (Box::pin(fstream::empty()), "manifest".to_string()),
+        Ok(None) => return (Box::pin(fstream::empty()), "manifest".to_string()),
+        Err(_elapsed) => {
+            // First chunk timed out — surface as a stall error
+            let err: anyhow::Error = anyhow!("Manifest stream stalled before first chunk ({}s timeout)", STREAM_STALL_TIMEOUT.as_secs());
+            let err_stream: crate::provider::SseStream =
+                Box::pin(fstream::once(async move { Err(err) }).chain(stream));
+            return (err_stream, "manifest".to_string());
+        }
     };
 
     // Scan the chunk for a `data: {` line and attempt to pull out `model`.
@@ -484,8 +481,11 @@ fn wrap_with_tracker_clear(
     resp: ProviderResponse,
     tracker: Arc<InferenceTracker>,
 ) -> ProviderResponse {
-    let ProviderResponse::Stream(stream) = resp;
-    ProviderResponse::Stream(Box::pin(TrackerClearStream { stream, tracker }))
+    match resp {
+        ProviderResponse::Stream(stream) => {
+            ProviderResponse::Stream(Box::pin(TrackerClearStream { stream, tracker }))
+        }
+    }
 }
 
 /// Stream wrapper that clears the inference tracker on drop.

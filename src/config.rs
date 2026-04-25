@@ -123,6 +123,14 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     if config.llama_swap.base_url.is_empty() {
         bail!("llama_swap.base_url must not be empty");
     }
+    if !config.llama_swap.base_url.starts_with("http://")
+        && !config.llama_swap.base_url.starts_with("https://")
+    {
+        bail!(
+            "llama_swap.base_url must start with http:// or https://, got: {}",
+            config.llama_swap.base_url
+        );
+    }
     if config.llama_swap.fallback_model.is_empty() {
         bail!("llama_swap.fallback_model must not be empty");
     }
@@ -136,4 +144,15 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     }
 
     Ok(config)
+}
+
+
+/// Default Unix domain socket path for the brainrouter daemon.
+/// Prefers $XDG_RUNTIME_DIR/brainrouter.sock, falls back to /run/brainrouter.sock.
+pub fn default_socket_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(dir).join("brainrouter.sock")
+    } else {
+        PathBuf::from("/run/brainrouter.sock")
+    }
 }

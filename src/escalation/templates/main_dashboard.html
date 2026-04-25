@@ -414,33 +414,31 @@
         return;
       }
 
-      // Group identical prompts close together using linear scan for sliding window.
+      // Group identical prompts using Map for O(1) lookups.
       // Events are newest-first.
-      const deduped = [];
       const rawEvents = events.slice(0, 200);
-      
+      const dedupMap = new Map();
       for (const e of rawEvents) {
-        // For review calls, key by session_id (prompt changes every iteration — dedup by session).
-        // For regular calls, key by prompt content so identical user messages collapse.
         const key = e.session_id
           ? (e.session_id + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''))
           : ((e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''));
         const time = new Date(e.timestamp).getTime();
-        
-        // Use a larger window (10 minutes) for reviews, and 30s for regular chat.
-        const window = e.session_id ? 600000 : 30000;
-        
-        // Find existing match within window (comparing against latest in bucket)
-        const existing = deduped.find(d => d._key === key && Math.abs(new Date(d._last_time).getTime() - time) < window && e.success === d.success);
-        
+        const windowMs = e.session_id ? 600000 : 30000;
+        const mapKey = key + '\x00' + String(e.success);
+        const existing = dedupMap.get(mapKey);
         if (existing) {
-           existing._count++;
-           existing._total_latency = (existing._total_latency || existing.latency_ms) + e.latency_ms;
+          if (Math.abs(new Date(existing._last_time).getTime() - time) < windowMs) {
+            existing._count++;
+            existing._total_latency = (existing._total_latency || existing.latency_ms) + e.latency_ms;
+          }
+          // Outside window: skip this event (preserve the first/newest entry)
         } else {
-          deduped.push({ ...e, _key: key, _count: 1, _last_time: e.timestamp, _total_latency: e.latency_ms });
+          const entry = { ...e, _key: key, _count: 1, _last_time: e.timestamp, _total_latency: e.latency_ms };
+          dedupMap.set(mapKey, entry);
         }
-        if (deduped.length >= 50) break;
+        if (dedupMap.size >= 50) break;
       }
+      const deduped = Array.from(dedupMap.values());
 
 
       const activeStatus = window.currentInferenceStatus;

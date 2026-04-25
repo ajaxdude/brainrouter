@@ -4,10 +4,11 @@
 //! failed chat completion call records a snapshot of what happened, enabling
 //! the dashboard to show a timeline of model selections over time.
 //!
-//! MaxEvents = 500 entries; oldest are dropped via shift when full.
+//! MaxEvents = 500 entries; oldest are dropped via pop_front when full.
 
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::VecDeque;
 
 /// Maximum number of events retained before dropping the oldest.
 const MAX_EVENTS: usize = 500;
@@ -61,8 +62,12 @@ pub struct RouteEvent {
 
 /// Thread-safe in-memory circular buffer.
 pub struct RoutingEvents {
-    events: std::sync::Mutex<Vec<RouteEvent>>,
-    counter: std::sync::Mutex<u64>,
+    inner: std::sync::Mutex<Inner>,
+}
+
+struct Inner {
+    events: VecDeque<RouteEvent>,
+    counter: u64,
 }
 
 /// JSON wrapper for the /api/routing-events endpoint.
@@ -80,31 +85,32 @@ impl Default for RoutingEvents {
 impl RoutingEvents {
     pub fn new() -> Self {
         Self {
-            events: std::sync::Mutex::new(Vec::with_capacity(MAX_EVENTS)),
-            counter: std::sync::Mutex::new(0),
+            inner: std::sync::Mutex::new(Inner {
+                events: VecDeque::with_capacity(MAX_EVENTS),
+                counter: 0,
+            }),
         }
     }
 
     /// Emit a new event into the buffer. Oldest entries are dropped when full.
     pub fn emit(&self, mut event: RouteEvent) {
-        let mut counter = self.counter.lock().unwrap();
-        *counter += 1;
-        event.id = *counter;
+        let mut inner = self.inner.lock().unwrap();
+        inner.counter += 1;
+        event.id = inner.counter;
         event.timestamp = Utc::now().to_rfc3339();
-
-        let mut events = self.events.lock().unwrap();
-        events.push(event);
-        while events.len() > MAX_EVENTS {
-            events.remove(0);
+        inner.events.push_back(event);
+        while inner.events.len() > MAX_EVENTS {
+            inner.events.pop_front();
         }
     }
 
-    /// Return all events sorted newest-first for dashboard rendering.
+    /// Return all events newest-first for dashboard rendering.
+    ///
+    /// Events are appended under a single Mutex, so insertion order matches
+    /// wall-clock order. Reversing the deque yields newest-first without sorting.
     pub fn get_all(&self) -> Vec<RouteEvent> {
-        let events = self.events.lock().unwrap();
-        let mut list: Vec<_> = events.iter().cloned().collect();
-        list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        list
+        let inner = self.inner.lock().unwrap();
+        inner.events.iter().rev().cloned().collect()
     }
 
     /// Wrap events in the HTTP response envelope.
@@ -114,7 +120,8 @@ impl RoutingEvents {
 
     /// Aggregate statistics over all events — used by the stat-cards row.
     pub fn get_stats(&self) -> EventStats {
-        let events = self.events.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let events = &inner.events;
         if events.is_empty() {
             return EventStats::default();
         }

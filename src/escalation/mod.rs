@@ -21,7 +21,6 @@ use crate::{
 };
 
 // Embed templates at compile time so the binary is self-contained.
-const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
 const SESSION_HTML: &str = include_str!("templates/session.html");
 
 /// Handle all /review/* requests. Called from the main request dispatcher.
@@ -34,8 +33,18 @@ pub async fn handle_review_request(
     let path = req.uri().path().to_string();
 
     let response = match (method, path.as_str()) {
-        // Dashboard
-        ("GET", "/review/" | "/review") => html_response(DASHBOARD_HTML),
+        // Review dashboard — redirect to unified dashboard
+        ("GET", "/review/" | "/review") => {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/dashboard")
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e: Infallible| match e {})
+                        .boxed_unsync(),
+                )
+                .expect("Failed to build redirect")
+        }
 
         // Session detail page
         ("GET", p) if p.starts_with("/review/session/") && !p.ends_with("/resolve") => {
@@ -86,8 +95,6 @@ async fn handle_request_review(
     review_service: Arc<ReviewService>,
     cwd: String,
 ) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    use http_body_util::BodyExt;
-
     // Read body
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
@@ -159,8 +166,6 @@ async fn handle_api_resolve(
     req: Request<Incoming>,
     review_service: Arc<ReviewService>,
 ) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    use http_body_util::BodyExt;
-
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Failed to read body: {}", e)),
@@ -189,8 +194,6 @@ async fn handle_resolve(
     review_service: Arc<ReviewService>,
     session_id: String,
 ) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    use http_body_util::BodyExt;
-
     // Read body
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
@@ -232,7 +235,7 @@ fn html_response(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Er
         .header("content-type", "text/html; charset=utf-8")
         .body(
             Full::new(Bytes::from_static(html.as_bytes()))
-                .map_err(|_| unreachable!())
+                .map_err(|e: std::convert::Infallible| match e {})
                 .boxed_unsync(),
         )
         .expect("Failed to build HTML response")
@@ -245,7 +248,7 @@ fn json_ok<T: Serialize>(body: &T) -> Response<UnsyncBoxBody<Bytes, anyhow::Erro
         .header("content-type", "application/json")
         .body(
             Full::new(Bytes::from(json))
-                .map_err(|_| unreachable!())
+                .map_err(|e: std::convert::Infallible| match e {})
                 .boxed_unsync(),
         )
         .expect("Failed to build JSON response")
@@ -259,7 +262,7 @@ fn json_error(status: StatusCode, message: &str) -> Response<UnsyncBoxBody<Bytes
         .header("content-type", "application/json")
         .body(
             Full::new(Bytes::from(json))
-                .map_err(|_| unreachable!())
+                .map_err(|e: std::convert::Infallible| match e {})
                 .boxed_unsync(),
         )
         .expect("Failed to build error response")

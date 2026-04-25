@@ -3,7 +3,7 @@
 use std::process::Command;
 
 const MAX_FILE_SIZE: usize = 200 * 1024; // 200 KB
-const MAX_SECTION_SIZE: usize = 150 * 1024; // 150 KB per section (enough for a large diff)
+pub(crate) const MAX_SECTION_SIZE: usize = 150 * 1024; // 150 KB per section
 
 /// Gathered context for a single review pass.
 pub struct ReviewContext {
@@ -13,7 +13,7 @@ pub struct ReviewContext {
 }
 
 /// Detect and read the PRD file from common paths relative to project_dir.
-pub fn load_prd(project_dir: &str) -> Option<String> {
+fn load_prd(project_dir: &str) -> Option<String> {
     let candidates = ["docs/PRD.md", "PRD.md", "README.md"];
     for candidate in &candidates {
         let path = if project_dir.is_empty() {
@@ -30,7 +30,7 @@ pub fn load_prd(project_dir: &str) -> Option<String> {
 
 /// Run `git diff HEAD` to collect unstaged + staged changes.
 /// Returns empty string if not in a git repo or git is unavailable.
-pub fn load_git_diff(project_dir: &str) -> String {
+fn load_git_diff(project_dir: &str) -> String {
     let mut cmd = Command::new("git");
     // Collect unstaged + staged changes. Exclude README.md because it is often large and 
     // crowds out actual code changes in the review prompt.
@@ -52,7 +52,7 @@ pub fn load_git_diff(project_dir: &str) -> String {
 /// 
 /// Note: This does not take project_dir because the agent contract is 
 /// user-wide configuration, not project-specific.
-pub fn load_agents() -> Option<String> {
+fn load_agents() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{}/.omp/agent/LLAMACPP.md", home);
     std::fs::read_to_string(&path).ok()
@@ -68,26 +68,22 @@ pub fn gather(project_dir: &str) -> ReviewContext {
 }
 
 /// Truncate `text` to `max` bytes, appending a warning note if truncated.
-pub fn truncate(text: String, max: usize) -> String {
+pub(crate) fn truncate(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
     let original_kb = text.len() / 1024;
-    let mut new_len = max;
+    let warning = format!(
+        "\n\n[WARNING: truncated to {}KB; original was {}KB]",
+        max / 1024,
+        original_kb
+    );
+    let mut new_len = max.saturating_sub(warning.len());
     while !text.is_char_boundary(new_len) && new_len > 0 {
         new_len -= 1;
     }
     let mut out = text;
     out.truncate(new_len);
-    out.push_str(&format!(
-        "\n\n[WARNING: truncated to {}KB; original was {}KB]",
-        max / 1024,
-        original_kb
-    ));
+    out.push_str(&warning);
     out
-}
-
-/// Per-section truncation limit.
-pub fn section_max() -> usize {
-    MAX_SECTION_SIZE
 }

@@ -133,7 +133,7 @@ pub async fn run_loop(
                                 feedback: Some(feedback.clone()),
                                 reviewer_type: Some(ReviewerType::Llm),
                                 escalation_reason: if status == ReviewStatus::Escalated {
-                                    Some(EscalationReason::LlmError)
+                                    Some(EscalationReason::LlmEscalated)
                                 } else {
                                     None
                                 },
@@ -256,35 +256,64 @@ async fn call_llm_for_review(
     use crate::provider::ProviderResponse;
     use futures_util::StreamExt;
 
-    let ProviderResponse::Stream(mut stream) = provider_response;
-    let mut collected = String::new();
+    match provider_response {
+        ProviderResponse::Stream(mut stream) => {
+            let mut collected = String::new();
+            let mut byte_buf = Vec::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        // Each chunk is a bytes::Bytes SSE line like "data: {...}\n\n"
-        let text = std::str::from_utf8(&chunk)?;
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if json_str == "[DONE]" {
-                    break;
-                }
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(content) = parsed
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        collected.push_str(content);
+            'outer: while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result?;
+                byte_buf.extend_from_slice(&chunk);
+
+                // Process all complete lines from the buffer
+                while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes = byte_buf.drain(..=newline_pos).collect::<Vec<_>>();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let line = line.trim();
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str == "[DONE]" {
+                            byte_buf.clear();
+                            break 'outer;
+                        }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let Some(content) = parsed
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c.get("delta"))
+                                .and_then(|d| d.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                collected.push_str(content);
+                            }
+                        }
                     }
                 }
             }
+
+            // Process any remaining bytes in the buffer
+            if !byte_buf.is_empty() {
+                let line = String::from_utf8_lossy(&byte_buf);
+                let line = line.trim();
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if json_str != "[DONE]" {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let Some(content) = parsed
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c.get("delta"))
+                                .and_then(|d| d.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                collected.push_str(content);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok((collected, route_info))
         }
     }
-
-    Ok((collected, route_info))
 }
 
 /// Extract JSON from LLM response text (may be wrapped in markdown code fences).

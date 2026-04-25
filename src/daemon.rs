@@ -35,12 +35,15 @@ pub struct ServeArgs {
     pub tcp_addr: String,
 
     /// Unix domain socket path.
-    #[arg(long, default_value = "/run/brainrouter.sock")]
-    pub socket: PathBuf,
+    /// Defaults to $XDG_RUNTIME_DIR/brainrouter.sock (or /run/brainrouter.sock).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
 }
 
 /// Entry point for `brainrouter serve`.
 pub async fn run(args: ServeArgs) -> Result<()> {
+    let socket = args.socket.unwrap_or_else(config::default_socket_path);
+
     // Config
     let config = config::load(&args.config).with_context(|| {
         format!("Failed to load config from {}", args.config.display())
@@ -54,7 +57,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     info!(
         config_path = %args.config.display(),
         tcp_addr = %tcp_addr,
-        uds_path = %args.socket.display(),
+        uds_path = %socket.display(),
         manifest_url = %config.manifest.base_url,
         llama_swap_url = %config.llama_swap.base_url,
         fallback_model = %config.llama_swap.fallback_model,
@@ -185,7 +188,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     });
 
     // Server (TCP + UDS)
-    server::run(tcp_addr, args.socket, state).await?;
+    server::run(tcp_addr, socket, state).await?;
 
     Ok(())
 }

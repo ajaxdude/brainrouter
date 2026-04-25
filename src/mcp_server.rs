@@ -19,8 +19,9 @@ use tracing::{error, info};
 #[derive(Args)]
 pub struct McpArgs {
     /// Path to the Unix domain socket used to reach the daemon.
-    #[arg(long, default_value = "/run/brainrouter.sock")]
-    pub socket: PathBuf,
+    /// Defaults to $XDG_RUNTIME_DIR/brainrouter.sock (or /run/brainrouter.sock).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
 }
 
 /// Entry point for `brainrouter mcp`.
@@ -29,13 +30,14 @@ pub struct McpArgs {
 /// crate dependency. The rmcp crate will be added in Phase 3; this
 /// implementation is fully functional in the meantime.
 pub async fn run(args: McpArgs) -> Result<()> {
-    info!(socket = %args.socket.display(), "Starting brainrouter MCP server");
+    let socket = args.socket.unwrap_or_else(brainrouter::config::default_socket_path);
+    info!(socket = %socket.display(), "Starting brainrouter MCP server");
 
     // Verify the daemon socket is reachable before starting the protocol loop
-    if !args.socket.exists() {
+    if !socket.exists() {
         bail!(
             "Daemon socket not found at {}. Is `brainrouter serve` running?",
-            args.socket.display()
+            socket.display()
         );
     }
 
@@ -67,7 +69,7 @@ pub async fn run(args: McpArgs) -> Result<()> {
             }
         };
 
-        let response = handle_message(&args.socket, msg).await;
+        let response = handle_message(&socket, msg).await;
         // Notifications return Value::Null — skip writing a response for them.
         if response.is_null() {
             continue;
@@ -173,10 +175,10 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
 async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result<Value> {
     match tool {
         "request_review" => {
-            http_uds_request(socket_path, "/review/api/request", args).await
+            http_uds_request(socket_path, "POST", "/review/api/request", args).await
         }
         "get_session_list" => {
-            http_uds_request(socket_path, "/review/api/sessions", json!({})).await
+            http_uds_request(socket_path, "GET", "/review/api/sessions", json!({})).await
         }
         "get_session_details" => {
             let session_id = args
@@ -184,18 +186,23 @@ async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result
                 .and_then(|v| v.as_str())
                 .context("missing sessionId")?
                 .to_string();
+            // Validate session_id to prevent path traversal
+            if !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                bail!("Invalid sessionId: must be alphanumeric, dashes, or underscores");
+            }
             let path = format!("/review/api/sessions/{}", session_id);
-            http_uds_request(socket_path, &path, json!({})).await
+            http_uds_request(socket_path, "GET", &path, json!({})).await
         }
         "resolve_session" => {
-            http_uds_request(socket_path, "/review/api/resolve", args).await
+            http_uds_request(socket_path, "POST", "/review/api/resolve", args).await
         }
         _ => bail!("Unknown tool: {}", tool),
     }
 }
 
 /// Make an HTTP request over the Unix domain socket.
-async fn http_uds_request(socket_path: &PathBuf, path: &str, body: Value) -> Result<Value> {
+async fn http_uds_request(socket_path: &PathBuf, method: &str, path: &str, body: Value) -> Result<Value> {
+    use tokio::io::AsyncReadExt;
     use tokio::net::UnixStream;
 
     let stream = UnixStream::connect(socket_path)
@@ -203,20 +210,20 @@ async fn http_uds_request(socket_path: &PathBuf, path: &str, body: Value) -> Res
         .with_context(|| format!("Cannot connect to daemon socket at {}", socket_path.display()))?;
 
     let body_bytes = serde_json::to_vec(&body)?;
-    let method = if body_bytes == b"{}" { "GET" } else { "POST" };
 
-    let request = format!(
-        "{} {} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        method,
-        path,
-        body_bytes.len()
-    );
+    let request = if method == "GET" {
+        format!("{} {} HTTP/1.0\r\nHost: localhost\r\n\r\n", method, path)
+    } else {
+        format!(
+            "{} {} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            method, path, body_bytes.len()
+        )
+    };
 
-    use tokio::io::AsyncReadExt;
     let (mut rx, mut tx) = stream.into_split();
 
     tx.write_all(request.as_bytes()).await?;
-    if method == "POST" {
+    if method != "GET" {
         tx.write_all(&body_bytes).await?;
     }
     // Keep tx alive until we finish reading — dropping it before read_to_end
@@ -225,12 +232,27 @@ async fn http_uds_request(socket_path: &PathBuf, path: &str, body: Value) -> Res
     rx.read_to_end(&mut response_bytes).await?;
     drop(tx);
 
-    // Strip HTTP headers — find \r\n\r\n
+    // Parse HTTP response
     let response_str = String::from_utf8_lossy(&response_bytes);
     let body_start = response_str
         .find("\r\n\r\n")
         .map(|i| i + 4)
         .unwrap_or(0);
+
+    // Check HTTP status code numerically
+    let status_line = response_str.lines().next().unwrap_or("");
+    if status_line.starts_with("HTTP/") {
+        let status_ok = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|code| (200..300).contains(&code))
+            .unwrap_or(false);
+        if !status_ok {
+            let body_preview: String = response_str[body_start..].chars().take(500).collect();
+            bail!("Daemon returned error: {} — body: {}", status_line.trim(), body_preview);
+        }
+    }
 
     let json_body = &response_bytes[body_start..];
     let result: Value = serde_json::from_slice(json_body)

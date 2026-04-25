@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 use uuid::Uuid;
 
@@ -44,6 +44,8 @@ impl std::fmt::Display for ReviewStatus {
 pub enum EscalationReason {
     MaxIterations,
     LlmError,
+    /// LLM voluntarily returned "escalated" status (not an error).
+    LlmEscalated,
     ConnectionFailed,
 }
 
@@ -202,6 +204,3 @@ impl SessionManager {
         self.sessions.lock().unwrap().remove(id);
     }
 }
-
-/// Shared handle passed around by the daemon.
-pub type SharedSessionManager = Arc<SessionManager>;

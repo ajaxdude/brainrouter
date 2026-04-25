@@ -4,7 +4,10 @@
 // These helpers resolve paths relative to $HOME at runtime.
 
 fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+    std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::warn!("$HOME is not set; upgrade and version-check paths will resolve under /root");
+        "/root".to_string()
+    })
 }
 
 /// Resolve a binary name relative to ~/.local/bin, falling back to PATH.
@@ -39,6 +42,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, error, info, warn};
+use std::sync::LazyLock;
+
+/// Shared HTTP client for lightweight polling and version checks.
+/// Each call site sets its own `.timeout()` on the request builder.
+static VERSION_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent("brainrouter")
+        .build()
+        .expect("Failed to build HTTP client")
+});
 
 use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
 use crate::escalation;
@@ -106,16 +119,20 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<By
         .expect("Failed to build response")
 }
 
+/// Convert a `Response<Full<Bytes>>` into the handler return type.
+/// `Full<Bytes>` is infallible, so the error mapping is a compile-time proof.
+fn into_unsync(resp: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    resp.map(|body| body.map_err(|e: Infallible| match e {}).boxed_unsync())
+}
+
 fn html_ok(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(
-            Full::new(Bytes::from_static(html.as_bytes()))
-                .map_err(|_| unreachable!())
-                .boxed_unsync(),
-        )
-        .expect("Failed to build HTML response")
+    into_unsync(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::from_static(html.as_bytes())))
+            .expect("Failed to build HTML response"),
+    )
 }
 
 /// Handle incoming HTTP requests
@@ -142,7 +159,7 @@ async fn handle_request(
                 StatusCode::FORBIDDEN,
                 &ErrorResponse { error: "Destructive APIs only allowed from localhost".to_string() },
             );
-            return Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))));
+            return Ok(into_unsync(resp));
         }
         
         // Anti-CSRF: Check Origin/Referer for browser-originated POSTs.
@@ -163,7 +180,7 @@ async fn handle_request(
                 StatusCode::FORBIDDEN,
                 &ErrorResponse { error: "CSRF protection: Invalid Origin/Referer".to_string() },
             );
-            return Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))));
+            return Ok(into_unsync(resp));
         }
     }
 
@@ -176,7 +193,7 @@ async fn handle_request(
     let response = match (method, path) {
         ("GET", "/health") => {
             let resp = json_response(StatusCode::OK, &HealthResponse { status: "ok" });
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("GET", "/v1/models") => {
@@ -189,7 +206,7 @@ async fn handle_request(
                 ],
             };
             let resp = json_response(StatusCode::OK, &models);
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/v1/chat/completions") => {
@@ -201,7 +218,7 @@ async fn handle_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
-                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                    into_unsync(resp)
                 }
             }
         }
@@ -215,7 +232,7 @@ async fn handle_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
-                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                    into_unsync(resp)
                 }
             }
         }
@@ -227,7 +244,7 @@ async fn handle_request(
                 .header("location", "/dashboard")
                 .body(Full::new(Bytes::new()))
                 .expect("Failed to build redirect");
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── Unified dashboard ──────────────────────────────────────────────────
@@ -239,7 +256,7 @@ async fn handle_request(
                 .header("content-type", "image/svg+xml")
                 .body(Full::new(Bytes::from_static(FAVICON_SVG)))
                 .expect("Failed to build favicon response");
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("GET", "/logo.svg") => {
@@ -248,45 +265,45 @@ async fn handle_request(
                 .header("content-type", "image/svg+xml")
                 .body(Full::new(Bytes::from_static(LOGO_SVG)))
                 .expect("Failed to build logo response");
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── Routing events API ─────────────────────────────────────────────────
         ("GET", "/api/routing-events") => {
             let resp = json_response(StatusCode::OK, &state.routing_events.get_all_as_response());
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("GET", "/api/routing-stats") => {
             let resp = json_response(StatusCode::OK, &state.routing_events.get_stats());
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── Inference status API (polls llama-swap + llama-server) ────────────
         ("GET", "/api/inference-status") => {
             let resp = inference_status(&state.router.inference_tracker, &state.llama_swap_url).await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── Service restart API ────────────────────────────────────────────────
         ("POST", "/api/restart/llama-swap") => {
             let resp = restart_service("llama-swap").await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/restart/llama-cpp") => {
             let resp = restart_llama_cpp(state.llama_cpp_restart_script.as_deref()).await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/restart/manifest") => {
             let resp = restart_service("manifest").await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/restart/brainrouter") => {
             let resp = restart_service("brainrouter").await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── System versions API ───────────────────────────────────────────────
@@ -299,31 +316,31 @@ async fn handle_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
-                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                    into_unsync(resp)
                 }
             }
         }
 
         ("POST", "/api/upgrade/llama-swap") => {
             let resp = upgrade_llama_swap().await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/upgrade/manifest") => {
             let resp = upgrade_manifest().await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/upgrade/toolbox") => {
             let resp = upgrade_toolbox().await;
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         // ── Review mode API ──────────────────────────────────────────────────
         ("GET", "/api/review-config") => {
             let config = &state.review_service.get_config();
             let resp = json_response(StatusCode::OK, config);
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
 
         ("POST", "/api/review-config") => {
@@ -335,7 +352,7 @@ async fn handle_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
-                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                    into_unsync(resp)
                 }
             }
         }
@@ -349,7 +366,7 @@ async fn handle_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
                     );
-                    resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+                    into_unsync(resp)
                 }
             }
         }
@@ -359,7 +376,7 @@ async fn handle_request(
                 StatusCode::NOT_FOUND,
                 &ErrorResponse { error: format!("Not found: {} {}", method, path) },
             );
-            resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!())))
+            into_unsync(resp)
         }
     };
 
@@ -515,10 +532,7 @@ async fn inference_status(
 /// Poll llama-swap /running for the active model's name, display name, and state.
 async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String, String)> {
     let url = format!("{}/running", llama_swap_url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build().ok()?;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = VERSION_CLIENT.get(&url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     let entry = data.get("running")?.as_array()?.first()?;
     let name = entry.get("model")?.as_str()?.to_string();
@@ -530,18 +544,15 @@ async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String
 /// Poll the active llama-server's /slots endpoint for processing state.
 /// Returns (is_processing, n_decoded) if reachable.
 async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build().ok()?;
     // First get the proxy URL from /running
     let running_url = format!("{}/running", llama_swap_url);
-    let resp = client.get(&running_url).send().await.ok()?;
+    let resp = VERSION_CLIENT.get(&running_url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     let entry = data.get("running")?.as_array()?.first()?;
     let proxy = entry.get("proxy")?.as_str()?;
     // Then poll /slots on the model's port
     let slots_url = format!("{}/slots", proxy);
-    let resp = client.get(&slots_url).send().await.ok()?;
+    let resp = VERSION_CLIENT.get(&slots_url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
     let slots: serde_json::Value = resp.json().await.ok()?;
     let slot = slots.as_array()?.first()?;
     let is_proc = slot.get("is_processing")?.as_bool()?;
@@ -640,7 +651,8 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     use tokio::process::Command;
 
     // 1. Get llama-swap version
-    // First try the --version flag
+    // --version is reliable in all current llama-swap releases; the fragile
+    // `strings` binary-scraping fallback has been removed.
     let swap_out = Command::new(home_bin("llama-swap"))
             .arg("--version")
         .output()
@@ -652,27 +664,6 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         }
         _ => String::new(),
     };
-
-    // If --version failed (common in newer builds that removed the flag), 
-    // try to extract version from build info via strings
-    if swap_ver.is_empty() {
-        let strings_out = Command::new("strings")
-                    .arg(home_bin("llama-swap"))
-            .output()
-            .await;
-            
-        if let Ok(out) = strings_out {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // Look for version tag like v0.1.5
-            if let Some(line) = s.lines().find(|l| l.contains("github.com/mostlygeek/llama-swap") && (l.contains("v0.") || l.contains("v1."))) {
-                // Example: mod github.com/mostlygeek/llama-swap v0.1.5 h1:...
-                swap_ver = line.split_whitespace()
-                    .find(|part| part.starts_with('v') && part.contains('.'))
-                    .unwrap_or(line)
-                    .to_string();
-            }
-        }
-    }
     
     if swap_ver.is_empty() {
         swap_ver = "unknown".to_string();
@@ -789,15 +780,11 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     });
 
     let resp = json_response(StatusCode::OK, &data);
-    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
+    Ok(into_unsync(resp))
 }
 
 async fn check_latest_llama_swap() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("brainrouter")
-        .timeout(std::time::Duration::from_secs(3))
-        .build().ok()?;
-    let resp = client.get("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
+    let resp = VERSION_CLIENT.get("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     data.get("tag_name").and_then(|v| v.as_str()).map(|v| v.trim_start_matches('v').to_string())
@@ -806,11 +793,7 @@ async fn check_latest_llama_swap() -> Option<String> {
 /// Fetch the remote manifest Docker Hub tag's last-pushed date (used as a proxy for
 /// "new version available"). Returns the ISO date string (first 10 chars) or None.
 async fn check_latest_manifest() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("brainrouter")
-        .timeout(std::time::Duration::from_secs(3))
-        .build().ok()?;
-    let resp = client.get("https://hub.docker.com/v2/repositories/manifestdotbuild/manifest/tags/latest")
+    let resp = VERSION_CLIENT.get("https://hub.docker.com/v2/repositories/manifestdotbuild/manifest/tags/latest")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     // tag_last_pushed looks like "2026-04-23T23:27:27.60508Z"
@@ -821,11 +804,7 @@ async fn check_latest_manifest() -> Option<String> {
 
 /// Fetch the remote toolbox image tag's last-pushed date.
 async fn check_latest_toolbox() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("brainrouter")
-        .timeout(std::time::Duration::from_secs(3))
-        .build().ok()?;
-    let resp = client.get("https://hub.docker.com/v2/repositories/kyuz0/amd-strix-halo-toolboxes/tags/vulkan-radv")
+    let resp = VERSION_CLIENT.get("https://hub.docker.com/v2/repositories/kyuz0/amd-strix-halo-toolboxes/tags/vulkan-radv")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     data.get("tag_last_pushed")
@@ -901,7 +880,6 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
     // 4. Extract the binary from the tarball via spawn_blocking (CPU-bound, sync)
     let target_bin_clone = target_bin.clone();
     let extract_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        use std::io::Read;
         let cursor = std::io::Cursor::new(tarball_bytes.as_ref());
         let gz = flate2::read::GzDecoder::new(cursor);
         let mut archive = tar::Archive::new(gz);
@@ -1088,22 +1066,18 @@ async fn handle_update_review_config(
     service.update_config(update).await;
     
     let resp = json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" }));
-    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
+    Ok(into_unsync(resp))
 }
 
 async fn handle_llama_swap_models(
     llama_swap_url: &str,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?;
-        
     let url = format!("{}/v1/models", llama_swap_url);
-    let resp = client.get(&url).send().await?;
+    let resp = VERSION_CLIENT.get(&url).timeout(std::time::Duration::from_secs(3)).send().await?;
     let data: serde_json::Value = resp.json().await?;
     
     let resp = json_response(StatusCode::OK, &data);
-    Ok(resp.map(|body| BodyExt::boxed_unsync(body.map_err(|_| unreachable!()))))
+    Ok(into_unsync(resp))
 }
 
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)
