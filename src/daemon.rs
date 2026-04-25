@@ -111,25 +111,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         });
 
-    // Operational safety: Validate toolbox restart script path if configured
-    if let Some(ref script) = config.llama_swap.llama_cpp_restart_script {
-        let path = std::path::Path::new(script);
-        if !path.exists() {
-            warn!(path = %script, "llama_cpp_restart_script path does not exist; toolbox restart will fail");
-        } else {
-            // Executable bit check is Unix-only; on other platforms only path existence is verified.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    if metadata.mode() & 0o111 == 0 {
-                        warn!(path = %script, "llama_cpp_restart_script is not executable; toolbox restart will fail");
-                    }
-                }
-            }
-        }
-    }
-
     // Warn if $HOME is unset — upgrade and version-check paths fall back to /root.
     if std::env::var("HOME").is_err() {
         warn!("$HOME is not set; upgrade paths will fall back to /root. Set HOME in the service environment if running as a non-root system user.");
@@ -190,7 +171,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         review_service,
         routing_events,
         llama_swap_url,
-        llama_cpp_restart_script: config.llama_swap.llama_cpp_restart_script,
         manifest_url,
     });
 

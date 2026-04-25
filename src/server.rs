@@ -77,8 +77,6 @@ pub struct AppState {
     pub routing_events: Arc<RoutingEvents>,
     /// llama-swap root URL (without /v1 suffix) for status polling.
     pub llama_swap_url: String,
-    /// Path to the script that restarts the llama.cpp toolbox.
-    pub llama_cpp_restart_script: Option<String>,
     /// Manifest base URL for health checking.
     pub manifest_url: String,
 }
@@ -300,7 +298,7 @@ async fn handle_request(
         }
 
         ("POST", "/api/restart/llama-cpp") => {
-            let resp = restart_llama_cpp(state.llama_cpp_restart_script.as_deref()).await;
+            let resp = restart_llama_cpp().await;
             into_unsync(resp)
         }
 
@@ -635,43 +633,36 @@ async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
     Some((is_proc, n_decoded))
 }
 
-/// Restart the llama.cpp toolbox container.
-async fn restart_llama_cpp(script_path: Option<&str>) -> Response<Full<Bytes>> {
-    let script_path = match script_path {
-        Some(p) => p,
-        None => {
-            return json_response(
-                StatusCode::NOT_IMPLEMENTED,
-                &ErrorResponse { error: "llama_cpp_restart_script not configured in brainrouter.yaml".to_string() },
-            );
-        }
-    };
-    info!("Restarting llama-vulkan-radv toolbox via {}...", script_path);
-    let output = tokio::process::Command::new(script_path)
-        .arg("llama-vulkan-radv")
+/// Restart the llama.cpp toolbox by restarting llama-swap.
+/// llama-swap manages the toolbox container lifecycle; restarting it
+/// kills the current model and lets llama-swap spawn fresh on next request.
+async fn restart_llama_cpp() -> Response<Full<Bytes>> {
+    info!("Restarting llama.cpp toolbox via llama-swap restart");
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", "llama-swap"])
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
-            info!("Toolbox refreshed successfully");
+            info!("llama-swap restarted (toolbox will reload on next request)");
             json_response(StatusCode::OK, &serde_json::json!({
                 "status": "ok",
                 "service": "llama-cpp",
-                "message": "llama-vulkan-radv toolbox refreshed"
+                "message": "llama-swap restarted — toolbox will reload on next model request"
             }))
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(%stderr, "Toolbox refresh failed");
+            error!(%stderr, "llama-swap restart failed");
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Refresh failed: {}", stderr.trim()),
+                error: format!("Restart failed: {}", stderr.trim()),
             })
         }
         Err(e) => {
-            error!(error = %e, "Failed to exec refresh script");
+            error!(error = %e, "Failed to exec systemctl");
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec refresh script {}: {}", script_path, e),
+                error: format!("Failed to exec systemctl: {}", e),
             })
         }
     }
