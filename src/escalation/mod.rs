@@ -67,6 +67,16 @@ pub async fn handle_review_request(
             handle_api_resolve(req, review_service).await
         }
 
+        // JSON API — continue iterating (additional LLM rounds, no human feedback needed)
+        ("POST", "/review/api/continue") => {
+            handle_continue_review(req, review_service).await
+        }
+
+        // JSON API — quick approve (LGTM, no feedback needed)
+        ("POST", "/review/api/lgtm") => {
+            handle_lgtm(req, review_service).await
+        }
+
         // JSON API — session list
         ("GET", "/review/api/sessions") => {
             let sessions = review_service.session_manager().list_sessions();
@@ -216,6 +226,70 @@ async fn handle_resolve(
 
     match review_service.resolve_session(&session_id, body.feedback.trim().to_string()) {
         Ok(()) => json_ok(&serde_json::json!({ "success": true, "session_id": session_id })),
+        Err(e) => json_error(StatusCode::NOT_FOUND, &e.to_string()),
+    }
+}
+
+async fn handle_continue_review(
+    req: Request<Incoming>,
+    review_service: Arc<ReviewService>,
+) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    use http_body_util::BodyExt;
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Failed to read body: {}", e)),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ContinueBody {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(default = "default_extra_iterations")]
+        iterations: u32,
+    }
+    fn default_extra_iterations() -> u32 { 4 }
+
+    let body: ContinueBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)),
+    };
+
+    match review_service.continue_review(&body.session_id, body.iterations).await {
+        Ok(result) => json_ok(&serde_json::json!({
+            "status": result.status.as_str(),
+            "feedback": result.feedback,
+            "sessionId": result.session_id,
+            "iterationCount": result.iteration_count,
+        })),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn handle_lgtm(
+    req: Request<Incoming>,
+    review_service: Arc<ReviewService>,
+) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    use http_body_util::BodyExt;
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Failed to read body: {}", e)),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct LgtmBody {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    }
+
+    let body: LgtmBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)),
+    };
+
+    match review_service.resolve_session(&body.session_id, "lgtm".to_string()) {
+        Ok(()) => json_ok(&serde_json::json!({ "success": true, "sessionId": body.session_id })),
         Err(e) => json_error(StatusCode::NOT_FOUND, &e.to_string()),
     }
 }

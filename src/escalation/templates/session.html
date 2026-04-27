@@ -18,8 +18,13 @@
     section h2 { font-size: 0.9rem; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
     .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; font-size: 0.875rem; }
     .escalation-form textarea { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; padding: 12px; font-size: 0.875rem; font-family: inherit; resize: vertical; min-height: 100px; }
-    .escalation-form button { margin-top: 12px; padding: 8px 20px; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 0.875rem; font-weight: 600; cursor: pointer; }
-    .escalation-form button:hover { background: #2ea043; }
+    .btn-row { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
+    .btn-row button { padding: 8px 20px; border: none; border-radius: 6px; font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+    .btn-row button:hover { opacity: 0.85; }
+    .btn-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-feedback { background: #da3633; color: #fff; }
+    .btn-continue { background: #d29922; color: #fff; }
+    .btn-lgtm { background: #238636; color: #fff; }
     .back { display: inline-block; margin-bottom: 16px; color: #388bfd; text-decoration: none; font-size: 0.875rem; }
     .back:hover { text-decoration: underline; }
     #status-msg { margin-top: 12px; font-size: 0.875rem; }
@@ -58,8 +63,12 @@
   <section id="resolve-section">
     <h2>Resolve (Human Review)</h2>
     <div class="escalation-form">
-      <textarea id="feedback-input" placeholder="Enter your feedback. Start with 'ok', 'lgtm', or 'approved' to approve."></textarea>
-      <button onclick="submitFeedback()">Submit Feedback</button>
+      <textarea id="feedback-input" placeholder="Write your feedback here (required for Send Feedback)."></textarea>
+      <div class="btn-row">
+        <button class="btn-feedback" onclick="submitFeedback()">Send Feedback</button>
+        <button class="btn-continue" onclick="continueIterating()">Continue Iterating</button>
+        <button class="btn-lgtm" onclick="submitLgtm()">LGTM</button>
+      </div>
       <div id="status-msg"></div>
     </div>
   </section>
@@ -102,12 +111,17 @@
       }
     }
 
+    function disableButtons() {
+      document.querySelectorAll('.btn-row button').forEach(b => b.disabled = true);
+    }
+
     async function submitFeedback() {
       const feedback = document.getElementById('feedback-input').value.trim();
-      if (!feedback) { alert('Please enter feedback.'); return; }
+      if (!feedback) { alert('Please enter your feedback before submitting.'); return; }
 
       const msg = document.getElementById('status-msg');
-      msg.textContent = 'Submitting...';
+      msg.textContent = 'Submitting feedback...';
+      disableButtons();
 
       const resp = await fetch(`/review/session/${sessionId}/resolve`, {
         method: 'POST',
@@ -121,6 +135,50 @@
       } else {
         const data = await resp.json().catch(() => ({}));
         msg.textContent = `Error: ${data.error || resp.statusText}`;
+        document.querySelectorAll('.btn-row button').forEach(b => b.disabled = false);
+      }
+    }
+
+    async function continueIterating() {
+      const msg = document.getElementById('status-msg');
+      msg.textContent = 'Requesting 4 more LLM review iterations...';
+      disableButtons();
+
+      const resp = await fetch('/review/api/continue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, iterations: 4 })
+      });
+
+      if (resp.ok) {
+        msg.textContent = 'Review iterations complete. Refreshing...';
+        setTimeout(load, 800);
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        msg.textContent = `Error: ${data.error || resp.statusText}`;
+        document.querySelectorAll('.btn-row button').forEach(b => b.disabled = false);
+      }
+    }
+
+    async function submitLgtm() {
+      const msg = document.getElementById('status-msg');
+      msg.textContent = 'Approving...';
+      disableButtons();
+
+      const resp = await fetch('/review/api/lgtm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId })
+      });
+
+      if (resp.ok) {
+        msg.textContent = 'Approved! Refreshing...';
+        msg.style.color = '#3fb950';
+        setTimeout(load, 800);
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        msg.textContent = `Error: ${data.error || resp.statusText}`;
+        document.querySelectorAll('.btn-row button').forEach(b => b.disabled = false);
       }
     }
 

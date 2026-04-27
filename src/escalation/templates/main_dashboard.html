@@ -312,6 +312,7 @@
       if (ms <= 2000) return 'medium';
       return 'slow';
     }
+    function fmtSec(ms) { return (ms / 1000).toFixed(1) + 's'; }
 
     function providerFromModel(modelKey) {
       if (!modelKey) return null;
@@ -406,7 +407,7 @@
           <div class="flow-arrow">\u2192</div>
           <div class="flow-box">
             <div class="label">Latency</div>
-            <div class="value ${latClass(last.latency_ms)}">${last.latency_ms} ms</div>
+            <div class="value ${latClass(last.latency_ms)}">${fmtSec(last.latency_ms)}</div>
           </div>
         </div>`;
     }
@@ -421,7 +422,7 @@
       document.getElementById('stat-direct-local').textContent = (stats.direct_local_count || 0) + ' (' + pct(stats.direct_local_count || 0) + '%)';
       document.getElementById('stat-direct-cloud').textContent = (stats.direct_cloud_count || 0) + ' (' + pct(stats.direct_cloud_count || 0) + '%)';
       document.getElementById('stat-fallbacks').textContent = stats.fallbacks;
-      document.getElementById('stat-latency').textContent = stats.avg_latency + ' ms';
+      document.getElementById('stat-latency').textContent = fmtSec(stats.avg_latency);
     }
 
     function renderEvents(events) {
@@ -511,8 +512,8 @@
           <td>${providerDisplay(e)}</td>
           <td>${modelDisplay(e)}</td>
           <td class="${latClass(e.latency_ms)}">
-            ${e.latency_ms} ms
-            ${e._count > 1 ? '<div class="muted" style="font-size:0.65rem">total: ' + e._total_latency + ' ms</div>' : ''}
+            ${fmtSec(e.latency_ms)}
+            ${e._count > 1 ? '<div class="muted" style="font-size:0.65rem">total: ' + fmtSec(e._total_latency) + '</div>' : ''}
           </td>
           <td>${status}</td>
           <td>${sessionTag}</td>

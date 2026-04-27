@@ -206,6 +206,57 @@ impl ReviewService {
         Ok(())
     }
 
+    /// Continue iterating on an existing session with additional LLM review rounds.
+    /// Resets the session to Pending and runs the review loop for `extra_iterations` more rounds.
+    pub async fn continue_review(
+        &self,
+        session_id: &str,
+        extra_iterations: u32,
+    ) -> Result<RequestReviewResult> {
+        let session = self
+            .sessions
+            .get_session(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+
+        // Reset session to pending so the loop can run
+        self.sessions.update_session(
+            session_id,
+            SessionUpdate {
+                status: Some(ReviewStatus::Pending),
+                feedback: None,
+                reviewer_type: None,
+                escalation_reason: None,
+                review_model: None,
+            },
+        );
+
+        info!(session_id, extra_iterations, "Continuing review with additional iterations");
+
+        // Build a config snapshot with the requested iteration count
+        let mut config_snapshot = self.get_config();
+        config_snapshot.max_iterations = extra_iterations;
+
+        let result = run_loop(
+            session_id,
+            &session.task_id,
+            &session.summary,
+            session.details.as_deref(),
+            &self.router,
+            &self.sessions,
+            &config_snapshot,
+            &session.cwd,
+        )
+        .await?;
+
+        Ok(RequestReviewResult {
+            status: result.status,
+            feedback: result.feedback,
+            session_id: result.session_id,
+            iteration_count: result.iteration_count,
+            reviewer_type: result.reviewer_type,
+        })
+    }
+
     pub fn session_manager(&self) -> &Arc<SessionManager> {
         &self.sessions
     }
