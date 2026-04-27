@@ -241,7 +241,7 @@ async fn call_llm_for_review(
         ],
         stream: Some(true),
         temperature: Some(0.1),
-        max_tokens: Some(8192),
+        max_tokens: Some(16384),
         top_p: None,
         stop: None,
         extra: serde_json::Value::Object(serde_json::Map::new()),
