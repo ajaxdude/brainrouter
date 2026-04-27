@@ -241,7 +241,7 @@ async fn call_llm_for_review(
         ],
         stream: Some(true),
         temperature: Some(0.1),
-        max_tokens: Some(2048),
+        max_tokens: Some(8192),
         top_p: None,
         stop: None,
         extra: serde_json::Value::Object(serde_json::Map::new()),
@@ -317,8 +317,9 @@ async fn call_llm_for_review(
 }
 
 /// Extract JSON from LLM response text (may be wrapped in markdown code fences).
+/// Handles truncated output from token limits by attempting to repair the JSON.
 fn parse_llm_response(text: &str) -> Result<LlmReviewResponse> {
-    // Try to find the first occurrence of a JSON block
+    // Strip markdown code fences if present
     let json_str = if let Some(start) = text.find("```json") {
         let after = &text[start + 7..];
         if let Some(end) = after.find("```") {
@@ -334,26 +335,136 @@ fn parse_llm_response(text: &str) -> Result<LlmReviewResponse> {
             after.trim()
         }
     } else if let Some(start) = text.find('{') {
-        // Find the last closing brace
         if let Some(end) = text.rfind('}') {
             &text[start..=end]
         } else {
-            text.trim()
+            // No closing brace — truncated JSON. Take from the opening brace onward.
+            &text[start..]
         }
     } else {
         text.trim()
     };
 
-    // Robust parsing: if it's truncated or has trailing garbage, 
-    // some JSON parsers might fail. We attempt to parse what we have.
-    match serde_json::from_str::<LlmReviewResponse>(json_str) {
-        Ok(parsed) => Ok(parsed),
-        Err(e) => {
-             // Fallback: If status and feedback are present but slightly malformed, 
-             // we could try a manual regex extraction, but let's stick to strict JSON first.
-             Err(anyhow::anyhow!("Could not parse JSON from LLM response: {}. Raw: {}", e, text))
+    // First try: parse as-is
+    if let Ok(parsed) = serde_json::from_str::<LlmReviewResponse>(json_str) {
+        return Ok(parsed);
+    }
+
+    // Second try: the JSON was likely truncated by the token limit.
+    // Common truncation: the "feedback" string is cut mid-sentence.
+    // Attempt repair by closing any open string and braces.
+    let repaired = repair_truncated_json(json_str);
+    if let Ok(parsed) = serde_json::from_str::<LlmReviewResponse>(&repaired) {
+        tracing::warn!("Parsed review response after repairing truncated JSON (token limit likely hit)");
+        return Ok(parsed);
+    }
+
+    // Third try: extract status and feedback fields manually with string search.
+    // This handles cases where the JSON structure is too damaged for serde but
+    // the key fields are present.
+    if let Some(resp) = extract_fields_manually(json_str) {
+        tracing::warn!("Extracted review fields via manual parsing (JSON was malformed)");
+        return Ok(resp);
+    }
+
+    Err(anyhow::anyhow!(
+        "Could not parse JSON from LLM response: truncated or malformed. First 500 chars: {}",
+        &text[..text.len().min(500)]
+    ))
+}
+
+/// Attempt to repair truncated JSON by closing open strings and braces.
+/// Handles the common case where max_tokens cuts off mid-string-value.
+fn repair_truncated_json(s: &str) -> String {
+    let mut result = s.to_string();
+    // Trim trailing whitespace and incomplete escape sequences
+    result = result.trim_end().to_string();
+    if result.ends_with('\\') {
+        result.push('n'); // close incomplete escape like \n
+    }
+    // Count unmatched quotes (ignoring escaped ones)
+    let mut in_string = false;
+    let mut chars = result.chars().peekable();
+    let mut prev = ' ';
+    while let Some(c) = chars.next() {
+        if c == '"' && prev != '\\' {
+            in_string = !in_string;
+        }
+        prev = c;
+    }
+    // If we're inside a string, close it
+    if in_string {
+        // Trim trailing backslash that would escape our closing quote
+        if result.ends_with('\\') {
+            result.pop();
+        }
+        result.push('"');
+    }
+    // Close any open braces/brackets
+    let open_braces = result.chars().filter(|&c| c == '{').count();
+    let close_braces = result.chars().filter(|&c| c == '}').count();
+    for _ in 0..(open_braces.saturating_sub(close_braces)) {
+        // Ensure the last token before } is valid JSON (not a trailing comma)
+        let trimmed = result.trim_end();
+        if trimmed.ends_with(',') {
+            result = trimmed.trim_end_matches(',').to_string();
+        }
+        result.push('}');
+    }
+    result
+}
+
+/// Last-resort field extraction using simple string matching.
+fn extract_fields_manually(text: &str) -> Option<LlmReviewResponse> {
+    // Look for "status": "..." pattern
+    let status = extract_json_string_field(text, "status")?;
+    // feedback may be truncated — extract whatever we have
+    let feedback = extract_json_string_field(text, "feedback")
+        .unwrap_or_else(|| "[feedback truncated by token limit]".to_string());
+    Some(LlmReviewResponse { status, feedback })
+}
+
+/// Extract a JSON string field value by name using simple pattern matching.
+fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", field);
+    let start = text.find(&pattern)?;
+    let after = &text[start + pattern.len()..];
+    let after = after.trim_start();
+    if !after.starts_with('"') {
+        return None;
+    }
+    let after = &after[1..]; // skip opening quote
+    // Find the closing quote (respecting escapes)
+    let mut result = String::new();
+    let mut chars = after.chars();
+    loop {
+        match chars.next() {
+            Some('\\') => {
+                // Escaped character — take the next one literally
+                if let Some(escaped) = chars.next() {
+                    match escaped {
+                        'n' => result.push('\n'),
+                        't' => result.push('\t'),
+                        '"' => result.push('"'),
+                        '\\' => result.push('\\'),
+                        other => { result.push('\\'); result.push(other); }
+                    }
+                } else {
+                    break; // truncated escape at end
+                }
+            }
+            Some('"') => return Some(result), // clean end
+            Some(c) => result.push(c),
+            None => {
+                // Truncated string — return what we have
+                if !result.is_empty() {
+                    return Some(result);
+                }
+                return None;
+            }
         }
     }
+    if !result.is_empty() { Some(result) } else { None }
 }
 
 /// Map the LLM's string status to our enum.
