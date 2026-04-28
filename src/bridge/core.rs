@@ -122,7 +122,12 @@ pub fn resolve_model(raw: &str, aliases: &HashMap<String, String>) -> String {
 /// `model` is passed as `--model <id>` when `Some`.
 /// `session_id` is passed as `--resume <id>` when `Some`.
 ///
-/// Returns `Err` if OMP couldn't be spawned, timed out, or if the parsed
+/// The timeout is an **inactivity** timeout: the clock resets every time OMP
+/// produces a line of output.  This lets long-running tool-call chains
+/// complete as long as OMP keeps making progress, while still catching
+/// genuine hangs.
+///
+/// Returns `Err` if OMP couldn't be spawned, hung silent, or if the parsed
 /// output contained a model-level error with no text.
 pub async fn invoke_omp(
     omp_path: &str,
@@ -133,10 +138,13 @@ pub async fn invoke_omp(
     timeout_secs: u64,
 ) -> Result<(String, Option<String>, Option<(String, String)>), String> {
     use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
     let mut cmd = Command::new(omp_path);
     cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     cmd.current_dir(work_dir);
     cmd.arg("-p");
     cmd.arg("--mode");
@@ -165,28 +173,65 @@ pub async fn invoke_omp(
 
     cmd.arg(&query);
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| format!("OMP timed out after {} seconds", timeout_secs))?
-    .map_err(|e| format!("OMP process I/O error: {}", e))?;
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("OMP process I/O error: {}", e))?;
 
-    // A non-zero exit with no stdout is a real failure (e.g. bad session ID,
-    // missing binary).  A non-zero exit WITH stdout means OMP ran but
-    // encountered an application-level error after producing some output —
-    // surface whatever text we extracted rather than swallowing it.
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // Read stdout line-by-line with an inactivity timeout.
+    // Each line of NDJSON output resets the clock.
+    let stdout = child.stdout.take()
+        .ok_or_else(|| "failed to capture OMP stdout".to_string())?;
+    let mut reader = BufReader::new(stdout).lines();
+    let inactivity = std::time::Duration::from_secs(timeout_secs);
+    let mut collected = Vec::new();
+
+    loop {
+        match tokio::time::timeout(inactivity, reader.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                collected.push(line);
+            }
+            Ok(Ok(None)) => break,           // EOF — process closed stdout
+            Ok(Err(e)) => {
+                tracing::warn!("OMP stdout read error: {}", e);
+                break;
+            }
+            Err(_) => {
+                // Inactivity timeout — kill the process and reap to avoid zombies.
+                tracing::warn!("OMP silent for {}s, killing", timeout_secs);
+                // Drop the stdout reader first to unblock the child if its pipe is full.
+                drop(reader);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(format!(
+                    "OMP timed out after {}s of inactivity",
+                    timeout_secs
+                ));
+            }
+        }
+    }
+
+    // Wait for the process to finish (should be instant after EOF).
+    let status = child.wait().await
+        .map_err(|e| format!("OMP wait error: {}", e))?;
+
+    if !status.success() && collected.is_empty() {
+        // Read stderr for diagnostics.
+        let stderr_bytes = if let Some(mut stderr) = child.stderr.take() {
+            let mut buf = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
+            buf
+        } else {
+            Vec::new()
+        };
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         return Err(if stderr.is_empty() {
-            format!("OMP exited with status {}", output.status)
+            format!("OMP exited with status {}", status)
         } else {
             stderr
         });
     }
 
-    parse_omp_json_output(&output.stdout)
+    let ndjson = collected.join("\n");
+    parse_omp_json_output(ndjson.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +258,8 @@ pub fn parse_omp_json_output(
     let mut model_info: Option<(String, String)> = None;
     // The first model-error we encounter; used only when no text was produced.
     let mut model_error: Option<String> = None;
+    let mut saw_tool_use = false;
+    let mut saw_any_event = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -225,6 +272,7 @@ pub fn parse_omp_json_output(
         let Some(event_type) = val.get("type").and_then(|t| t.as_str()) else {
             continue;
         };
+        saw_any_event = true;
 
         match event_type {
             "session" => {
@@ -250,13 +298,19 @@ pub fn parse_omp_json_output(
                     continue;
                 };
                 for item in content {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            let trimmed = text.trim().to_string();
-                            if !trimmed.is_empty() {
-                                text_pieces.push(trimmed);
+                    match item.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                let trimmed = text.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    text_pieces.push(trimmed);
+                                }
                             }
                         }
+                        Some("tool_use") => {
+                            saw_tool_use = true;
+                        }
+                        _ => {}
                     }
                 }
                 // Record model-level errors only when content was empty.
@@ -273,10 +327,18 @@ pub fn parse_omp_json_output(
         }
     }
 
-    // Return Err only when OMP produced no text at all and signalled an error.
+    // Return Err when OMP produced no text at all and signalled an error.
     if text_pieces.is_empty() {
         if let Some(err) = model_error {
             return Err(err);
+        }
+        // If OMP ran tool calls but never produced a text response, that's
+        // unexpected for a conversational bridge query.  Return a diagnostic.
+        if saw_tool_use {
+            return Err("The model performed actions but produced no visible response. Try rephrasing.".to_string());
+        }
+        if !saw_any_event {
+            return Err("No response received from OMP.".to_string());
         }
     }
 

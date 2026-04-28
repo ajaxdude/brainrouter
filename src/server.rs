@@ -25,6 +25,23 @@ fn home_path(rel: &str) -> String {
     format!("{}/{}", home_dir(), rel)
 }
 
+/// Return the list of editable config/agent files: (display_name, path, exists).
+fn config_file_list(home: &str, config_path: &std::path::Path) -> Vec<(&'static str, PathBuf, bool)> {
+    let config_abs = std::fs::canonicalize(config_path)
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let entries: Vec<(&str, PathBuf)> = vec![
+        ("Agent System Prompt", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.md", home))),
+        ("Review Prompt Template", PathBuf::from(format!("{}/.omp/agent/LLAMACPP.md", home))),
+        ("Local System Prompt Override", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.local.md", home))),
+        ("Model Aliases", PathBuf::from(format!("{}/.config/omp-bridge/config.yaml", home))),
+        ("brainrouter.yaml (raw)", config_abs),
+    ];
+    entries.into_iter().map(|(name, path)| {
+        let exists = path.exists();
+        (name, path, exists)
+    }).collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
@@ -81,6 +98,8 @@ pub struct AppState {
     pub manifest_url: String,
     /// Bridge transport manager (Discord, Signal status tracking).
     pub bridge_manager: Arc<crate::bridge::BridgeManager>,
+    /// Path to the brainrouter.yaml config file.
+    pub config_path: PathBuf,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -151,7 +170,8 @@ async fn handle_request(
     // Security: Only allow localhost (127.0.0.1 or ::1) for destructive APIs.
     // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
     let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
-    let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/");
+    let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
+        || (method == "POST" && (path == "/api/config" || path == "/api/open-editor"));
 
     if is_destructive {
         if !is_local {
@@ -382,6 +402,134 @@ async fn handle_request(
         ("GET", "/api/bridge-status") => {
             let status = state.bridge_manager.status();
             let resp = json_response(StatusCode::OK, &status);
+            into_unsync(resp)
+        }
+
+ // __ Config API _______________________________________________________
+        ("GET", "/api/config") => {
+            match std::fs::read_to_string(&state.config_path) {
+                Ok(yaml) => {
+                    let resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/yaml; charset=utf-8")
+                        .body(Full::new(Bytes::from(yaml)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
+                        .unwrap();
+                    resp
+                }
+                Err(e) => {
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Failed to read config: {}", e) },
+                    );
+                    into_unsync(resp)
+                }
+            }
+        }
+
+        ("POST", "/api/config") => {
+            let body_bytes = req.collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            if body_bytes.len() > 1_048_576 {
+                let resp = json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse { error: "Request body too large (max 1MB)".to_string() },
+                );
+                into_unsync(resp)
+            } else {
+                let body = String::from_utf8_lossy(&body_bytes).to_string();
+                // Validate against the real config struct, not just generic YAML.
+                match serde_yaml::from_str::<crate::config::BrainrouterConfig>(&body) {
+                    Err(e) => {
+                        let resp = json_response(
+                            StatusCode::BAD_REQUEST,
+                            &ErrorResponse { error: format!("Invalid config: {}", e) },
+                        );
+                        into_unsync(resp)
+                    }
+                    Ok(_) => {
+                        // Atomic write: write to .tmp then rename.
+                        let tmp_path = state.config_path.with_extension("yaml.tmp");
+                        let write_result = std::fs::write(&tmp_path, body.as_bytes())
+                            .and_then(|_| std::fs::rename(&tmp_path, &state.config_path));
+                        if let Err(e) = write_result {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            let resp = json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &ErrorResponse { error: format!("Failed to write config: {}", e) },
+                            );
+                            into_unsync(resp)
+                        } else {
+                            let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
+                            into_unsync(resp)
+                        }
+                    }
+                }
+            }
+        }
+
+        ("POST", "/api/open-editor") => {
+            let body_bytes = req.collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+            match parsed {
+                Err(e) => {
+                    let resp = json_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorResponse { error: format!("Invalid JSON: {}", e) },
+                    );
+                    into_unsync(resp)
+                }
+                Ok(val) => {
+                    let file_path = val.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                    if file_path.is_empty() {
+                        let resp = json_response(
+                            StatusCode::BAD_REQUEST,
+                            &ErrorResponse { error: "Missing 'path' field".to_string() },
+                        );
+                        into_unsync(resp)
+                    } else {
+                        // Allowlist: only files from the config-files list can be opened.
+                        let home = home_dir();
+                        let allowed = config_file_list(&home, &state.config_path);
+                        let canonical = std::fs::canonicalize(file_path).unwrap_or_default();
+                        let is_allowed = allowed.iter().any(|(_, p, exists)| {
+                            *exists && std::fs::canonicalize(p).ok().as_ref() == Some(&canonical)
+                        });
+                        if !is_allowed {
+                            let resp = json_response(
+                                StatusCode::FORBIDDEN,
+                                &ErrorResponse { error: "Path not in the allowed file list".to_string() },
+                            );
+                            into_unsync(resp)
+                        } else {
+                            use std::process::Stdio;
+                            let _ = tokio::process::Command::new("xdg-open")
+                                .arg(file_path)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn();
+                            let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
+                            into_unsync(resp)
+                        }
+                    }
+                }
+            }
+        }
+
+        ("GET", "/api/config-files") => {
+            let home = home_dir();
+            let files: Vec<serde_json::Value> = config_file_list(&home, &state.config_path)
+                .into_iter()
+                .map(|(name, path, exists)| serde_json::json!({
+                    "name": name,
+                    "path": path.to_string_lossy(),
+                    "exists": exists
+                }))
+                .collect();
+            let resp = json_response(StatusCode::OK, &files);
             into_unsync(resp)
         }
 

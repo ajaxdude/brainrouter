@@ -126,11 +126,27 @@
     .notify-banner .notify-text { flex: 1; }
     .notify-banner .notify-dismiss { background: none; border: 1px solid rgba(210,153,34,.4); color: var(--orange); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 0.7rem; font-family: inherit; }
     .notify-banner .notify-dismiss:hover { background: rgba(210,153,34,.2); }
+
+    /* ── Config page ────────────────────────────────── */
+    .config-group { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .config-group h3 { margin: 0 0 12px 0; font-size: 0.9rem; color: var(--accent); }
+    .config-actions { display: flex; gap: 10px; margin-top: 16px; align-items: center; }
+    .config-actions button { padding: 8px 20px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--fg); cursor: pointer; font-family: inherit; font-size: 0.8rem; transition: all 0.15s; }
+    .config-actions button.primary { border-color: var(--accent); color: var(--accent); }
+    .config-actions button.primary:hover { background: var(--accent); color: var(--bg); }
+    .config-actions button:hover { border-color: var(--accent); }
+    .file-card { display: flex; align-items: center; justify-content: space-between; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+    .file-card .file-info { flex: 1; }
+    .file-card .file-name { font-size: 0.85rem; color: var(--text); }
+    .file-card .file-path { font-size: 0.7rem; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+    .file-card .file-missing { color: var(--orange); font-size: 0.7rem; }
+    .file-card button { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; font-family: inherit; font-size: 0.75rem; transition: all 0.15s; }
+    .file-card button:hover { border-color: var(--accent); color: var(--accent); }
   </style>
 </head>
 <body>
   <div class="header">
-    <a href="/dashboard"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
+    <a href="#" onclick="showPage('dashboard'); return false;"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
     <div id="version-header" style="font-size:0.7rem; color:var(--muted); display:flex; gap:10px; align-items:center; border:1px solid var(--border); border-radius:6px; padding:6px 12px; background:rgba(255,255,255,0.03);">
       <div id="ver-llama-swap" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
         <span id="health-llama-swap" class="health-dot unknown" title="checking..."></span>
@@ -158,12 +174,14 @@
     </div>
     <div class="nav">
       <a href="/review/">Review Sessions</a>
+      <a href="#" onclick="showPage('config'); return false;">Config</a>
       <button onclick="restartService('llama-swap', this)">Restart Local Stack</button>
       <button onclick="restartService('manifest', this)">Restart Manifest</button>
       <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
     </div>
   </div>
 
+  <div id="dashboard-content">
   <!-- Notification banner (shown when cloud falls back to local) -->
   <div id="notify-banner" class="notify-banner">
     <span class="notify-text" id="notify-text"></span>
@@ -266,6 +284,14 @@
       <div class="slabel">Signal</div>
       <div class="sval" id="bridge-signal-status" style="font-size:0.8rem;">&mdash;</div>
     </div>
+  </div>
+  </div>
+
+  <div id="config-page" style="display:none">
+    <div class="section-title">Configuration</div>
+    <div id="config-form-container"></div>
+    <div class="section-title" style="margin-top:24px">Agent Files</div>
+    <div id="config-files-container"></div>
   </div>
 
   <script>
@@ -869,6 +895,110 @@
     setInterval(refreshSlow, 30000);
     refresh();
     refreshSlow();
+
+    // ── Config page ─────────────────────────────────────────────────────────────
+    function showPage(page) {
+      document.getElementById('dashboard-content').style.display = page === 'dashboard' ? '' : 'none';
+      document.getElementById('config-page').style.display = page === 'config' ? '' : 'none';
+      document.querySelectorAll('.nav a').forEach(a => a.classList.remove('nav-active'));
+      if (page === 'config') {
+        document.querySelector('.nav a[onclick*=config]').classList.add('nav-active');
+        loadConfig();
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const resp = await fetch('/api/config');
+        if (!resp.ok) {
+          document.getElementById('config-form-container').innerHTML = '<div style="color:var(--red)">Failed to load config</div>';
+          return;
+        }
+        const yamlText = await resp.text();
+        renderConfigForm(yamlText);
+      } catch (e) {
+        document.getElementById('config-form-container').innerHTML = '<div style="color:var(--red)">Failed to load config: ' + esc(e.message) + '</div>';
+      }
+      try {
+        const filesResp = await fetch('/api/config-files');
+        if (filesResp.ok) {
+          const files = await filesResp.json();
+          renderConfigFiles(files);
+        }
+      } catch (_) {}
+    }
+
+    function renderConfigForm(yamlText) {
+      const container = document.getElementById('config-form-container');
+      container.innerHTML = `
+        <div class="config-group">
+          <h3>brainrouter.yaml</h3>
+          <textarea id="config-yaml" spellcheck="false" style="width:100%;min-height:400px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(yamlText)}</textarea>
+          <div class="config-actions">
+            <button class="primary" onclick="saveConfig(false)">Save</button>
+            <button class="primary" onclick="saveConfig(true)">Save &amp; Restart</button>
+            <span id="save-status" style="font-size:0.8rem;color:var(--muted)"></span>
+          </div>
+        </div>
+      `;
+    }
+
+    async function saveConfig(restart) {
+      const yaml = document.getElementById('config-yaml').value;
+      const status = document.getElementById('save-status');
+      status.textContent = 'Saving\u2026';
+      status.style.color = 'var(--muted)';
+      try {
+        const resp = await fetch('/api/config', {
+          method: 'POST',
+          headers: {'Content-Type': 'text/yaml'},
+          body: yaml
+        });
+        if (resp.ok) {
+          status.textContent = 'Saved';
+          status.style.color = 'var(--green)';
+          if (restart) {
+            status.textContent = 'Saved \u2014 restarting\u2026';
+            await fetch('/api/restart/brainrouter', {method:'POST'}).catch(()=>{});
+            setTimeout(() => location.reload(), 3000);
+          }
+        } else {
+          const err = await resp.text();
+          status.textContent = 'Error: ' + err;
+          status.style.color = 'var(--red)';
+        }
+      } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        status.style.color = 'var(--red)';
+      }
+    }
+
+    function renderConfigFiles(files) {
+      const container = document.getElementById('config-files-container');
+      container.innerHTML = files.map(f => {
+        const escapedPath = f.path.replace(/'/g, "\\'");
+        return `
+          <div class="file-card">
+            <div class="file-info">
+              <div class="file-name">${esc(f.name)}</div>
+              <div class="file-path">${esc(f.path)}</div>
+              ${!f.exists ? '<div class="file-missing">File does not exist</div>' : ''}
+            </div>
+            ${f.exists ? `<button onclick="openFile('${escapedPath}')">Open in Editor</button>` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function openFile(path) {
+      try {
+        await fetch('/api/open-editor', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path: path})
+        });
+      } catch (_) {}
+    }
   </script>
 </body>
 </html>

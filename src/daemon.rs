@@ -176,6 +176,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         llama_swap_url,
         manifest_url,
         bridge_manager: Arc::clone(&bridge_manager),
+        config_path: std::fs::canonicalize(&args.config).unwrap_or(args.config.clone()),
     });
 
     // Start bridge transports if configured
