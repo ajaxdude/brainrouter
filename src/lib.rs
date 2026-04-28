@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bridge;
 pub mod classifier;
 pub mod config;
 pub mod escalation;

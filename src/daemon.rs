@@ -165,6 +165,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .unwrap_or(&config.manifest.base_url)
         .to_string();
 
+    // Bridge manager (status tracking for Discord/Signal transports)
+    let bridge_manager = Arc::new(brainrouter::bridge::BridgeManager::new());
+
     let state = Arc::new(AppState {
         router,
         session_manager,
@@ -172,7 +175,17 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         routing_events,
         llama_swap_url,
         manifest_url,
+        bridge_manager: Arc::clone(&bridge_manager),
     });
+
+    // Start bridge transports if configured
+    if let Some(ref bridge_config) = config.bridge {
+        let bm = Arc::clone(&bridge_manager);
+        let bc = bridge_config.clone();
+        tokio::spawn(async move {
+            brainrouter::bridge::start(bc, bm).await;
+        });
+    }
 
     // Server (TCP + UDS)
     server::run(tcp_addr, socket, state).await?;

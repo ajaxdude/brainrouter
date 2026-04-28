@@ -255,6 +255,19 @@
     </table>
   </div>
 
+  <!-- Bridge status -->
+  <div class="section-title">Bridge Transports</div>
+  <div id="bridge-status" style="display:flex; gap:16px; margin-bottom:16px;">
+    <div class="stat-card" style="flex:1; text-align:center;">
+      <div class="slabel">Discord</div>
+      <div class="sval" id="bridge-discord-status" style="font-size:0.8rem;">&mdash;</div>
+    </div>
+    <div class="stat-card" style="flex:1; text-align:center;">
+      <div class="slabel">Signal</div>
+      <div class="sval" id="bridge-signal-status" style="font-size:0.8rem;">&mdash;</div>
+    </div>
+  </div>
+
   <script>
     let allEvents = [];
     let prevModel = null;
@@ -585,12 +598,41 @@
 
     // Slow refresh: versions (runs podman) and review config — less frequent.
     async function refreshSlow() {
-      const [verData, revData] = await Promise.all([
+      const [verData, revData, bridgeData] = await Promise.all([
         safeFetch('/api/versions'),
         safeFetch('/api/review-config'),
+        safeFetch('/api/bridge-status'),
       ]);
       if (verData) renderVersions(verData);
       if (revData) syncReviewConfig(revData);
+      if (bridgeData) renderBridgeStatus(bridgeData);
+    }
+
+    function renderBridgeStatus(data) {
+      const discordEl = document.getElementById('bridge-discord-status');
+      const signalEl = document.getElementById('bridge-signal-status');
+      if (data.discord) {
+        const d = data.discord;
+        const uptime = d.uptime_secs > 0 ? (d.uptime_secs / 3600).toFixed(1) + 'h' : '';
+        if (d.connected) {
+          discordEl.innerHTML = `<span class="green">\'Connected</span> ${d.messages_handled} msgs${uptime ? ' / ' + uptime : ''}`;
+        } else {
+          discordEl.innerHTML = `<span class="orange">\'Disconnected</span>${d.last_error ? ' \'\u2014 ' + esc(d.last_error) : ''}`;
+        }
+      } else {
+        discordEl.textContent = 'Not configured';
+      }
+      if (data.signal) {
+        const s = data.signal;
+        const uptime = s.uptime_secs > 0 ? (s.uptime_secs / 3600).toFixed(1) + 'h' : '';
+        if (s.connected) {
+          signalEl.innerHTML = `<span class="green">\'Connected</span> ${s.messages_handled} msgs${uptime ? ' / ' + uptime : ''}`;
+        } else {
+          signalEl.innerHTML = `<span class="orange">\'Disconnected</span>${s.last_error ? ' \'\u2014 ' + esc(s.last_error) : ''}`;
+        }
+      } else {
+        signalEl.textContent = 'Not configured';
+      }
     }
 
     let currentReviewConfig = null;

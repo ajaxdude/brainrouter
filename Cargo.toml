@@ -52,6 +52,17 @@ libc = "0.2"
 flate2 = "1.1.9"
 tar = "0.4.45"
 
+
+# Bridge transports (optional, feature-gated)
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"], optional = true }
+async-trait = { version = "0.1", optional = true }
+serde_yml = { version = "0.0.12", optional = true }
+
+[features]
+default = ["bridge-discord", "bridge-signal"]
+bridge-discord = ["dep:serenity", "dep:async-trait", "dep:serde_yml"]
+bridge-signal = ["dep:serde_yml"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"

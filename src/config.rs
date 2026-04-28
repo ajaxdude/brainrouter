@@ -10,6 +10,9 @@ pub struct BrainrouterConfig {
     pub bonsai: BonsaiConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Bridge transports (Discord, Signal) — optional, disabled by default.
+    #[serde(default)]
+    pub bridge: Option<crate::bridge::BridgeConfig>,
 }
 
 /// Configuration for the Manifest cloud LLM router.

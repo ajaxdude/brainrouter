@@ -79,8 +79,9 @@ pub struct AppState {
     pub llama_swap_url: String,
     /// Manifest base URL for health checking.
     pub manifest_url: String,
+    /// Bridge transport manager (Discord, Signal status tracking).
+    pub bridge_manager: Arc<crate::bridge::BridgeManager>,
 }
-
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -375,6 +376,13 @@ async fn handle_request(
                     into_unsync(resp)
                 }
             }
+        }
+
+        // \_\_ Bridge status API \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+        ("GET", "/api/bridge-status") => {
+            let status = state.bridge_manager.status();
+            let resp = json_response(StatusCode::OK, &status);
+            into_unsync(resp)
         }
 
         _ => {
