@@ -159,19 +159,20 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        tracing::debug!(
+            channel = %msg.channel_id,
+            author = %msg.author.name,
+            is_bot = msg.author.bot,
+            is_dm = msg.guild_id.is_none(),
+            guild_id = ?msg.guild_id,
+            "Discord message event"
+        );
         if msg.author.bot {
             return;
         }
 
         let prefix = &self.config.prefix;
         let is_dm = msg.guild_id.is_none();
-        tracing::debug!(
-            channel = %msg.channel_id,
-            author = %msg.author.name,
-            is_dm = is_dm,
-            content = %msg.content,
-            "Discord message received"
-        );
         // Normalize em-dash (U+2014) → "--" so command parsing always sees ASCII hyphens.
         let content_normalized = msg.content.replace('\u{2014}', "--");
         let mut text = content_normalized.trim();
@@ -191,7 +192,7 @@ impl EventHandler for DiscordHandler {
         }
 
         // !omp reset  (works in both DMs and guilds)
-        if text == format!("{}omp reset", prefix) || (is_dm && text == "reset") {
+        if text == format!("{}omp reset", prefix) || text == "reset" {
             let channel_key = msg.channel_id.to_string();
             let had_session = {
                 let mut sessions = self.sessions.lock().await;
@@ -210,7 +211,7 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // Strip !omp prefix, @mention, or (for DMs) accept bare text.
+        // Strip !omp prefix or @mention if present; bare text is always accepted.
         if let Some(rest) = text.strip_prefix(&format!("{}omp", prefix)) {
             text = rest.trim();
         } else if let Some(bot_id) = self.bot_id.get() {
@@ -220,14 +221,8 @@ impl EventHandler for DiscordHandler {
                 text = rest.trim();
             } else if let Some(rest) = text.strip_prefix(&nick_mention) {
                 text = rest.trim();
-            } else if !is_dm {
-                // Guild message not addressed to us — ignore.
-                return;
             }
-            // DM without prefix/mention: fall through with full text as query.
-        } else if !is_dm {
-            // Guild message, no prefix, bot_id not yet known — ignore.
-            return;
+            // No prefix/mention: use full text as query.
         }
         // In DMs: bare text falls through here as the query.
 
@@ -332,7 +327,13 @@ impl EventHandler for DiscordHandler {
                     }
                 }
             } else {
-                resolve_model(name, &self.model_aliases)
+                let raw = resolve_model(name, &self.model_aliases);
+                // Ensure model routes through brainrouter (OMP needs brainrouter/* format).
+                if raw.starts_with("brainrouter/") {
+                    raw
+                } else {
+                    "brainrouter/auto".to_string()
+                }
             };
             {
                 let mut channel_models = self.channel_models.lock().await;
@@ -594,7 +595,8 @@ impl DiscordHandler {
             if q.starts_with("model ") {
                 let parts: Vec<&str> = q.splitn(3, ' ').collect();
                 if parts.len() >= 3 {
-                    m = Some(resolve_model(parts[1], &self.model_aliases));
+                    let resolved = resolve_model(parts[1], &self.model_aliases);
+                    m = Some(if resolved.starts_with("brainrouter/") { resolved } else { self.config.default_model.clone() });
                     q = parts[2];
                     is_override = true;
                 }
@@ -602,6 +604,12 @@ impl DiscordHandler {
             if m.is_none() {
                 let channel_models = self.channel_models.lock().await;
                 m = channel_models.get(&channel_key).cloned();
+                // Sanitize stale models that OMP can't route (e.g. llama.cpp/*).
+                if let Some(ref model) = m {
+                    if !model.starts_with("brainrouter/") {
+                        m = Some(self.config.default_model.clone());
+                    }
+                }
             }
             // Fall back to configured default (brainrouter/auto by default).
             if m.is_none() {
