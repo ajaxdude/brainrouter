@@ -142,6 +142,8 @@
     .file-card .file-missing { color: var(--orange); font-size: 0.7rem; }
     .file-card button { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; font-family: inherit; font-size: 0.75rem; transition: all 0.15s; }
     .file-card button:hover { border-color: var(--accent); color: var(--accent); }
+    .config-editors { display: flex; gap: 16px; }
+    @media (max-width: 1200px) { .config-editors { flex-direction: column; } }
   </style>
 </head>
 <body>
@@ -908,17 +910,13 @@
     }
 
     async function loadConfig() {
-      try {
-        const resp = await fetch('/api/config');
-        if (!resp.ok) {
-          document.getElementById('config-form-container').innerHTML = '<div style="color:var(--red)">Failed to load config</div>';
-          return;
-        }
-        const yamlText = await resp.text();
-        renderConfigForm(yamlText);
-      } catch (e) {
-        document.getElementById('config-form-container').innerHTML = '<div style="color:var(--red)">Failed to load config: ' + esc(e.message) + '</div>';
-      }
+      const [brResp, lsResp] = await Promise.all([
+        fetch('/api/config').catch(() => null),
+        fetch('/api/llama-swap-config').catch(() => null)
+      ]);
+      const brYaml = brResp && brResp.ok ? await brResp.text() : null;
+      const lsYaml = lsResp && lsResp.ok ? await lsResp.text() : null;
+      renderConfigForm(brYaml, lsYaml);
       try {
         const filesResp = await fetch('/api/config-files');
         if (filesResp.ok) {
@@ -928,28 +926,38 @@
       } catch (_) {}
     }
 
-    function renderConfigForm(yamlText) {
+    function renderConfigForm(brYaml, lsYaml) {
       const container = document.getElementById('config-form-container');
-      container.innerHTML = `
-        <div class="config-group">
+      const brPanel = brYaml !== null ? `
+        <div class="config-group" style="flex:1;min-width:0">
           <h3>brainrouter.yaml</h3>
-          <textarea id="config-yaml" spellcheck="false" style="width:100%;min-height:400px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(yamlText)}</textarea>
+          <textarea id="config-yaml" spellcheck="false" style="width:100%;min-height:500px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.78rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(brYaml)}</textarea>
           <div class="config-actions">
-            <button class="primary" onclick="saveConfig(false)">Save</button>
-            <button class="primary" onclick="saveConfig(true)">Save &amp; Restart</button>
-            <span id="save-status" style="font-size:0.8rem;color:var(--muted)"></span>
+            <button class="primary" onclick="saveConfig('/api/config','config-yaml','br-save-status',false)">Save</button>
+            <button class="primary" onclick="saveConfig('/api/config','config-yaml','br-save-status',true)">Save &amp; Restart</button>
+            <span id="br-save-status" style="font-size:0.8rem;color:var(--muted)"></span>
           </div>
-        </div>
-      `;
+        </div>` : '<div class="config-group" style="flex:1"><h3>brainrouter.yaml</h3><div style="color:var(--red)">Failed to load</div></div>';
+      const lsPanel = lsYaml !== null ? `
+        <div class="config-group" style="flex:1;min-width:0">
+          <h3>llama-swap config</h3>
+          <textarea id="ls-config-yaml" spellcheck="false" style="width:100%;min-height:500px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.78rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(lsYaml)}</textarea>
+          <div class="config-actions">
+            <button class="primary" onclick="saveConfig('/api/llama-swap-config','ls-config-yaml','ls-save-status',false)">Save</button>
+            <button class="primary" onclick="saveConfig('/api/llama-swap-config','ls-config-yaml','ls-save-status',true)">Save &amp; Restart llama-swap</button>
+            <span id="ls-save-status" style="font-size:0.8rem;color:var(--muted)"></span>
+          </div>
+        </div>` : '<div class="config-group" style="flex:1"><h3>llama-swap config</h3><div style="color:var(--red)">Failed to load</div></div>';
+      container.innerHTML = `<div class="config-editors">${brPanel}${lsPanel}</div>`;
     }
 
-    async function saveConfig(restart) {
-      const yaml = document.getElementById('config-yaml').value;
-      const status = document.getElementById('save-status');
+    async function saveConfig(endpoint, textareaId, statusId, restart) {
+      const yaml = document.getElementById(textareaId).value;
+      const status = document.getElementById(statusId);
       status.textContent = 'Saving\u2026';
       status.style.color = 'var(--muted)';
       try {
-        const resp = await fetch('/api/config', {
+        const resp = await fetch(endpoint, {
           method: 'POST',
           headers: {'Content-Type': 'text/yaml'},
           body: yaml
@@ -958,9 +966,11 @@
           status.textContent = 'Saved';
           status.style.color = 'var(--green)';
           if (restart) {
-            status.textContent = 'Saved \u2014 restarting\u2026';
-            await fetch('/api/restart/brainrouter', {method:'POST'}).catch(()=>{});
-            setTimeout(() => location.reload(), 3000);
+            // Restart the appropriate service.
+            const svc = endpoint.includes('llama-swap') ? 'llama-swap' : 'brainrouter';
+            status.textContent = 'Saved \u2014 restarting ' + svc + '\u2026';
+            await fetch('/api/restart/' + svc, {method:'POST'}).catch(()=>{});
+            if (svc === 'brainrouter') setTimeout(() => location.reload(), 3000);
           }
         } else {
           const err = await resp.text();
