@@ -34,3 +34,21 @@ bonsai:
 #     prd_paths: [docs/PRD.md, PRD.md, README.md]
 #     include_git_diff: true
 #     git_diff_max_bytes: 102400
+
+
+# Bridge transports — forward Discord/Signal messages to OMP (all optional)
+# bridge:
+#   omp_path: "omp"                          # Path to omp binary (default: "omp" in $PATH)
+#   work_dir: "~/ai/projects"                 # Sandbox root for omp invocations
+#   aliases_config: "~/.config/omp-bridge/config.yaml"  # Model alias map
+#   timeout_secs: 600                         # Per-invocation timeout
+#   default_model: "brainrouter/auto"         # Routes through Bonsai classification
+#   discord:
+#     enabled: true
+#     token: "your-discord-bot-token"
+#     prefix: "!"                             # Command prefix (default: !)
+#   signal:
+#     enabled: true
+#     account: "+1234567890"                  # E.164 phone number
+#     prefix: "!"                             # Command prefix (default: !)
+#     llama_swap_url: "http://localhost:9099"  # For model listing command
