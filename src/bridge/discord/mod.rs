@@ -165,6 +165,13 @@ impl EventHandler for DiscordHandler {
 
         let prefix = &self.config.prefix;
         let is_dm = msg.guild_id.is_none();
+        tracing::debug!(
+            channel = %msg.channel_id,
+            author = %msg.author.name,
+            is_dm = is_dm,
+            content = %msg.content,
+            "Discord message received"
+        );
         // Normalize em-dash (U+2014) → "--" so command parsing always sees ASCII hyphens.
         let content_normalized = msg.content.replace('\u{2014}', "--");
         let mut text = content_normalized.trim();
@@ -231,17 +238,19 @@ impl EventHandler for DiscordHandler {
         // !omp ? / help  (also bare "help"/"?" in DMs)
         if text == "?" || text == "help" {
             let help_msg = if is_dm {
-                "**OMP Bridge — Discord Commands**\n\
-                Just type your message — no prefix needed in DMs.\n\n\
-                `reset` — Clear session\n\
-                `model <alias> <query>` — One-off model override\n\
-                `swap <alias>` — Sticky model\n\
-                `swaplist` — List available models\n\
-                `ls` — List working directory\n\
-                `cd <dir>` — Change directory\n\
-                `..` — Go up one directory\n\
-                `mkdir <name>` — Create a directory\n\
-                `help` / `?` — Show this help"
+                "**OMP Bridge \u{2014} Discord Commands**\n\
+                Just type your message \u{2014} no prefix needed in DMs.\n\n\
+                `reset` \u{2014} Clear session\n\
+                `model <alias> <query>` \u{2014} One-off model override\n\
+                `swap <alias>` \u{2014} Sticky model\n\
+                `swap brainrouter [auto|local|cloud]` \u{2014} Brainrouter routing mode\n\
+                `review [auto|local|cloud]` \u{2014} Set/show review mode\n\
+                `swaplist` \u{2014} List available models\n\
+                `ls` \u{2014} List working directory\n\
+                `cd <dir>` \u{2014} Change directory\n\
+                `..` \u{2014} Go up one directory\n\
+                `mkdir <name>` \u{2014} Create a directory\n\
+                `help` / `?` \u{2014} Show this help"
             } else {
                 "**OMP Bridge — Discord Commands**\n\
                 `!ping` — Health check\n\
@@ -249,8 +258,10 @@ impl EventHandler for DiscordHandler {
                 `!omp <query>` — Send a query to OMP\n\
                 `@bot <query>` — Same as `!omp <query>`\n\
                 `!omp model <alias> <query>` — One-off model override\n\
-                `!omp swap <alias>` — Sticky model for this channel\n\
-                `!omp swaplist` — List models available via brainrouter\n\
+                `!omp swap <alias>` \u{2014} Sticky model for this channel\n\
+                `!omp swap brainrouter [auto|local|cloud]` \u{2014} Brainrouter routing mode\n\
+                `!omp review [auto|local|cloud]` \u{2014} Set/show review mode\n\
+                `!omp swaplist` \u{2014} List models available via brainrouter\n\
                 `!omp ls` — List current working directory\n\
                 `!omp cd <dir>` — Change directory (sandboxed)\n\
                 `!omp ..` — Go up one directory\n\
@@ -305,29 +316,94 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // !omp swap <alias>
+        // !omp swap <alias> [auto|local|cloud]
+        // Special case: "swap brainrouter [mode]" sets brainrouter/<mode>
         if let Some(alias) = text.strip_prefix("swap ") {
-            let alias = alias.trim();
-            let resolved = resolve_model(alias, &self.model_aliases);
+            let parts: Vec<&str> = alias.trim().splitn(2, ' ').collect();
+            let name = parts[0];
+            let resolved = if name.eq_ignore_ascii_case("brainrouter") {
+                let mode = parts.get(1).copied().unwrap_or("auto");
+                match mode {
+                    "auto" | "local" | "cloud" => format!("brainrouter/{}", mode),
+                    _ => {
+                        let _ = msg.channel_id.say(&ctx.http,
+                            "Usage: `swap brainrouter [auto|local|cloud]`").await;
+                        return;
+                    }
+                }
+            } else {
+                resolve_model(name, &self.model_aliases)
+            };
             {
                 let mut channel_models = self.channel_models.lock().await;
                 channel_models.insert(msg.channel_id.to_string(), resolved.clone());
                 spawn_save_channel_models(&channel_models);
             }
             {
-                // Clear session — it is model-scoped in OMP.
                 let mut sessions = self.sessions.lock().await;
                 if sessions.remove(&msg.channel_id.to_string()).is_some() {
                     spawn_save_sessions(&sessions);
                 }
             }
-            let _ = msg
-                .channel_id
-                .say(
-                    &ctx.http,
-                    format!("Model swapped to `{}`. Previous session cleared.", resolved),
-                )
-                .await;
+            let _ = msg.channel_id.say(&ctx.http,
+                format!("Model swapped to `{}`. Previous session cleared.", resolved)).await;
+            return;
+        }
+
+        // !omp review [auto|local|cloud] — set the code review routing mode
+        if let Some(rest) = text.strip_prefix("review ") {
+            let mode = rest.trim();
+            if mode != "auto" && mode != "local" && mode != "cloud" {
+                let _ = msg.channel_id.say(&ctx.http,
+                    "Usage: `review auto|local|cloud`").await;
+                return;
+            }
+            let body = serde_json::json!({
+                "forced_mode": mode,
+                "max_iterations": 5
+            });
+            match reqwest::Client::new()
+                .post("http://127.0.0.1:9099/api/review-config")
+                .json(&body)
+                .send().await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let _ = msg.channel_id.say(&ctx.http,
+                        format!("Review mode set to `{}`.", mode)).await;
+                }
+                Ok(resp) => {
+                    let err = resp.text().await.unwrap_or_default();
+                    let _ = msg.channel_id.say(&ctx.http,
+                        format!("Failed to set review mode: {}", err)).await;
+                }
+                Err(e) => {
+                    let _ = msg.channel_id.say(&ctx.http,
+                        format!("Failed to reach brainrouter: {}", e)).await;
+                }
+            }
+            return;
+        }
+        if text == "review" {
+            match reqwest::get("http://127.0.0.1:9099/api/review-config").await {
+                Ok(resp) => {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        let mode = json.get("forced_mode").and_then(|v| v.as_str()).unwrap_or("auto");
+                        let model = json.get("forced_model").and_then(|v| v.as_str());
+                        let reply = if let Some(m) = model {
+                            format!("Review mode: `{}` (model: `{}`)", mode, m)
+                        } else {
+                            format!("Review mode: `{}`", mode)
+                        };
+                        let _ = msg.channel_id.say(&ctx.http, reply).await;
+                    } else {
+                        let _ = msg.channel_id.say(&ctx.http, "Failed to parse review config.").await;
+                    }
+                }
+                Err(e) => {
+                    let _ = msg.channel_id.say(&ctx.http,
+                        format!("Failed to reach brainrouter: {}", e)).await;
+                }
+            }
             return;
         }
 
