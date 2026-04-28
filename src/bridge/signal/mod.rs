@@ -16,6 +16,16 @@ use crate::bridge::persist::{
 
 const TRANSPORT: &str = "signal";
 
+// Non-blocking persistence — fire-and-forget on a background thread.
+fn spawn_save_sessions(sessions: &HashMap<String, String>) {
+    let snapshot = sessions.clone();
+    tokio::task::spawn_blocking(move || save_sessions(TRANSPORT, &snapshot));
+}
+fn spawn_save_channel_models(models: &HashMap<String, String>) {
+    let snapshot = models.clone();
+    tokio::task::spawn_blocking(move || save_channel_models(TRANSPORT, &snapshot));
+}
+
 type SessionMap = Arc<Mutex<HashMap<String, String>>>;
 type ModelMap = Arc<Mutex<HashMap<String, String>>>;
 
@@ -268,7 +278,7 @@ async fn handle_message(
             let mut sessions = sessions.lock().await;
             let removed = sessions.remove(sender).is_some();
             if removed {
-                save_sessions(TRANSPORT, &sessions);
+                spawn_save_sessions(&sessions);
             }
             removed
         };
@@ -303,12 +313,12 @@ async fn handle_message(
         {
             let mut prefs = channel_models.lock().await;
             prefs.insert(sender.to_string(), resolved.clone());
-            save_channel_models(TRANSPORT, &prefs);
+            spawn_save_channel_models(&prefs);
         }
         {
             let mut sessions = sessions.lock().await;
             if sessions.remove(sender).is_some() {
-                save_sessions(TRANSPORT, &sessions);
+                spawn_save_sessions(&sessions);
             }
         }
         let _ = send_message_to(
@@ -391,7 +401,7 @@ async fn handle_message(
             if let Some(sid) = new_session {
                 let mut sessions = sessions.lock().await;
                 sessions.insert(sender.to_string(), sid);
-                save_sessions(TRANSPORT, &sessions);
+                spawn_save_sessions(&sessions);
             }
             let text = if response.is_empty() {
                 "(OMP returned an empty response)".to_string()

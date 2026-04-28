@@ -25,6 +25,26 @@ use crate::bridge::persist::{
 
 const TRANSPORT: &str = "discord";
 
+
+// ---------------------------------------------------------------------------
+// Non-blocking persistence — fire-and-forget on a background thread.
+// Clones the map so the caller's mutex is released immediately.
+// ---------------------------------------------------------------------------
+
+fn spawn_save_sessions(sessions: &HashMap<String, String>) {
+    let snapshot = sessions.clone();
+    tokio::task::spawn_blocking(move || save_sessions(TRANSPORT, &snapshot));
+}
+
+fn spawn_save_channel_models(models: &HashMap<String, String>) {
+    let snapshot = models.clone();
+    tokio::task::spawn_blocking(move || save_channel_models(TRANSPORT, &snapshot));
+}
+
+fn spawn_save_work_dirs(dirs: &HashMap<String, String>) {
+    let snapshot = dirs.clone();
+    tokio::task::spawn_blocking(move || save_work_dirs(TRANSPORT, &snapshot));
+}
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -144,11 +164,12 @@ impl EventHandler for DiscordHandler {
         }
 
         let prefix = &self.config.prefix;
+        let is_dm = msg.guild_id.is_none();
         // Normalize em-dash (U+2014) → "--" so command parsing always sees ASCII hyphens.
         let content_normalized = msg.content.replace('\u{2014}', "--");
         let mut text = content_normalized.trim();
 
-        // !ping
+        // !ping  (works in both DMs and guilds)
         if text == format!("{}ping", prefix) {
             let now = serenity::all::Timestamp::now();
             let now_f64 = now.unix_timestamp() as f64 + now.nanosecond() as f64 / 1e9;
@@ -162,14 +183,14 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // !omp reset
-        if text == format!("{}omp reset", prefix) {
+        // !omp reset  (works in both DMs and guilds)
+        if text == format!("{}omp reset", prefix) || (is_dm && text == "reset") {
             let channel_key = msg.channel_id.to_string();
             let had_session = {
                 let mut sessions = self.sessions.lock().await;
                 let removed = sessions.remove(&channel_key).is_some();
                 if removed {
-                    save_sessions(TRANSPORT, &sessions);
+                    spawn_save_sessions(&sessions);
                 }
                 removed
             };
@@ -182,7 +203,7 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // Strip !omp prefix or @mention
+        // Strip !omp prefix, @mention, or (for DMs) accept bare text.
         if let Some(rest) = text.strip_prefix(&format!("{}omp", prefix)) {
             text = rest.trim();
         } else if let Some(bot_id) = self.bot_id.get() {
@@ -192,21 +213,37 @@ impl EventHandler for DiscordHandler {
                 text = rest.trim();
             } else if let Some(rest) = text.strip_prefix(&nick_mention) {
                 text = rest.trim();
-            } else {
-                // Not addressed to us
+            } else if !is_dm {
+                // Guild message not addressed to us — ignore.
                 return;
             }
-        } else {
+            // DM without prefix/mention: fall through with full text as query.
+        } else if !is_dm {
+            // Guild message, no prefix, bot_id not yet known — ignore.
             return;
         }
+        // In DMs: bare text falls through here as the query.
 
         if text.is_empty() {
             return;
         }
 
-        // !omp ? / help
+        // !omp ? / help  (also bare "help"/"?" in DMs)
         if text == "?" || text == "help" {
-            let help_msg = "**OMP Bridge — Discord Commands**\n\
+            let help_msg = if is_dm {
+                "**OMP Bridge — Discord Commands**\n\
+                Just type your message — no prefix needed in DMs.\n\n\
+                `reset` — Clear session\n\
+                `model <alias> <query>` — One-off model override\n\
+                `swap <alias>` — Sticky model\n\
+                `swaplist` — List available models\n\
+                `ls` — List working directory\n\
+                `cd <dir>` — Change directory\n\
+                `..` — Go up one directory\n\
+                `mkdir <name>` — Create a directory\n\
+                `help` / `?` — Show this help"
+            } else {
+                "**OMP Bridge — Discord Commands**\n\
                 `!ping` — Health check\n\
                 `!omp reset` — Clear session for this channel\n\
                 `!omp <query>` — Send a query to OMP\n\
@@ -218,7 +255,8 @@ impl EventHandler for DiscordHandler {
                 `!omp cd <dir>` — Change directory (sandboxed)\n\
                 `!omp ..` — Go up one directory\n\
                 `!omp mkdir <name>` — Create a directory\n\
-                `!omp help` / `!omp ?` — Show this help";
+                `!omp help` / `!omp ?` — Show this help"
+            };
             let _ = msg.channel_id.say(&ctx.http, help_msg).await;
             return;
         }
@@ -274,13 +312,13 @@ impl EventHandler for DiscordHandler {
             {
                 let mut channel_models = self.channel_models.lock().await;
                 channel_models.insert(msg.channel_id.to_string(), resolved.clone());
-                save_channel_models(TRANSPORT, &channel_models);
+                spawn_save_channel_models(&channel_models);
             }
             {
                 // Clear session — it is model-scoped in OMP.
                 let mut sessions = self.sessions.lock().await;
                 if sessions.remove(&msg.channel_id.to_string()).is_some() {
-                    save_sessions(TRANSPORT, &sessions);
+                    spawn_save_sessions(&sessions);
                 }
             }
             let _ = msg
@@ -459,13 +497,13 @@ impl DiscordHandler {
     async fn set_workdir(&self, channel_key: &str, path: &Path) {
         let mut dirs = self.work_dirs.lock().await;
         dirs.insert(channel_key.to_string(), path.to_string_lossy().to_string());
-        save_work_dirs(TRANSPORT, &dirs);
+        spawn_save_work_dirs(&dirs);
     }
 
     async fn clear_session(&self, channel_key: &str) {
         let mut sessions = self.sessions.lock().await;
         if sessions.remove(channel_key).is_some() {
-            save_sessions(TRANSPORT, &sessions);
+            spawn_save_sessions(&sessions);
         }
     }
 
@@ -576,7 +614,7 @@ impl DiscordHandler {
                 if let Some(sid) = new_session {
                     let mut sessions = self.sessions.lock().await;
                     sessions.insert(channel_key.clone(), sid.clone());
-                    save_sessions(TRANSPORT, &sessions);
+                    spawn_save_sessions(&sessions);
                     info!("Saved session {} for channel {}", sid, channel_key);
                 }
                 let text = if response.is_empty() {
