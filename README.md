@@ -47,7 +47,8 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 5. [Connect your harness](#connect-your-harness)
 6. [Dashboard guide](#dashboard-guide)
 7. [MCP code review guide](#mcp-code-review-guide)
-8. [Reference](#reference)
+8. [Bridge: Discord and Signal](#bridge-discord-and-signal)
+9. [Reference](#reference)
 
 ---
 
@@ -319,12 +320,10 @@ bonsai:
   # Absolute path to the Bonsai GGUF file you downloaded
   model_path: "/home/yourname/models/bonsai/Bonsai-8B-Q6_K_L.gguf"
 
-# Optional — all fields have sensible defaults:
+# Optional 		-- all fields have sensible defaults:
 # review:
 #   max_iterations: 5
-#   context:
-#     prd_paths: [docs/PRD.md, PRD.md, README.md]
-#     include_git_diff: true
+#   forced_mode: "auto"  # "auto" | "cloud" | "local"
 ```
 
 After editing, restart:
@@ -608,6 +607,63 @@ Do not consider the task complete until you receive status: "approved".
 
 ---
 
+## Bridge: Discord and Signal
+
+brainrouter includes bridge transports that connect Discord and Signal to OMP. Each bridge runs as part of the brainrouter daemon and shells out to the `omp` CLI to handle queries. Enable them in the `bridge` section of `brainrouter.yaml`.
+
+### Discord bot commands
+
+| Command | Description |
+|---|---|
+| `!ping` | Health check |
+| `!omp <query>` | Send query to OMP |
+| `@bot <query>` | Mention-based query (same as `!omp`) |
+| `!omp reset` | Clear conversation session |
+| `!omp model <alias> <query>` | Query using a specific model alias |
+| `!omp swap <alias>` | Switch default model for this channel |
+| `!omp swaplist` | List available model aliases |
+| `!omp ls` | List files in current working directory |
+| `!omp cd <dir>` | Change working directory |
+| `!omp ..` | Go up one directory |
+| `!omp mkdir <name>` | Create a directory |
+| `!omp help` | Show command help |
+
+### Signal bot commands
+
+| Command | Description |
+|---|---|
+| `!ping` | Health check |
+| `!omp <query>` | Send query to OMP |
+| `--model <name> <query>` | Query using a specific model |
+| `!omp reset` | Clear conversation session |
+| `!omp model` | Show current model |
+| `!omp model <name>` | Switch model |
+| `!omp llama-list` | List llama-swap models |
+| `!omp help` | Show command help |
+
+### Model aliases
+
+Model aliases map short names to llama-swap model keys. Configure them in the aliases config file (default `~/.config/omp-bridge/config.yaml`).
+
+### Session management
+
+Each channel (Discord) or conversation (Signal) maintains its own session. Sessions track conversation history, current working directory, and selected model. Use `!omp reset` to clear a session.
+
+### Persistence paths
+
+| Data | Path |
+|---|---|
+| Discord sessions | `~/.local/share/omp-bridge/discord-sessions.json` |
+| Discord channel models | `~/.local/share/omp-bridge/discord-channel-models.json` |
+| Discord work dirs | `~/.local/share/omp-bridge/discord-work-dirs.json` |
+| Signal sessions | `~/.local/share/omp-bridge/signal-sessions.json` |
+| Signal channel models | `~/.local/share/omp-bridge/signal-channel-models.json` |
+| Signal work dirs | `~/.local/share/omp-bridge/signal-work-dirs.json` |
+
+Long responses are automatically chunked (1500 chars for Discord, 4000 chars for Signal).
+
+---
+
 ## Reference
 
 ### brainrouter.yaml — full options
@@ -620,20 +676,45 @@ manifest:
 llama_swap:
   base_url: "http://localhost:8081/v1"   # required
   fallback_model: "my-model"             # required — must match a key in llama-swap config
-  local_system_prompt: "/path/to/prompt.md"   # optional — override built-in lean prompt
-  llama_cpp_restart_script: "/path/to/script.sh"  # optional — used by Restart llama.cpp button
+  local_system_prompt: "/path/to/prompt.md"  # optional — override built-in lean prompt
 
 bonsai:
   model_path: "/path/to/Bonsai-8B-Q6_K_L.gguf"  # required — absolute path
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
-  retry_on_llm_error: true    # retry if the LLM returns a malformed response
-  context:
-    prd_paths: [docs/PRD.md, PRD.md, README.md]  # searched in order; first found wins
-    include_git_diff: true
-    git_diff_max_bytes: 102400
+  forced_mode: "auto"         # "auto" | "cloud" | "local" — default "auto"
+  forced_model: "my-model"    # only used when forced_mode = "local"
+
+bridge:
+  omp_path: "omp"                              # path to omp CLI binary
+  work_dir: "/home/you"                         # default working directory
+  aliases_config: "~/.config/omp-bridge/config.yaml"  # model alias definitions
+  timeout_secs: 600                              # per-query timeout
+  default_model: "brainrouter/auto"              # model for new sessions
+  discord:
+    enabled: false                               # set true + provide token to activate
+    token: "Bot ..."                              # Discord bot token — required when enabled
+    prefix: "!"                                   # command prefix
+  signal:
+    enabled: false                               # set true + provide account to activate
+    account: "+15551234567"                       # E.164 phone — required when enabled
+    group_id: "base64..."                         # restrict to one Signal group
+    prefix: "!"                                   # command prefix
+    storage_path: "/path/to/signal-cli/data"      # signal-cli storage
+    llama_swap_url: "http://localhost:8081"        # for llama-list command
 ```
+
+### Environment variables
+
+| Variable | Description |
+|---|---|
+| `RUST_LOG` | Log level filter (default `info`). Overrides `--log-level`. Example: `RUST_LOG=debug` |
+| `HOME` | User home directory. Used for default paths |
+| `XDG_RUNTIME_DIR` | Runtime directory for UDS socket (default `/run/user/$UID`) |
+| `XDG_CONFIG_HOME` | Config directory for persisted review state (default `~/.config`) |
+| `BRAINROUTER_MANIFEST_DIR` | Override Manifest docker-compose directory for restart/upgrade |
+| `<manifest.api_key_env>` | Dynamic: whatever env var name is set in `manifest.api_key_env` (e.g. `MANIFEST_API_KEY`) holds the Manifest API key |
 
 ### Subcommands
 
@@ -661,6 +742,10 @@ All on `http://127.0.0.1:9099`.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/versions` | Installed versions + latest available |
+| `GET` | `/api/routing-events` | Live routing events feed |
+| `GET` | `/api/routing-stats` | Routing statistics |
+| `GET` | `/api/service-health` | Service health status per provider |
+| `GET` | `/api/bridge-status` | Bridge transport status (Discord / Signal) |
 | `GET` | `/api/inference-status` | Current inference state (for progress bar) |
 | `GET` | `/api/review-config` | Current review mode and forced model |
 | `POST` | `/api/review-config` | Update review mode / forced model |
@@ -679,37 +764,52 @@ All on `http://127.0.0.1:9099`.
 | `GET` | `/review/api/sessions` | JSON session list |
 | `GET` | `/review/api/sessions/:id` | JSON session detail |
 | `POST` | `/review/api/request` | Start a review. Body: `{taskId, summary, details?}` |
+| `POST` | `/review/api/resolve` | Resolve a review session. Body: `{sessionId, feedback}` |
+| `POST` | `/review/api/continue` | Continue a review iteration |
+| `POST` | `/review/api/lgtm` | Quick-approve a review session |
 | `POST` | `/review/session/:id/resolve` | Human resolve. Body: `{feedback: "lgtm"}` |
 
 ### Architecture
 
 ```
 src/
-  main.rs            — clap dispatcher (serve | mcp | install)
-  daemon.rs          — startup: loads Bonsai, wires state, starts server
-  server.rs          — hyper HTTP router
-  classifier.rs      — Bonsai 8B classifier (Cloud/Local decision)
-  router.rs          — routes to Manifest or llama-swap; circuit breaker; fallback
-  prompt_rewriter.rs — system prompt rewriter for local mode
-  anthropic.rs       — Anthropic ↔ OpenAI protocol translation
-  mcp_server.rs      — JSON-RPC stdio, forwards to daemon over UDS
-  install.rs         — idempotent harness config merger
-  session.rs         — in-memory review session store
+  main.rs            	-- clap dispatcher (serve | mcp | install)
+  daemon.rs          	-- startup: loads Bonsai, wires state, starts server
+  server.rs          	-- hyper HTTP router
+  classifier.rs      	-- Bonsai 8B classifier (Cloud/Local decision)
+  router.rs          	-- routes to Manifest or llama-swap; circuit breaker; fallback
+  prompt_rewriter.rs 	-- system prompt rewriter for local mode
+  anthropic.rs       	-- Anthropic <> OpenAI protocol translation
+  mcp_server.rs      	-- JSON-RPC stdio, forwards to daemon over UDS
+  install.rs         	-- idempotent harness config merger
+  session.rs         	-- in-memory review session store
+  config.rs          	-- YAML config parsing and validation
+  types.rs           	-- OpenAI-compatible request/response types
+  lib.rs             	-- library root
+  peer_cwd.rs        	-- peer CWD resolution via /proc
+  routing_events.rs  	-- routing event store (last 500 events)
+  inference_state.rs 	-- inference state tracking
   review/
-    mod.rs           — ReviewService
-    review_loop.rs   — iterative LLM review loop
-    context.rs       — gathers PRD, git diff, AGENTS.md
-    prompt.rs        — review prompt template
+    mod.rs           	-- ReviewService
+    review_loop.rs   	-- iterative LLM review loop
+    context.rs       	-- gathers PRD, git diff, AGENTS.md
+    prompt.rs        	-- review prompt template
   escalation/
-    mod.rs           — /review/* HTTP handlers + ReviewRequest parsing
-    templates/       — embedded HTML: dashboard + session detail
+    mod.rs           	-- /review/* HTTP handlers + ReviewRequest parsing
+    templates/       	-- embedded HTML: dashboard + session detail
   provider/
-    mod.rs           — Provider trait + SseStream type
-    openai.rs        — OpenAI-compatible HTTP adapter
-  health.rs          — circuit breaker (3 failures → open; 60 s cooldown)
-  stream.rs          — TimeoutStream: chunk stall detection
-  config.rs          — YAML config parsing and validation
-  types.rs           — OpenAI-compatible request/response types
+    mod.rs           	-- Provider trait + SseStream type
+    openai.rs        	-- OpenAI-compatible HTTP adapter
+  health.rs          	-- circuit breaker (3 failures -> open; 60 s cooldown)
+  stream.rs          	-- TimeoutStream: chunk stall detection
+  bridge/
+    mod.rs           	-- bridge feature flags and init
+    core.rs          	-- shared bridge logic (session, OMP dispatch, chunking)
+    persist.rs       	-- JSON persistence for sessions, models, work dirs
+    discord/
+      mod.rs         	-- Discord bot (serenity) with command handler
+    signal/
+      mod.rs         	-- Signal bot with polling loop
 ```
 
 ### External services
@@ -726,5 +826,5 @@ src/
 cargo test
 ```
 
-38 tests across 6 suites: circuit breaker, Anthropic↔OpenAI translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation.
+46 tests across 10 suites (4 integration test files + 6 inline test modules): circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
 

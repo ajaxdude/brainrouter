@@ -51,4 +51,4 @@ bonsai:
 #     enabled: true
 #     account: "+1234567890"                  # E.164 phone number
 #     prefix: "!"                             # Command prefix (default: !)
-#     llama_swap_url: "http://localhost:9099"  # For model listing command
+#     llama_swap_url: "http://localhost:8081"  # For model listing command
