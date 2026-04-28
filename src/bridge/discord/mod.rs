@@ -237,10 +237,11 @@ impl EventHandler for DiscordHandler {
                 Just type your message \u{2014} no prefix needed in DMs.\n\n\
                 `reset` \u{2014} Clear session\n\
                 `model <alias> <query>` \u{2014} One-off model override\n\
-                `swap <alias>` \u{2014} Sticky model\n\
-                `swap brainrouter [auto|local|cloud]` \u{2014} Brainrouter routing mode\n\
+                `brainrouter` \u{2014} Show current model\n\
+                `brainrouter auto|local|cloud` \u{2014} Set routing mode\n\
+                `brainrouter <model>` \u{2014} Use specific local model\n\
+                `brainrouter list` \u{2014} List all available models\n\
                 `review [auto|local|cloud]` \u{2014} Set/show review mode\n\
-                `swaplist` \u{2014} List available models\n\
                 `ls` \u{2014} List working directory\n\
                 `cd <dir>` \u{2014} Change directory\n\
                 `..` \u{2014} Go up one directory\n\
@@ -253,10 +254,11 @@ impl EventHandler for DiscordHandler {
                 `!omp <query>` — Send a query to OMP\n\
                 `@bot <query>` — Same as `!omp <query>`\n\
                 `!omp model <alias> <query>` — One-off model override\n\
-                `!omp swap <alias>` \u{2014} Sticky model for this channel\n\
-                `!omp swap brainrouter [auto|local|cloud]` \u{2014} Brainrouter routing mode\n\
+                `!omp brainrouter` \u{2014} Show current model\n\
+                `!omp brainrouter auto|local|cloud` \u{2014} Set routing mode\n\
+                `!omp brainrouter <model>` \u{2014} Use specific local model\n\
+                `!omp brainrouter list` \u{2014} List all available models\n\
                 `!omp review [auto|local|cloud]` \u{2014} Set/show review mode\n\
-                `!omp swaplist` \u{2014} List models available via brainrouter\n\
                 `!omp ls` — List current working directory\n\
                 `!omp cd <dir>` — Change directory (sandboxed)\n\
                 `!omp ..` — Go up one directory\n\
@@ -267,89 +269,76 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        // !omp swaplist — list models from brainrouter (falls back to llama-swap)
-        if text == "swaplist" {
-            let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
-            // brainrouter proxies GET /v1/models from llama-swap
-            match reqwest::get("http://127.0.0.1:9099/v1/models").await {
-                Ok(resp) => {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        let mut models = Vec::new();
-                        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                            for item in data {
-                                if let (Some(id), Some(name)) = (
-                                    item.get("id").and_then(|v| v.as_str()),
-                                    item.get("name").and_then(|v| v.as_str()),
-                                ) {
-                                    models.push(format!("- **{}** (`{}`)", name, id));
-                                }
-                            }
-                        }
-                        let reply = if models.is_empty() {
-                            "No models found.".to_string()
-                        } else {
-                            format!("**Available models:**\n{}", models.join("\n"))
-                        };
-                        send_chunked(&ctx, msg.channel_id, &reply).await;
-                    } else {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, "Failed to parse models response.")
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    let _ = msg
-                        .channel_id
-                        .say(
-                            &ctx.http,
-                            format!("Failed to reach brainrouter: {}", e),
-                        )
-                        .await;
-                }
-            }
-            return;
-        }
-
-        // !omp swap <alias> [auto|local|cloud]
-        // Special case: "swap brainrouter [mode]" sets brainrouter/<mode>
-        if let Some(alias) = text.strip_prefix("swap ") {
-            let parts: Vec<&str> = alias.trim().splitn(2, ' ').collect();
-            let name = parts[0];
-            let resolved = if name.eq_ignore_ascii_case("brainrouter") {
-                let mode = parts.get(1).copied().unwrap_or("auto");
-                match mode {
-                    "auto" | "local" | "cloud" => format!("brainrouter/{}", mode),
-                    _ => {
-                        let _ = msg.channel_id.say(&ctx.http,
-                            "Usage: `swap brainrouter [auto|local|cloud]`").await;
-                        return;
-                    }
-                }
-            } else {
-                let raw = resolve_model(name, &self.model_aliases);
-                // Ensure model routes through brainrouter (OMP needs brainrouter/* format).
-                if raw.starts_with("brainrouter/") {
-                    raw
-                } else {
-                    "brainrouter/auto".to_string()
-                }
-            };
-            {
-                let mut channel_models = self.channel_models.lock().await;
-                channel_models.insert(msg.channel_id.to_string(), resolved.clone());
-                spawn_save_channel_models(&channel_models);
-            }
-            {
-                let mut sessions = self.sessions.lock().await;
-                if sessions.remove(&msg.channel_id.to_string()).is_some() {
-                    spawn_save_sessions(&sessions);
-                }
-            }
-            let _ = msg.channel_id.say(&ctx.http,
-                format!("Model swapped to `{}`. Previous session cleared.", resolved)).await;
-            return;
-        }
+		// !omp brainrouter [auto|cloud|local|list|<model>]
+		if let Some(rest) = text.strip_prefix("brainrouter ") {
+		    let arg = rest.trim();
+		    let arg = if arg.is_empty() { "auto" } else { arg };
+		    if arg == "list" {
+		        // List all available models from brainrouter /v1/models
+		        let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
+		        match reqwest::get("http://127.0.0.1:9099/v1/models").await {
+		            Ok(resp) => {
+		                if let Ok(json) = resp.json::<serde_json::Value>().await {
+		                    let mut routing = Vec::new();
+		                    let mut local = Vec::new();
+		                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+		                        for item in data {
+		                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+		                                let owner = item.get("owned_by").and_then(|v| v.as_str()).unwrap_or("");
+		                                if owner == "brainrouter" {
+		                                    routing.push(format!("  `{}` \u{2014} routing mode", id));
+		                                } else {
+		                                    local.push(format!("  `{}`", id));
+		                                }
+		                            }
+		                        }
+		                    }
+		                    let mut reply = String::from("**Routing modes:**\n");
+		                    reply.push_str(&routing.join("\n"));
+		                    if !local.is_empty() {
+		                        reply.push_str("\n\n**Local models (llama-swap):**\n");
+		                        reply.push_str(&local.join("\n"));
+		                    }
+		                    reply.push_str("\n\n**Cloud:** Manifest (auto-selects provider)");
+		                    send_chunked(&ctx, msg.channel_id, &reply).await;
+		                } else {
+		                    let _ = msg.channel_id.say(&ctx.http, "Failed to parse models.").await;
+		                }
+		            }
+		            Err(e) => {
+		                let _ = msg.channel_id.say(&ctx.http, format!("Failed: {}", e)).await;
+		            }
+		        }
+		        return;
+		    }
+		    // auto, local, cloud, or specific model name
+		    let model_id = format!("brainrouter/{}", arg);
+		    {
+		        let mut channel_models = self.channel_models.lock().await;
+		        channel_models.insert(msg.channel_id.to_string(), model_id.clone());
+		        spawn_save_channel_models(&channel_models);
+		    }
+		    {
+		        let mut sessions = self.sessions.lock().await;
+		        if sessions.remove(&msg.channel_id.to_string()).is_some() {
+		            spawn_save_sessions(&sessions);
+		        }
+		    }
+		    let _ = msg.channel_id.say(&ctx.http,
+		        format!("Model set to `{}`. Session cleared.", model_id)).await;
+		    return;
+		}
+		// Also handle bare "brainrouter" (no arg) — show current model
+		if text == "brainrouter" {
+		    let channel_key = msg.channel_id.to_string();
+		    let channel_models = self.channel_models.lock().await;
+		    let current = channel_models.get(&channel_key)
+		        .map(|m| m.as_str())
+		        .unwrap_or(&self.config.default_model);
+		    let _ = msg.channel_id.say(&ctx.http,
+		        format!("Current model: `{}`\nUse `brainrouter list` to see options.", current)).await;
+		    return;
+		}
 
         // !omp review [auto|local|cloud] — set the code review routing mode
         if let Some(rest) = text.strip_prefix("review ") {

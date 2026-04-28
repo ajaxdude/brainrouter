@@ -223,14 +223,36 @@ async fn handle_request(
         }
 
         ("GET", "/v1/models") => {
-            let models = ModelListResponse {
-                object: "list",
-                data: vec![
-                    ModelObject { id: "auto".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-                    ModelObject { id: "local".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-                    ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-                ],
-            };
+            let mut data = vec![
+                ModelObject { id: "auto".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+                ModelObject { id: "local".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+                ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+            ];
+            // Fetch llama-swap models and append them
+            let ls_url = format!("{}/v1/models", &state.llama_swap_url);
+            if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
+                .timeout(std::time::Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+                        let skip = ["auto", "local", "cloud"];
+                        for m in arr {
+                            if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                                if !skip.contains(&id) {
+                                    data.push(ModelObject {
+                                        id: id.to_string(),
+                                        object: "model",
+                                        created: 0,
+                                        owned_by: "llama-swap".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let models = ModelListResponse { object: "list", data };
             let resp = json_response(StatusCode::OK, &models);
             into_unsync(resp)
         }

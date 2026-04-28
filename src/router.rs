@@ -136,21 +136,55 @@ impl Router {
             }
             // Auto: existing Bonsai classification
             _ => {
-                tracker.set(Phase::Classifying, None, None);
-                let decision = self
-                    .classifier
-                    .classify_async(request.clone())
-                    .await;
-                info!(?decision, "Bonsai routing decision");
-                match decision {
-                    RoutingDecision::Cloud => {
-                        tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
-                        ("cloud", self.route_cloud(request).await)
+                // Check for brainrouter/<specific-model> — direct to llama-swap
+                if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
+                    if !specific.is_empty() {
+                        info!(model = specific, "Direct model mode — routing to llama-swap");
+                        tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()));
+                        request.messages = prompt_rewriter::rewrite_for_local(
+                            request.messages,
+                            self.local_system_prompt.as_deref(),
+                        );
+                        request.model = specific.to_string();
+                        ("local-specific", self.route_local(request).await)
+                    } else {
+                        // Empty suffix, treat as auto — fall through to Bonsai
+                        tracker.set(Phase::Classifying, None, None);
+                        let decision = self
+                            .classifier
+                            .classify_async(request.clone())
+                            .await;
+                        info!(?decision, "Bonsai routing decision");
+                        match decision {
+                            RoutingDecision::Cloud => {
+                                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
+                                ("cloud", self.route_cloud(request).await)
+                            }
+                            RoutingDecision::Local { model } => {
+                                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
+                                request.model = model;
+                                ("local", self.route_local(request).await)
+                            }
+                        }
                     }
-                    RoutingDecision::Local { model } => {
-                        tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
-                        request.model = model;
-                        ("local", self.route_local(request).await)
+                } else {
+                    // No brainrouter/ prefix — existing Bonsai classification
+                    tracker.set(Phase::Classifying, None, None);
+                    let decision = self
+                        .classifier
+                        .classify_async(request.clone())
+                        .await;
+                    info!(?decision, "Bonsai routing decision");
+                    match decision {
+                        RoutingDecision::Cloud => {
+                            tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
+                            ("cloud", self.route_cloud(request).await)
+                        }
+                        RoutingDecision::Local { model } => {
+                            tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
+                            request.model = model;
+                            ("local", self.route_local(request).await)
+                        }
                     }
                 }
             }
