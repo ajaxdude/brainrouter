@@ -134,7 +134,7 @@ The MCP server needs to know the caller's working directory. On Linux, brainrout
 | Config | `src/config.rs` | YAML parsing + validation |
 | Types | `src/types.rs` | OpenAI request/response structs |
 | Health tracker | `src/health.rs` | Per-provider circuit breaker |
-| Stream wrapper | `src/stream.rs` | `TimeoutStream`: 180s chunk stall detection; `SafeStream`: error-to-SSE converter |
+| Stream wrapper | `src/stream.rs` | `TimeoutStream`: lazy-armed 180s inter-chunk stall detection; `SafeStream`: error-to-SSE converter |
 | Routing events | `src/routing_events.rs` | In-memory event buffer for dashboard live feed |
 | Inference state | `src/inference_state.rs` | Track active inference status per provider |
 | Peer CWD | `src/peer_cwd.rs` | Linux-native PID/inode mapping for directory discovery (IPv4/IPv6/UDS) |
@@ -415,8 +415,12 @@ All bridge state is persisted to `~/.local/share/omp-bridge/`:
 | `!br ping` | Health check |
 | `!br reset` | Clear the current session |
 | `!br status` | Show current model |
-| `!br model <name>` | Set model |
+| `!br auto` / `local` / `cloud` | Set routing mode |
+| `!br <model-name>` | Set specific llama-swap model (names containing `-` or `.`) |
+| `!br model <name>` | Set model (legacy form) |
 | `!br list` | List available models |
+| `!br review` | Show current review mode |
+| `!br review auto\|local\|cloud` | Set review mode |
 | `!br help` / `!br ?` | Show command help |
 | `!br <query>` | Send a query to the LLM |
 | bare text | Send a query (no prefix needed) |
@@ -456,7 +460,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 |---|---|---|
 | `GET` | `/api/routing-events` | Live routing event feed (SSE or polling) |
 | `GET` | `/api/routing-stats` | Aggregate routing statistics |
-| `GET` | `/api/inference-status` | Current inference state per provider |
+| `GET` | `/api/inference-status` | Current inference state, model, elapsed time, token progress |
 | `GET` | `/api/service-health` | Circuit breaker status for all providers |
 | `GET` | `/api/versions` | Version information for brainrouter and dependencies |
 | `GET` | `/api/review-config` | Current review configuration (mode, model) |

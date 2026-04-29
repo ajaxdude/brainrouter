@@ -239,7 +239,6 @@
           <th style="width:8%">Time</th>
           <th style="width:9%">Folder</th>
           <th style="width:18%">Prompt</th>
-          <th style="width:7%">Route</th>
           <th style="width:8%">Router</th>
           <th style="width:9%">Provider</th>
           <th style="width:14%">Model</th>
@@ -249,7 +248,7 @@
         </tr>
       </thead>
       <tbody id="events-body">
-        <tr><td colspan="10" class="empty">No routing events yet.</td></tr>
+        <tr><td colspan="9" class="empty">No routing events yet.</td></tr>
       </tbody>
     </table>
   </div>
@@ -281,10 +280,12 @@
     <div class="stat-card" style="flex:1; text-align:center;">
       <div class="slabel">Discord</div>
       <div class="sval" id="bridge-discord-status" style="font-size:0.8rem;">&mdash;</div>
+      <div style="margin-top:8px;"><button id="bridge-discord-toggle" onclick="toggleBridge('discord')" style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid var(--border); background:transparent; color:var(--muted); cursor:pointer; font-family:inherit; transition:all 0.15s;">&mdash;</button></div>
     </div>
     <div class="stat-card" style="flex:1; text-align:center;">
       <div class="slabel">Signal</div>
       <div class="sval" id="bridge-signal-status" style="font-size:0.8rem;">&mdash;</div>
+      <div style="margin-top:8px;"><button id="bridge-signal-toggle" onclick="toggleBridge('signal')" style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid var(--border); background:transparent; color:var(--muted); cursor:pointer; font-family:inherit; transition:all 0.15s;">&mdash;</button></div>
     </div>
   </div>
   </div>
@@ -471,7 +472,7 @@
       // Prevent refresh from blowing away user selection while they are trying to copy.
       if (!window.getSelection().isCollapsed && tbody.contains(window.getSelection().anchorNode)) return;
       if (!events.length) {
-        tbody.innerHTML = '<tr><td colspan="10" class="empty">No routing events yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No routing events yet.</td></tr>';
         return;
       }
 
@@ -529,15 +530,29 @@
           const elapsed = activeStatus.elapsed_ms ? (activeStatus.elapsed_ms / 1000).toFixed(1) + 's' : '';
           let fillClass = 'progress-fill';
           let fillWidth = '0%';
-          if (activeStatus.state === 'loading') { fillClass += ' loading'; }
-          else if (activeStatus.state.includes('processing')) { fillClass += ' processing'; fillWidth = '40%'; }
-          else if (activeStatus.state.includes('streaming') || activeStatus.state.includes('generating')) { fillClass += ' generating'; fillWidth = '100%'; }
+          let pctText = '';
+          if (activeStatus.state === 'loading' || activeStatus.state === 'classifying') {
+            fillClass += ' loading';
+          } else if (activeStatus.state.includes('processing')) {
+            fillClass += ' loading';
+            pctText = 'Processing\u2026';
+          } else if (activeStatus.state.includes('streaming') || activeStatus.state.includes('generating')) {
+            if (activeStatus.progress != null && activeStatus.progress >= 0) {
+              fillClass += ' generating';
+              const pct = Math.min(Math.round(activeStatus.progress * 100), 100);
+              fillWidth = pct + '%';
+              pctText = pct + '%';
+            } else {
+              fillClass += ' loading';
+              pctText = 'Generating\u2026';
+            }
+          }
 
           progressHtml = `
             <div class="progress-track" style="margin-top:6px; height:4px;">
-              <div class="progress-fill ${fillClass}" style="width:${fillWidth}"></div>
+              <div class="${fillClass}" style="width:${fillWidth}"></div>
             </div>
-            <div style="font-size:0.65rem; color:var(--muted); margin-top:2px;">${stateLabel} ${elapsed}</div>
+            <div style="font-size:0.65rem; color:var(--muted); margin-top:2px;">${stateLabel} ${elapsed} ${pctText}</div>
           `;
         }
 
@@ -548,7 +563,6 @@
             <span class="truncate" title="${esc(e.prompt_excerpt)}">${promptDisplay}</span>${countBadge}
             ${progressHtml}
           </td>
-          <td><span class="badge badge-${e.bonsai_decision || 'unknown'}">${e.bonsai_decision || '&mdash;'}</span>${fallback}</td>
           <td>${routerDisplay(e)}</td>
           <td>${providerDisplay(e)}</td>
           <td>${modelDisplay(e)}</td>
@@ -626,19 +640,34 @@
 
     // Slow refresh: versions (runs podman) and review config — less frequent.
     async function refreshSlow() {
-      const [verData, revData, bridgeData] = await Promise.all([
+      const [verData, revData, bridgeData, cfgResp] = await Promise.all([
         safeFetch('/api/versions'),
         safeFetch('/api/review-config'),
         safeFetch('/api/bridge-status'),
+        fetch('/api/config').then(r => r.ok ? r.text() : null).catch(() => null),
       ]);
       if (verData) renderVersions(verData);
       if (revData) syncReviewConfig(revData);
+      if (cfgResp) parseBridgeEnabled(cfgResp);
       if (bridgeData) renderBridgeStatus(bridgeData);
+    }
+
+    let bridgeEnabledState = { discord: null, signal: null };
+
+    function parseBridgeEnabled(yaml) {
+      // Parse enabled state from each bridge section in the YAML config
+      for (const transport of ['discord', 'signal']) {
+        const re = new RegExp('(?:^|\\n)\\s*' + transport + ':\\s*\\n(?:.*\\n)*?\\s+enabled:\\s*(true|false)', 'm');
+        const m = yaml.match(re);
+        if (m) bridgeEnabledState[transport] = m[1] === 'true';
+      }
     }
 
     function renderBridgeStatus(data) {
       const discordEl = document.getElementById('bridge-discord-status');
       const signalEl = document.getElementById('bridge-signal-status');
+      const discordBtn = document.getElementById('bridge-discord-toggle');
+      const signalBtn = document.getElementById('bridge-signal-toggle');
       if (data.discord) {
         const d = data.discord;
         const uptime = d.uptime_secs > 0 ? (d.uptime_secs / 3600).toFixed(1) + 'h' : '';
@@ -648,8 +677,9 @@
           discordEl.innerHTML = `<span class="orange">\'Disconnected</span>${d.last_error ? ' \'\u2014 ' + esc(d.last_error) : ''}`;
         }
       } else {
-        discordEl.textContent = 'Not configured';
+        discordEl.textContent = bridgeEnabledState.discord === false ? 'Disabled' : 'Not configured';
       }
+      setBridgeToggleBtn(discordBtn, bridgeEnabledState.discord !== false);
       if (data.signal) {
         const s = data.signal;
         const uptime = s.uptime_secs > 0 ? (s.uptime_secs / 3600).toFixed(1) + 'h' : '';
@@ -659,7 +689,56 @@
           signalEl.innerHTML = `<span class="orange">\'Disconnected</span>${s.last_error ? ' \'\u2014 ' + esc(s.last_error) : ''}`;
         }
       } else {
-        signalEl.textContent = 'Not configured';
+        signalEl.textContent = bridgeEnabledState.signal === false ? 'Disabled' : 'Not configured';
+      }
+      setBridgeToggleBtn(signalBtn, bridgeEnabledState.signal !== false);
+    }
+
+    function setBridgeToggleBtn(btn, enabled) {
+      if (!btn) return;
+      btn.textContent = enabled ? 'Enabled' : 'Disabled';
+      btn.style.borderColor = enabled ? 'var(--green)' : 'var(--red)';
+      btn.style.color = enabled ? 'var(--green)' : 'var(--red)';
+    }
+
+    async function toggleBridge(transport) {
+      const btn = document.getElementById('bridge-' + transport + '-toggle');
+      if (!btn) return;
+      const wasEnabled = bridgeEnabledState[transport];
+      const newEnabled = !wasEnabled;
+      btn.textContent = 'Saving\u2026';
+      btn.style.color = 'var(--orange)';
+      btn.style.borderColor = 'var(--orange)';
+      btn.disabled = true;
+      try {
+        const resp = await fetch('/api/config');
+        if (!resp.ok) throw new Error('Failed to load config');
+        let yaml = await resp.text();
+        // Flip the enabled line in the appropriate bridge section.
+        // Match: transport name header, then find the next enabled: line.
+        const sectionRe = new RegExp('((?:^|\\n)([ \\t]*)' + transport + ':\\s*\\n)((?:.|\\n)*?)(([ \\t]+)enabled:\\s*)(true|false)', 'm');
+        const m = yaml.match(sectionRe);
+        if (m) {
+          yaml = yaml.replace(sectionRe, (match, prefix, indent, mid, enabledLine, spaces, val) => {
+            return prefix + mid + spaces + 'enabled: ' + newEnabled;
+          });
+        } else {
+          alert('Could not find ' + transport + ' enabled setting in config');
+          btn.disabled = false;
+          setBridgeToggleBtn(btn, wasEnabled);
+          return;
+        }
+        const saveResp = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'text/yaml'}, body: yaml });
+        if (!saveResp.ok) throw new Error('Failed to save config');
+        btn.textContent = 'Restarting\u2026';
+        await fetch('/api/restart/brainrouter', { method: 'POST' }).catch(() => {});
+        setTimeout(() => location.reload(), 3000);
+      } catch (e) {
+        btn.textContent = 'Error';
+        btn.style.color = 'var(--red)';
+        btn.style.borderColor = 'var(--red)';
+        console.error('Bridge toggle failed', e);
+        setTimeout(() => { btn.disabled = false; setBridgeToggleBtn(btn, wasEnabled); }, 3000);
       }
     }
 

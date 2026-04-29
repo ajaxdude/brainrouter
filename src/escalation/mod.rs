@@ -1,12 +1,15 @@
 //! Escalation UI — HTTP handlers for /review/* routes.
 //!
 //! Routes:
-//!   GET  /review/              — session dashboard (HTML, auto-refresh)
-//!   GET  /review/session/:id   — session detail (HTML, with human-resolve form)
-//!   POST /review/session/:id/resolve — human submits feedback
-//!   GET  /review/api/sessions  — JSON session list
-//!   GET  /review/api/sessions/:id — JSON session detail
-
+//!   GET  /review/                       — redirect to /dashboard
+//!   GET  /review/session/:id             — session detail (HTML)
+//!   POST /review/session/:id/resolve     — human submits feedback
+//!   POST /review/api/request             — MCP: start review (blocks until done)
+//!   POST /review/api/resolve             — MCP: resolve session with feedback
+//!   POST /review/api/continue            — MCP: additional LLM review rounds
+//!   POST /review/api/lgtm               — MCP: quick-approve a session
+//!   GET  /review/api/sessions            — JSON session list
+//!   GET  /review/api/sessions/:id        — JSON session detail
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
@@ -51,6 +54,12 @@ pub async fn handle_review_request(
             html_response(SESSION_HTML)
         }
 
+        // JSON API — MCP: resolve a session with human feedback
+        // Must come BEFORE the wildcard /resolve guard to avoid shadowing.
+        ("POST", "/review/api/resolve") => {
+            handle_api_resolve(req, review_service).await
+        }
+
         // Human resolve endpoint
         ("POST", p) if p.ends_with("/resolve") => {
             let session_id = extract_session_id_from_resolve_path(&path);
@@ -60,11 +69,6 @@ pub async fn handle_review_request(
         // JSON API — MCP: start review (long-running, blocks until loop completes)
         ("POST", "/review/api/request") => {
             handle_request_review(req, review_service, cwd).await
-        }
-
-        // JSON API — MCP: resolve a session with human feedback
-        ("POST", "/review/api/resolve") => {
-            handle_api_resolve(req, review_service).await
         }
 
         // JSON API — continue iterating (additional LLM rounds, no human feedback needed)

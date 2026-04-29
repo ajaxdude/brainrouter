@@ -638,8 +638,12 @@ brainrouter includes bridge transports that connect Discord and Signal to OMP. E
 | `!br ping` | Health check |
 | `!br reset` | Clear conversation session |
 | `!br status` | Show current model |
-| `!br model <name>` | Set model |
+| `!br auto` / `local` / `cloud` | Set routing mode |
+| `!br <model-name>` | Set specific llama-swap model (names containing `-` or `.`) |
+| `!br model <name>` | Set model (legacy form) |
 | `!br list` | List models |
+| `!br review` | Show current review mode |
+| `!br review auto\|local\|cloud` | Set review mode |
 | `!br help` / `!br ?` | Show command help |
 | bare text or `!br <query>` | Send query |
 

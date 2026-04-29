@@ -343,6 +343,79 @@ async fn handle_message(
         return;
     }
 
+    // !br auto | !br local | !br cloud
+    for mode in ["auto", "local", "cloud"] {
+        if text == format!("{prefix}br {mode}") {
+            let model_id = format!("brainrouter/{mode}");
+            {
+                let mut prefs = channel_models.lock().await;
+                prefs.insert(sender.to_string(), model_id.clone());
+                spawn_save_channel_models(&prefs);
+            }
+            {
+                let mut sessions = sessions.lock().await;
+                if sessions.remove(sender).is_some() {
+                    spawn_save_sessions(&sessions);
+                }
+            }
+            let _ = send_message_to(account, sender, &format!("Routing set to {model_id}. Session cleared.")).await;
+            return;
+        }
+    }
+
+    // !br review [auto|local|cloud]
+    if let Some(rest) = text.strip_prefix(&format!("{prefix}br review ")) {
+        let mode = rest.trim();
+        if mode != "auto" && mode != "local" && mode != "cloud" {
+            let _ = send_message_to(account, sender, "Usage: !br review auto|local|cloud").await;
+            return;
+        }
+        let body = serde_json::json!({"forced_mode": mode, "max_iterations": 5});
+        match reqwest::Client::new().post("http://127.0.0.1:9099/api/review-config").json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let _ = send_message_to(account, sender, &format!("Review mode set to {mode}.")).await;
+            }
+            _ => {
+                let _ = send_message_to(account, sender, "Failed to set review mode.").await;
+            }
+        }
+        return;
+    }
+    if text == format!("{prefix}br review") {
+        match reqwest::get("http://127.0.0.1:9099/api/review-config").await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let mode = json.get("forced_mode").and_then(|v| v.as_str()).unwrap_or("auto");
+                    let _ = send_message_to(account, sender, &format!("Review mode: {mode}")).await;
+                }
+            }
+            _ => { let _ = send_message_to(account, sender, "Failed to get review config.").await; }
+        }
+        return;
+    }
+
+    // !br <model-name> — set specific llama-swap model
+    if let Some(rest) = text.strip_prefix(&format!("{prefix}br ")) {
+        let arg = rest.trim();
+        let reserved = ["ping", "reset", "help", "?", "status", "list", "auto", "local", "cloud", "review", "model"];
+        if !reserved.contains(&arg) && !arg.contains(' ') && (arg.contains('-') || arg.contains('.')) {
+            let model_id = format!("brainrouter/{arg}");
+            {
+                let mut prefs = channel_models.lock().await;
+                prefs.insert(sender.to_string(), model_id.clone());
+                spawn_save_channel_models(&prefs);
+            }
+            {
+                let mut sessions = sessions.lock().await;
+                if sessions.remove(sender).is_some() {
+                    spawn_save_sessions(&sessions);
+                }
+            }
+            let _ = send_message_to(account, sender, &format!("Model set to {model_id}. Session cleared.")).await;
+            return;
+        }
+    }
+
     // Strip !br prefix if present, leaving the bare query.
     let mut query_text = text;
     if let Some(rest) = text.strip_prefix(&format!("{prefix}br")) {

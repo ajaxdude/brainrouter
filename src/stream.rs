@@ -89,6 +89,9 @@ where
 
 /// A stream that applies a per-chunk timeout.
 /// If no item arrives within `duration`, the stream yields a "stalled" error.
+///
+/// The sleep deadline is deferred until the first `Pending` poll, so the
+/// timeout counts from the first actual wait — not from construction.
 #[pin_project]
 pub struct TimeoutStream<S: Stream> {
     #[pin]
@@ -97,6 +100,7 @@ pub struct TimeoutStream<S: Stream> {
     sleep: Sleep,
     duration: Duration,
     timed_out: bool,
+    started: bool,
 }
 
 impl<S: Stream> TimeoutStream<S>
@@ -109,6 +113,7 @@ where
             sleep: sleep(duration),
             duration,
             timed_out: false,
+            started: false,
         }
     }
 }
@@ -129,7 +134,7 @@ where
         // 1. Try to get the next item from the inner stream
         match this.stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
-                // Item received! Reset the timeout for the next chunk
+                // Item received! Reset the timeout for the next chunk.
                 this.sleep.reset(tokio::time::Instant::now() + *this.duration);
                 Poll::Ready(Some(item))
             }
@@ -138,7 +143,13 @@ where
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                // No item yet, check if the timeout has elapsed
+                // Lazily arm the timer on first pending poll so the
+                // deadline counts from now, not from construction.
+                if !*this.started {
+                    *this.started = true;
+                    this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.duration);
+                }
+                // Check if the timeout has elapsed
                 match this.sleep.poll(cx) {
                     Poll::Ready(_) => {
                         // Timeout elapsed!

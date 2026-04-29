@@ -115,12 +115,13 @@ impl Router {
         let prompt_excerpt = extract_prompt_excerpt(&request);
 
         let tracker = &self.inference_tracker;
+        let max_tokens = request.max_tokens;
 
         let (bonsai_decision, result) = match requested_model.as_str() {
             // Direct local: skip Bonsai, rewrite prompt, go to llama-swap
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
-                tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()));
+                tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
                 request.messages = prompt_rewriter::rewrite_for_local(
                     request.messages,
                     self.local_system_prompt.as_deref(),
@@ -131,7 +132,7 @@ impl Router {
             // Direct cloud: skip Bonsai, go straight to Manifest
             "cloud" | "brainrouter/cloud" => {
                 info!("Direct cloud mode — routing to Manifest");
-                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
+                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 ("cloud-direct", self.route_cloud(request).await)
             }
             // Auto: existing Bonsai classification
@@ -140,7 +141,7 @@ impl Router {
                 if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
                     if !specific.is_empty() {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
-                        tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()));
+                        tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
                         request.messages = prompt_rewriter::rewrite_for_local(
                             request.messages,
                             self.local_system_prompt.as_deref(),
@@ -149,7 +150,7 @@ impl Router {
                         ("local-specific", self.route_local(request).await)
                     } else {
                         // Empty suffix, treat as auto — fall through to Bonsai
-                        tracker.set(Phase::Classifying, None, None);
+                        tracker.set(Phase::Classifying, None, None, max_tokens);
                         let decision = self
                             .classifier
                             .classify_async(request.clone())
@@ -157,11 +158,11 @@ impl Router {
                         info!(?decision, "Bonsai routing decision");
                         match decision {
                             RoutingDecision::Cloud => {
-                                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
+                                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                                 ("cloud", self.route_cloud(request).await)
                             }
                             RoutingDecision::Local { model } => {
-                                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
+                                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                                 request.model = model;
                                 ("local", self.route_local(request).await)
                             }
@@ -169,7 +170,7 @@ impl Router {
                     }
                 } else {
                     // No brainrouter/ prefix — existing Bonsai classification
-                    tracker.set(Phase::Classifying, None, None);
+                    tracker.set(Phase::Classifying, None, None, max_tokens);
                     let decision = self
                         .classifier
                         .classify_async(request.clone())
@@ -177,11 +178,11 @@ impl Router {
                     info!(?decision, "Bonsai routing decision");
                     match decision {
                         RoutingDecision::Cloud => {
-                            tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()));
+                            tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                             ("cloud", self.route_cloud(request).await)
                         }
                         RoutingDecision::Local { model } => {
-                            tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()));
+                            tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                             request.model = model;
                             ("local", self.route_local(request).await)
                         }
@@ -201,7 +202,7 @@ impl Router {
                 } else {
                     Phase::LocalStreaming
                 };
-                tracker.set(streaming_phase, Some(info.model_key.clone()), None);
+                tracker.set(streaming_phase, Some(info.model_key.clone()), None, max_tokens);
                 self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()

@@ -38,8 +38,10 @@ pub struct InferenceSnapshot {
     pub provider: Option<String>,
     /// Elapsed milliseconds since the request started.
     pub elapsed_ms: u64,
+    /// Maximum tokens requested (for progress calculation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
-
 /// Thread-safe inference state tracker. Updated by the router, read by the
 /// dashboard endpoint. Interior mutability via Mutex — contention is negligible
 /// at the access pattern here (one writer, one poller per second).
@@ -52,8 +54,8 @@ struct Inner {
     model: Option<String>,
     provider: Option<String>,
     started_at: Option<Instant>,
+    max_tokens: Option<u32>,
 }
-
 impl Default for InferenceTracker {
     fn default() -> Self {
         Self::new()
@@ -68,12 +70,13 @@ impl InferenceTracker {
                 model: None,
                 provider: None,
                 started_at: None,
+                max_tokens: None,
             }),
         }
     }
 
     /// Transition to a new phase, optionally setting model/provider.
-    pub fn set(&self, phase: Phase, model: Option<String>, provider: Option<String>) {
+    pub fn set(&self, phase: Phase, model: Option<String>, provider: Option<String>, max_tokens: Option<u32>) {
         let mut inner = self.inner.lock().unwrap();
         // Start the timer on first non-idle transition.
         if inner.phase == Phase::Idle && phase != Phase::Idle {
@@ -86,8 +89,10 @@ impl InferenceTracker {
         if provider.is_some() {
             inner.provider = provider;
         }
+        if max_tokens.is_some() {
+            inner.max_tokens = max_tokens;
+        }
     }
-
     /// Reset to idle. Called when the request completes or errors.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
@@ -95,6 +100,7 @@ impl InferenceTracker {
         inner.model = None;
         inner.provider = None;
         inner.started_at = None;
+        inner.max_tokens = None;
     }
 
     /// Take a snapshot of the current state for the dashboard.
@@ -109,6 +115,7 @@ impl InferenceTracker {
             model: inner.model.clone(),
             provider: inner.provider.clone(),
             elapsed_ms,
+            max_tokens: inner.max_tokens,
         }
     }
 }

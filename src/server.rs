@@ -721,11 +721,17 @@ async fn inference_status(
                         Some((true, n)) => ("local_generating", *n),
                         _ => ("ready", 0),
                     };
+                    let progress = match (n_decoded, snap.max_tokens) {
+                        (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
+                        _ => None,
+                    };
                     json_response(StatusCode::OK, &serde_json::json!({
                         "state": state,
                         "model": name,
                         "model_name": display,
                         "n_decoded": n_decoded,
+                        "max_tokens": snap.max_tokens,
+                        "progress": progress,
                     }))
                 }
                 None => json_response(StatusCode::OK, &serde_json::json!({
@@ -767,6 +773,10 @@ async fn inference_status(
                 None if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
                 None => ("local_processing", 0),
             };
+            let progress = match (n_decoded, snap.max_tokens) {
+                (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
+                _ => None,
+            };
             json_response(StatusCode::OK, &serde_json::json!({
                 "state": sub_state,
                 "model": snap.model,
@@ -774,6 +784,8 @@ async fn inference_status(
                 "provider": snap.provider,
                 "elapsed_ms": snap.elapsed_ms,
                 "n_decoded": n_decoded,
+                "max_tokens": snap.max_tokens,
+                "progress": progress,
             }))
         }
     }
