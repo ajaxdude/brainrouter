@@ -251,29 +251,31 @@ async fn handle_message(
 
     let text = content.trim();
 
-    // !ping
-    if text == format!("{prefix}ping") {
+    // !br ping
+    if text == format!("{prefix}ping") || text == format!("{prefix}br ping") {
         let _ = send_message_to(account, sender, "Pong! (Signal)").await;
         return;
     }
 
-    // !omp help / ?
-    if text == format!("{prefix}omp help") || text == format!("{prefix}omp ?") {
+    // !br help / ?
+    if text == format!("{prefix}br help") || text == format!("{prefix}br ?") {
         let help = format!(
-            "Available {prefix}omp commands:\n\n\
-            {prefix}omp reset      \u{2014} Clear current conversation session\n\
-            {prefix}omp model      \u{2014} Show current model\n\
-            {prefix}omp model <n>  \u{2014} Set model (clears session)\n\
-            {prefix}omp llama-list \u{2014} List available models\n\
-            {prefix}omp ? / help   \u{2014} Show this help\n\n\
+            "brainrouter commands:\n\n\
+            {prefix}br reset      \u{2014} Clear session\n\
+            {prefix}br status     \u{2014} Show current model\n\
+            {prefix}br auto|local|cloud \u{2014} Set routing mode\n\
+            {prefix}br <model>    \u{2014} Use specific local model\n\
+            {prefix}br list       \u{2014} List available models\n\
+            {prefix}br review [mode] \u{2014} Set/show review mode\n\
+            {prefix}br ? / help   \u{2014} Show this help\n\n\
             Tip: Use --model <name> at the start of any message for a one-time override."
         );
         let _ = send_message_to(account, sender, &help).await;
         return;
     }
 
-    // !omp reset
-    if text == format!("{prefix}omp reset") {
+    // !br reset
+    if text == format!("{prefix}br reset") {
         let had_session = {
             let mut sessions = sessions.lock().await;
             let removed = sessions.remove(sender).is_some();
@@ -291,8 +293,8 @@ async fn handle_message(
         return;
     }
 
-    // !omp model — show current model
-    if text == format!("{prefix}omp model") {
+    // !br status \ show current model
+    if text == format!("{prefix}br status") {
         let prefs = channel_models.lock().await;
         let reply = match prefs.get(sender) {
             Some(m) => format!("Current model: {m}"),
@@ -302,11 +304,11 @@ async fn handle_message(
         return;
     }
 
-    // !omp model <name>
-    if let Some(rest) = text.strip_prefix(&format!("{prefix}omp model ")) {
+    // !br model <name> \ set sticky model (clears session)
+    if let Some(rest) = text.strip_prefix(&format!("{prefix}br model ")) {
         let name = rest.trim();
         if name.is_empty() {
-            let _ = send_message_to(account, sender, "Usage: !omp model <name>").await;
+            let _ = send_message_to(account, sender, "Usage: !br model <name>").await;
             return;
         }
         let resolved = resolve_model(name, model_aliases);
@@ -330,8 +332,8 @@ async fn handle_message(
         return;
     }
 
-    // !omp llama-list
-    if text == format!("{prefix}omp llama-list") {
+    // !br list
+    if text == format!("{prefix}br list") {
         let reply = match list_llama_models(llama_swap_url).await {
             Ok(models) if models.is_empty() => "No models found.".to_string(),
             Ok(models) => format!("Available models:\n{}", models.join("\n")),
@@ -341,9 +343,9 @@ async fn handle_message(
         return;
     }
 
-    // Strip !omp prefix if present, leaving the bare query.
+    // Strip !br prefix if present, leaving the bare query.
     let mut query_text = text;
-    if let Some(rest) = text.strip_prefix(&format!("{prefix}omp")) {
+    if let Some(rest) = text.strip_prefix(&format!("{prefix}br")) {
         query_text = rest.trim();
     } else if let Some(rest) = text.strip_prefix(account) {
         query_text = rest.trim();
@@ -598,11 +600,11 @@ mod tests {
 
     #[test]
     fn test_parse_received_messages_group() {
-        let json = r#"{"envelope":{"source":"+1555000001","sourceNumber":"+1555000001","sourceUuid":"abc","sourceName":"Alice","sourceDevice":1,"timestamp":1000,"dataMessage":{"timestamp":1000,"message":"!omp hello","groupInfo":{"groupId":"AAAA=","type":"DELIVER"}}}}"#;
+        let json = r#"{"envelope":{"source":"+1555000001","sourceNumber":"+1555000001","sourceUuid":"abc","sourceName":"Alice","sourceDevice":1,"timestamp":1000,"dataMessage":{"timestamp":1000,"message":"!br hello","groupInfo":{"groupId":"AAAA=","type":"DELIVER"}}}}"#;
         let msgs = parse_received_messages(json.as_bytes()).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, "AAAA=");
-        assert_eq!(msgs[0].1, "!omp hello");
+        assert_eq!(msgs[0].1, "!br hello");
         assert!(msgs[0].2);
     }
 
