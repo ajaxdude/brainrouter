@@ -150,6 +150,13 @@ pub async fn invoke_omp(
     cmd.arg("--mode");
     cmd.arg("json");
 
+    // Disable MCP server discovery and skill loading. Bridge messages are
+    // conversational — the harness handles tool calls internally. Without this,
+    // OMP loads ~/.omp/agent/mcp.json and exposes brainrouter's review tools
+    // to the LLM, which then tries to call them and fails.
+    cmd.arg("--no-extensions");
+    cmd.arg("--no-skills");
+
     if let Some(sid) = session_id {
         cmd.arg("--resume");
         cmd.arg(sid);
