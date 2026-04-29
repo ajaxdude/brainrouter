@@ -5,7 +5,7 @@
 **Binary:** `target/release/brainrouter`
 **Config:** `brainrouter.yaml` + `.env`
 **Repository:** https://github.com/ajaxdude/brainrouter
-**Tests:** 46 tests across 10 suites (4 integration test files + 6 inline test modules)
+**Tests:** 74 tests across the codebase
 
 ---
 
@@ -53,7 +53,7 @@ A single Rust daemon that:
 4. **Manages system state** via the dashboard, allowing one-click upgrades of llama-swap and resets of the llama.cpp toolbox environment.
 5. **Explicit review control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 8B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
-7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model aliases, and working directory tracking.
+7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
 
 ---
@@ -307,6 +307,9 @@ Incoming request (OpenAI or Anthropic format)
   |
   +-- model="cloud" --> manifest (direct) --> llama-swap fallback
   |
+  +-- model="brainrouter/<model>" --> prompt_rewriter.rs: rewrite system msgs
+  |                               --> llama-swap (specific model)
+  |
   v provider/openai.rs: HTTP request to chosen backend
   |
   v stream.rs: TimeoutStream wraps SSE (180s stall detection)
@@ -388,39 +391,43 @@ All bridge state is persisted to `~/.local/share/omp-bridge/`:
 
 | Command | Description |
 |---|---|
-| `!ping` | Health check |
-| `!omp reset` | Reset the current channel's session |
-| `!omp <query>` | Send a query to the LLM |
+| `!br ping` | Health check |
+| `!br reset` | Clear the current channel's session |
+| `!br status` | Show current model |
+| `!br auto` / `local` / `cloud` | Set routing mode |
+| `!br <model-name>` | Set a specific llama-swap model (names containing `-` or `.`) |
+| `!br list` | List all models (routing modes + llama-swap) |
+| `!br review` | Show current review mode |
+| `!br review auto\|local\|cloud` | Set review mode |
+| `!br model <name> <query>` | One-off query with a specific model |
+| `!br ls` | List files in current working directory |
+| `!br cd <dir>` | Change working directory |
+| `!br ..` | Move up one directory |
+| `!br mkdir <name>` | Create a directory |
+| `!br help` / `!br ?` | Show command help |
 | `@bot <query>` | Send a query via mention |
-| `!omp model <alias> <query>` | Query using a specific model alias |
-| `!omp swap <alias>` | Switch the channel's default model |
-| `!omp swaplist` | List available model aliases |
-| `!omp ls` | List files in current working directory |
-| `!omp cd <dir>` | Change working directory |
-| `!omp ..` | Move up one directory |
-| `!omp mkdir <name>` | Create a directory |
-| `!omp help` | Show command help |
+| bare text | Send a query to the LLM (no prefix needed) |
 
 #### Signal
 
 | Command | Description |
 |---|---|
-| `!ping` | Health check |
-| `!omp reset` | Reset the current session |
-| `!omp model` | Show current model |
-| `!omp model <name>` | Switch to a named model |
-| `!omp llama-list` | List available llama-swap models |
-| `!omp help` | Show command help |
-| `!omp <query>` | Send a query to the LLM |
-| `--model <name> <query>` | One-off query with a specific model |
+| `!br ping` | Health check |
+| `!br reset` | Clear the current session |
+| `!br status` | Show current model |
+| `!br model <name>` | Set model |
+| `!br list` | List available models |
+| `!br help` / `!br ?` | Show command help |
+| `!br <query>` | Send a query to the LLM |
+| bare text | Send a query (no prefix needed) |
 
-### Model Aliases and Session Management
+### Model Selection and Session Management
 
 Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 
-- **Model aliases:** Users can switch models with `!omp swap` (Discord) or `!omp model` (Signal). The alias persists across messages until explicitly changed.
-- **Working directories:** Tracked per-channel/user. Commands like `!omp cd`, `!omp ..`, and `!omp mkdir` manipulate the working directory, which is passed to `omp` as the CWD for file-aware operations.
-- **Sessions:** Conversation context is maintained per-channel/user and can be reset with `!omp reset`.
+- **Model selection:** Users can set a specific llama-swap model with `!br <model-name>` (Discord) or `!br model <name>` (Signal), or switch routing modes with `!br auto`, `!br local`, `!br cloud`. The selection persists across messages until explicitly changed.
+- **Working directories:** Tracked per-channel/user. Commands like `!br cd`, `!br ..`, and `!br mkdir` manipulate the working directory, which is passed to `omp` as the CWD for file-aware operations.
+- **Sessions:** Conversation context is maintained per-channel/user and can be reset with `!br reset`. Bare text (without any prefix) is treated as a query.
 
 ---
 

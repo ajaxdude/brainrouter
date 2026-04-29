@@ -615,39 +615,41 @@ brainrouter includes bridge transports that connect Discord and Signal to OMP. E
 
 | Command | Description |
 |---|---|
-| `!ping` | Health check |
-| `!omp <query>` | Send query to OMP |
-| `@bot <query>` | Mention-based query (same as `!omp`) |
-| `!omp reset` | Clear conversation session |
-| `!omp model <alias> <query>` | Query using a specific model alias |
-| `!omp swap <alias>` | Switch default model for this channel |
-| `!omp swaplist` | List available model aliases |
-| `!omp ls` | List files in current working directory |
-| `!omp cd <dir>` | Change working directory |
-| `!omp ..` | Go up one directory |
-| `!omp mkdir <name>` | Create a directory |
-| `!omp help` | Show command help |
+| `!br ping` | Health check |
+| `!br reset` | Clear conversation session |
+| `!br status` | Show current model |
+| `!br auto` / `local` / `cloud` | Set routing mode |
+| `!br <model-name>` | Set specific llama-swap model (names containing `-` or `.`) |
+| `!br list` | List all models (routing + llama-swap) |
+| `!br model <name> <query>` | One-off model override for a single query |
+| `!br ls` | List files in current working directory |
+| `!br cd <dir>` | Change working directory |
+| `!br ..` | Go up one directory |
+| `!br mkdir <name>` | Create a directory |
+| `!br review` | Show review mode |
+| `!br review auto\|local\|cloud` | Set review mode |
+| `!br help` / `!br ?` | Show command help |
+| bare text | Send query directly (no prefix needed) |
 
 ### Signal bot commands
 
 | Command | Description |
 |---|---|
-| `!ping` | Health check |
-| `!omp <query>` | Send query to OMP |
-| `--model <name> <query>` | Query using a specific model |
-| `!omp reset` | Clear conversation session |
-| `!omp model` | Show current model |
-| `!omp model <name>` | Switch model |
-| `!omp llama-list` | List llama-swap models |
-| `!omp help` | Show command help |
+| `!br ping` | Health check |
+| `!br reset` | Clear conversation session |
+| `!br status` | Show current model |
+| `!br model <name>` | Set model |
+| `!br list` | List models |
+| `!br help` / `!br ?` | Show command help |
+| bare text or `!br <query>` | Send query |
 
 ### Model aliases
 
-Model aliases map short names to llama-swap model keys. Configure them in the aliases config file (default `~/.config/omp-bridge/config.yaml`).
+Specific llama-swap models can be set directly via `!br <model-name>` (e.g. `!br gemma-4-26b-a4b`). Model names are detected by containing `-` or `.`. Use `!br list` to see all available models.
 
 ### Session management
 
-Each channel (Discord) or conversation (Signal) maintains its own session. Sessions track conversation history, current working directory, and selected model. Use `!omp reset` to clear a session.
+Each channel (Discord) or conversation (Signal) maintains its own session. Sessions track conversation history, current working directory, and selected model. Use `!br reset` to clear a session.
 
 ### Persistence paths
 
@@ -826,5 +828,5 @@ src/
 cargo test
 ```
 
-46 tests across 10 suites (4 integration test files + 6 inline test modules): circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
+74 tests across the codebase: circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
 
