@@ -176,7 +176,7 @@ async fn handle_request(
     // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
     let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
     let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
-        || (method == "POST" && (path == "/api/config" || path == "/api/llama-swap-config" || path == "/api/open-editor"));
+        || (method == "POST" && (path == "/api/config" || path == "/api/llama-swap-config" || path == "/api/open-editor" || path == "/api/models/sync-omp"));
 
     if is_destructive {
         if !is_local {
@@ -419,6 +419,26 @@ async fn handle_request(
                     let resp = json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Internal error: {}", e) },
+                    );
+                    into_unsync(resp)
+                }
+            }
+        }
+
+        ("POST", "/api/models/sync-omp") => {
+            match sync_omp_models(&state.llama_swap_url).await {
+                Ok(count) => {
+                    let resp = json_response(StatusCode::OK, &serde_json::json!({
+                        "synced": true,
+                        "model_count": count
+                    }));
+                    into_unsync(resp)
+                }
+                Err(e) => {
+                    error!("Error syncing OMP models: {}", e);
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Sync failed: {}", e) },
                     );
                     into_unsync(resp)
                 }
@@ -1432,6 +1452,160 @@ async fn handle_llama_swap_models(
     Ok(into_unsync(resp))
 }
 
+/// Fetch live models from llama-swap and update the brainrouter section of
+/// `~/.omp/agent/models.yml`. Preserves all other provider sections.
+///
+/// Returns the total number of models written to the brainrouter section.
+pub async fn sync_omp_models(llama_swap_url: &str) -> anyhow::Result<usize> {
+    let home = home_dir();
+    // Refuse to write to /root — brainrouter is a user-facing daemon and
+    // should not modify root's home directory.
+    if home.is_empty() || home == "/root" {
+        anyhow::bail!("$HOME is not set; cannot locate models.yml");
+    }
+
+    // Fetch live models from llama-swap (async HTTP).
+    let url = format!("{}/v1/models", llama_swap_url);
+    let resp = VERSION_CLIENT.get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send().await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch llama-swap models: {}", e))?;
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("Failed to parse llama-swap models response: {}", e))?;
+    let model_ids: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // All filesystem + YAML work runs off the async executor.
+    tokio::task::spawn_blocking(move || write_omp_models_yml(&home, &model_ids))
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {}", e))?
+}
+
+/// Blocking: read models.yml, merge brainrouter models, write atomically.
+fn write_omp_models_yml(home: &str, model_ids: &[String]) -> anyhow::Result<usize> {
+    let models_path = format!("{}/.omp/agent/models.yml", home);
+    let path = std::path::Path::new(&models_path);
+
+    // Read existing models.yml (or start fresh).
+    let mut doc: serde_yaml::Value = if path.exists() {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", models_path, e))?;
+        serde_yaml::from_str(&content).unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+    } else {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    };
+
+    // Build the brainrouter models list.
+    let mut models = Vec::new();
+
+    // Fixed routing models.
+    for (id, name) in [("auto", "Brainrouter (auto)"), ("local", "Brainrouter (local)"), ("cloud", "Brainrouter (cloud)")] {
+        let mut entry = serde_yaml::Mapping::new();
+        entry.insert(ykey("id"), yval(id));
+        entry.insert(ykey("name"), yval(name));
+        entry.insert(ykey("reasoning"), serde_yaml::Value::Bool(false));
+        let mut input = serde_yaml::Sequence::new();
+        input.push(yval("text"));
+        entry.insert(ykey("input"), serde_yaml::Value::Sequence(input));
+        models.push(serde_yaml::Value::Mapping(entry));
+    }
+
+    // llama-swap models (skip the fixed ones).
+    let skip = ["auto", "local", "cloud"];
+    for id in model_ids {
+        if skip.contains(&id.as_str()) {
+            continue;
+        }
+        let mut entry = serde_yaml::Mapping::new();
+        entry.insert(ykey("id"), yval(id));
+        entry.insert(ykey("name"), yval(&model_id_to_display_name(id)));
+        models.push(serde_yaml::Value::Mapping(entry));
+    }
+
+    let total = models.len();
+
+    // Build the brainrouter provider entry.
+    let mut br_provider = serde_yaml::Mapping::new();
+    br_provider.insert(ykey("baseUrl"), yval("http://127.0.0.1:9099/v1"));
+    br_provider.insert(ykey("api"), yval("openai-completions"));
+    br_provider.insert(ykey("auth"), yval("none"));
+    br_provider.insert(ykey("models"), serde_yaml::Value::Sequence(models));
+
+    // Merge into the document, preserving other providers.
+    let providers = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("models.yml root is not a mapping"))?
+        .entry(ykey("providers"))
+        .or_insert(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let providers_map = providers
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("models.yml 'providers' is not a mapping"))?;
+    providers_map.insert(ykey("brainrouter"), serde_yaml::Value::Mapping(br_provider));
+
+    // Atomic write: tempfile (PID-qualified to avoid races) then rename.
+    let yaml_str = serde_yaml::to_string(&doc)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize models.yml: {}", e))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create directory {}: {}", parent.display(), e))?;
+    }
+    let tmp_path = format!("{}.{}.tmp", models_path, std::process::id());
+    std::fs::write(&tmp_path, &yaml_str)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", tmp_path, e))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path, models_path, e))?;
+
+    info!(path = %models_path, model_count = total, "Synced OMP models.yml");
+    Ok(total)
+}
+
+/// Convert a model ID like "qwen3.6-27b-q6-amdvlk" to "Qwen3.6 27B Q6 AMDVLK".
+fn model_id_to_display_name(id: &str) -> String {
+    id.split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let upper = part.to_uppercase();
+            // Parameter-count suffixes: 27b, 120b, 128B → 27B, 120B
+            if part.len() >= 2 && (part.ends_with('b') || part.ends_with('B')) {
+                let prefix = &part[..part.len() - 1];
+                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                    return upper;
+                }
+            }
+            match upper.as_str() {
+                // Quant tags: Q6, Q8, Q4, etc.
+                s if s.starts_with('Q') && s.len() <= 4 && s[1..].chars().all(|c| c.is_ascii_digit()) => upper,
+                // Known all-caps abbreviations
+                "A4B" | "A3B" | "A10B" | "E2B" | "E4B" | "AIR" | "OSS" | "GOOG" | "AMDVLK" | "DRAFT" => upper,
+                _ => {
+                    // Titlecase: capitalize first char, leave rest as-is
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ykey(s: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(s.to_string())
+}
+
+fn yval(s: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(s.to_string())
+}
+
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)
 pub async fn run(
     tcp_addr: SocketAddr,
@@ -1525,4 +1699,83 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_name_full_model_id() {
+        assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-amdvlk"), "Qwen3.6 27B Q6 AMDVLK");
+    }
+
+    #[test]
+    fn display_name_size_suffixes() {
+        assert_eq!(model_id_to_display_name("llama-3.1-8b"), "Llama 3.1 8B");
+        assert_eq!(model_id_to_display_name("gpt-oss-120b"), "Gpt OSS 120B");
+        assert_eq!(model_id_to_display_name("mistral-medium-3.5-128B"), "Mistral Medium 3.5 128B");
+    }
+
+    #[test]
+    fn display_name_quant_tags() {
+        assert_eq!(model_id_to_display_name("gemma-4-31b-q6"), "Gemma 4 31B Q6");
+        assert_eq!(model_id_to_display_name("gemma-4-31b-q8-heretic"), "Gemma 4 31B Q8 Heretic");
+    }
+
+    #[test]
+    fn display_name_known_abbreviations() {
+        assert_eq!(model_id_to_display_name("gemma-4-e2b"), "Gemma 4 E2B");
+        assert_eq!(model_id_to_display_name("glm4.5-air"), "Glm4.5 AIR");
+        assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-draft"), "Qwen3.6 27B Q6 DRAFT");
+    }
+
+    #[test]
+    fn display_name_empty_and_edge_cases() {
+        assert_eq!(model_id_to_display_name(""), "");
+        assert_eq!(model_id_to_display_name("foo--bar"), "Foo Bar");  // consecutive hyphens
+        assert_eq!(model_id_to_display_name("stepfun"), "Stepfun");  // single word
+    }
+
+    #[test]
+    fn display_name_moe_parts() {
+        assert_eq!(model_id_to_display_name("qwen3.6-35b-a3b"), "Qwen3.6 35B A3B");
+        assert_eq!(model_id_to_display_name("qwen3.5-122b-a10b"), "Qwen3.5 122B A10B");
+    }
+
+    #[test]
+    fn write_omp_preserves_other_providers() {
+        // Create a temp dir to simulate ~/.omp/agent/
+        let tmp = std::env::temp_dir().join(format!("brainrouter-test-{}", std::process::id()));
+        let agent_dir = tmp.join(".omp/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let models_file = agent_dir.join("models.yml");
+
+        // Write initial YAML with a manifest provider
+        std::fs::write(&models_file, r#"providers:
+  manifest:
+    baseUrl: http://localhost:3001/v1
+    models:
+    - id: auto
+      name: Manifest
+"#).unwrap();
+
+        // Sync with some fake model IDs
+        let result = write_omp_models_yml(tmp.to_str().unwrap(), &[
+            "auto".to_string(), "local".to_string(), "my-model-27b".to_string(),
+        ]);
+        assert!(result.is_ok());
+        let count = result.unwrap();
+        assert_eq!(count, 4); // auto + local + cloud + my-model-27b
+
+        // Verify manifest provider survived
+        let content = std::fs::read_to_string(&models_file).unwrap();
+        assert!(content.contains("manifest"), "manifest provider should be preserved");
+        assert!(content.contains("brainrouter"), "brainrouter provider should exist");
+        assert!(content.contains("my-model-27b"), "synced model should be present");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -180,6 +180,7 @@
       <button onclick="restartService('llama-swap', this)">Restart Local Stack</button>
       <button onclick="restartService('manifest', this)">Restart Manifest</button>
       <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
+      <button onclick="syncOmpModels(this)">Sync Models</button>
     </div>
   </div>
 
@@ -325,6 +326,30 @@
           setTimeout(() => location.reload(), 3000);
           return;
         }
+        btn.textContent = 'Error';
+        btn.className = 'restart-err';
+        btn.title = e.message;
+      }
+      setTimeout(() => { btn.textContent = label; btn.className = ''; btn.disabled = false; btn.title = ''; }, 3000);
+    }
+
+    async function syncOmpModels(btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Syncing\u2026';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/models/sync-omp', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          btn.textContent = `Synced (${data.model_count} models)`;
+          btn.className = 'restart-ok';
+          await loadLlamaSwapModels();
+        } else {
+          btn.textContent = 'Failed';
+          btn.className = 'restart-err';
+          btn.title = data.error || 'Unknown error';
+        }
+      } catch (e) {
         btn.textContent = 'Error';
         btn.className = 'restart-err';
         btn.title = e.message;
