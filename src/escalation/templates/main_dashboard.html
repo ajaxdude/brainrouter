@@ -862,61 +862,64 @@
 
     function renderVersions(data) {
        if (!data) return;
-       const swapEl      = document.getElementById('ver-llama-swap');
-       const cppEl       = document.getElementById('ver-llama-cpp');
-       const manifestEl  = document.getElementById('ver-manifest');
-       const toolboxEl   = document.getElementById('ver-toolbox');
-       
+       // Helper: safely set innerHTML of a child div, skipping the health-dot span.
+       const setVer = (parentId, html) => {
+         const el = document.getElementById(parentId);
+         if (!el) return;
+         // The version text lives in the first <div> child (after the <span> health dot).
+         const div = el.querySelector('div');
+         if (div) div.innerHTML = html;
+       };
        const swapBtn      = document.getElementById('upgrade-llama-swap');
        const cppBtn       = document.getElementById('upgrade-llama-cpp');
        const manifestBtn  = document.getElementById('upgrade-manifest');
        const toolboxBtn   = document.getElementById('upgrade-toolbox');
        
-       swapBtn.innerHTML = '';
-       cppBtn.innerHTML = '';
-       manifestBtn.innerHTML = '';
-       toolboxBtn.innerHTML = '';
+       if (swapBtn) swapBtn.innerHTML = '';
+       if (cppBtn) cppBtn.innerHTML = '';
+       if (manifestBtn) manifestBtn.innerHTML = '';
+       if (toolboxBtn) toolboxBtn.innerHTML = '';
 
        // llama-swap
        let currentSwap = '';
        if (data.llama_swap) {
          currentSwap = data.llama_swap.split(' ')[0];
-         swapEl.querySelector('div:first-child').innerHTML = `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`;
+         setVer('ver-llama-swap', `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`);
        }
 
        // llama.cpp (inside toolbox container)
        if (data.llama_cpp) {
          const ver = data.llama_cpp.split(' ')[0];
-         cppEl.querySelector('div:first-child').innerHTML = `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`;
+         setVer('ver-llama-cpp', `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`);
        }
 
        // Manifest
        if (data.manifest) {
-         manifestEl.querySelector('div:first-child').innerHTML = `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`;
+         setVer('ver-manifest', `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`);
        }
 
        // toolbox container image
        if (data.toolbox_image_ver) {
-         toolboxEl.querySelector('div:first-child').innerHTML = `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`;
+         setVer('ver-toolbox', `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`);
        }
 
        // Upgrade buttons — placed under each component
        const btnStyle = 'font-size:0.6rem; padding:1px 6px; border-radius:3px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;';
        
-       if (data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
-         swapBtn.innerHTML = `<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="${btnStyle}">Upgrade → v${esc(data.llama_swap_latest)}</button>`;
+       if (swapBtn && data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
+         swapBtn.innerHTML = `<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="${btnStyle}">Upgrade \u2192 v${esc(data.llama_swap_latest)}</button>`;
        }
        
-       if (data.manifest_latest) {
+       if (manifestBtn && data.manifest_latest) {
          const localDate = data.manifest ? data.manifest.split(' ')[0] : '';
          if (data.manifest_latest !== localDate) {
-           manifestBtn.innerHTML = `<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="${btnStyle}">Upgrade → ${esc(data.manifest_latest)}</button>`;
+           manifestBtn.innerHTML = `<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="${btnStyle}">Upgrade \u2192 ${esc(data.manifest_latest)}</button>`;
          }
        }
        
-       if (data.toolbox_latest && data.toolbox_image_created) {
+       if (toolboxBtn && data.toolbox_latest && data.toolbox_image_created) {
          if (data.toolbox_latest > data.toolbox_image_created) {
-           toolboxBtn.innerHTML = `<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="${btnStyle}">Upgrade → ${esc(data.toolbox_latest)}</button>`;
+           toolboxBtn.innerHTML = `<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="${btnStyle}">Upgrade \u2192 ${esc(data.toolbox_latest)}</button>`;
          }
        }
     }
