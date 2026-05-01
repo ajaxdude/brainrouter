@@ -20,7 +20,7 @@ pub struct BrainrouterConfig {
 /// cloud routing decisions to Manifest by sending requests with model="auto".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestConfig {
-    /// Base URL of the Manifest instance. Example: "http://localhost:3001".
+    /// Base URL of the Manifest instance. Example: "http://localhost:2099".
     pub base_url: String,
 
     /// Name of the environment variable holding the Manifest API key (mnfst_*).

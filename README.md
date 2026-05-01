@@ -14,7 +14,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
         │
   ┌─────┼──────────────────────────────────────────────────┐
   │     ├─ model=auto  → Bonsai classifies query           │
-  │     │    Cloud ──── Manifest :3001                     │
+  │     │    Cloud ──── Manifest :2099                     │
   │     │    Local ──── llama-swap :8081                   │
   │     ├─ model=local → rewrite prompt → llama-swap       │
   │     └─ model=cloud → Manifest (direct)                 │
@@ -206,7 +206,7 @@ cd ~/ai/stack/manifest
 docker compose up -d
 ```
 
-Visit `http://localhost:3001` and complete the setup wizard (create admin account, add cloud provider API keys).
+Visit `http://localhost:2099` and complete the setup wizard (create admin account, add cloud provider API keys).
 
 **d. Get your Manifest API key**
 
@@ -225,20 +225,19 @@ Bonsai 8B is an 8-billion-parameter GGUF model that classifies each query as "cl
 
 ```bash
 # Install huggingface-cli if needed:
-pip install huggingface_hub
+pip install -U "huggingface_hub[cli]"
 
-# Download only the recommended Q6_K_L quant (~6 GB):
-# Using --include with the exact filename avoids pulling all quants (can be 50+ GB).
-huggingface-cli download prism-ml/Bonsai-8B \
-  --include "*Q6_K_L*.gguf" \
+# Download the recommended Q4_K_M quant (~5.2 GB):
+huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \
+  --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" \
   --local-dir ~/models/bonsai
 
 # Verify the file is present and note the exact path for brainrouter.yaml:
 ls ~/models/bonsai/*.gguf
 ```
 
-Any Q4 or Q6 quant works. Q6_K_L is the recommended balance of speed and accuracy.
-Use Q4_K_M if you are short on VRAM.
+Q4_K_M (~5.2 GB) is the recommended balance of speed and size.
+Use Q6_K_L (~7.3 GB) for higher accuracy if VRAM allows.
 
 
 ---
@@ -308,7 +307,7 @@ cp brainrouter.example.yaml brainrouter.yaml
 # brainrouter.yaml
 
 manifest:
-  base_url: "http://localhost:3001/v1"
+  base_url: "http://localhost:2099/v1"
   api_key_env: MANIFEST_API_KEY   # env var name — value goes in .env
 
 llama_swap:
@@ -318,7 +317,7 @@ llama_swap:
 
 bonsai:
   # Absolute path to the Bonsai GGUF file you downloaded
-  model_path: "/home/yourname/models/bonsai/Bonsai-8B-Q6_K_L.gguf"
+  model_path: "/home/yourname/models/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
 
 # Optional 		-- all fields have sensible defaults:
 # review:
@@ -482,6 +481,18 @@ args = ["mcp", "--socket", "/run/user/$(id -u)/brainrouter.sock"]
 ```
 
 > **Note:** `provider: "anthropic"` is required for droid. Droid's `openai` mode posts to `/responses` (not served here). `anthropic` mode posts to `/v1/messages`, which brainrouter handles.
+
+
+
+## Multi-user deployment
+
+For shared machines with multiple users, see [`deploy/brainrouter_ecosystem.md`](deploy/brainrouter_ecosystem.md) which covers:
+
+- **System-level services**: llama-swap and Manifest run as system Docker services, shared by all users.
+- **Per-user brainrouter**: Each user runs their own brainrouter instance as a systemd user service.
+- **Shared model storage**: GGUFs in `/opt/models` with `aistack` group permissions.
+- **Automated scripts**: `deploy/deploy.sh --multi-user` for the admin, `deploy/user-setup.sh` for each user.
+- **Uninstall**: `deploy/uninstall.sh` and `deploy/uninstall_brainrouter_ecosystem.md`.
 
 
 ---
@@ -676,7 +687,7 @@ Long responses are automatically chunked (1500 chars for Discord, 4000 chars for
 
 ```yaml
 manifest:
-  base_url: "http://localhost:3001/v1"   # required
+  base_url: "http://localhost:2099/v1"   # required
   api_key_env: MANIFEST_API_KEY          # optional — name of env var holding mnfst_* key
 
 llama_swap:
@@ -685,7 +696,7 @@ llama_swap:
   local_system_prompt: "/path/to/prompt.md"  # optional — override built-in lean prompt
 
 bonsai:
-  model_path: "/path/to/Bonsai-8B-Q6_K_L.gguf"  # required — absolute path
+  model_path: "/path/to/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"  # required — absolute path
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
@@ -822,7 +833,7 @@ src/
 
 | Service | Purpose | Default URL |
 |---|---|---|
-| **Manifest** | Cloud LLM router — provider selection, failover, cost tracking | `http://localhost:3001` |
+| **Manifest** | Cloud LLM router — provider selection, failover, cost tracking | `http://localhost:2099` |
 | **llama-swap** | Local model runner — spawns llama-server on demand | `http://localhost:8081` |
 | **Bonsai** | In-process classifier — no HTTP hop | loaded from `model_path` |
 

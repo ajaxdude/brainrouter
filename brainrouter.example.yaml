@@ -10,8 +10,8 @@
 #   Manifest failure → llama-swap fallback_model
 
 manifest:
-  # URL of your Manifest instance (docker compose, usually localhost:3001)
-  base_url: "http://localhost:3001/v1"
+  # URL of your Manifest instance (docker compose, default port 2099)
+  base_url: "http://localhost:2099/v1"
   # Name of the env var holding your Manifest API key (mnfst_* format)
   api_key_env: MANIFEST_API_KEY
 
@@ -23,8 +23,9 @@ llama_swap:
   fallback_model: "your-local-model-key"
 
 bonsai:
-  # Absolute path to the Bonsai GGUF file (Q6_K_L recommended)
-  model_path: "/path/to/Bonsai-8B-Q6_K_L.gguf"
+  # Absolute path to the Bonsai GGUF file (Q4_K_M recommended, Q6_K_L for higher accuracy)
+  # Download: huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" --local-dir ~/models/bonsai
+  model_path: "/path/to/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
 
 # Review loop configuration (all fields optional — defaults shown)
 # review:
