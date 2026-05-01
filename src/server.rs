@@ -36,7 +36,7 @@ fn config_file_list(home: &str, config_path: &std::path::Path, llama_swap_config
         ("Review Prompt Template", PathBuf::from(format!("{}/.omp/agent/LLAMACPP.md", home))),
         ("Local System Prompt Override", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.local.md", home))),
         ("Model Aliases", PathBuf::from(format!("{}/.config/omp-bridge/config.yaml", home))),
-        ("brainrouter.yaml (raw)", config_abs),
+        ("brainrouter.yaml", config_abs),
         ("llama-swap config", ls_abs),
     ];
     entries.into_iter().map(|(name, path)| {
