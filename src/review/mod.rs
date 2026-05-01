@@ -193,7 +193,7 @@ impl ReviewService {
             iteration_count,
             reviewer_type,
         })
-
+    }
     /// Get a copy of the current review configuration.
     pub fn get_config(&self) -> ReviewConfig {
         self.config.lock().unwrap().clone()
