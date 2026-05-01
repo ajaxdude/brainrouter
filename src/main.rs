@@ -12,7 +12,7 @@ mod daemon;
 mod install;
 mod mcp_server;
 #[derive(Parser)]
-#[command(name = "brainrouter", about = "Bonsai-routed LLM failover proxy")]
+#[command(name = "brainrouter", version, about = "Bonsai-routed LLM failover proxy")]
 struct Cli {
     /// Default log level if RUST_LOG is not set.
     #[arg(long, default_value = "info", global = true)]
