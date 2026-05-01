@@ -150,12 +150,13 @@ pub async fn invoke_omp(
     cmd.arg("--mode");
     cmd.arg("json");
 
-    // Disable MCP server discovery and skill loading. Bridge messages are
-    // conversational — the harness handles tool calls internally. Without this,
-    // OMP loads ~/.omp/agent/mcp.json and exposes brainrouter's review tools
-    // to the LLM, which then tries to call them and fails.
+    // Disable MCP server discovery, skill loading, and built-in tools.
+    // Bridge messages are conversational — the model must respond with text,
+    // not start a tool-call loop. Without --no-tools the cloud model immediately
+    // calls bash/read and never produces a text response.
     cmd.arg("--no-extensions");
     cmd.arg("--no-skills");
+    cmd.arg("--no-tools");
 
     if let Some(sid) = session_id {
         cmd.arg("--resume");
