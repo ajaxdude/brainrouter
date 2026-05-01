@@ -1141,6 +1141,7 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
     );
 
     let data = serde_json::json!({
+        "brainrouter": env!("CARGO_PKG_VERSION"),
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
         "toolbox_image_ver": toolbox_image_ver,

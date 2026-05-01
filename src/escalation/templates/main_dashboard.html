@@ -149,6 +149,7 @@
 <body>
   <div class="header">
     <a href="#" onclick="showPage('dashboard'); return false;"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
+    <div id="brainrouter-version" style="font-size:0.65rem; color:var(--muted); text-align:center; margin-top:4px;">v&mdash;</div>
     <div id="version-header" style="font-size:0.7rem; color:var(--muted); display:flex; gap:10px; align-items:center; border:1px solid var(--border); border-radius:6px; padding:6px 12px; background:rgba(255,255,255,0.03);">
       <div id="ver-llama-swap" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
         <span id="health-llama-swap" class="health-dot unknown" title="checking..."></span>
@@ -879,6 +880,12 @@
        if (cppBtn) cppBtn.innerHTML = '';
        if (manifestBtn) manifestBtn.innerHTML = '';
        if (toolboxBtn) toolboxBtn.innerHTML = '';
+
+       // brainrouter
+       if (data.brainrouter) {
+         const el = document.getElementById('brainrouter-version');
+         if (el) el.textContent = 'v' + data.brainrouter;
+       }
 
        // llama-swap
        let currentSwap = '';
