@@ -7,8 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 /// Status of a review session lifecycle.
@@ -115,6 +116,8 @@ pub struct SessionUpdate {
 /// Thread-safe in-memory session store.
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Per-session notifiers: fired when a session's status changes (e.g. human resolves).
+    notifiers: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl Default for SessionManager {
@@ -127,6 +130,7 @@ impl SessionManager {
     pub fn new() -> Self {
         SessionManager {
             sessions: Mutex::new(HashMap::new()),
+            notifiers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -183,6 +187,11 @@ impl SessionManager {
             }
         }
         session.updated_at = chrono::Utc::now().to_rfc3339();
+        // Notify any waiter (e.g. start_review blocked on human escalation).
+        let notifier = self.notifiers.lock().unwrap().get(id).cloned();
+        if let Some(n) = notifier {
+            n.notify_one();
+        }
     }
 
     /// Increment the iteration counter for a session.
@@ -192,6 +201,18 @@ impl SessionManager {
             session.iteration_count += 1;
             session.updated_at = chrono::Utc::now().to_rfc3339();
         }
+    }
+    /// Register a `Notify` for a session so that `start_review` can be woken
+    /// when human feedback arrives via `update_session`.
+    pub fn register_notifier(&self, session_id: &str) -> Arc<Notify> {
+        let n = Arc::new(Notify::new());
+        self.notifiers.lock().unwrap().insert(session_id.to_string(), Arc::clone(&n));
+        n
+    }
+
+    /// Remove and return the `Notify` for a session, cleaning up the registry.
+    pub fn remove_notifier(&self, session_id: &str) {
+        self.notifiers.lock().unwrap().remove(session_id);
     }
 
     /// List all sessions (snapshot).

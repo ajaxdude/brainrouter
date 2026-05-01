@@ -102,6 +102,10 @@ impl ReviewService {
         );
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
 
+        // Register a notifier *before* the loop so we never miss a notification
+        // that arrives between the loop returning Escalated and our first wait.
+        let notifier = self.sessions.register_notifier(&session.id);
+
         // Clone current config snapshot for this review run
         let config_snapshot = self.get_config();
 
@@ -117,14 +121,78 @@ impl ReviewService {
         )
         .await?;
 
+        let (loop_status, loop_feedback, loop_reviewer_type, iteration_count, loop_session_id) = (
+            result.status,
+            result.feedback,
+            result.reviewer_type,
+            result.iteration_count,
+            result.session_id,
+        );
+
+        let (final_status, final_feedback, reviewer_type) =
+            if loop_status == ReviewStatus::Escalated {
+                info!(session_id = %session.id, "Review escalated — waiting for human resolution");
+                loop {
+                    // Register the notified() future BEFORE checking state so we
+                    // cannot miss a notification that fires between the check and
+                    // the await.
+                    let next = notifier.notified();
+                    tokio::pin!(next);
+                    // Re-read session to get the latest status.
+                    if let Some(s) = self.sessions.get_session(&session.id) {
+                        match s.status {
+                            ReviewStatus::Escalated => {
+                                // Still escalated — wait for the next signal.
+                                next.await;
+                            }
+                            ReviewStatus::Approved => {
+                                info!(session_id = %session.id, "Human approved the review");
+                                break (
+                                    ReviewStatus::Approved,
+                                    s.human_feedback.unwrap_or_else(|| "lgtm".to_string()),
+                                    ReviewerType::Human,
+                                );
+                            }
+                            ReviewStatus::NeedsRevision => {
+                                info!(session_id = %session.id, "Human requested revision");
+                                break (
+                                    ReviewStatus::NeedsRevision,
+                                    s.human_feedback.unwrap_or_default(),
+                                    ReviewerType::Human,
+                                );
+                            }
+                            ReviewStatus::Pending => {
+                                // Should not normally happen; wait for the next signal.
+                                next.await;
+                            }
+                        }
+                    } else {
+                        // Session was deleted — treat as aborted.
+                        warn!(session_id = %session.id, "Session disappeared while waiting for human");
+                        break (
+                            ReviewStatus::Escalated,
+                            "Session was deleted before human resolved it.".to_string(),
+                            ReviewerType::Human,
+                        );
+                    }
+                }
+            } else {
+                (loop_status, loop_feedback, loop_reviewer_type)
+            };
+
+        // Clean up the notifier regardless of outcome.
+        self.sessions.remove_notifier(&session.id);
+
+        // loop_session_id and session.id should match; use session.id as primary.
+        let _ = loop_session_id;
+
         Ok(RequestReviewResult {
-            status: result.status,
-            feedback: result.feedback,
-            session_id: result.session_id,
-            iteration_count: result.iteration_count,
-            reviewer_type: result.reviewer_type,
+            status: final_status,
+            feedback: final_feedback,
+            session_id: session.id,
+            iteration_count,
+            reviewer_type,
         })
-    }
 
     /// Get a copy of the current review configuration.
     pub fn get_config(&self) -> ReviewConfig {
