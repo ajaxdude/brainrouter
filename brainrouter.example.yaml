@@ -1,7 +1,7 @@
 # brainrouter.example.yaml
 #
-# Copy this file to brainrouter.yaml and fill in your paths and URLs.
-# brainrouter.yaml is gitignored — it stays local.
+# Copy to ~/.config/brainrouter/brainrouter.yaml and fill in your paths and URLs.
+# The daemon loads this file by default (override with --config).
 #
 # Flow:
 #   harness → brainrouter → Bonsai classifies query

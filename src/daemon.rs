@@ -27,8 +27,10 @@ use brainrouter::{
 #[derive(Args)]
 pub struct ServeArgs {
     /// Path to the YAML config file.
-    #[arg(short, long, default_value = "brainrouter.yaml")]
-    pub config: PathBuf,
+    /// Defaults to ~/.config/brainrouter/brainrouter.yaml
+    /// (or $XDG_CONFIG_HOME/brainrouter/brainrouter.yaml).
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     /// TCP listen address.
     #[arg(long, default_value = "127.0.0.1:9099")]
@@ -43,10 +45,11 @@ pub struct ServeArgs {
 /// Entry point for `brainrouter serve`.
 pub async fn run(args: ServeArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(config::default_socket_path);
+    let config_path = args.config.unwrap_or_else(config::default_config_path);
 
     // Config
-    let config = config::load(&args.config).with_context(|| {
-        format!("Failed to load config from {}", args.config.display())
+    let config = config::load(&config_path).with_context(|| {
+        format!("Failed to load config from {}", config_path.display())
     })?;
 
     let tcp_addr: std::net::SocketAddr = args
@@ -55,7 +58,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .with_context(|| format!("Invalid TCP address: {}", args.tcp_addr))?;
 
     info!(
-        config_path = %args.config.display(),
+        config_path = %config_path.display(),
         tcp_addr = %tcp_addr,
         uds_path = %socket.display(),
         manifest_url = %config.manifest.base_url,
@@ -177,7 +180,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         llama_swap_url,
         manifest_url,
         bridge_manager: Arc::clone(&bridge_manager),
-        config_path: std::fs::canonicalize(&args.config).unwrap_or(args.config.clone()),
+        config_path: std::fs::canonicalize(&config_path).unwrap_or(config_path.clone()),
         llama_swap_config_path: {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
             let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));

@@ -252,9 +252,12 @@ cd ~/ai/projects/brainrouter
 # 2. Build
 cargo build --release
 
-# 3. Create env file
-cp .env.example .env
-# Edit .env and set MANIFEST_API_KEY=mnfst_your_key_here
+# 3. Create config and env file
+mkdir -p ~/.config/brainrouter
+cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml
+cp .env.example ~/.config/brainrouter/.env
+# Edit ~/.config/brainrouter/brainrouter.yaml (set paths, ports)
+# Edit ~/.config/brainrouter/.env and set MANIFEST_API_KEY=mnfst_your_key_here
 ```
 
 **Systemd user service**
@@ -269,10 +272,8 @@ Wants=llama-swap.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/ai/projects/brainrouter
-EnvironmentFile=%h/ai/projects/brainrouter/.env
+EnvironmentFile=%h/.config/brainrouter/.env
 ExecStart=%h/ai/projects/brainrouter/target/release/brainrouter serve \
-    --config %h/ai/projects/brainrouter/brainrouter.yaml \
     --socket /run/user/%U/brainrouter.sock \
     --tcp-addr 127.0.0.1:9099
 Restart=on-failure
@@ -297,14 +298,15 @@ curl http://127.0.0.1:9099/health
 
 ## Configure
 
-Copy the example config and fill in your paths:
+Copy the example config to the default location and fill in your paths:
 
 ```bash
-cp brainrouter.example.yaml brainrouter.yaml
+mkdir -p ~/.config/brainrouter
+cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml
 ```
 
 ```yaml
-# brainrouter.yaml
+# ~/.config/brainrouter/brainrouter.yaml
 
 manifest:
   base_url: "http://localhost:2099/v1"

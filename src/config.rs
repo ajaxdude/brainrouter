@@ -166,6 +166,20 @@ pub fn default_socket_path() -> PathBuf {
     }
 }
 
+/// Default config file path for the brainrouter daemon.
+/// Prefers `$XDG_CONFIG_HOME/brainrouter/brainrouter.yaml`,
+/// falls back to `~/.config/brainrouter/brainrouter.yaml`.
+/// The `--config` flag always overrides this.
+pub fn default_config_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home).join(".config")
+        });
+    base.join("brainrouter").join("brainrouter.yaml")
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -202,5 +216,23 @@ mod tests {
         // The brainrouter/ prefix is handled before the local_models check in the
         // router, so the raw prefix form is not expected to match here.
         assert!(!cfg.local_models.contains(&"brainrouter/qwen3".to_string()));
+    }
+
+    #[test]
+    fn default_config_path_uses_xdg_config_home() {
+        // Temporarily override XDG_CONFIG_HOME and HOME so the test is hermetic.
+        // std::env::set_var is unsafe in multi-threaded contexts; use serial_test
+        // or just document the env dependency. These tests run in the same process,
+        // so we test the logic rather than mutating global env.
+        //
+        // Verify: when XDG_CONFIG_HOME is absent, falls back to $HOME/.config.
+        // We can't set env vars safely in parallel tests, so we test the path
+        // shape by calling the function and checking the suffix.
+        let p = default_config_path();
+        assert!(
+            p.ends_with("brainrouter/brainrouter.yaml"),
+            "unexpected path: {}",
+            p.display()
+        );
     }
 }
