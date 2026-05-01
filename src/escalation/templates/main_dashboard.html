@@ -108,6 +108,7 @@
     .progress-track { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; position: relative; }
     .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
     .progress-fill.loading { background: var(--orange); animation: progress-pulse 1.5s ease-in-out infinite; width: 100%; }
+    .progress-fill.loading-progress { background: var(--orange); transition: width 0.4s ease; }
     .progress-fill.processing { background: var(--accent); transition: width 0.8s ease; }
     .progress-fill.generating { background: var(--green); width: 100%; }
     .progress-pct { font-size: 0.75rem; color: var(--muted); min-width: 60px; text-align: right; white-space: nowrap; }
@@ -558,10 +559,17 @@
           let fillWidth = '0%';
           let pctText = '';
           if (activeStatus.state === 'loading' || activeStatus.state === 'classifying') {
-            fillClass += ' loading';
+            if (activeStatus.progress != null && activeStatus.progress >= 0) {
+              fillClass += ' loading-progress';
+              const pct = Math.min(Math.round(activeStatus.progress * 100), 100);
+              fillWidth = pct + '%';
+              pctText = pct + '%';
+            } else {
+              fillClass += ' loading';
+            }
           } else if (activeStatus.state.includes('processing')) {
             fillClass += ' loading';
-            pctText = 'Processing\u2026';
+            pctText = 'Processing…';
           } else if (activeStatus.state.includes('streaming') || activeStatus.state.includes('generating')) {
             if (activeStatus.progress != null && activeStatus.progress >= 0) {
               fillClass += ' generating';
@@ -570,7 +578,7 @@
               pctText = pct + '%';
             } else {
               fillClass += ' loading';
-              pctText = 'Generating\u2026';
+              pctText = 'Generating…';
             }
           }
 

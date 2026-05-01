@@ -724,15 +724,17 @@ async fn inference_status(
             // No active request in brainrouter. Check if llama-swap has a model loaded.
             let model_info = poll_llama_swap_running(llama_swap_url).await;
             match model_info {
-                Some((name, display, swap_state)) if swap_state != "ready" => {
+                Some((name, display, swap_state, ref proxy)) if swap_state != "ready" => {
+                    let load_progress = poll_llama_server_health(proxy).await;
                     json_response(StatusCode::OK, &serde_json::json!({
                         "state": "loading",
                         "model": name,
                         "model_name": display,
                         "elapsed_ms": 0,
+                        "progress": load_progress,
                     }))
                 }
-                Some((name, display, _)) => {
+                Some((name, display, _, _)) => {
                     // Model is loaded and ready. Check /slots to detect activity
                     // from clients hitting llama-swap directly (bypassing brainrouter).
                     let slot_info = poll_llama_swap_slot(llama_swap_url).await;
@@ -782,8 +784,11 @@ async fn inference_status(
             }))
         }
         Phase::LocalWaiting | Phase::LocalStreaming => {
-            // For local, enrich with llama-swap /slots data if available.
-            let slot_info = poll_llama_swap_slot(llama_swap_url).await;
+            // For local, enrich with llama-swap /slots and /health data if available.
+            let (slot_info, running_info) = tokio::join!(
+                poll_llama_swap_slot(llama_swap_url),
+                poll_llama_swap_running(llama_swap_url),
+            );
             let (sub_state, n_decoded) = match &slot_info {
                 Some((true, 0)) => ("local_processing", 0u64),
                 Some((true, n)) => ("local_generating", *n),
@@ -793,9 +798,16 @@ async fn inference_status(
                 None if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
                 None => ("local_processing", 0),
             };
-            let progress = match (n_decoded, snap.max_tokens) {
-                (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
-                _ => None,
+            // If the slot shows no token generation yet, check if the model is still loading.
+            let progress: Option<f32> = if n_decoded == 0 {
+                let proxy = running_info.as_ref().map(|(_, _, _, p)| p.as_str()).unwrap_or("");
+                poll_llama_server_health(proxy).await
+            } else {
+                // Token generation in progress: use decoded/max_tokens ratio.
+                match (n_decoded, snap.max_tokens) {
+                    (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
+                    _ => None,
+                }
             };
             json_response(StatusCode::OK, &serde_json::json!({
                 "state": sub_state,
@@ -908,8 +920,8 @@ async fn service_health(
     }))
 }
 
-/// Poll llama-swap /running for the active model's name, display name, and state.
-async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String, String)> {
+/// Poll llama-swap /running for the active model's name, display name, state, and proxy URL.
+async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String, String, String)> {
     let url = format!("{}/running", llama_swap_url);
     let resp = VERSION_CLIENT.get(&url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
@@ -917,7 +929,24 @@ async fn poll_llama_swap_running(llama_swap_url: &str) -> Option<(String, String
     let name = entry.get("model")?.as_str()?.to_string();
     let display = entry.get("name").and_then(|n| n.as_str()).unwrap_or(&name).to_string();
     let state = entry.get("state").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
-    Some((name, display, state))
+    let proxy = entry.get("proxy").and_then(|p| p.as_str()).unwrap_or("").to_string();
+    Some((name, display, state, proxy))
+}
+
+/// Poll a llama-server's /health endpoint for model load progress.
+/// Returns Some(progress) where progress is 0.0–1.0 when status is "loading_model".
+/// Returns None when the server is not reachable or not currently loading.
+async fn poll_llama_server_health(proxy_url: &str) -> Option<f32> {
+    if proxy_url.is_empty() { return None; }
+    let health_url = format!("{}/health", proxy_url);
+    let resp = VERSION_CLIENT.get(&health_url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    // llama-server returns {"status": "loading_model", "progress": 0.75} while loading.
+    if data.get("status").and_then(|s| s.as_str()) == Some("loading_model") {
+        data.get("progress").and_then(|p| p.as_f64()).map(|p| p as f32)
+    } else {
+        None
+    }
 }
 
 /// Poll the active llama-server's /slots endpoint for processing state.
