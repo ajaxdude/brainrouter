@@ -136,6 +136,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         manifest,
         llama_swap,
         fallback_model: config.llama_swap.fallback_model.clone(),
+        local_models: config.llama_swap.local_models.clone(),
         health,
         routing_events: Arc::clone(&routing_events),
         local_system_prompt,

@@ -40,6 +40,17 @@ pub struct LlamaSwapConfig {
     /// specific model hint. Must match an entry in the llama-swap config.
     pub fallback_model: String,
 
+    /// Explicit list of model keys served by llama-swap. When a request arrives
+    /// with `model` set to one of these names, brainrouter routes directly to
+    /// llama-swap without consulting Bonsai — the user's model choice is
+    /// authoritative. Omit or leave empty to rely on the `brainrouter/<model>`
+    /// prefix convention for direct-local routing.
+    ///
+    /// Matching is case-sensitive; model names must exactly match the keys in
+    /// your llama-swap config (e.g. the key in llama-swap's `models:` map).
+    #[serde(default)]
+    pub local_models: Vec<String>,
+
     /// Optional path to a custom system prompt file for local routing mode.
     /// If absent, the built-in lean prompt is used.
     #[serde(default)]
@@ -152,5 +163,44 @@ pub fn default_socket_path() -> PathBuf {
         PathBuf::from(dir).join("brainrouter.sock")
     } else {
         PathBuf::from("/run/brainrouter.sock")
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_llama_swap(yaml: &str) -> LlamaSwapConfig {
+        serde_yaml::from_str(yaml).expect("parse failed")
+    }
+
+    #[test]
+    fn local_models_defaults_to_empty() {
+        let cfg = parse_llama_swap(
+            "base_url: http://localhost:8081/v1\nfallback_model: default\n",
+        );
+        assert!(cfg.local_models.is_empty());
+    }
+
+    #[test]
+    fn local_models_parses_list() {
+        let cfg = parse_llama_swap(
+            "base_url: http://localhost:8081/v1\nfallback_model: default\nlocal_models:\n  - qwen3\n  - mistral-7b\n",
+        );
+        assert_eq!(cfg.local_models, vec!["qwen3", "mistral-7b"]);
+    }
+
+    #[test]
+    fn local_models_membership_check() {
+        // Mirrors the router check: `self.local_models.contains(&requested_model)`
+        let cfg = parse_llama_swap(
+            "base_url: http://localhost:8081/v1\nfallback_model: default\nlocal_models:\n  - qwen3\n",
+        );
+        assert!(cfg.local_models.contains(&"qwen3".to_string()));
+        assert!(!cfg.local_models.contains(&"claude-3-opus".to_string()));
+        // The brainrouter/ prefix is handled before the local_models check in the
+        // router, so the raw prefix form is not expected to match here.
+        assert!(!cfg.local_models.contains(&"brainrouter/qwen3".to_string()));
     }
 }

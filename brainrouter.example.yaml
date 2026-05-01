@@ -21,6 +21,13 @@ llama_swap:
   # Model key to use when Manifest fails, or when Bonsai picks Local
   # without a specific model. Must match a key in your llama-swap config.
   fallback_model: "your-local-model-key"
+  # Optional: list of model keys served by llama-swap. Requests with any of
+  # these as model= bypass Bonsai entirely and go straight to llama-swap.
+  # Useful when clients (IDEs, scripts) set a specific model name directly.
+  # local_models:
+  #   - "qwen3"
+  #   - "mistral-7b"
+  #   - "your-local-model-key"
 
 bonsai:
   # Absolute path to the Bonsai GGUF file (Q4_K_M recommended, Q6_K_L for higher accuracy)

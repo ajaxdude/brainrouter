@@ -68,6 +68,8 @@ pub struct Router {
     manifest: Arc<OpenAiProvider>,
     llama_swap: Arc<OpenAiProvider>,
     fallback_model: String,
+    /// Model keys known to belong to llama-swap. Requests for these bypass Bonsai.
+    local_models: Vec<String>,
     health: Arc<HealthTracker>,
     routing_events: Arc<RoutingEvents>,
     /// Optional custom system prompt for local routing mode.
@@ -81,6 +83,8 @@ pub struct RouterArgs {
     pub manifest: Arc<OpenAiProvider>,
     pub llama_swap: Arc<OpenAiProvider>,
     pub fallback_model: String,
+    /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
+    pub local_models: Vec<String>,
     pub health: Arc<HealthTracker>,
     pub routing_events: Arc<RoutingEvents>,
     pub local_system_prompt: Option<String>,
@@ -94,6 +98,7 @@ impl Router {
             manifest: args.manifest,
             llama_swap: args.llama_swap,
             fallback_model: args.fallback_model,
+            local_models: args.local_models,
             health: args.health,
             routing_events: args.routing_events,
             local_system_prompt: args.local_system_prompt,
@@ -168,8 +173,20 @@ impl Router {
                             }
                         }
                     }
+                } else if self.local_models.contains(&requested_model) {
+                    // Model is explicitly listed as a local model — route directly
+                    // to llama-swap without consulting Bonsai. The user's model
+                    // choice is authoritative.
+                    info!(model = %requested_model, "Known local model — routing directly to llama-swap");
+                    tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
+                    request.messages = prompt_rewriter::rewrite_for_local(
+                        request.messages,
+                        self.local_system_prompt.as_deref(),
+                    );
+                    // request.model is already correct (it's the llama-swap model key)
+                    ("local-specific", self.route_local(request).await)
                 } else {
-                    // No brainrouter/ prefix — existing Bonsai classification
+                    // No brainrouter/ prefix, not a known local model — use Bonsai
                     tracker.set(Phase::Classifying, None, None, max_tokens);
                     let decision = self
                         .classifier
