@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pre-commit hook — auto-increments the patch version in Cargo.toml on every commit.
+#
+# Install: bash scripts/install-hooks.sh
+# Manual:  cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Idempotency: records the staged Cargo.toml blob hash after bumping.
+# Re-running the hook (e.g. after a failed commit) detects the same hash and skips.
+
+set -euo pipefail
+
+CARGO_TOML="Cargo.toml"
+SENTINEL=".git/BRAINROUTER_VERSION_BUMPED"
+
+# ── Read current version ──────────────────────────────────────────────────────
+current_version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$CARGO_TOML" | head -1)
+if [[ -z "$current_version" ]]; then
+    echo "pre-commit: could not read version from $CARGO_TOML" >&2
+    exit 1
+fi
+
+IFS='.' read -r major minor patch <<< "$current_version"
+if [[ -z "$major" || -z "$minor" || -z "$patch" ]]; then
+    echo "pre-commit: unexpected version format '$current_version' (expected MAJOR.MINOR.PATCH)" >&2
+    exit 1
+fi
+
+# ── Idempotency: skip if already bumped for this staged state ─────────────────
+staged_blob=$(git ls-files --cached --format='%(objectname)' -- "$CARGO_TOML" 2>/dev/null || true)
+if [[ -f "$SENTINEL" && "$(cat "$SENTINEL")" == "$staged_blob" ]]; then
+    exit 0
+fi
+
+# ── Increment patch ───────────────────────────────────────────────────────────
+new_version="${major}.${minor}.$(( patch + 1 ))"
+
+awk -v old="$current_version" -v new="$new_version" '
+    !done && /^version = "/ { sub(old, new); done=1 }
+    { print }
+' "$CARGO_TOML" > "${CARGO_TOML}.tmp" && mv "${CARGO_TOML}.tmp" "$CARGO_TOML"
+
+echo "pre-commit: version $current_version → $new_version"
+
+# ── Update Cargo.lock ─────────────────────────────────────────────────────────
+if command -v cargo &>/dev/null && [[ -f "Cargo.lock" ]]; then
+    cargo update --workspace --precise "$new_version" brainrouter 2>/dev/null \
+        || cargo generate-lockfile 2>/dev/null \
+        || true
+    git add Cargo.lock
+fi
+
+git add "$CARGO_TOML"
+
+# ── Record sentinel ───────────────────────────────────────────────────────────
+new_blob=$(git ls-files --cached --format='%(objectname)' -- "$CARGO_TOML" 2>/dev/null || true)
+echo "$new_blob" > "$SENTINEL"
