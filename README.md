@@ -14,7 +14,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
         │
   ┌─────┼──────────────────────────────────────────────────┐
   │     ├─ model=auto  → Bonsai classifies query           │
-  │     │    Cloud ──── Manifest :2099                     │
+  │     │    Cloud ──── Manifest :3001                     │
   │     │    Local ──── llama-swap :8081                   │
   │     ├─ model=local → rewrite prompt → llama-swap       │
   │     └─ model=cloud → Manifest (direct)                 │
@@ -36,265 +36,74 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 
 ## Table of contents
 
-1. [Prerequisites](#prerequisites)
-2. [Install dependencies](#install-dependencies)
-   - [1. llama.cpp inside a toolbox container](#1-llamacpp-inside-a-toolbox-container)
-   - [2. llama-swap](#2-llama-swap)
-   - [3. Manifest](#3-manifest)
-   - [4. Bonsai classifier model](#4-bonsai-classifier-model)
-3. [Install brainrouter](#install-brainrouter)
-4. [Configure](#configure)
-5. [Connect your harness](#connect-your-harness)
-6. [Dashboard guide](#dashboard-guide)
-7. [MCP code review guide](#mcp-code-review-guide)
-8. [Bridge: Discord and Signal](#bridge-discord-and-signal)
-9. [Reference](#reference)
+1. [Install (one script)](#install)
+2. [Configure](#configure)
+3. [Connect your harness](#connect-your-harness)
+4. [Dashboard guide](#dashboard-guide)
+5. [MCP code review guide](#mcp-code-review-guide)
+6. [Bridge: Discord and Signal](#bridge-discord-and-signal)
+7. [Reference](#reference)
 
 ---
 
-## Prerequisites
+## Install
 
-- Linux (systemd user services, `/run/user/$UID`)
-- Rust toolchain: `curl https://sh.rustup.rs | sh`
-- Go ≥ 1.22 (for llama-swap): `sudo dnf install golang` or `sudo apt install golang`
-- Docker / Podman (for Manifest)
-- [toolbox](https://containertoolbx.org/) (`sudo dnf install toolbox`)
-- A GPU with Vulkan support (AMD RDNA or NVIDIA; the llama-server toolbox ships Vulkan drivers)
-
----
-
-## Install dependencies
-
-### 1. llama.cpp inside a toolbox container
-
-llama-swap launches `llama-server` for inference. brainrouter wraps it in a toolbox container so the GPU drivers stay isolated.
-
-**a. Create the toolbox container**
-
-For AMD RDNA (RADV driver — recommended for RX 7000 / RX 8000 / Strix Halo):
-```bash
-toolbox create --image docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv llama-vulkan-radv
-```
-
-For AMD with the AMDVLK driver:
-```bash
-toolbox create --image docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-amdvlk llama-vulkan-amdvlk
-```
-
-Verify `llama-server` is available inside:
-```bash
-toolbox run --container llama-vulkan-radv llama-server --version
-```
-
-**b. Create the wrapper script**
-
-llama-swap calls this script instead of `llama-server` directly so it can route to the right container:
+For Fedora Linux with multiple users, one script installs and configures everything.
+Run it as a user with sudo access:
 
 ```bash
-cat > ~/.local/bin/llama-server-toolbox << 'EOF'
-#!/bin/bash
-# Wrapper: run llama-server inside a toolbox container.
-# LLAMA_CONTAINER defaults to llama-vulkan-radv.
-# LLAMA_ICD defaults to RADV.
-CONTAINER=${LLAMA_CONTAINER:-llama-vulkan-radv}
-ICD=${LLAMA_ICD:-RADV}
-exec toolbox run --container "$CONTAINER" env AMD_VULKAN_ICD="$ICD" llama-server "$@"
-EOF
-chmod +x ~/.local/bin/llama-server-toolbox
-```
-
----
-
-### 2. llama-swap
-
-llama-swap loads models on demand, unloads the previous one, and presents a single OpenAI-compatible endpoint.
-
-**a. Install**
-```bash
-go install github.com/mostlygeek/llama-swap@latest
-cp ~/go/bin/llama-swap ~/.local/bin/llama-swap
-```
-
-**b. Configure**
-
-Create `~/.config/llama-swap/config.yaml`. Minimal example:
-
-```yaml
-# ~/.config/llama-swap/config.yaml
-startPort: 5800
-healthCheckTimeout: 300
-globalTTL: 180
-
-macros:
-  "ls": "/home/$USER/.local/bin/llama-server-toolbox"
-  "ctx": "-c 32768"
-  "common": >-
-    --no-webui --jinja
-    -t 8 -tb 16 --parallel 1
-    -ngl 999 --no-mmap -fa on
-    --host 0.0.0.0
-    ${ctx}
-
-models:
-  "my-model":
-    name: "My Model"
-    cmd: |
-      ${ls}
-      --port ${PORT}
-      ${common}
-      --model /path/to/model.gguf
-```
-
-Replace `/path/to/model.gguf` with the path to a GGUF file on your system. The model key (`"my-model"`) is what you reference in `brainrouter.yaml` as `fallback_model`.
-
-**c. Systemd user service**
-
-```bash
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/llama-swap.service << 'EOF'
-[Unit]
-Description=llama-swap — on-demand local model router
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/llama-swap \
-    --config %h/.config/llama-swap/config.yaml \
-    --listen 0.0.0.0:8081
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-
-systemctl --user daemon-reload
-systemctl --user enable --now llama-swap
-systemctl --user status llama-swap
-```
-
-Test it:
-```bash
-curl http://localhost:8081/v1/models
-```
-
----
-
-### 3. Manifest
-
-Manifest is a self-hosted cloud LLM router. It runs in Docker and handles provider selection (Anthropic, OpenAI, Google, Mistral, DeepSeek, Copilot, etc.) with its own fallback logic. brainrouter delegates all cloud requests to it.
-
-**a. Get the docker-compose stack**
-
-```bash
-mkdir -p ~/ai/stack/manifest
-cd ~/ai/stack/manifest
-curl -fsSL https://raw.githubusercontent.com/mnfst/manifest/main/docker-compose.yml -o docker-compose.yml
-```
-
-**b. Configure**
-
-```bash
-cp .env.example .env 2>/dev/null || touch .env
-# Set a secret — required:
-echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)" >> .env
-```
-
-**c. Start**
-
-```bash
-cd ~/ai/stack/manifest
-docker compose up -d
-```
-
-Visit `http://localhost:2099` and complete the setup wizard (create admin account, add cloud provider API keys).
-
-**d. Get your Manifest API key**
-
-After setup: Settings → API Keys → Create key. It looks like `mnfst_xxxxxxxx`.
-
-```bash
-# Add to your brainrouter env file (created in the next step):
-echo "MANIFEST_API_KEY=mnfst_your_key_here" >> ~/ai/projects/brainrouter/.env
-```
-
----
-
-### 4. Bonsai classifier model
-
-Bonsai 8B is an 8-billion-parameter GGUF model that classifies each query as "cloud" or "local" in under 200 ms. Download it from Hugging Face:
-
-```bash
-# Install huggingface-cli if needed:
-pip install -U "huggingface_hub[cli]"
-
-# Download the recommended Q4_K_M quant (~5.2 GB):
-huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \
-  --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" \
-  --local-dir ~/models/bonsai
-
-# Verify the file is present and note the exact path for brainrouter.yaml:
-ls ~/models/bonsai/*.gguf
-```
-
-Q4_K_M (~5.2 GB) is the recommended balance of speed and size.
-Use Q6_K_L (~7.3 GB) for higher accuracy if VRAM allows.
-
-
----
-
-## Install brainrouter
-
-```bash
-# 1. Clone
-git clone https://github.com/yourusername/brainrouter ~/ai/projects/brainrouter
+git clone https://github.com/ajaxdude/brainrouter ~/ai/projects/brainrouter
 cd ~/ai/projects/brainrouter
-
-# 2. Build
-cargo build --release
-
-# 3. Create config and env file
-mkdir -p ~/.config/brainrouter
-cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml
-cp .env.example ~/.config/brainrouter/.env
-# Edit ~/.config/brainrouter/brainrouter.yaml (set paths, ports)
-# Edit ~/.config/brainrouter/.env and set MANIFEST_API_KEY=mnfst_your_key_here
+sudo bash install.sh
 ```
 
-**Systemd user service**
+The script installs (idempotent — safe to re-run):
 
-```bash
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/brainrouter.service << 'EOF'
-[Unit]
-Description=brainrouter — Bonsai-routed LLM proxy
-After=llama-swap.service network-online.target
-Wants=llama-swap.service
+- **System packages** — git, golang, toolbox, docker, vulkan headers
+- **bun** — JavaScript runtime for oh-my-pi, installed system-wide
+- **oh-my-pi** — installed for every human user via bun
+- **Bonsai Q4_K_M** — downloaded to `/opt/models/bonsai/` (~5.2 GB)
+- **Manifest** — cloud LLM router running as a system Docker service on port 3001
+- **llama-swap** — local model runner as a system Docker service on port 8081
+- **brainrouter** — compiled and installed to `/usr/local/bin/brainrouter`
+- **llama-server-toolbox** — wrapper at `/usr/local/bin/llama-server-toolbox`
+- **toolbox container** `llama-vulkan-radv` — AMD RADV Vulkan environment
+- **Shared config** — `/etc/brainrouter/brainrouter.yaml` and `/etc/brainrouter/env`
+- **Per-user systemd services** — brainrouter enabled for every user, auto-starts at boot via `loginctl linger`
+- **Shell environment** — `/etc/profile.d/ai-stack.sh` sets PATH and harness env vars for all users
 
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/brainrouter/.env
-ExecStart=%h/ai/projects/brainrouter/target/release/brainrouter serve \
-    --socket /run/user/%U/brainrouter.sock \
-    --tcp-addr 127.0.0.1:9099
-Restart=on-failure
-RestartSec=5
+### After the script finishes — one manual step
 
-[Install]
-WantedBy=default.target
-EOF
+The Manifest API key cannot be automated (you create it in the browser wizard):
 
-systemctl --user daemon-reload
-systemctl --user enable --now brainrouter
-systemctl --user status brainrouter
-```
+1. Open **http://localhost:3001**, complete the setup wizard, add your cloud API keys
+2. Go to **Settings → API Keys → Create key** — copy the `mnfst_…` key
+3. Paste it into the shared env file:
+   ```bash
+   sudo nano /etc/brainrouter/env
+   # Replace: MANIFEST_API_KEY=mnfst_REPLACE_WITH_YOUR_KEY
+   ```
+4. Reboot — all users come up with brainrouter running automatically.
+   Or without rebooting, for each user:
+   ```bash
+   sudo -u USERNAME XDG_RUNTIME_DIR=/run/user/$(id -u USERNAME) \
+     systemctl --user restart brainrouter
+   ```
 
-Verify:
-```bash
-curl http://127.0.0.1:9099/health
-# → {"status":"ok"}
-```
+### Multi-user notes
 
----
+- The Manifest API key lives in `/etc/brainrouter/env` (owned `root:aistack`, mode `640`).
+  All users in the `aistack` group can read it. The script adds every human user to this group.
+- `loginctl enable-linger` is set for each user so brainrouter starts at boot without anyone
+  needing to log in.
+- New users added after install: their service file comes from `/etc/skel`; run
+  `sudo bash install.sh` again (idempotent) to complete their setup.
+- To edit which local model llama-swap serves:
+  ```bash
+  sudo nano /opt/ai/llama-swap/config.yaml
+  sudo systemctl restart llama-swap
+  ```
+
 
 ## Configure
 
@@ -309,7 +118,7 @@ cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml
 # ~/.config/brainrouter/brainrouter.yaml
 
 manifest:
-  base_url: "http://localhost:2099/v1"
+  base_url: "http://localhost:3001/v1"
   api_key_env: MANIFEST_API_KEY   # env var name — value goes in .env
 
 llama_swap:
@@ -689,7 +498,7 @@ Long responses are automatically chunked (1500 chars for Discord, 4000 chars for
 
 ```yaml
 manifest:
-  base_url: "http://localhost:2099/v1"   # required
+  base_url: "http://localhost:3001/v1"   # required
   api_key_env: MANIFEST_API_KEY          # optional — name of env var holding mnfst_* key
 
 llama_swap:
@@ -835,7 +644,7 @@ src/
 
 | Service | Purpose | Default URL |
 |---|---|---|
-| **Manifest** | Cloud LLM router — provider selection, failover, cost tracking | `http://localhost:2099` |
+| **Manifest** | Cloud LLM router — provider selection, failover, cost tracking | `http://localhost:3001` |
 | **llama-swap** | Local model runner — spawns llama-server on demand | `http://localhost:8081` |
 | **Bonsai** | In-process classifier — no HTTP hop | loaded from `model_path` |
 
