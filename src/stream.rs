@@ -21,7 +21,7 @@ pub enum StreamFormat {
 /// before ending gracefully, avoiding "unexpected socket closure" errors.
 ///
 /// Intended to be the outer wrapper for streaming responses:
-/// `SafeStream::new(TimeoutStream::new(raw_stream, ...), format)`
+/// `SafeStream::new(KeepaliveStream::new(TimeoutStream::new(raw_stream, ...), ...), format)`
 #[pin_project]
 pub struct SafeStream<S: Stream> {
     #[pin]
@@ -162,6 +162,76 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+/// Interval at which keepalive SSE comments are emitted when the inner stream is
+/// idle. Chosen to be well below any reasonable client-side stream-idle watchdog.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// An SSE comment (`": ping\n\n"`) used as a keepalive beat.
+/// SSE clients **MUST** ignore comment lines; this only exists to flush the TCP
+/// write buffer and reset client-side idle timers.
+const KEEPALIVE_BYTES: &[u8] = b": ping\n\n";
+
+/// A stream wrapper that emits a periodic SSE keepalive comment while the inner
+/// stream is idle (returning `Poll::Pending`). Once the inner stream yields data
+/// or terminates, this wrapper is fully transparent.
+///
+/// Place this **outside** `TimeoutStream` so keepalive bytes do not interfere with
+/// the stall detector — if the backend is truly hung the 180-second error still
+/// fires; the keepalive only prevents the HTTP client from declaring the
+/// connection dead during normal TTFT latency.
+#[pin_project]
+pub struct KeepaliveStream<S: Stream> {
+    #[pin]
+    inner: S,
+    #[pin]
+    sleep: Sleep,
+    interval: Duration,
+}
+
+impl<S> KeepaliveStream<S>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
+    pub fn new(inner: S, interval: Duration) -> Self {
+        Self {
+            inner,
+            sleep: sleep(interval),
+            interval,
+        }
+    }
+}
+
+impl<S> Stream for KeepaliveStream<S>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
+    type Item = Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        // 1. Try to get the next item from the inner stream.
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(item) => {
+                // Data or end — reset the keepalive clock and pass through.
+                this.sleep.reset(tokio::time::Instant::now() + *this.interval);
+                return Poll::Ready(item);
+            }
+            Poll::Pending => {}
+        }
+
+        // 2. Inner is idle. Check whether a keepalive interval has elapsed.
+        match this.sleep.as_mut().poll(cx) {
+            Poll::Ready(_) => {
+                // Emit a comment and restart the clock.
+                this.sleep.reset(tokio::time::Instant::now() + *this.interval);
+                Poll::Ready(Some(Ok(Bytes::from_static(KEEPALIVE_BYTES))))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
