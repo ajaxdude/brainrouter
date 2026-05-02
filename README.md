@@ -107,36 +107,42 @@ The Manifest API key cannot be automated (you create it in the browser wizard):
 
 ## Configure
 
-Copy the example config to the default location and fill in your paths:
+After `install.sh` runs, the system config is already in place at `/etc/brainrouter/brainrouter.yaml`.
+Each user also gets a copy seeded to `~/.config/brainrouter/brainrouter.yaml` at install time.
+
+The only value you need to change post-install is `fallback_model` — set it to match a model key
+in `/opt/ai/llama-swap/config.yaml`:
 
 ```bash
-mkdir -p ~/.config/brainrouter
-cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml
+sudo nano /etc/brainrouter/brainrouter.yaml
+sudo nano /opt/ai/llama-swap/config.yaml  # define the model
+sudo systemctl restart llama-swap
 ```
 
 ```yaml
-# ~/.config/brainrouter/brainrouter.yaml
+# /etc/brainrouter/brainrouter.yaml (shared for all users)
 
 manifest:
   base_url: "http://localhost:3001/v1"
-  api_key_env: MANIFEST_API_KEY   # env var name — value goes in .env
+  api_key_env: MANIFEST_API_KEY  # key lives in /etc/brainrouter/env
 
 llama_swap:
   base_url: "http://localhost:8081/v1"
-  # Must match a model key in ~/.config/llama-swap/config.yaml
-  fallback_model: "my-model"
+  fallback_model: "your-local-model"  # must match a key in /opt/ai/llama-swap/config.yaml
 
 bonsai:
-  # Absolute path to the Bonsai GGUF file you downloaded
-  model_path: "/home/yourname/models/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
-
-# Optional 		-- all fields have sensible defaults:
-# review:
-#   max_iterations: 5
-#   forced_mode: "auto"  # "auto" | "cloud" | "local"
+  model_path: "/opt/models/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
 ```
 
-After editing, restart:
+The Manifest API key lives in `/etc/brainrouter/env` (readable by the `aistack` group — all human
+users are added to it by `install.sh`):
+
+```bash
+sudo nano /etc/brainrouter/env
+# MANIFEST_API_KEY=mnfst_your_key_here
+```
+
+After any config change, restart brainrouter for your user:
 ```bash
 systemctl --user restart brainrouter
 ```

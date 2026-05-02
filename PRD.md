@@ -3,7 +3,7 @@
 **Status:** Implemented (V1)
 **Language:** Rust
 **Binary:** `target/release/brainrouter`
-**Config:** `brainrouter.yaml` + `.env`
+**Config:** `brainrouter.yaml` + `/etc/brainrouter/env` (multi-user) or `~/.config/brainrouter/.env` (single-user)
 **Repository:** https://github.com/ajaxdude/brainrouter
 **Tests:** 74 tests across the codebase
 
@@ -156,10 +156,29 @@ The MCP server needs to know the caller's working directory. On Linux, brainrout
 | Integration tests | `tests/failover_test.rs` | Circuit breaker and fallback behavior tests |
 | Integration tests | `tests/install_test.rs` | Harness installer tests |
 | Integration tests | `tests/review_test.rs` | Review loop and session lifecycle tests |
+| System installer | `install.sh` | One-script Fedora system-wide installer: packages, bun, oh-my-pi, Bonsai, Manifest, llama-swap, brainrouter, toolbox container, shared `/etc/brainrouter/` config, per-user services with linger |
 
 ---
 
 ## Configuration Reference
+
+### System paths (multi-user install)
+
+When installed via `install.sh` on a shared Fedora machine:
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/brainrouter` | System-wide brainrouter binary |
+| `/usr/local/bin/llama-server-toolbox` | Wrapper: runs `llama-server` inside the `llama-vulkan-radv` toolbox container |
+| `/etc/brainrouter/brainrouter.yaml` | Shared base config (readable by all `aistack` group members) |
+| `/etc/brainrouter/env` | Shared env file holding `MANIFEST_API_KEY` (`root:aistack`, mode `640`) |
+| `/etc/skel/.config/systemd/user/brainrouter.service` | Template brainrouter service for new user accounts |
+| `/etc/profile.d/ai-stack.sh` | Sets `PATH`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` for all login shells |
+| `/opt/models/bonsai/` | Shared GGUF model storage (`root:aistack`, setgid `2775`) |
+| `/opt/ai/llama-swap/` | llama-swap Docker compose stack |
+| `/opt/ai/manifest/` | Manifest Docker compose stack |
+| `/etc/systemd/system/llama-swap.service` | System service: starts llama-swap Docker stack at boot |
+| `/etc/systemd/system/manifest.service` | System service: starts Manifest Docker stack at boot |
 
 ### YAML Configuration (`brainrouter.yaml`)
 
@@ -597,6 +616,14 @@ Required configuration is validated at daemon startup:
 - `manifest.base_url` must start with `http://` or `https://`
 - `bonsai.model_path` must exist on disk
 - `llama_swap.fallback_model` is required
+
+### Shared credentials (multi-user install)
+
+`/etc/brainrouter/env` is owned `root:aistack` with mode `640`. Only the root user and members of
+the `aistack` group can read it. `install.sh` adds every human system user to `aistack` automatically.
+Individual users never have write access to this file -- only root can update the API key.
+The file is not world-readable; a user not in `aistack` cannot extract the Manifest API key.
+
 
 The daemon refuses to start if validation fails, with descriptive error messages.
 
