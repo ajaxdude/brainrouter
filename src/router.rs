@@ -6,9 +6,9 @@
 //!   2. Dispatches to the chosen backend.
 //!   3. On cloud failure / stall, falls through to llama-swap with the
 //!      configured fallback model.
-//!   4. Wraps the resulting stream in TimeoutStream + KeepaliveStream so a
-//!      stalled provider surfaces as an error and the HTTP client is kept alive
-//!      during normal TTFT latency via periodic SSE comment pings.
+//!   4. Wraps the resulting stream in TimeoutStream so a stalled provider
+//!      surfaces as an error instead of hanging the client. KeepaliveStream is
+//!      applied in server.rs where the wire format (OpenAI/Anthropic) is known.
 
 use crate::{
     classifier::{Classifier, RoutingDecision},
@@ -17,7 +17,7 @@ use crate::{
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{RouteEvent, RoutingEvents, Stage},
-    stream::{KeepaliveStream, TimeoutStream, KEEPALIVE_INTERVAL},
+    stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
 use anyhow::{anyhow, Result};
@@ -534,8 +534,7 @@ fn wrap_with_timeout(
     stream: crate::provider::SseStream,
 ) -> ProviderResponse {
     let timeout_stream = TimeoutStream::new(stream, STREAM_STALL_TIMEOUT);
-    let keepalive_stream = KeepaliveStream::new(timeout_stream, KEEPALIVE_INTERVAL);
-    ProviderResponse::Stream(Box::pin(keepalive_stream))
+    ProviderResponse::Stream(Box::pin(timeout_stream))
 }
 
 /// Wrap a ProviderResponse stream so the inference tracker is cleared when

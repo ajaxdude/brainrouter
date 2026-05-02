@@ -166,23 +166,38 @@ where
     }
 }
 
-/// Interval at which keepalive SSE comments are emitted when the inner stream is
-/// idle. Chosen to be well below any reasonable client-side stream-idle watchdog.
+/// Interval at which keepalive frames are emitted when the inner stream is
+/// idle. Chosen to be well below any reasonable client-side stream-idle watchdog
+/// (OMP defaults to 120 s; we ping every 15 s).
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// An SSE comment (`": ping\n\n"`) used as a keepalive beat.
-/// SSE clients **MUST** ignore comment lines; this only exists to flush the TCP
-/// write buffer and reset client-side idle timers.
-const KEEPALIVE_BYTES: &[u8] = b": ping\n\n";
+/// An SSE comment used as a keepalive for Anthropic-format streams.
+/// Anthropic SDK and OMP both treat comment lines as ignorable heartbeats.
+const KEEPALIVE_ANTHROPIC: &[u8] = b": ping\n\n";
 
-/// A stream wrapper that emits a periodic SSE keepalive comment while the inner
-/// stream is idle (returning `Poll::Pending`). Once the inner stream yields data
-/// or terminates, this wrapper is fully transparent.
+/// An empty-delta OpenAI SSE chunk used as a keepalive for OpenAI-format streams.
 ///
-/// Place this **outside** `TimeoutStream` so keepalive bytes do not interfere with
-/// the stall detector — if the backend is truly hung the 180-second error still
-/// fires; the keepalive only prevents the HTTP client from declaring the
-/// connection dead during normal TTFT latency.
+/// OMP's `iterateWithIdleTimeout` races `iterator.next()` against a wall-clock
+/// timer. The openai SDK's SSE parser silently discards comment lines and never
+/// yields them to the async iterator — so SSE comments cannot reset that timer.
+/// We must emit a valid `data:` frame that the SDK will parse into a
+/// `ChatCompletionChunk` and yield, which resets OMP's idle watchdog.
+///
+/// An empty string delta is safe: the provider code skips zero-length content.
+const KEEPALIVE_OPENAI: &[u8] =
+    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+
+/// A stream wrapper that emits a periodic keepalive frame while the inner stream
+/// is idle (`Poll::Pending`). Once the inner stream yields data or terminates this
+/// wrapper is fully transparent.
+///
+/// **Format matters:** for OpenAI streams, keepalives must be real `data:` frames
+/// because the SDK parser discards SSE comment lines before they reach the
+/// application-level async iterator. For Anthropic streams, SSE comments suffice.
+///
+/// Place this **outside** `TimeoutStream` so keepalive frames do not interfere
+/// with the stall detector — if the backend is truly hung for 180 s the stall
+/// error still fires.
 #[pin_project]
 pub struct KeepaliveStream<S: Stream> {
     #[pin]
@@ -190,17 +205,19 @@ pub struct KeepaliveStream<S: Stream> {
     #[pin]
     sleep: Sleep,
     interval: Duration,
+    format: StreamFormat,
 }
 
 impl<S> KeepaliveStream<S>
 where
     S: Stream<Item = Result<Bytes>>,
 {
-    pub fn new(inner: S, interval: Duration) -> Self {
+    pub fn new(inner: S, interval: Duration, format: StreamFormat) -> Self {
         Self {
             inner,
             sleep: sleep(interval),
             interval,
+            format,
         }
     }
 }
@@ -227,9 +244,13 @@ where
         // 2. Inner is idle. Check whether a keepalive interval has elapsed.
         match this.sleep.as_mut().poll(cx) {
             Poll::Ready(_) => {
-                // Emit a comment and restart the clock.
+                // Emit a keepalive and restart the clock.
                 this.sleep.reset(tokio::time::Instant::now() + *this.interval);
-                Poll::Ready(Some(Ok(Bytes::from_static(KEEPALIVE_BYTES))))
+                let bytes = match this.format {
+                    StreamFormat::OpenAi => Bytes::from_static(KEEPALIVE_OPENAI),
+                    StreamFormat::Anthropic => Bytes::from_static(KEEPALIVE_ANTHROPIC),
+                };
+                Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Pending => Poll::Pending,
         }

@@ -82,7 +82,7 @@ use crate::routing_events::RoutingEvents;
 use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
-use crate::stream::{SafeStream, StreamFormat};
+use crate::stream::{KeepaliveStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
@@ -665,7 +665,8 @@ async fn handle_chat_completion(
 
     match provider_response {
         ProviderResponse::Stream(stream) => {
-            let safe_stream = SafeStream::new(stream, StreamFormat::OpenAi);
+            let ka_stream = KeepaliveStream::new(stream, KEEPALIVE_INTERVAL, StreamFormat::OpenAi);
+            let safe_stream = SafeStream::new(ka_stream, StreamFormat::OpenAi);
             let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
             let response = Response::builder()
                 .status(StatusCode::OK)
@@ -696,7 +697,8 @@ async fn handle_anthropic_messages(
     match provider_response {
         ProviderResponse::Stream(stream) => {
             let adapted = AnthropicSseAdapter::new(stream, model);
-            let safe_stream = SafeStream::new(adapted, StreamFormat::Anthropic);
+            let ka_stream = KeepaliveStream::new(adapted, KEEPALIVE_INTERVAL, StreamFormat::Anthropic);
+            let safe_stream = SafeStream::new(ka_stream, StreamFormat::Anthropic);
             let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
             let response = Response::builder()
                 .status(StatusCode::OK)
