@@ -468,7 +468,13 @@ _skel_needed=0
 [[ ! -f /etc/skel/.config/systemd/user/brainrouter.service ]] && _skel_needed=1
 while IFS= read -r u; do
     uh=$(getent passwd "$u" | cut -d: -f6)
-    [[ ! -f "${uh}/.config/systemd/user/brainrouter.service" ]] && _skel_needed=1
+    _u_uid=$(id -u "$u")
+    _u_port=$((8099 + _u_uid))
+    # Trigger re-seed if the service file is missing or has the wrong TCP port
+    if [[ ! -f "${uh}/.config/systemd/user/brainrouter.service" ]] || \
+       ! grep -q "tcp-addr 127.0.0.1:${_u_port}" "${uh}/.config/systemd/user/brainrouter.service" 2>/dev/null; then
+        _skel_needed=1
+    fi
 done < <(human_users)
 
 if [[ $_skel_needed -eq 0 ]]; then
@@ -504,6 +510,9 @@ SERVICE
         [[ -d "$user_home" ]] || continue
         step "  Configuring $user"
 
+        uid=$(id -u "$user")
+        brainrouter_port=$((8099 + uid))
+
         # brainrouter.yaml copy
         install -d -o "$user" -g "$user" -m 750 "${user_home}/.config/brainrouter"
         if [[ ! -f "${user_home}/.config/brainrouter/brainrouter.yaml" ]]; then
@@ -512,13 +521,37 @@ SERVICE
                 "${user_home}/.config/brainrouter/brainrouter.yaml"
         fi
 
-        # service file
+        # service file — always written/updated with per-user TCP port
+        # (uid 1000 → 9099, uid 1001 → 9100, …)
         install -d -o "$user" -g "$user" -m 755 "${user_home}/.config/systemd/user"
-        if [[ ! -f "${user_home}/.config/systemd/user/brainrouter.service" ]]; then
-            install -o "$user" -g "$user" -m 644 \
-                /etc/skel/.config/systemd/user/brainrouter.service \
-                "${user_home}/.config/systemd/user/brainrouter.service"
-        fi
+        install -o "$user" -g "$user" -m 644 \
+            /dev/stdin "${user_home}/.config/systemd/user/brainrouter.service" << SERVICE
+[Unit]
+Description=brainrouter — Bonsai-routed LLM proxy
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brainrouter/env
+ExecStart=/usr/local/bin/brainrouter serve \\
+  --config /etc/brainrouter/brainrouter.yaml \\
+  --socket /run/user/${uid}/brainrouter.sock \\
+  --tcp-addr 127.0.0.1:${brainrouter_port}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+        # shell env — set per-user brainrouter base URLs in .bashrc for non-login shells
+        for rc in "${user_home}/.bashrc" "${user_home}/.zshrc"; do
+            [[ -f "$rc" ]] || continue
+            grep -q "ANTHROPIC_BASE_URL" "$rc" && continue
+            printf '\n# brainrouter — per-user AI proxy port\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:%s\nexport OPENAI_BASE_URL=http://127.0.0.1:%s/v1\n' \
+                "${brainrouter_port}" "${brainrouter_port}" >> "$rc"
+            ok "    ANTHROPIC_BASE_URL → :${brainrouter_port} added to $(basename "$rc") for $user"
+        done
 
         # linger
         if ! loginctl show-user "$user" 2>/dev/null | grep -q 'Linger=yes'; then
@@ -527,7 +560,6 @@ SERVICE
         fi
 
         # enable + start
-        uid=$(id -u "$user")
         if ! systemctl --user --machine="${user}@.host" is-active --quiet default.target 2>/dev/null; then
             systemd-run --uid="$uid" --gid="$(id -g "$user")" \
                 --unit="user-session-bootstrap-${user}" \
@@ -548,28 +580,36 @@ SERVICE
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
             XDG_RUNTIME_DIR="/run/user/${uid}" \
             systemctl --user start brainrouter 2>/dev/null \
-            && ok "    brainrouter started for $user" \
+            && ok "    brainrouter started for $user (port ${brainrouter_port})" \
             || warn "    brainrouter not yet running for $user (starts after reboot + API key set)"
     done < <(human_users)
 fi
 
 # ── Step 14: /etc/profile.d/ai-stack.sh ──────────────────────────────────────
 
-if [[ -f /etc/profile.d/ai-stack.sh ]]; then
+if [[ -f /etc/profile.d/ai-stack.sh ]] && grep -q "_br_port" /etc/profile.d/ai-stack.sh; then
     skip "Step 14/14 — /etc/profile.d/ai-stack.sh (already installed)"
 elif confirm_step \
     "Step 14/14 — Shell environment (/etc/profile.d/ai-stack.sh)" \
     "Will write /etc/profile.d/ai-stack.sh which:
     - Adds ~/.bun/bin and /usr/local/bin to PATH for all users
-    - Sets ANTHROPIC_BASE_URL=http://127.0.0.1:9099
-    - Sets OPENAI_BASE_URL=http://127.0.0.1:9099/v1
+    - Sets ANTHROPIC_BASE_URL and OPENAI_BASE_URL per-user (uid 1000 → :9099, uid 1001 → :9100, …)
     This makes omp, brainrouter, and all harness env vars available in every login shell."; then
     cat > /etc/profile.d/ai-stack.sh <<'PROFILE'
 # AI stack — added by brainrouter install.sh
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:/usr/local/bin:$PATH"
-export ANTHROPIC_BASE_URL="http://127.0.0.1:9099"
-export OPENAI_BASE_URL="http://127.0.0.1:9099/v1"
+if [ -d "$HOME/.bun/bin" ]; then
+    PATH="$HOME/.bun/bin:$PATH"
+fi
+if [ -d /usr/local/bin ]; then
+    PATH="/usr/local/bin:$PATH"
+fi
+export PATH
+
+# brainrouter — per-user port: uid 1000 → 9099, uid 1001 → 9100, …
+_br_port=$(( $(id -u) + 8099 ))
+export ANTHROPIC_BASE_URL="http://127.0.0.1:${_br_port}"
+export OPENAI_BASE_URL="http://127.0.0.1:${_br_port}/v1"
+unset _br_port
 PROFILE
     chmod 644 /etc/profile.d/ai-stack.sh
     ok "/etc/profile.d/ai-stack.sh written"
