@@ -636,6 +636,32 @@ elif confirm_step \
     done
 fi
 
+# ── System-wide omp wrapper ──────────────────────────────────────────────────
+# /usr/local/bin/omp delegates to the per-user ~/.bun/bin/omp.
+# This ensures `omp` works from any shell — including inside toolbox containers
+# which inherit /usr/local/bin via the host bind-mount but don't have the
+# per-user ~/.bun/bin on PATH until profile.d is sourced.
+
+if [[ -x /usr/local/bin/omp ]]; then
+    skip "System omp wrapper — already at /usr/local/bin/omp"
+elif confirm_step \
+    "System-wide omp wrapper (/usr/local/bin/omp)" \
+    "Will write /usr/local/bin/omp — a thin wrapper that delegates to each user's
+    ~/.bun/bin/omp. Required so 'omp' works inside toolbox containers."; then
+    cat > /usr/local/bin/omp <<'OMP'
+#!/usr/bin/env bash
+# System-wide omp launcher — delegates to per-user ~/.bun/bin/omp.
+BUN_OMP="$HOME/.bun/bin/omp"
+if [[ -x "$BUN_OMP" ]]; then
+    exec "$BUN_OMP" "$@"
+fi
+echo "omp not found. Install: bun install -g @oh-my-pi/pi-coding-agent" >&2
+exit 1
+OMP
+    chmod 755 /usr/local/bin/omp
+    ok "/usr/local/bin/omp wrapper written"
+fi
+
 # ── Harness installation ───────────────────────────────────────────────────────
 #
 # brainrouter install <harness> patches harness config files to point at
