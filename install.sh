@@ -12,7 +12,6 @@ set -euo pipefail
 BRAINROUTER_REPO="https://github.com/ajaxdude/brainrouter"
 BONSAI_HF_REPO="bartowski/prism-ml_Bonsai-8B-unpacked-GGUF"
 BONSAI_FILE="prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
-BONSAI_PATH="/opt/models/bonsai/${BONSAI_FILE}"
 MANIFEST_PORT=3001
 LLAMA_SWAP_PORT=8081
 BRAINROUTER_PORT=9099
@@ -21,6 +20,52 @@ TOOLBOX_NAME="llama-vulkan-radv"
 
 SUDO_USER_HOME=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
 BR_SRC="${SUDO_USER_HOME}/ai/projects/brainrouter"
+
+# ── Read models config from brainrouter.yaml (if it exists already) ───────────
+# Defaults match ModelsConfig defaults in config.rs.
+MODELS_PATH="/opt/models"
+MODELS_SHARED_WRITE="false"
+_br_yaml="/etc/brainrouter/brainrouter.yaml"
+if [[ -f "$_br_yaml" ]] && command -v python3 &>/dev/null; then
+    _py_out=$(python3 - "$_br_yaml" <<'PYEOF'
+import sys, re
+try:
+    import yaml
+    with open(sys.argv[1]) as f:
+        cfg = yaml.safe_load(f) or {}
+    m = cfg.get('models', {}) or {}
+    print(m.get('path', '/opt/models'))
+    print(str(m.get('shared_write', False)).lower())
+except Exception:
+    print('/opt/models')
+    print('false')
+PYEOF
+    ) 2>/dev/null || true
+    if [[ -n "$_py_out" ]]; then
+        MODELS_PATH=$(echo "$_py_out" | sed -n '1p')
+        MODELS_SHARED_WRITE=$(echo "$_py_out" | sed -n '2p')
+    fi
+fi
+BONSAI_PATH="${MODELS_PATH}/bonsai/${BONSAI_FILE}"
+
+# setup_models_dir PATH SHARED_WRITE
+#   Creates PATH/{bonsai,gguf} with correct group ownership and permissions.
+#   SHARED_WRITE=true  → group aistack gets write (770)
+#   SHARED_WRITE=false → group aistack gets read-only (750)
+setup_models_dir() {
+    local mpath="$1" shared="$2"
+    local mode=750
+    [[ "$shared" == "true" ]] && mode=770
+    mkdir -p "${mpath}/bonsai" "${mpath}/gguf"
+    chown -R root:aistack "$mpath"
+    # setgid so new sub-dirs inherit aistack group automatically
+    find "$mpath" -type d -exec chmod "2${mode}" {} \;
+    # Files: owner rw, group r (750→640, 770→660)
+    local fmode=640
+    [[ "$shared" == "true" ]] && fmode=660
+    find "$mpath" -type f -exec chmod "$fmode" {} \; 2>/dev/null || true
+    ok "  ${mpath} — mode ${mode} (shared_write=${shared})"
+}
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
 
@@ -143,15 +188,15 @@ fi
 
 # ── Step 4: Shared directories ────────────────────────────────────────────────
 
-if [[ -d /opt/models/bonsai && -d /opt/ai/llama-swap && -d /etc/brainrouter ]]; then
-    skip "Step 4/14 — Shared directories (already exist)"
+if [[ -d "${MODELS_PATH}/bonsai" && -d /opt/ai/llama-swap && -d /etc/brainrouter ]]; then
+    skip "Step 4/14 — Shared directories (already exist at ${MODELS_PATH})"
 elif confirm_step \
     "Step 4/14 — Shared directories" \
-    "Will create /opt/models/bonsai, /opt/ai/{llama-swap,manifest,bin}, /etc/brainrouter with aistack group permissions."; then
-    mkdir -p /opt/models/bonsai /opt/ai/{llama-swap,manifest,bin} /etc/brainrouter
-    chown -R root:aistack /opt/models /opt/ai /etc/brainrouter
-    find /opt/models -type d -exec chmod 2775 {} \;
-    find /opt/models -type f -exec chmod 664 {} \; 2>/dev/null || true
+    "Will create ${MODELS_PATH}/{bonsai,gguf}, /opt/ai/{llama-swap,manifest,bin}, /etc/brainrouter.
+    Models directory: $([ "$MODELS_SHARED_WRITE" = "true" ] && echo "group aistack can write (770)" || echo "group aistack read-only (750)")"; then
+    setup_models_dir "$MODELS_PATH" "$MODELS_SHARED_WRITE"
+    mkdir -p /opt/ai/{llama-swap,manifest,bin} /etc/brainrouter
+    chown -R root:aistack /opt/ai /etc/brainrouter
     chmod -R 775 /opt/ai
     chmod 750 /etc/brainrouter
     ok "Shared directories ready"
@@ -163,14 +208,14 @@ if [[ -f "$BONSAI_PATH" ]]; then
     skip "Step 5/14 — Bonsai model (already at $BONSAI_PATH)"
 elif confirm_step \
     "Step 5/14 — Bonsai classifier model (~5.2 GB download)" \
-    "Will download prism-ml/Bonsai-8B Q4_K_M from Hugging Face to /opt/models/bonsai/.
+    "Will download prism-ml/Bonsai-8B Q4_K_M from Hugging Face to ${MODELS_PATH}/bonsai/.
     This is the local LLM that decides cloud vs local routing in <200ms."; then
     if ! has huggingface-cli; then
         pip3 install -q "huggingface_hub[cli]"
     fi
     huggingface-cli download "$BONSAI_HF_REPO" \
         --include "$BONSAI_FILE" \
-        --local-dir /opt/models/bonsai
+        --local-dir "${MODELS_PATH}/bonsai"
     chown root:aistack "$BONSAI_PATH"
     chmod 664 "$BONSAI_PATH"
     ok "Bonsai model downloaded"
@@ -267,7 +312,7 @@ else
     if confirm_step "Step 7/14 — llama-swap (local model runner)" "$_lswap_desc"; then
         if [[ ! -f "${LSWAP_DIR}/docker-compose.yml" ]]; then
             mkdir -p "$LSWAP_DIR"
-            cat > "${LSWAP_DIR}/docker-compose.yml" <<'YAML'
+            cat > "${LSWAP_DIR}/docker-compose.yml" <<YAML
 services:
   llama-swap:
     image: ghcr.io/mostlygeek/llama-swap:latest
@@ -275,7 +320,7 @@ services:
       - "127.0.0.1:8081:8080"
     volumes:
       - ./config.yaml:/config.yaml:ro
-      - /opt/models:/models:ro
+      - ${MODELS_PATH}:/models:ro
       - /dev/dri:/dev/dri
     devices:
       - /dev/dri:/dev/dri
@@ -291,7 +336,7 @@ YAML
         if [[ ! -f "${LSWAP_DIR}/config.yaml" ]]; then
             cat > "${LSWAP_DIR}/config.yaml" <<'YAML'
 # llama-swap config — edit model key and path to match your GGUF file.
-# Models live in /opt/models/ on this machine.
+# Models live in ${MODELS_PATH}/ on this machine (mounted as /models in the container).
 # After editing: sudo systemctl restart llama-swap
 
 startPort: 5800
@@ -313,8 +358,8 @@ models:
   "your-local-model":
     name: "Your Local Model"
     cmd: >
-      llama-server --port ${PORT} ${common}
-        --model /models/path/to/your-model.gguf
+      llama-server --port \${PORT} \${common}
+        --model /models/gguf/your-model.gguf
 YAML
             chown root:aistack "${LSWAP_DIR}/config.yaml"
             chmod 664 "${LSWAP_DIR}/config.yaml"
@@ -446,6 +491,10 @@ elif confirm_step \
 # Edit fallback_model to match a model key in /opt/ai/llama-swap/config.yaml.
 # After editing: sudo -u USER XDG_RUNTIME_DIR=/run/user/UID systemctl --user restart brainrouter
 
+models:
+  path: ${MODELS_PATH}
+  shared_write: ${MODELS_SHARED_WRITE}
+
 manifest:
   base_url: "http://localhost:${MANIFEST_PORT}/v1"
   api_key_env: MANIFEST_API_KEY
@@ -455,7 +504,7 @@ llama_swap:
   fallback_model: "your-local-model"
 
 bonsai:
-  model_path: "${BONSAI_PATH}"
+  model_path: "\${models_path}/bonsai/${BONSAI_FILE}"
 YAML
     chown root:aistack /etc/brainrouter/brainrouter.yaml
     chmod 644 /etc/brainrouter/brainrouter.yaml

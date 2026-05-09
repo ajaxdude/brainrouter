@@ -325,6 +325,89 @@ impl ReviewService {
         })
     }
 
+    /// Spawn the review loop in the background and return the session ID immediately.
+    ///
+    /// Unlike [`start_review`], this method does **not** wait for the review to
+    /// finish — it returns as soon as the session is created so the caller can
+    /// poll [`SessionManager::get_session`] (or GET /review/api/sessions/:id)
+    /// until the status reaches a terminal state.
+    ///
+    /// This is the preferred entry point for MCP callers where a long-lived
+    /// blocking HTTP request would exceed the client-side MCP timeout.
+    pub fn start_review_async(
+        self: &Arc<Self>,
+        task_id: String,
+        summary: String,
+        details: Option<String>,
+        conversation_history: Vec<String>,
+        cwd: String,
+    ) -> String {
+        // Create the session synchronously so the caller has an ID to poll.
+        let session = self.sessions.create_session(
+            task_id.clone(),
+            summary.clone(),
+            details.clone(),
+            conversation_history,
+            cwd.clone(),
+        );
+        let session_id = session.id.clone();
+        info!(session_id = %session_id, task_id = %task_id, "Created review session (async mode)");
+
+        // Spawn the review loop directly on the already-created session.
+        // We do NOT call start_review() here — that would create a second session.
+        let router = Arc::clone(&self.router);
+        let sessions = Arc::clone(&self.sessions);
+        let config_snapshot = self.get_config();
+        let sid = session_id.clone();
+        let tid = task_id.clone();
+        let summ = summary.clone();
+        let det = details.clone();
+        let cwd2 = cwd.clone();
+        let notifier = self.sessions.register_notifier(&session_id);
+
+        tokio::spawn(async move {
+            let result = run_loop(
+                &sid,
+                &tid,
+                &summ,
+                det.as_deref(),
+                &router,
+                &sessions,
+                &config_snapshot,
+                &cwd2,
+            )
+            .await;
+
+            match result {
+                Err(e) => {
+                    warn!(session_id = %sid, error = %e, "Background review task failed");
+                }
+                Ok(r) if r.status == ReviewStatus::Escalated => {
+                    // Wait for human resolution, same as start_review.
+                    loop {
+                        let next = notifier.notified();
+                        tokio::pin!(next);
+                        if let Some(s) = sessions.get_session(&sid) {
+                            match s.status {
+                                ReviewStatus::Escalated => { next.await; }
+                                ReviewStatus::Approved | ReviewStatus::NeedsRevision => break,
+                                ReviewStatus::Pending => { next.await; }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    sessions.remove_notifier(&sid);
+                }
+                Ok(_) => {
+                    sessions.remove_notifier(&sid);
+                }
+            }
+        });
+
+        session_id
+    }
+
     pub fn session_manager(&self) -> &Arc<SessionManager> {
         &self.sessions
     }

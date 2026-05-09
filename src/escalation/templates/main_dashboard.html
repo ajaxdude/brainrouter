@@ -1,1136 +1,1074 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>brainrouter — Dashboard</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <style>
-    :root {
-      --bg: #0a0e17;
-      --bg2: #141b26;
-      --bg3: #1c2533;
-      --text: #c9d1d9;
-      --muted: #8b949e;
-      --border: #30363d;
-      --accent: #388bfd;
-      --green: #3fb950;
-      --orange: #d29922;
-      --red: #f85149;
-      --purple: #bc8cff;
-      --teal: #39d353;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 20px; user-select: text; }
-
-    /* ── Header ─────────────────────────────────────────── */
-    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
-    .header h1 { font-size: 1.4rem; font-weight: 700; color: #f0f6fc; }
-    .header h1 span { color: var(--accent); }
-    .nav { display: flex; gap: 10px; }
-    .nav a { font-size: 0.8rem; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); text-decoration: none; transition: all 0.15s; }
-    .nav a:hover { border-color: var(--accent); color: var(--accent); }
-    .nav a.nav-active { border-color: var(--accent); color: var(--accent); }
-    .nav button { font-size: 0.8rem; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); background: transparent; cursor: pointer; transition: all 0.15s; font-family: inherit; }
-    .nav button:hover { border-color: var(--orange); color: var(--orange); }
-    .nav button.restarting { border-color: var(--orange); color: var(--orange); opacity: .6; cursor: wait; }
-    .nav button.restart-ok { border-color: var(--green); color: var(--green); }
-    .nav button.restart-err { border-color: var(--red); color: var(--red); }
-
-    /* ── Live model flow ────────────────────────────────── */
-    .flow-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
-    .flow-section h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 16px; }
-    .flow-row { display: flex; align-items: center; gap: 0; }
-    .flow-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 0; }
-    .flow-box .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
-    .flow-box .value { font-size: 0.95rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .flow-arrow { color: var(--border); font-size: 1.4rem; padding: 0 10px; flex-shrink: 0; }
-    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
-    .flow-empty { color: var(--muted); font-size: 0.85rem; }
-
-    /* ── Stats row ──────────────────────────────────────── */
-    .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; text-align: center; }
-    .stat-card .slabel { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
-    .stat-card .sval { font-size: 1.6rem; font-weight: 700; }
-    .sval.green { color: var(--green); }
-    .sval.orange { color: var(--orange); }
-    .sval.red { color: var(--red); }
-    .sval.accent { color: var(--accent); }
-    .sval.purple { color: var(--purple); }
-
-    /* ── Section titles ─────────────────────────────────── */
-    .section-title { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 24px 0 10px; }
-
-    /* ── Tables ─────────────────────────────────────────── */
-    .table-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-bottom: 28px; }
-    table { width: 100%; min-width: 700px; border-collapse: collapse; }
-    th { text-align: left; padding: 10px 14px; font-size: 0.7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--bg3); }
-    td { padding: 10px 14px; font-size: 0.83rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
-    tbody tr:last-child td { border-bottom: none; }
-    tbody tr:hover td { background: rgba(255,255,255,.04); }
-    tbody tr td { user-select: text; }
-    th { user-select: none; }
-
-    /* ── Badges ─────────────────────────────────────────── */
-    .badge { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
-    .badge-cloud   { background: rgba(56,139,253,.18); color: var(--accent); border: 1px solid rgba(56,139,253,.4); }
-    .badge-local   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
-    .badge-local-direct { background: rgba(188,140,255,.30); color: #d4b8ff; border: 1px solid rgba(188,140,255,.6); }
-    .badge-cloud-direct { background: rgba(56,139,253,.30); color: #7db8ff; border: 1px solid rgba(56,139,253,.6); }
-    .badge-manifest { background: rgba(57,211,83,.18); color: var(--teal); border: 1px solid rgba(57,211,83,.4); }
-    .badge-llama   { background: rgba(188,140,255,.18); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
-    .badge-fallback { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.4); }
-    .badge-ok      { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
-    .badge-err     { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
-    .badge-pending   { background: rgba(56,139,253,.18); color: var(--accent); border: 1px solid rgba(56,139,253,.4); }
-    .badge-approved  { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
-    .badge-needs_revision { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.4); }
-    .badge-escalated { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
-
-    .badge-folder { background: rgba(57,211,83,.1); color: var(--teal); border: 1px solid rgba(57,211,83,.25); font-size: 0.65rem; padding: 1px 6px; font-weight: 600; text-transform: none; letter-spacing: 0; margin-right: 5px; }
-    .badge-count { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid rgba(139,148,158,.3); font-size: 0.65rem; padding: 1px 5px; font-weight: 700; }
-    .muted { color: var(--muted); }
-    .truncate { max-width: 400px; overflow-wrap: break-word; word-break: break-all; white-space: normal; user-select: text; }
-    .fast { color: var(--green); }
-    .medium { color: var(--orange); }
-    .slow { color: var(--red); }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 0.85rem; }
-    .refresh-note { font-size: 0.7rem; color: var(--muted); float: right; }
-
-    /* ── Inference progress bar ──────────────────────── */
-    .progress-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: none; align-items: center; gap: 12px; }
-    .progress-wrap.active { display: flex; }
-    .progress-label { font-size: 0.8rem; color: var(--text); white-space: nowrap; display: flex; align-items: center; gap: 8px; }
-    .progress-track { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; position: relative; }
-    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
-    .progress-fill.loading { background: var(--orange); animation: progress-pulse 1.5s ease-in-out infinite; width: 100%; }
-    .progress-fill.loading-progress { background: var(--orange); transition: width 0.4s ease; }
-    .progress-fill.processing { background: var(--accent); transition: width 0.8s ease; }
-    .progress-fill.generating { background: var(--green); width: 100%; }
-    .progress-pct { font-size: 0.75rem; color: var(--muted); min-width: 60px; text-align: right; white-space: nowrap; }
-    @keyframes progress-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
-    /* ── Health status dots ───────────────────────────── */
-    .health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-bottom: 2px; background: var(--muted); transition: background 0.3s; }
-    .health-dot.healthy { background: var(--green); }
-    .health-dot.unhealthy { background: var(--red); }
-    .health-dot.idle { background: var(--muted); }
-    .health-dot.loading { background: var(--orange); animation: pulse 1.5s infinite; }
-    .health-dot.unknown { background: var(--muted); }
-
-    /* ── Notification banner ──────────────────────────── */
-    .notify-banner { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.35); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: none; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--orange); }
-    .notify-banner.visible { display: flex; }
-    .notify-banner .notify-text { flex: 1; }
-    .notify-banner .notify-dismiss { background: none; border: 1px solid rgba(210,153,34,.4); color: var(--orange); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 0.7rem; font-family: inherit; }
-    .notify-banner .notify-dismiss:hover { background: rgba(210,153,34,.2); }
-
-    /* ── Config page ────────────────────────────────── */
-    .config-group { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-    .config-group h3 { margin: 0 0 12px 0; font-size: 0.9rem; color: var(--accent); }
-    .config-actions { display: flex; gap: 10px; margin-top: 16px; align-items: center; }
-    .config-actions button { padding: 8px 20px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--fg); cursor: pointer; font-family: inherit; font-size: 0.8rem; transition: all 0.15s; }
-    .config-actions button.primary { border-color: var(--accent); color: var(--accent); }
-    .config-actions button.primary:hover { background: var(--accent); color: var(--bg); }
-    .config-actions button:hover { border-color: var(--accent); }
-    .file-card { display: flex; align-items: center; justify-content: space-between; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
-    .file-card .file-info { flex: 1; }
-    .file-card .file-name { font-size: 0.85rem; color: var(--text); }
-    .file-card .file-path { font-size: 0.7rem; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
-    .file-card .file-missing { color: var(--orange); font-size: 0.7rem; }
-    .file-card button { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; font-family: inherit; font-size: 0.75rem; transition: all 0.15s; }
-    .file-card button:hover { border-color: var(--accent); color: var(--accent); }
-    .config-editors { display: flex; gap: 16px; }
-    @media (max-width: 1200px) { .config-editors { flex-direction: column; } }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>brainrouter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0b0e13;
+  --bg2: #11151c;
+  --bg3: #161b24;
+  --panel: #141923;
+  --border: #1f2632;
+  --borderHi: #2a3343;
+  --text: #e6edf6;
+  --textDim: #8693a8;
+  --textMute: #5a6679;
+  --green: #22d39a;
+  --greenDim: rgba(34,211,154,0.14);
+  --cyan: #3ec5ff;
+  --cyanDim: rgba(62,197,255,0.14);
+  --violet: #9d7bff;
+  --violetDim: rgba(157,123,255,0.16);
+  --amber: #f5b14a;
+  --amberDim: rgba(245,177,74,0.16);
+  --red: #ff6b6b;
+  --redDim: rgba(255,107,107,0.14);
+  --pink: #ff7ac6;
+  --pinkDim: rgba(255,122,198,0.14);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+button { font-family: inherit; }
+input, textarea { font-family: inherit; }
+textarea { resize: vertical; }
+@keyframes brPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+@keyframes brShimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer-bar {
+  position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(34,211,154,0.4), transparent);
+  background-size: 200% 100%;
+  animation: brShimmer 1.8s linear infinite;
+}
+.pulse-dot { animation: brPulse 1.4s ease-in-out infinite; }
+.br-btn {
+  all: unset; cursor: pointer;
+  padding: 6px 12px; border-radius: 6px;
+  font-size: 12px; border: 1px solid var(--border); color: var(--textDim);
+  background: transparent;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.br-btn:hover { color: var(--text); border-color: var(--borderHi); background: var(--bg3); }
+.sidebar-btn {
+  all: unset; cursor: pointer;
+  padding: 7px 10px; border-radius: 6px;
+  font-size: 12px; color: var(--textDim);
+  border: 1px solid var(--border);
+  text-align: left; display: block; width: 100%;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.sidebar-btn:hover { color: var(--text); border-color: var(--borderHi); background: var(--bg3); }
+.sidebar-btn:disabled { opacity: 0.5; cursor: default; }
+.nav-item {
+  all: unset; cursor: pointer;
+  padding: 8px 12px; border-radius: 8px;
+  display: flex; align-items: center; gap: 10;
+  font-size: 13px; color: var(--textDim);
+  width: 100%;
+  border-left: 2px solid transparent;
+  transition: background 0.15s, color 0.15s;
+}
+.nav-item:hover { background: var(--bg3); color: var(--text); }
+.nav-item.active {
+  background: var(--bg3);
+  color: var(--text);
+  border-left-color: var(--green);
+}
+.nav-item.active .nav-icon { color: var(--green); }
+.nav-icon { font-size: 14px; width: 16px; text-align: center; color: var(--textMute); }
+.filter-btn {
+  all: unset; cursor: pointer;
+  padding: 5px 12px; border-radius: 6px;
+  font-size: 12px; color: var(--textDim);
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
+.filter-btn:hover { color: var(--text); background: var(--bg3); }
+.filter-btn.active { background: var(--bg3); color: var(--text); border-color: var(--border); }
+.config-input {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 10px 12px;
+  font-size: 12px; font-family: 'JetBrains Mono', monospace;
+  line-height: 1.6;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.config-input:focus { border-color: var(--borderHi); }
+.save-btn {
+  all: unset; cursor: pointer;
+  padding: 6px 16px; border-radius: 6px;
+  font-size: 12px; background: var(--greenDim); color: var(--green);
+  border: 1px solid rgba(34,211,154,0.35);
+  transition: all 0.15s;
+}
+.save-btn:hover { background: rgba(34,211,154,0.22); }
+.file-card {
+  padding: 10px 14px; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; display: flex; align-items: center; gap: 10;
+  cursor: pointer; transition: border-color 0.15s;
+}
+.file-card:hover { border-color: var(--borderHi); }
+</style>
 </head>
 <body>
-  <div class="header">
-    <a href="#" onclick="showPage('dashboard'); return false;"><img src="/logo.svg" alt="brainrouter" style="height: 64px; width: auto; display: block;"></a>
-    <div id="brainrouter-version" style="font-size:0.65rem; color:var(--muted); text-align:center; margin-top:4px;">v&mdash;</div>
-    <div id="version-header" style="font-size:0.7rem; color:var(--muted); display:flex; gap:10px; align-items:center; border:1px solid var(--border); border-radius:6px; padding:6px 12px; background:rgba(255,255,255,0.03);">
-      <div id="ver-llama-swap" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
-        <span id="health-llama-swap" class="health-dot unknown" title="checking..."></span>
-        <div>llama-swap: &mdash;</div>
-        <div class="upgrade-btn" id="upgrade-llama-swap" style="display:flex; justify-content:center;"></div>
-      </div>
-      <div style="width:1px; height:24px; background:var(--border);"></div>
-      <div id="ver-llama-cpp" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
-        <span id="health-llama-cpp" class="health-dot unknown" title="checking..."></span>
-        <div>llama.cpp: &mdash;</div>
-        <div class="upgrade-btn" id="upgrade-llama-cpp" style="display:flex; justify-content:center;"></div>
-      </div>
-      <div style="width:1px; height:24px; background:var(--border);"></div>
-      <div id="ver-toolbox" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
-        <span id="health-toolbox" class="health-dot unknown" title="checking..."></span>
-        <div>toolbox: &mdash;</div>
-        <div class="upgrade-btn" id="upgrade-toolbox" style="display:flex; justify-content:center;"></div>
-      </div>
-      <div style="width:1px; height:24px; background:var(--border);"></div>
-      <div id="ver-manifest" style="display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;">
-        <span id="health-manifest" class="health-dot unknown" title="checking..."></span>
-        <div>Manifest: &mdash;</div>
-        <div class="upgrade-btn" id="upgrade-manifest" style="display:flex; justify-content:center;"></div>
-      </div>
-    </div>
-    <div class="nav">
-      <a href="/review/">Review Sessions</a>
-      <a href="#" onclick="showPage('config'); return false;">Config</a>
-      <button onclick="restartService('llama-swap', this)">Restart Local Stack</button>
-      <button onclick="restartService('manifest', this)">Restart Manifest</button>
-      <button onclick="restartService('brainrouter', this)">Restart brainrouter</button>
-      <button onclick="syncOmpModels(this)">Sync Models</button>
+<div id="app" style="display:flex;height:100vh;overflow:hidden">
+<!-- SIDEBAR -->
+<nav id="sidebar" style="width:224px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;font-size:13px;color:var(--text);flex-shrink:0;overflow:hidden">
+  <!-- Logo -->
+  <div style="padding:20px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10">
+    <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:var(--bg);flex-shrink:0">br</div>
+    <div>
+      <div style="font-weight:600;letter-spacing:0.2px">brainrouter</div>
+      <div style="font-size:10px;color:var(--textMute);font-family:'JetBrains Mono',monospace" id="ver-brainrouter">v—</div>
     </div>
   </div>
 
-  <div id="dashboard-content">
-  <!-- Notification banner (shown when cloud falls back to local) -->
-  <div id="notify-banner" class="notify-banner">
-    <span class="notify-text" id="notify-text"></span>
-    <button class="notify-dismiss" onclick="dismissNotify()">dismiss</button>
+  <!-- Nav -->
+  <nav style="padding:12px 8px;display:flex;flex-direction:column;gap:2px">
+    <button class="nav-item active" id="nav-stream" onclick="switchView('stream')">
+      <span class="nav-icon">◉</span>
+      <span>Stream</span>
+    </button>
+    <button class="nav-item" id="nav-reviews" onclick="switchView('reviews')">
+      <span class="nav-icon">✓</span>
+      <span>Reviews</span>
+      <span id="reviews-count" style="margin-left:auto;font-size:10px;padding:2px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;display:none">0</span>
+    </button>
+    <button class="nav-item" id="nav-config" onclick="switchView('config')">
+      <span class="nav-icon">⚙</span>
+      <span>Config</span>
+    </button>
+  </nav>
+
+  <!-- System Health -->
+  <div style="padding:8px 18px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:8px;text-transform:uppercase">System Health</div>
+  <div style="padding:0 12px;display:flex;flex-direction:column;gap:4px">
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-llama-swap" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">llama-swap</span>
+      <span id="ver-llama-swap" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:11px">—</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-llama-cpp" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">llama.cpp</span>
+      <span id="ver-llama-cpp" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:11px">—</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">toolbox</span>
+      <span id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:11px">—</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-manifest" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">manifest</span>
+      <span id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:11px">—</span>
+    </div>
   </div>
 
-  <!-- Current model flow -->
-  <div class="flow-section">
-    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-      <div style="flex: 1;">
-        <h2><span class="live-dot"></span>Live routing flow <span class="refresh-note">polling every 3s</span></h2>
-        <div id="flow-content" class="flow-empty">Waiting for first request...</div>
+  <!-- Bridges -->
+  <div style="padding:12px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:12px;text-transform:uppercase">Bridges</div>
+  <div style="padding:0 12px;display:flex;flex-direction:column;gap:4px">
+    <div id="bridge-discord-row" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-discord" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">discord</span>
+      <span id="bridge-discord-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+    </div>
+    <div id="bridge-signal-row" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span id="dot-signal" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">signal</span>
+      <span id="bridge-signal-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+    </div>
+  </div>
+
+  <!-- Tools -->
+  <div style="margin-top:auto;padding:12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px">
+    <button class="sidebar-btn" onclick="restartService('llama-swap')">↻ Restart Local Stack</button>
+    <button class="sidebar-btn" onclick="restartService('manifest')">↻ Restart Manifest</button>
+    <button class="sidebar-btn" onclick="restartService('brainrouter')">↻ Restart brainrouter</button>
+    <button class="sidebar-btn" onclick="syncModels()">⇄ Sync Models</button>
+  </div>
+</nav>
+<!-- MAIN COLUMN -->
+<div id="main" style="flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0">
+
+  <!-- Command Bar -->
+  <div id="cmdbar" style="padding:14px 24px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;align-items:center;gap:16px;flex-shrink:0">
+    <div style="min-width:0">
+      <h1 id="cmdbar-title" style="font-size:16px;font-weight:600;color:var(--text)">Stream</h1>
+      <span id="cmdbar-sub" style="font-size:12px;color:var(--textMute)">Newest first · polling every 3s</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;background:var(--bg3);padding:6px 12px;border-radius:8px;border:1px solid var(--border);min-width:320px;flex:1;max-width:500px">
+      <span style="color:var(--textMute);font-size:14px">⌕</span>
+      <input id="search-input" placeholder="Search tasks, models... ⌘K" style="background:transparent;border:none;outline:none;color:var(--text);font-size:12px;flex:1;min-width:0" oninput="onSearch(this.value)">
+      <span style="color:var(--textMute);font-size:10px;font-family:'JetBrains Mono',monospace;padding:2px 6px;border:1px solid var(--border);border-radius:4px">⌘K</span>
+    </div>
+    <div id="filter-btns" style="display:flex;gap:4px">
+      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">all</button>
+      <button class="filter-btn" data-filter="live" onclick="setFilter('live')">live</button>
+      <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">approved</button>
+      <button class="filter-btn" data-filter="escalated" onclick="setFilter('escalated')">escalated</button>
+    </div>
+  </div>
+
+  <!-- Scrollable content -->
+  <div id="content" style="flex:1;overflow:auto;padding:24px">
+
+    <!-- Stream View -->
+    <div id="stream-view" style="display:grid;grid-template-columns:1fr 320px;gap:24px;align-items:start">
+      <div id="card-list" style="display:flex;flex-direction:column;gap:14px">
+        <div style="color:var(--textMute);font-size:12px;padding:20px 0;text-align:center">Loading...</div>
       </div>
-      <div id="review-settings" class="stat-card" style="padding: 12px 16px; text-align: left; min-width: 280px; margin-bottom: 0; margin-left: 20px;">
-        <div class="slabel" style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
-          Code Review Mode
-          <span id="review-mode-status" class="badge badge-auto">auto</span>
+      <div id="right-rail" style="position:sticky;top:0;display:flex;flex-direction:column;gap:14px">
+        <!-- Sankey panel -->
+        <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
+          <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-bottom:10px;text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · 24h</div>
+          <div id="sankey-container" style="width:100%;overflow:hidden">
+            <svg id="sankey-svg" viewBox="0 0 290 240" width="100%" style="display:block"></svg>
+          </div>
         </div>
-        <div style="display: flex; flex-direction: column; gap: 8px;">
-          <select id="select-review-mode" onchange="updateReviewConfig()" style="background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 0.8rem;">
-            <option value="auto">Auto (Bonsai decided)</option>
-            <option value="cloud">Force Cloud (Manifest)</option>
-            <option value="local">Force Local (llama-swap)</option>
-          </select>
-          <div id="local-model-select-wrap" style="display: none; flex-direction: column; gap: 4px;">
-            <div class="slabel" style="font-size: 0.6rem;">Target Local Model</div>
-            <select id="select-review-model" onchange="updateReviewConfig()" style="background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 0.8rem;">
-              <option value="">(Loading models...)</option>
-            </select>
-          </div>
+        <!-- KPI grid -->
+        <div id="kpi-grid" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <!-- filled by updateKPI() -->
         </div>
       </div>
     </div>
-  </div>
 
-  <!-- Stats -->
-  <div class="stats-row">
-    <div class="stat-card"><div class="slabel">Total</div><div class="sval accent" id="stat-total">—</div></div>
-    <div class="stat-card"><div class="slabel">Cloud (auto)</div><div class="sval green" id="stat-cloud">—</div></div>
-    <div class="stat-card"><div class="slabel">Local (auto)</div><div class="sval purple" id="stat-local">—</div></div>
-    <div class="stat-card"><div class="slabel">Direct Local</div><div class="sval purple" id="stat-direct-local">—</div></div>
-    <div class="stat-card"><div class="slabel">Direct Cloud</div><div class="sval green" id="stat-direct-cloud">—</div></div>
-    <div class="stat-card"><div class="slabel">Fallbacks</div><div class="sval orange" id="stat-fallbacks">—</div></div>
-    <div class="stat-card"><div class="slabel">Avg Latency</div><div class="sval accent" id="stat-latency">—</div></div>
-  </div>
-
-  <!-- Route event feed -->
-  <div class="section-title">Route Event Feed</div>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:8%">Time</th>
-          <th style="width:9%">Folder</th>
-          <th style="width:18%">Prompt</th>
-          <th style="width:8%">Router</th>
-          <th style="width:9%">Provider</th>
-          <th style="width:14%">Model</th>
-          <th style="width:6%">Latency</th>
-          <th style="width:5%">Status</th>
-          <th style="width:6%">Review?</th>
-        </tr>
-      </thead>
-      <tbody id="events-body">
-        <tr><td colspan="9" class="empty">No routing events yet.</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- Review sessions -->
-  <div class="section-title">Review Sessions</div>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:12%">Session</th>
-          <th style="width:9%">Folder</th>
-          <th style="width:20%">Task ID</th>
-          <th style="width:10%">Status</th>
-          <th style="width:28%">Review Model</th>
-          <th style="width:8%">Iters</th>
-          <th style="width:13%">Updated</th>
-        </tr>
-      </thead>
-      <tbody id="sessions-body">
-        <tr><td colspan="7" class="empty">No review sessions yet.</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- Bridge status -->
-  <div class="section-title">Bridge Transports</div>
-  <div id="bridge-status" style="display:flex; gap:16px; margin-bottom:16px;">
-    <div class="stat-card" style="flex:1; text-align:center;">
-      <div class="slabel">Discord</div>
-      <div class="sval" id="bridge-discord-status" style="font-size:0.8rem;">&mdash;</div>
-      <div style="margin-top:8px;"><button id="bridge-discord-toggle" onclick="toggleBridge('discord')" style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid var(--border); background:transparent; color:var(--muted); cursor:pointer; font-family:inherit; transition:all 0.15s;">&mdash;</button></div>
+    <!-- Reviews View -->
+    <div id="reviews-view" style="display:none">
+      <div id="reviews-list" style="display:flex;flex-direction:column;gap:14px"></div>
     </div>
-    <div class="stat-card" style="flex:1; text-align:center;">
-      <div class="slabel">Signal</div>
-      <div class="sval" id="bridge-signal-status" style="font-size:0.8rem;">&mdash;</div>
-      <div style="margin-top:8px;"><button id="bridge-signal-toggle" onclick="toggleBridge('signal')" style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid var(--border); background:transparent; color:var(--muted); cursor:pointer; font-family:inherit; transition:all 0.15s;">&mdash;</button></div>
+
+    <!-- Config View -->
+    <div id="config-view" style="display:none;max-width:900px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+
+        <!-- brainrouter config -->
+        <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div style="font-size:13px;font-weight:600">brainrouter.yaml</div>
+            <button class="save-btn" onclick="saveConfig()">Save</button>
+          </div>
+          <textarea id="config-br-textarea" class="config-input" rows="20" placeholder="Loading..."></textarea>
+          <div id="config-br-msg" style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;min-height:14px"></div>
+        </div>
+
+        <!-- llama-swap config -->
+        <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div style="font-size:13px;font-weight:600">llama-swap config</div>
+            <button class="save-btn" onclick="saveLlamaSwapConfig()">Save</button>
+          </div>
+          <textarea id="config-ls-textarea" class="config-input" rows="20" placeholder="Loading..."></textarea>
+          <div id="config-ls-msg" style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;min-height:14px"></div>
+        </div>
+      </div>
+
+      <!-- Config files list -->
+      <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:12px">Config files</div>
+        <div id="config-files-list" style="display:flex;flex-direction:column;gap:6px">
+          <div style="color:var(--textMute);font-size:12px">Loading config files...</div>
+        </div>
+      </div>
     </div>
-  </div>
-  </div>
 
-  <div id="config-page" style="display:none">
-    <div class="section-title">Configuration</div>
-    <div id="config-form-container"></div>
-    <div class="section-title" style="margin-top:24px">Agent Files</div>
-    <div id="config-files-container"></div>
-  </div>
+  </div><!-- /content -->
+</div><!-- /main -->
+</div><!-- /app -->
+<script>
+// ─── Design constants ────────────────────────────────────────────────────────
+const SOURCES = {
+  discord: { label: 'Discord', color: '#9d7bff', glyph: 'D' },
+  signal:  { label: 'Signal',  color: '#3ec5ff', glyph: 'S' },
+  local:   { label: 'Local',   color: '#22d39a', glyph: 'L' },
+};
+const HARNESSES = {
+  omp:      { label: 'OMP',        color: '#22d39a' },
+  droid:    { label: 'Droid',      color: '#3ec5ff' },
+  cc:       { label: 'Claude Code',color: '#9d7bff' },
+  opencode: { label: 'OpenCode',   color: '#f5b14a' },
+  vibe:     { label: 'Vibe',       color: '#ff7ac6' },
+};
+const STATUS_MAP = {
+  queued:     { c: '#5a6679', l: 'Queued',     pulse: false },
+  routing:    { c: '#3ec5ff', l: 'Routing',    pulse: false },
+  generating: { c: '#22d39a', l: 'Generating', pulse: true  },
+  reviewing:  { c: '#f5b14a', l: 'Reviewing',  pulse: true  },
+  approved:   { c: '#22d39a', l: 'Approved',   pulse: false },
+  escalated:  { c: '#ff6b6b', l: 'Escalated',  pulse: false },
+  failed:     { c: '#ff6b6b', l: 'Failed',     pulse: false },
+  iterating:  { c: '#f5b14a', l: 'Iterating',  pulse: true  },
+  pending:    { c: '#5a6679', l: 'Pending',    pulse: false },
+};
 
-  <script>
-    let allEvents = [];
-    let prevModel = null;
+// ─── State ───────────────────────────────────────────────────────────────────
+let allEvents = [], allSessions = [], activeFilter = 'all', activeView = 'stream';
+let inferenceStatus = null, healthData = {}, versionsData = {}, bridgeData = {}, statsData = {};
+let searchQuery = '';
 
-    async function restartService(name, btn) {
-      const label = btn.textContent;
-      btn.textContent = 'Restarting\u2026';
-      btn.className = 'restarting';
-      btn.disabled = true;
-      try {
-        const res = await fetch('/api/restart/' + name, { method: 'POST' });
-        if (res.ok) {
-          btn.textContent = 'Restarted';
-          btn.className = 'restart-ok';
-        } else {
-          const data = await res.json().catch(() => ({}));
-          btn.textContent = 'Failed';
-          btn.className = 'restart-err';
-          btn.title = data.error || 'Unknown error';
-        }
-      } catch (e) {
-        // brainrouter restarts itself — connection drops before response arrives
-        if (name === 'brainrouter') {
-          btn.textContent = 'Restarting\u2026';
-          btn.className = 'restart-ok';
-          setTimeout(() => location.reload(), 3000);
-          return;
-        }
-        btn.textContent = 'Error';
-        btn.className = 'restart-err';
-        btn.title = e.message;
-      }
-      setTimeout(() => { btn.textContent = label; btn.className = ''; btn.disabled = false; btn.title = ''; }, 3000);
-    }
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+async function safeFetch(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
 
-    async function syncOmpModels(btn) {
-      const label = btn.textContent;
-      btn.textContent = 'Syncing\u2026';
-      btn.disabled = true;
-      try {
-        const res = await fetch('/api/models/sync-omp', { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          btn.textContent = `Synced (${data.model_count} models)`;
-          btn.className = 'restart-ok';
-          await loadLlamaSwapModels();
-        } else {
-          btn.textContent = 'Failed';
-          btn.className = 'restart-err';
-          btn.title = data.error || 'Unknown error';
-        }
-      } catch (e) {
-        btn.textContent = 'Error';
-        btn.className = 'restart-err';
-        btn.title = e.message;
-      }
-      setTimeout(() => { btn.textContent = label; btn.className = ''; btn.disabled = false; btn.title = ''; }, 3000);
-    }
+function fmtAge(ts) {
+  if (!ts) return '—';
+  const d = Date.now() - new Date(ts).getTime();
+  if (d < 0) return 'just now';
+  if (d < 60000) return Math.floor(d/1000) + 's ago';
+  if (d < 3600000) return Math.floor(d/60000) + 'm ago';
+  if (d < 86400000) return Math.floor(d/3600000) + 'h ago';
+  return new Date(ts).toLocaleDateString();
+}
 
-    function esc(s) {
-      const d = document.createElement('div');
-      d.appendChild(document.createTextNode(s || ''));
-      return d.innerHTML;
-    }
+function fmtLatency(ms) {
+  if (!ms || ms === 0) return '—';
+  if (ms < 1000) return ms + 'ms';
+  return (ms/1000).toFixed(1) + 's';
+}
 
-    function fmtTime(iso) {
-      try {
-        const d = new Date(iso);
-        const now = new Date();
-        const diff = now - d;
-        if (diff < 60000) return Math.round(diff/1000) + 's ago';
-        if (diff < 3600000) return Math.round(diff/60000) + 'm ago';
-        return d.toLocaleTimeString();
-      } catch { return iso; }
-    }
+function fmtUptime(secs) {
+  if (!secs) return '—';
+  const h = Math.floor(secs/3600);
+  const m = Math.floor((secs%3600)/60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
 
-    function latClass(ms) {
-      if (ms < 500) return 'fast';
-      if (ms <= 2000) return 'medium';
-      return 'slow';
-    }
-    function fmtSec(ms) { return (ms / 1000).toFixed(1) + 's'; }
+// ─── Derive helpers ───────────────────────────────────────────────────────────
+function deriveSource(e) { return 'local'; }
 
-    function providerFromModel(modelKey) {
-      if (!modelKey) return null;
-      const m = modelKey.toLowerCase();
-      if (m.startsWith('claude')) return 'Anthropic';
-      if (m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return 'OpenAI';
-      if (m.startsWith('gemini') || m.startsWith('gemma')) return 'Google';
-      if (m.startsWith('copilot')) return 'GitHub Copilot';
-      if (m.startsWith('mistral') || m.startsWith('codestral')) return 'Mistral';
-      if (m.startsWith('deepseek')) return 'DeepSeek';
-      if (m.startsWith('command') || m.startsWith('c4ai')) return 'Cohere';
-      if (m.startsWith('llama') || m.startsWith('meta-llama')) return 'Meta';
-      return null;
-    }
+function deriveRoute(e) {
+  if (e.stage === 'cloud_primary') return e.bonsai_decision === 'cloud' ? 'cloud-direct' : 'cloud-auto';
+  if (e.stage === 'cloud_fallback') return 'cloud-fallback';
+  if (e.stage === 'local_primary') return 'local-auto';
+  if (e.stage === 'local_fallback') return 'local-auto';
+  return e.bonsai_decision === 'cloud' ? 'cloud-auto' : 'local-auto';
+}
 
-    function routerDisplay(e) {
-      if (e.effective_provider === 'manifest') return '<span class="badge badge-manifest">Manifest</span>';
-      if (e.effective_provider === 'llama-swap') return '<span class="badge badge-llama">llama-swap</span>';
-      return '<span class="muted">&mdash;</span>';
-    }
+function deriveStatus(e, sess, inf) {
+  if (!e.success && e.error) return 'failed';
+  if (sess) {
+    const ss = sess.status;
+    if (ss === 'escalated') return 'escalated';
+    if (ss === 'needs_revision') return 'reviewing';
+    if (ss === 'approved') return 'approved';
+    if (ss === 'pending') return e.success ? 'approved' : 'generating';
+  }
+  return e.success ? 'approved' : 'generating';
+}
 
-    function providerDisplay(e) {
-      if (e.effective_provider === 'manifest') {
-        const p = providerFromModel(e.model_key);
-        return p ? '<span class="badge badge-manifest">' + esc(p) + '</span>' : '<span class="muted">&mdash;</span>';
-      }
-      return '<span class="muted">&mdash;</span>';
-    }
-
-    function modelDisplay(e) {
-      if (e.effective_provider === 'manifest') {
-        const name = e.model_key || 'auto';
-        return '<span class="badge badge-manifest">' + esc(name) + '</span>';
-      }
-      if (e.effective_provider === 'llama-swap') return '<span class="badge badge-llama">' + esc(e.model_key || 'llama-swap') + '</span>';
-      return '<span class="muted">&mdash;</span>';
-    }
-
-    function stageIsFallback(stage) {
-      return stage === 'cloud_fallback' || stage === 'local_fallback';
-    }
-
-    function renderFlow(events) {
-      if (!events.length) return;
-      const last = events[0]; // newest first
-      const bonsai = last.bonsai_decision || 'unknown';
-      let router = '\u2014';
-      let provider = '\u2014';
-      let modelStr = '\u2014';
-      if (last.effective_provider === 'manifest') {
-        router = 'Manifest';
-        provider = providerFromModel(last.model_key) || '\u2014';
-        modelStr = last.model_key || 'auto';
-      } else if (last.effective_provider === 'llama-swap') {
-        router = 'llama-swap';
-        modelStr = last.model_key || 'unknown';
-      }
-
-      const fallbackNote = stageIsFallback(last.stage)
-        ? ' <span class="badge badge-fallback">fallback</span>' : '';
-
-      // Track previous model for "was before" indicator
-      let prevNote = '';
-      if (prevModel && prevModel !== modelStr) {
-        prevNote = '<div style="margin-top:4px;font-size:0.7rem;color:var(--muted)">was: ' + esc(prevModel) + '</div>';
-      }
-      prevModel = modelStr;
-
-      document.getElementById('flow-content').innerHTML = `
-        <div class="flow-row">
-          <div class="flow-box">
-            <div class="label">Route mode</div>
-            <div class="value">
-              <span class="badge badge-${bonsai}">${bonsai}</span>${fallbackNote}
-            </div>
-          </div>
-          <div class="flow-arrow">\u2192</div>
-          <div class="flow-box">
-            <div class="label">Router</div>
-            <div class="value">${esc(router)}</div>
-          </div>
-          <div class="flow-arrow">\u2192</div>
-          <div class="flow-box">
-            <div class="label">Provider</div>
-            <div class="value">${esc(provider)}</div>
-          </div>
-          <div class="flow-arrow">\u2192</div>
-          <div class="flow-box">
-            <div class="label">Model${fallbackNote ? ' (fallback)' : ''}</div>
-            <div class="value">${esc(modelStr)}${prevNote}</div>
-          </div>
-          <div class="flow-arrow">\u2192</div>
-          <div class="flow-box">
-            <div class="label">Latency</div>
-            <div class="value ${latClass(last.latency_ms)}">${fmtSec(last.latency_ms)}</div>
-          </div>
-        </div>`;
-    }
-
-    function renderStats(stats) {
-      if (!stats || !stats.total) return;
-      const t = stats.total;
-      const pct = n => Math.round(n / t * 100);
-      document.getElementById('stat-total').textContent = t;
-      document.getElementById('stat-cloud').textContent = (stats.cloud_count - (stats.direct_cloud_count || 0)) + ' (' + pct(stats.cloud_count - (stats.direct_cloud_count || 0)) + '%)';
-      document.getElementById('stat-local').textContent = (stats.local_count - (stats.direct_local_count || 0)) + ' (' + pct(stats.local_count - (stats.direct_local_count || 0)) + '%)';
-      document.getElementById('stat-direct-local').textContent = (stats.direct_local_count || 0) + ' (' + pct(stats.direct_local_count || 0) + '%)';
-      document.getElementById('stat-direct-cloud').textContent = (stats.direct_cloud_count || 0) + ' (' + pct(stats.direct_cloud_count || 0) + '%)';
-      document.getElementById('stat-fallbacks').textContent = stats.fallbacks;
-      document.getElementById('stat-latency').textContent = fmtSec(stats.avg_latency);
-    }
-
-    function renderEvents(events) {
-      const tbody = document.getElementById('events-body');
-      // Prevent refresh from blowing away user selection while they are trying to copy.
-      if (!window.getSelection().isCollapsed && tbody.contains(window.getSelection().anchorNode)) return;
-      if (!events.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="empty">No routing events yet.</td></tr>';
-        return;
-      }
-
-      // Group identical prompts using Map for O(1) lookups.
-      // Events are newest-first.
-      const rawEvents = events.slice(0, 200);
-      const dedupMap = new Map();
-      for (const e of rawEvents) {
-        const key = e.session_id
-          ? (e.session_id + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''))
-          : ((e.prompt_excerpt || '') + '\x00' + (e.effective_provider || '') + '\x00' + (e.model_key || ''));
-        const time = new Date(e.timestamp).getTime();
-        const windowMs = e.session_id ? 600000 : 30000;
-        const mapKey = key + '\x00' + String(e.success);
-        const existing = dedupMap.get(mapKey);
-        if (existing) {
-          if (Math.abs(new Date(existing._last_time).getTime() - time) < windowMs) {
-            existing._count++;
-            existing._total_latency = (existing._total_latency || existing.latency_ms) + e.latency_ms;
-          }
-          // Outside window: skip this event (preserve the first/newest entry)
-        } else {
-          const entry = { ...e, _key: key, _count: 1, _last_time: e.timestamp, _total_latency: e.latency_ms };
-          dedupMap.set(mapKey, entry);
-        }
-        if (dedupMap.size >= 50) break;
-      }
-      const deduped = Array.from(dedupMap.values());
-
-
-      const activeStatus = window.currentInferenceStatus;
-
-      tbody.innerHTML = deduped.map(e => {
-        const fallback = stageIsFallback(e.stage) ? ' <span class="badge badge-fallback">&#x21a9;</span>' : '';
-        const status = e.success
-          ? '<span class="badge badge-ok">ok</span>'
-          : '<span class="badge badge-err" title="' + esc(e.error) + '">err</span>';
-        const sessionTag = e.session_id
-          ? '<span class="badge badge-pending" title="' + esc(e.session_id) + '">review</span>'
-          : '<span class="muted">&mdash;</span>';
-        // Show a concise label for review iterations instead of dumping the PRD text.
-        const promptDisplay = e.session_id
-          ? '<span class="muted" style="font-size:0.78rem">review&nbsp;/&nbsp;' + esc(e.session_id.substring(0, 8)) + '&hellip;</span>'
-          : esc(e.prompt_excerpt || '\u2014');
-        const folderName = e.cwd ? (e.cwd.split('/').filter(Boolean).pop() || e.cwd) : '';
-        const countBadge = e._count > 1
-          ? ' <span class="badge badge-count">' + (e.session_id ? 'iter ' : '&times;') + e._count + '</span>'
-          : '';
-
-        // Progress bar for active request
-        let progressHtml = '';
-        const isActive = activeStatus && activeStatus.state !== 'idle' && allEvents.length > 0 && e.id === allEvents[0].id;
-        if (isActive) {
-          const stateLabel = activeStatus.state.replace(/_/g, ' ');
-          const elapsed = activeStatus.elapsed_ms ? (activeStatus.elapsed_ms / 1000).toFixed(1) + 's' : '';
-          let fillClass = 'progress-fill';
-          let fillWidth = '0%';
-          let pctText = '';
-          if (activeStatus.state === 'loading' || activeStatus.state === 'classifying') {
-            if (activeStatus.progress != null && activeStatus.progress >= 0) {
-              fillClass += ' loading-progress';
-              const pct = Math.min(Math.round(activeStatus.progress * 100), 100);
-              fillWidth = pct + '%';
-              pctText = pct + '%';
-            } else {
-              fillClass += ' loading';
-            }
-          } else if (activeStatus.state.includes('processing')) {
-            fillClass += ' loading';
-            pctText = 'Processing…';
-          } else if (activeStatus.state.includes('streaming') || activeStatus.state.includes('generating')) {
-            if (activeStatus.progress != null && activeStatus.progress >= 0) {
-              fillClass += ' generating';
-              const pct = Math.min(Math.round(activeStatus.progress * 100), 100);
-              fillWidth = pct + '%';
-              pctText = pct + '%';
-            } else {
-              fillClass += ' loading';
-              pctText = 'Generating…';
-            }
-          }
-
-          progressHtml = `
-            <div class="progress-track" style="margin-top:6px; height:4px;">
-              <div class="${fillClass}" style="width:${fillWidth}"></div>
-            </div>
-            <div style="font-size:0.65rem; color:var(--muted); margin-top:2px;">${stateLabel} ${elapsed} ${pctText}</div>
-          `;
-        }
-
-        return `<tr>
-          <td class="muted">${fmtTime(e.timestamp)}</td>
-          <td>${folderName ? '<span class="badge badge-folder" title="' + esc(e.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
-          <td>
-            <span class="truncate" title="${esc(e.prompt_excerpt)}">${promptDisplay}</span>${countBadge}
-            ${progressHtml}
-          </td>
-          <td>${routerDisplay(e)}</td>
-          <td>${providerDisplay(e)}</td>
-          <td>${modelDisplay(e)}</td>
-          <td class="${latClass(e.latency_ms)}">
-            ${fmtSec(e.latency_ms)}
-            ${e._count > 1 ? '<div class="muted" style="font-size:0.65rem">total: ' + fmtSec(e._total_latency) + '</div>' : ''}
-          </td>
-          <td>${status}</td>
-          <td>${sessionTag}</td>
-        </tr>`;
-      }).join('');
-    }
-
-    function renderSessions(sessions) {
-      const tbody = document.getElementById('sessions-body');
-      // Prevent refresh from blowing away user selection while they are trying to copy.
-      if (!window.getSelection().isCollapsed && tbody.contains(window.getSelection().anchorNode)) return;
-      if (!sessions.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty">No review sessions yet.</td></tr>';
-        return;
-      }
-      // Sort newest first
-      const sorted = [...sessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-      tbody.innerHTML = sorted.map(s => {
-        const cls = 'badge-' + s.status.replace('_','-');
-        let rm = '<span class="muted">—</span>';
-        if (s.review_model) {
-          // Robustly extract the content inside the last set of parentheses
-          const match = s.review_model.match(/\(([^)]+)\)$/);
-          const modelKey = match ? match[1] : s.review_model;
-          const provider = providerFromModel(modelKey);
-          rm = `<div style="font-size:0.78rem">${esc(s.review_model)}</div>`;
-          if (provider) {
-             rm += `<div class="muted" style="font-size:0.7rem">${esc(provider)}</div>`;
-          }
-        }
-        const folderName = s.cwd ? (s.cwd.split('/').filter(Boolean).pop() || s.cwd) : '';
-        return `<tr>
-          <td><a href="/review/session/${esc(s.id)}">${esc(s.id.substring(0,8))}&hellip;</a></td>
-          <td>${folderName ? '<span class="badge badge-folder" title="' + esc(s.cwd) + '">' + esc(folderName) + '</span>' : '<span class="muted">&mdash;</span>'}</td>
-          <td class="truncate" title="${esc(s.task_id)}">${esc(s.task_id)}</td>
-          <td><span class="badge ${cls}">${esc(s.status)}</span></td>
-          <td>${rm}</td>
-          <td class="muted">${s.iteration_count}</td>
-          <td class="muted">${fmtTime(s.updated_at)}</td>
-        </tr>`;
-      }).join('');
-    }
-
-    async function safeFetch(url) {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        return await res.json();
-      } catch (_) { return null; }
-    }
-
-    // Fast refresh: events, sessions, stats, inference status — near-realtime.
-    async function refresh() {
-      const [evData, sesData, statsData, infData] = await Promise.all([
-        safeFetch('/api/routing-events'),
-        safeFetch('/review/api/sessions'),
-        safeFetch('/api/routing-stats'),
-        safeFetch('/api/inference-status'),
-      ]);
-      window.currentInferenceStatus = infData;
-      if (evData) {
-        allEvents = evData.events || [];
-        renderFlow(allEvents);
-        renderEvents(allEvents);
-      }
-      if (statsData) renderStats(statsData);
-      if (sesData) renderSessions(sesData.sessions || []);
-    }
-
-    // Slow refresh: versions (runs podman) and review config — less frequent.
-    async function refreshSlow() {
-      const [verData, revData, bridgeData, cfgResp] = await Promise.all([
-        safeFetch('/api/versions'),
-        safeFetch('/api/review-config'),
-        safeFetch('/api/bridge-status'),
-        fetch('/api/config').then(r => r.ok ? r.text() : null).catch(() => null),
-      ]);
-      if (verData) renderVersions(verData);
-      if (revData) syncReviewConfig(revData);
-      if (cfgResp) parseBridgeEnabled(cfgResp);
-      if (bridgeData) renderBridgeStatus(bridgeData);
-    }
-
-    let bridgeEnabledState = { discord: null, signal: null };
-
-    function parseBridgeEnabled(yaml) {
-      // Parse enabled state from each bridge section in the YAML config
-      for (const transport of ['discord', 'signal']) {
-        const re = new RegExp('(?:^|\\n)\\s*' + transport + ':\\s*\\n(?:.*\\n)*?\\s+enabled:\\s*(true|false)', 'm');
-        const m = yaml.match(re);
-        if (m) bridgeEnabledState[transport] = m[1] === 'true';
-      }
-    }
-
-    function renderBridgeStatus(data) {
-      const discordEl = document.getElementById('bridge-discord-status');
-      const signalEl = document.getElementById('bridge-signal-status');
-      const discordBtn = document.getElementById('bridge-discord-toggle');
-      const signalBtn = document.getElementById('bridge-signal-toggle');
-      if (data.discord) {
-        const d = data.discord;
-        const uptime = d.uptime_secs > 0 ? (d.uptime_secs / 3600).toFixed(1) + 'h' : '';
-        if (d.connected) {
-          discordEl.innerHTML = `<span class="green">\'Connected</span> ${d.messages_handled} msgs${uptime ? ' / ' + uptime : ''}`;
-        } else {
-          discordEl.innerHTML = `<span class="orange">\'Disconnected</span>${d.last_error ? ' \'\u2014 ' + esc(d.last_error) : ''}`;
-        }
-      } else {
-        discordEl.textContent = bridgeEnabledState.discord === false ? 'Disabled' : 'Not configured';
-      }
-      setBridgeToggleBtn(discordBtn, bridgeEnabledState.discord !== false);
-      if (data.signal) {
-        const s = data.signal;
-        const uptime = s.uptime_secs > 0 ? (s.uptime_secs / 3600).toFixed(1) + 'h' : '';
-        if (s.connected) {
-          signalEl.innerHTML = `<span class="green">\'Connected</span> ${s.messages_handled} msgs${uptime ? ' / ' + uptime : ''}`;
-        } else {
-          signalEl.innerHTML = `<span class="orange">\'Disconnected</span>${s.last_error ? ' \'\u2014 ' + esc(s.last_error) : ''}`;
-        }
-      } else {
-        signalEl.textContent = bridgeEnabledState.signal === false ? 'Disabled' : 'Not configured';
-      }
-      setBridgeToggleBtn(signalBtn, bridgeEnabledState.signal !== false);
-    }
-
-    function setBridgeToggleBtn(btn, enabled) {
-      if (!btn) return;
-      btn.textContent = enabled ? 'Enabled' : 'Disabled';
-      btn.style.borderColor = enabled ? 'var(--green)' : 'var(--red)';
-      btn.style.color = enabled ? 'var(--green)' : 'var(--red)';
-    }
-
-    async function toggleBridge(transport) {
-      const btn = document.getElementById('bridge-' + transport + '-toggle');
-      if (!btn) return;
-      const wasEnabled = bridgeEnabledState[transport];
-      const newEnabled = !wasEnabled;
-      btn.textContent = 'Saving\u2026';
-      btn.style.color = 'var(--orange)';
-      btn.style.borderColor = 'var(--orange)';
-      btn.disabled = true;
-      try {
-        const resp = await fetch('/api/config');
-        if (!resp.ok) throw new Error('Failed to load config');
-        let yaml = await resp.text();
-        // Flip the enabled line in the appropriate bridge section.
-        // Match: transport name header, then find the next enabled: line.
-        const sectionRe = new RegExp('((?:^|\\n)([ \\t]*)' + transport + ':\\s*\\n)((?:.|\\n)*?)(([ \\t]+)enabled:\\s*)(true|false)', 'm');
-        const m = yaml.match(sectionRe);
-        if (m) {
-          yaml = yaml.replace(sectionRe, (match, prefix, indent, mid, enabledLine, spaces, val) => {
-            return prefix + mid + spaces + 'enabled: ' + newEnabled;
-          });
-        } else {
-          alert('Could not find ' + transport + ' enabled setting in config');
-          btn.disabled = false;
-          setBridgeToggleBtn(btn, wasEnabled);
-          return;
-        }
-        const saveResp = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'text/yaml'}, body: yaml });
-        if (!saveResp.ok) throw new Error('Failed to save config');
-        btn.textContent = 'Restarting\u2026';
-        await fetch('/api/restart/brainrouter', { method: 'POST' }).catch(() => {});
-        setTimeout(() => location.reload(), 3000);
-      } catch (e) {
-        btn.textContent = 'Error';
-        btn.style.color = 'var(--red)';
-        btn.style.borderColor = 'var(--red)';
-        console.error('Bridge toggle failed', e);
-        setTimeout(() => { btn.disabled = false; setBridgeToggleBtn(btn, wasEnabled); }, 3000);
-      }
-    }
-
-    let currentReviewConfig = null;
-    let llamaSwapModels = [];
-    let isUpdatingConfig = false;
-
-    async function syncReviewConfig(config) {
-      if (!config || isUpdatingConfig) return;
-      currentReviewConfig = config;
-      
-      const modeSelect = document.getElementById('select-review-mode');
-      const statusBadge = document.getElementById('review-mode-status');
-      const localWrap = document.getElementById('local-model-select-wrap');
-      
-      if (modeSelect.value !== config.forced_mode) {
-        modeSelect.value = config.forced_mode;
-      }
-      
-      statusBadge.textContent = config.forced_mode;
-      statusBadge.className = 'badge badge-' + config.forced_mode;
-      
-      if (config.forced_mode === 'local') {
-        localWrap.style.display = 'flex';
-        if (llamaSwapModels.length === 0) {
-           await loadLlamaSwapModels();
-        }
-        const modelSelect = document.getElementById('select-review-model');
-        if (modelSelect.value !== (config.forced_model || '')) {
-           modelSelect.value = config.forced_model || '';
-        }
-      } else {
-        localWrap.style.display = 'none';
-      }
-    }
-
-    async function loadLlamaSwapModels() {
-      try {
-        const res = await fetch('/api/models/llama-swap');
-        const data = await res.json();
-        llamaSwapModels = data.data || [];
-        const select = document.getElementById('select-review-model');
-        select.innerHTML = llamaSwapModels.map(m => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
-        if (currentReviewConfig && currentReviewConfig.forced_model) {
-           select.value = currentReviewConfig.forced_model;
-        }
-      } catch (e) {
-        console.error('Failed to load llama-swap models', e);
-      }
-    }
-
-    async function updateReviewConfig() {
-      const modeSelect = document.getElementById('select-review-mode');
-      const modelSelect = document.getElementById('select-review-model');
-      const mode = modeSelect.value;
-      const model = modelSelect.value;
-      
-      const payload = {
-        max_iterations: currentReviewConfig ? currentReviewConfig.max_iterations : 5,
-        forced_mode: mode,
-        forced_model: mode === 'local' ? model : null
-      };
-
-      // Prevent polling from overwriting our local UI state during the update
-      isUpdatingConfig = true;
-      
-      // Immediate UI feedback
-      const statusBadge = document.getElementById('review-mode-status');
-      const prevText = statusBadge.textContent;
-      statusBadge.textContent = mode + '...';
-      
-      try {
-        const res = await fetch('/api/review-config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        if (res.ok) {
-           currentReviewConfig = payload;
-           syncReviewConfig(payload);
-        } else {
-           const data = await res.json().catch(() => ({}));
-           console.error('Failed to update review config', data.error);
-           statusBadge.textContent = 'error';
-           setTimeout(() => syncReviewConfig(currentReviewConfig), 2000);
-        }
-      } catch (e) {
-        console.error('Failed to update review config', e);
-        statusBadge.textContent = 'error';
-        setTimeout(() => syncReviewConfig(currentReviewConfig), 2000);
-      } finally {
-        // Wait a bit before allowing polling to resume to ensure the server state has settled
-        setTimeout(() => { isUpdatingConfig = false; }, 1000);
-      }
-    }
-
-    function renderVersions(data) {
-       if (!data) return;
-       // Helper: safely set innerHTML of a child div, skipping the health-dot span.
-       const setVer = (parentId, html) => {
-         const el = document.getElementById(parentId);
-         if (!el) return;
-         // The version text lives in the first <div> child (after the <span> health dot).
-         const div = el.querySelector('div');
-         if (div) div.innerHTML = html;
-       };
-       const swapBtn      = document.getElementById('upgrade-llama-swap');
-       const cppBtn       = document.getElementById('upgrade-llama-cpp');
-       const manifestBtn  = document.getElementById('upgrade-manifest');
-       const toolboxBtn   = document.getElementById('upgrade-toolbox');
-       
-       if (swapBtn) swapBtn.innerHTML = '';
-       if (cppBtn) cppBtn.innerHTML = '';
-       if (manifestBtn) manifestBtn.innerHTML = '';
-       if (toolboxBtn) toolboxBtn.innerHTML = '';
-
-       // brainrouter
-       if (data.brainrouter) {
-         const el = document.getElementById('brainrouter-version');
-         if (el) el.textContent = 'v' + data.brainrouter;
-       }
-
-       // llama-swap
-       let currentSwap = '';
-       if (data.llama_swap) {
-         currentSwap = data.llama_swap.split(' ')[0];
-         setVer('ver-llama-swap', `llama-swap: <span style="color:var(--text); font-weight:600">${esc(currentSwap)}</span>`);
-       }
-
-       // llama.cpp (inside toolbox container)
-       if (data.llama_cpp) {
-         const ver = data.llama_cpp.split(' ')[0];
-         setVer('ver-llama-cpp', `llama.cpp: <span style="color:var(--text); font-weight:600">${esc(ver)}</span>`);
-       }
-
-       // Manifest
-       if (data.manifest) {
-         setVer('ver-manifest', `Manifest: <span style="color:var(--text); font-weight:600">${esc(data.manifest)}</span>`);
-       }
-
-       // toolbox container image
-       if (data.toolbox_image_ver) {
-         setVer('ver-toolbox', `toolbox: <span style="color:var(--text); font-weight:600">v${esc(data.toolbox_image_ver)}</span>`);
-       }
-
-       // Upgrade buttons — placed under each component
-       const btnStyle = 'font-size:0.6rem; padding:1px 6px; border-radius:3px; background:var(--orange); color:var(--bg); border:none; cursor:pointer; font-weight:700;';
-       
-       if (swapBtn && data.llama_swap_latest && currentSwap && data.llama_swap_latest !== currentSwap) {
-         swapBtn.innerHTML = `<button onclick="upgradeComponent('llama-swap', 'llama-swap', this)" style="${btnStyle}">Upgrade \u2192 v${esc(data.llama_swap_latest)}</button>`;
-       }
-       
-       if (manifestBtn && data.manifest_latest) {
-         const localDate = data.manifest ? data.manifest.split(' ')[0] : '';
-         if (data.manifest_latest !== localDate) {
-           manifestBtn.innerHTML = `<button onclick="upgradeComponent('manifest', 'Manifest', this)" style="${btnStyle}">Upgrade \u2192 ${esc(data.manifest_latest)}</button>`;
-         }
-       }
-       
-       if (toolboxBtn && data.toolbox_latest && data.toolbox_image_created) {
-         if (data.toolbox_latest > data.toolbox_image_created) {
-           toolboxBtn.innerHTML = `<button onclick="upgradeComponent('toolbox', 'toolbox (llama.cpp)', this)" style="${btnStyle}">Upgrade \u2192 ${esc(data.toolbox_latest)}</button>`;
-         }
-       }
-    }
-
-    async function upgradeComponent(endpoint, label, btn) {
-      const confirmMsg = endpoint === 'manifest'
-        ? `Pull latest Manifest image and recreate container? This will briefly interrupt the Manifest service.`
-        : endpoint === 'toolbox'
-          ? `Pull latest toolbox image and recreate the llama-vulkan-radv container? This will interrupt active inference.`
-          : `Upgrade ${label} and restart? This will interrupt active inference.`;
-      if (!confirm(confirmMsg)) return;
-      const origText = btn.textContent;
-      btn.textContent = 'UPGRADING…';
-      btn.disabled = true;
-      try {
-        const res = await fetch(`/api/upgrade/${endpoint}`, { method: 'POST' });
-        const data = await res.json();
-        if (res.ok) {
-          btn.textContent = 'DONE ✓';
-          btn.style.background = 'var(--green)';
-          setTimeout(() => refresh(), 2500);
-        } else {
-          btn.textContent = 'FAILED';
-          btn.title = data.error || data.message || 'Unknown error';
-          setTimeout(() => { btn.textContent = origText; btn.disabled = false; btn.title = ''; }, 4000);
-        }
-      } catch (e) {
-        console.error('Upgrade failed', e);
-        btn.textContent = 'ERROR';
-        setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
-      }
-    }
-
-
-    // ── Service health dots ───────────────────────────────────────────────────────
-    const healthTitles = {
-      healthy: 'healthy',
-      unhealthy: 'unreachable or unhealthy',
-      idle: 'service up, no model loaded',
-      loading: 'model is loading',
-      unknown: 'checking...',
+function enrichEvents(events, sessions) {
+  const sessMap = {};
+  sessions.forEach(s => { sessMap[s.id] = s; });
+  return events.map(e => {
+    const sess = e.session_id ? sessMap[e.session_id] : null;
+    const _route = deriveRoute(e);
+    const _status = deriveStatus(e, sess, inferenceStatus);
+    return {
+      ...e,
+      _session: sess,
+      _source: deriveSource(e),
+      _route,
+      _displayModel: e.model_key || (e.effective_provider ? e.effective_provider.split('/').pop() : '—'),
+      _folder: e.cwd ? e.cwd.split('/').filter(Boolean).pop() : '',
+      _status,
     };
+  });
+}
 
-    function setHealthDot(id, state) {
-      const dot = document.getElementById(id);
-      if (!dot) return;
-      const cls = state === true ? 'healthy' : state === false ? 'unhealthy' : (state || 'unknown');
-      dot.className = 'health-dot ' + cls;
-      dot.title = healthTitles[cls] || cls;
+// ─── View switching ──────────────────────────────────────────────────────────
+function switchView(view) {
+  activeView = view;
+  document.getElementById('stream-view').style.display   = view === 'stream'  ? 'grid'  : 'none';
+  document.getElementById('reviews-view').style.display  = view === 'reviews' ? 'block' : 'none';
+  document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
+
+  ['stream','reviews','config'].forEach(v => {
+    const btn = document.getElementById('nav-' + v);
+    if (btn) btn.classList.toggle('active', v === view);
+  });
+
+  const titles = { stream: 'Stream', reviews: 'Reviews', config: 'Config' };
+  document.getElementById('cmdbar-title').textContent = titles[view] || view;
+
+  const subs = {
+    stream: 'Newest first · polling every 3s',
+    reviews: 'Active review sessions',
+    config: 'Edit configuration files',
+  };
+  document.getElementById('cmdbar-sub').textContent = subs[view] || '';
+
+  const filterDiv = document.getElementById('filter-btns');
+  filterDiv.style.display = view === 'stream' ? 'flex' : 'none';
+
+  if (view === 'config') loadConfig();
+}
+
+// ─── Filter ───────────────────────────────────────────────────────────────────
+function setFilter(f) {
+  activeFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.filter === f);
+  });
+  renderStream();
+}
+
+function onSearch(q) {
+  searchQuery = q.toLowerCase();
+  renderStream();
+}
+
+function matchesSearch(t) {
+  if (!searchQuery) return true;
+  const haystack = [
+    t.prompt_excerpt || '',
+    t._displayModel || '',
+    t._folder || '',
+    t.requested_model || '',
+    t.effective_provider || '',
+    t.session_id || '',
+  ].join(' ').toLowerCase();
+  return haystack.includes(searchQuery);
+}
+
+function matchesFilter(t) {
+  if (activeFilter === 'all') return true;
+  if (activeFilter === 'live') return ['queued','generating','reviewing','routing','iterating'].includes(t._status);
+  if (activeFilter === 'approved') return t._status === 'approved';
+  if (activeFilter === 'escalated') return t._status === 'escalated';
+  return true;
+}
+</script>
+<script>
+// ─── Status pill HTML ─────────────────────────────────────────────────────────
+function statusPill(status) {
+  const x = STATUS_MAP[status] || STATUS_MAP.pending;
+  const dot = x.pulse
+    ? `<span class="pulse-dot" style="width:6px;height:6px;border-radius:99px;background:${x.c};box-shadow:0 0 6px ${x.c};display:inline-block"></span>`
+    : `<span style="width:6px;height:6px;border-radius:99px;background:${x.c};box-shadow:0 0 6px ${x.c};display:inline-block"></span>`;
+  return `<span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:99px;font-size:11px;background:${x.c}20;color:${x.c};border:1px solid ${x.c}40;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${dot}${x.l}</span>`;
+}
+
+// ─── Mini flow HTML ───────────────────────────────────────────────────────────
+function miniFlowNode(label, color, sub) {
+  return `<div style="display:flex;align-items:center;gap:6px;padding:5px 9px;border-radius:6px;background:${color}14;border:1px solid ${color}40;color:${color}">
+    <span style="width:5px;height:5px;border-radius:99px;background:${color};box-shadow:0 0 5px ${color};flex-shrink:0"></span>
+    <span style="font-size:11px;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${label}</span>
+    ${sub ? `<span style="color:var(--textMute);font-size:10px">${sub}</span>` : ''}
+  </div>`;
+}
+
+function miniFlowArrow() {
+  return `<span style="color:var(--textMute);font-size:11px">→</span>`;
+}
+
+function miniFlowHtml(t) {
+  const src = SOURCES[t._source] || SOURCES.local;
+  const routeColor = (t._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
+  const modelColor = (t._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
+  const modelLabel = t._displayModel || '—';
+
+  let nodes = [miniFlowNode(src.label, src.color)];
+  nodes.push(miniFlowArrow());
+  nodes.push(miniFlowNode(modelLabel, modelColor, (t._route || '').includes('cloud') ? 'cloud' : 'local'));
+  if (t._session) {
+    const rev = t._session.review_model || '—';
+    nodes.push(miniFlowArrow());
+    nodes.push(miniFlowNode('rev: ' + rev, '#f5b14a'));
+  }
+  return `<div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">${nodes.join('')}</div>`;
+}
+
+// ─── Review section HTML ──────────────────────────────────────────────────────
+function reviewHtml(sess, eventId) {
+  if (!sess) return '';
+  const st = sess.status;
+  if (st === 'pending') return '';
+
+  const feedbackBg = st === 'escalated' ? 'var(--redDim)' : 'var(--amberDim)';
+  const feedbackBorder = st === 'escalated' ? 'var(--red)' : 'var(--amber)';
+  const reviewSt = st === 'needs_revision' ? 'reviewing' : st;
+
+  const iterText = sess.iteration_count != null ? `iter ${sess.iteration_count}/5` : '';
+  const byText = sess.review_model ? `by ${sess.review_model}` : '';
+  const metaParts = [iterText, byText].filter(Boolean).join(' · ');
+
+  const feedback = sess.llm_feedback || sess.summary || '';
+
+  let actionHtml = '';
+  if (st === 'escalated') {
+    actionHtml = `<div style="margin-left:36px;margin-top:10px;display:flex;gap:6px">
+      <button class="br-btn" style="background:var(--redDim);color:var(--red);border-color:rgba(255,107,107,0.35)" onclick="sendFeedback('${sess.id}')">Send Feedback</button>
+      <button class="br-btn" style="background:var(--amberDim);color:var(--amber);border-color:rgba(245,177,74,0.35)" onclick="continueReview('${sess.id}')">Continue iterating</button>
+      <button class="br-btn" style="background:var(--greenDim);color:var(--green);border-color:rgba(34,211,154,0.35)" onclick="lgtmReview('${sess.id}')">LGTM</button>
+    </div>`;
+  }
+
+  return `<div style="border-top:1px solid var(--border);background:var(--bg2);padding:12px 16px 14px;position:relative">
+    <div style="position:absolute;left:30px;top:-1px;width:24px;height:14px;border-left:1px dashed var(--borderHi);border-bottom:1px dashed var(--borderHi);border-bottom-left-radius:6px"></div>
+    <div style="display:flex;align-items:center;gap:10px;margin-left:36px;flex-wrap:wrap">
+      <span style="font-size:10px;color:var(--textMute);font-family:'JetBrains Mono',monospace;letter-spacing:1px">↳ REVIEW</span>
+      ${statusPill(reviewSt)}
+      ${metaParts ? `<span style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace">${metaParts}</span>` : ''}
+      ${st === 'escalated' ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace">HUMAN NEEDED</span>` : ''}
+    </div>
+    ${feedback ? `<div style="margin-left:36px;margin-top:8px;padding:10px;background:${feedbackBg};border-left:2px solid ${feedbackBorder};border-radius:4px;font-size:12px;color:var(--text);line-height:1.5">${escHtml(feedback)}</div>` : ''}
+    ${actionHtml}
+  </div>`;
+}
+
+// ─── Card HTML ────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderCard(t) {
+  const src = SOURCES[t._source] || SOURCES.local;
+  const isLive = ['generating','reviewing','routing','iterating'].includes(t._status);
+  const routeColor = (t._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
+
+  const lat = fmtLatency(t.latency_ms);
+  const latColor = t.latency_ms > 5000 ? '#f5b14a' : 'var(--textDim)';
+
+  const folder = t._folder || '';
+  const age = fmtAge(t.timestamp);
+  const prompt = escHtml(t.prompt_excerpt || '(no prompt excerpt)');
+
+  const errHtml = (t.error && !t.success)
+    ? `<div style="margin-top:10px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(t.error)}</div>`
+    : '';
+
+  return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
+    ${isLive ? '<div class="shimmer-bar"></div>' : ''}
+    <!-- Header -->
+    <header style="padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
+      <div style="width:28px;height:28px;border-radius:8px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:13px;flex-shrink:0">${src.glyph}</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;color:var(--text)">
+          <span style="color:${src.color};font-weight:600">${src.label}</span>
+          ${t.cwd ? `<span style="color:var(--textMute);margin-left:6px">${escHtml(t.cwd)}</span>` : ''}
+        </div>
+        <div style="font-size:10.5px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          ${escHtml(t.id)} · ${escHtml(folder)} · ${age}
+        </div>
+      </div>
+      ${statusPill(t._status)}
+    </header>
+    <!-- Flow rail -->
+    <div style="padding:10px 16px;background:var(--bg2);border-bottom:1px solid var(--border)">
+      ${miniFlowHtml(t)}
+    </div>
+    <!-- Body -->
+    <div style="padding:16px;display:grid;grid-template-columns:1fr 200px;gap:16px">
+      <div>
+        <div style="font-size:13px;color:var(--text);line-height:1.55">${prompt}</div>
+        ${errHtml}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;padding:10px;background:var(--bg2);border-radius:6px;font-size:11px;font-family:'JetBrains Mono',monospace">
+        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">route</span><span style="color:${routeColor};text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(t._route || '—')}</span></div>
+        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">model</span><span style="color:${routeColor};text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(t._displayModel)}</span></div>
+        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">latency</span><span style="color:${latColor}">${lat}</span></div>
+        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">bonsai</span><span style="color:var(--textDim)">${escHtml(t.bonsai_decision || '—')}</span></div>
+      </div>
+    </div>
+    <!-- Review subtask -->
+    ${reviewHtml(t._session, t.id)}
+  </article>`;
+}
+</script>
+<script>
+// ─── Sankey SVG ───────────────────────────────────────────────────────────────
+function buildSankey(stats) {
+  const W = 290, H = 240;
+  const nodeW = 12;
+  const headerH = 20;
+  const usableH = H - headerH - 16;
+  const padBetween = 5;
+
+  // Build node data from statsData
+  // Columns: Source | Route | Model
+  // We derive from stats: total, cloud_count, local_count, direct_cloud_count, direct_local_count
+  const total = stats.total || 1;
+  const cloudCount = (stats.cloud_count || 0);
+  const localCount = (stats.local_count || 0);
+  const directCloud = (stats.direct_cloud_count || 0);
+  const cloudAuto = Math.max(0, cloudCount - directCloud);
+  const directLocal = (stats.direct_local_count || 0);
+  const localAuto = Math.max(0, localCount - directLocal);
+
+  const safePct = (n) => Math.max(2, (n / Math.max(total, 1)) * usableH);
+
+  // Col 0: Source (we only know local, no bridge breakdown)
+  const srcNodes = [{ key: 'all', label: 'All', color: '#22d39a', value: total, y: headerH + 8 }];
+  srcNodes[0].h = usableH;
+
+  // Col 1: Route
+  const routes = [];
+  if (directCloud > 0)  routes.push({ key: 'cloud-direct', label: 'cloud-direct', color: '#9d7bff', value: directCloud });
+  if (cloudAuto > 0)    routes.push({ key: 'cloud-auto',   label: 'cloud-auto',   color: '#9d7bff', value: cloudAuto });
+  if (directLocal > 0)  routes.push({ key: 'local-direct', label: 'local-direct', color: '#3ec5ff', value: directLocal });
+  if (localAuto > 0)    routes.push({ key: 'local-auto',   label: 'local-auto',   color: '#3ec5ff', value: localAuto });
+
+  if (routes.length === 0) {
+    // No data: placeholder
+    return `<text x="145" y="120" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No data yet</text>`;
+  }
+
+  const routeTotalH = usableH - (routes.length - 1) * padBetween;
+  let ry = headerH + 8;
+  routes.forEach(n => {
+    n.h = Math.max(6, (n.value / total) * routeTotalH);
+    n.y = ry;
+    ry += n.h + padBetween;
+  });
+
+  const colX = [20, 148];
+  const cols = [
+    { header: 'SOURCE', x: colX[0], nodes: srcNodes },
+    { header: 'ROUTE',  x: colX[1], nodes: routes   },
+  ];
+
+  let svg = '';
+
+  // Headers
+  cols.forEach(c => {
+    svg += `<text x="${c.x}" y="14" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace" letter-spacing="1.5">${c.header}</text>`;
+  });
+
+  // Links: all → each route
+  routes.forEach(rt => {
+    const x1 = colX[0] + nodeW;
+    const x2 = colX[1];
+    const y1 = srcNodes[0].y + srcNodes[0].h / 2;
+    const y2 = rt.y + rt.h / 2;
+    const w  = Math.max(1, rt.h * 0.5);
+    const cx1 = x1 + (x2 - x1) * 0.5;
+    const cx2 = x2 - (x2 - x1) * 0.5;
+    svg += `<path d="M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}" stroke="${rt.color}" stroke-width="${w}" fill="none" opacity="0.32"/>`;
+  });
+
+  // Nodes + labels
+  cols.forEach(c => {
+    c.nodes.forEach(n => {
+      svg += `<rect x="${c.x}" y="${n.y}" width="${nodeW}" height="${n.h}" fill="${n.color}" rx="2"/>`;
+      svg += `<text x="${c.x + nodeW + 6}" y="${n.y + n.h/2 + 3.5}" fill="#e6edf6" font-size="10" font-family="JetBrains Mono, monospace">${n.label}</text>`;
+      svg += `<text x="${c.x + nodeW + 6}" y="${n.y + n.h/2 + 16}" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace">${n.value}</text>`;
+    });
+  });
+
+  return svg;
+}
+
+function updateSankey() {
+  const svg = document.getElementById('sankey-svg');
+  if (!svg) return;
+  if (!statsData || !statsData.total) {
+    svg.innerHTML = `<text x="145" y="120" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
+    return;
+  }
+  svg.innerHTML = buildSankey(statsData);
+}
+
+// ─── KPI tiles ────────────────────────────────────────────────────────────────
+function kpiTile(label, value, color, sub) {
+  return `<div style="padding:8px;background:var(--bg2);border-radius:6px;border:1px solid var(--border)">
+    <div style="font-size:9px;letter-spacing:1.4px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">${label}</div>
+    <div style="font-size:18px;font-family:'JetBrains Mono',monospace;color:${color};margin-top:2px;font-weight:500">${value}</div>
+    ${sub ? `<div style="font-size:10px;color:var(--textMute)">${sub}</div>` : ''}
+  </div>`;
+}
+
+function updateKPI() {
+  const grid = document.getElementById('kpi-grid');
+  if (!grid) return;
+  const s = statsData;
+  if (!s || !s.total) {
+    grid.innerHTML = `<div style="grid-column:1/-1;color:var(--textMute);font-size:12px;text-align:center;padding:8px">No stats yet</div>`;
+    return;
+  }
+  const total = s.total || 0;
+  const cloud = s.cloud_count || 0;
+  const local = s.local_count || 0;
+  const directCloud = s.direct_cloud_count || 0;
+  const fallbacks = s.fallbacks || 0;
+  const avg = s.avg_latency ? (s.avg_latency / 1000).toFixed(1) + 's' : '—';
+  const cloudPct = total > 0 ? Math.round(cloud/total*100) + '%' : '—';
+  const localPct = total > 0 ? Math.round(local/total*100) + '%' : '—';
+
+  grid.innerHTML =
+    kpiTile('Total', total, '#3ec5ff') +
+    kpiTile('Direct cloud', directCloud, '#22d39a', cloudPct) +
+    kpiTile('Cloud', cloud, '#9d7bff', cloudPct) +
+    kpiTile('Local', local, '#3ec5ff', localPct) +
+    kpiTile('Fallbacks', fallbacks, '#f5b14a') +
+    kpiTile('Avg latency', avg, '#3ec5ff');
+}
+</script>
+<script>
+// ─── Render stream ────────────────────────────────────────────────────────────
+function renderStream() {
+  const list = document.getElementById('card-list');
+  if (!list) return;
+
+  const enriched = enrichEvents(allEvents, allSessions);
+  const filtered = enriched.filter(t => matchesFilter(t) && matchesSearch(t));
+
+  // Sort newest first
+  filtered.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  if (filtered.length === 0) {
+    const msg = allEvents.length === 0
+      ? 'No routing events yet. Events appear here as requests flow through brainrouter.'
+      : 'No events match the current filter.';
+    list.innerHTML = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center;line-height:1.7">${msg}</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(t => renderCard(t)).join('');
+}
+
+// ─── Render reviews view ──────────────────────────────────────────────────────
+function renderReviews() {
+  const list = document.getElementById('reviews-list');
+  if (!list) return;
+
+  const pending = allSessions.filter(s => ['pending','needs_revision','escalated'].includes(s.status));
+
+  // Update badge
+  const badge = document.getElementById('reviews-count');
+  if (badge) {
+    const active = allSessions.filter(s => ['needs_revision','escalated'].includes(s.status)).length;
+    badge.textContent = active;
+    badge.style.display = active > 0 ? 'inline' : 'none';
+  }
+
+  if (pending.length === 0) {
+    list.innerHTML = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center">No active review sessions.</div>`;
+    return;
+  }
+
+  list.innerHTML = pending.map(sess => {
+    const st = sess.status === 'needs_revision' ? 'reviewing' : sess.status;
+    const feedbackBg = sess.status === 'escalated' ? 'var(--redDim)' : 'var(--amberDim)';
+    const feedbackBorder = sess.status === 'escalated' ? 'var(--red)' : 'var(--amber)';
+    const feedback = sess.llm_feedback || sess.summary || '';
+    const age = fmtAge(sess.updated_at);
+    const iterText = sess.iteration_count != null ? `iter ${sess.iteration_count}/5` : '';
+    const byText = sess.review_model ? `by ${sess.review_model}` : '';
+    const meta = [iterText, byText, age].filter(Boolean).join(' · ');
+
+    let actionHtml = '';
+    if (sess.status === 'escalated') {
+      actionHtml = `<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="br-btn" style="background:var(--redDim);color:var(--red);border-color:rgba(255,107,107,0.35)" onclick="sendFeedback('${sess.id}')">Send Feedback</button>
+        <button class="br-btn" style="background:var(--amberDim);color:var(--amber);border-color:rgba(245,177,74,0.35)" onclick="continueReview('${sess.id}')">Continue iterating</button>
+        <button class="br-btn" style="background:var(--greenDim);color:var(--green);border-color:rgba(34,211,154,0.35)" onclick="lgtmReview('${sess.id}')">LGTM</button>
+      </div>`;
     }
 
-    let notifyDismissed = false;
-    function dismissNotify() {
-      notifyDismissed = true;
-      document.getElementById('notify-banner').classList.remove('visible');
+    return `<div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <span style="font-size:12px;font-weight:600;font-family:'JetBrains Mono',monospace;color:var(--text)">${escHtml(sess.id)}</span>
+        ${statusPill(st)}
+        <span style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace">${meta}</span>
+        ${sess.status === 'escalated' ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace">HUMAN NEEDED</span>` : ''}
+      </div>
+      ${sess.cwd ? `<div style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-bottom:8px">${escHtml(sess.cwd)}</div>` : ''}
+      ${feedback ? `<div style="padding:10px;background:${feedbackBg};border-left:2px solid ${feedbackBorder};border-radius:4px;font-size:12px;color:var(--text);line-height:1.5">${escHtml(feedback)}</div>` : ''}
+      ${actionHtml}
+    </div>`;
+  }).join('');
+}
+
+// ─── Health / sidebar updates ─────────────────────────────────────────────────
+function updateDot(id, up) {
+  const el = document.getElementById('dot-' + id);
+  if (!el) return;
+  const color = up ? '#22d39a' : '#ff6b6b';
+  el.style.background = color;
+  el.style.boxShadow = up ? `0 0 8px ${color}` : 'none';
+}
+
+function updateHealth() {
+  const h = healthData;
+  if (!h) return;
+
+  const services = ['llama_swap','llama_cpp','toolbox','manifest'];
+  const dotIds   = ['llama-swap','llama-cpp','toolbox','manifest'];
+  const verIds   = ['ver-llama-swap','ver-llama-cpp','ver-toolbox','ver-manifest'];
+
+  services.forEach((svc, i) => {
+    const info = h[svc];
+    if (!info) return;
+    updateDot(dotIds[i], info.healthy !== false);
+    const verEl = document.getElementById(verIds[i]);
+    if (verEl && info.version) verEl.textContent = String(info.version).slice(0, 12);
+  });
+}
+
+function updateBridges() {
+  const b = bridgeData;
+  if (!b) return;
+
+  const disc = b.discord;
+  if (disc) {
+    updateDot('discord', disc.connected);
+    const meta = document.getElementById('bridge-discord-meta');
+    if (meta) {
+      const msgs = disc.messages_handled != null ? disc.messages_handled + ' msg' : '—';
+      const uptime = disc.uptime_secs != null ? fmtUptime(disc.uptime_secs) : '';
+      meta.textContent = [msgs, uptime].filter(Boolean).join(' · ');
     }
+  }
 
-    async function refreshHealth() {
-      const data = await safeFetch('/api/service-health');
-      if (!data) return;
-      setHealthDot('health-llama-swap', data.llama_swap);
-      setHealthDot('health-llama-cpp', data.llama_cpp);
-      setHealthDot('health-toolbox', data.toolbox);
-      setHealthDot('health-manifest', data.manifest);
-
-      // Cloud fallback notification
-      const banner = document.getElementById('notify-banner');
-      if (data.cloud_fallback && !notifyDismissed) {
-        document.getElementById('notify-text').textContent =
-          'Cloud requests are falling back to local. Manifest may be out of provider credits or unreachable. Check your Manifest dashboard for details.';
-        banner.classList.add('visible');
-      } else if (!data.cloud_fallback) {
-        banner.classList.remove('visible');
-        notifyDismissed = false; // reset dismiss when the issue clears
-      }
+  const sig = b.signal;
+  if (sig) {
+    updateDot('signal', sig.connected);
+    const meta = document.getElementById('bridge-signal-meta');
+    if (meta) {
+      const msgs = sig.messages_handled != null ? sig.messages_handled + ' msg' : '—';
+      const uptime = sig.uptime_secs != null ? fmtUptime(sig.uptime_secs) : '';
+      meta.textContent = [msgs, uptime].filter(Boolean).join(' · ');
     }
+  }
+}
 
-    setInterval(refreshHealth, 10000);
-    refreshHealth();
+function updateVersions() {
+  const v = versionsData;
+  if (!v) return;
+  const brEl = document.getElementById('ver-brainrouter');
+  if (brEl && v.brainrouter) brEl.textContent = 'v' + v.brainrouter;
+}
 
-    setInterval(refresh, 500);
-    setInterval(refreshSlow, 30000);
-    refresh();
-    refreshSlow();
+// ─── Action handlers ──────────────────────────────────────────────────────────
+async function restartService(svc) {
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '↻ Restarting...'; }
+  try {
+    await fetch('/api/restart/' + svc, { method: 'POST' });
+  } catch(e) {}
+  if (btn) {
+    btn.disabled = false;
+    const labels = { 'llama-swap': 'Restart Local Stack', 'manifest': 'Restart Manifest', 'brainrouter': 'Restart brainrouter' };
+    btn.textContent = '↻ ' + (labels[svc] || svc);
+  }
+  setTimeout(refreshHealth, 2000);
+}
 
-    // ── Config page ─────────────────────────────────────────────────────────────
-    function showPage(page) {
-      document.getElementById('dashboard-content').style.display = page === 'dashboard' ? '' : 'none';
-      document.getElementById('config-page').style.display = page === 'config' ? '' : 'none';
-      document.querySelectorAll('.nav a').forEach(a => a.classList.remove('nav-active'));
-      if (page === 'config') {
-        document.querySelector('.nav a[onclick*=config]').classList.add('nav-active');
-        loadConfig();
-      }
-    }
+async function syncModels() {
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '⇄ Syncing...'; }
+  try { await fetch('/api/models/sync-omp', { method: 'POST' }); } catch(e) {}
+  if (btn) { btn.disabled = false; btn.textContent = '⇄ Sync Models'; }
+}
 
-    async function loadConfig() {
-      const [brResp, lsResp] = await Promise.all([
-        fetch('/api/config').catch(() => null),
-        fetch('/api/llama-swap-config').catch(() => null)
-      ]);
-      const brYaml = brResp && brResp.ok ? await brResp.text() : null;
-      const lsYaml = lsResp && lsResp.ok ? await lsResp.text() : null;
-      renderConfigForm(brYaml, lsYaml);
-      try {
-        const filesResp = await fetch('/api/config-files');
-        if (filesResp.ok) {
-          const files = await filesResp.json();
-          renderConfigFiles(files);
-        }
-      } catch (_) {}
-    }
+async function sendFeedback(sessionId) {
+  const msg = prompt('Enter feedback for the review session:');
+  if (!msg) return;
+  try {
+    await fetch('/review/session/' + sessionId + '/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feedback: msg, action: 'feedback' }),
+    });
+  } catch(e) {}
+  await refreshFast();
+}
 
-    function renderConfigForm(brYaml, lsYaml) {
-      const container = document.getElementById('config-form-container');
-      const brPanel = brYaml !== null ? `
-        <div class="config-group" style="flex:1;min-width:0">
-          <h3>brainrouter.yaml</h3>
-          <textarea id="config-yaml" spellcheck="false" style="width:100%;min-height:500px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.78rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(brYaml)}</textarea>
-          <div class="config-actions">
-            <button class="primary" onclick="saveConfig('/api/config','config-yaml','br-save-status',false)">Save</button>
-            <button class="primary" onclick="saveConfig('/api/config','config-yaml','br-save-status',true)">Save &amp; Restart</button>
-            <span id="br-save-status" style="font-size:0.8rem;color:var(--muted)"></span>
-          </div>
-        </div>` : '<div class="config-group" style="flex:1"><h3>brainrouter.yaml</h3><div style="color:var(--red)">Failed to load</div></div>';
-      const lsPanel = lsYaml !== null ? `
-        <div class="config-group" style="flex:1;min-width:0">
-          <h3>llama-swap config</h3>
-          <textarea id="ls-config-yaml" spellcheck="false" style="width:100%;min-height:500px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.78rem;resize:vertical;line-height:1.5;tab-size:2;-moz-tab-size:2">${esc(lsYaml)}</textarea>
-          <div class="config-actions">
-            <button class="primary" onclick="saveConfig('/api/llama-swap-config','ls-config-yaml','ls-save-status',false)">Save</button>
-            <button class="primary" onclick="saveConfig('/api/llama-swap-config','ls-config-yaml','ls-save-status',true)">Save &amp; Restart llama-swap</button>
-            <span id="ls-save-status" style="font-size:0.8rem;color:var(--muted)"></span>
-          </div>
-        </div>` : '<div class="config-group" style="flex:1"><h3>llama-swap config</h3><div style="color:var(--red)">Failed to load</div></div>';
-      container.innerHTML = `<div class="config-editors">${brPanel}${lsPanel}</div>`;
-    }
+async function continueReview(sessionId) {
+  try {
+    await fetch('/review/api/continue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+  } catch(e) {}
+  await refreshFast();
+}
 
-    async function saveConfig(endpoint, textareaId, statusId, restart) {
-      const yaml = document.getElementById(textareaId).value;
-      const status = document.getElementById(statusId);
-      status.textContent = 'Saving\u2026';
-      status.style.color = 'var(--muted)';
-      try {
-        const resp = await fetch(endpoint, {
-          method: 'POST',
-          headers: {'Content-Type': 'text/yaml'},
-          body: yaml
-        });
-        if (resp.ok) {
-          status.textContent = 'Saved';
-          status.style.color = 'var(--green)';
-          if (restart) {
-            // Restart the appropriate service.
-            const svc = endpoint.includes('llama-swap') ? 'llama-swap' : 'brainrouter';
-            status.textContent = 'Saved \u2014 restarting ' + svc + '\u2026';
-            await fetch('/api/restart/' + svc, {method:'POST'}).catch(()=>{});
-            if (svc === 'brainrouter') setTimeout(() => location.reload(), 3000);
-          }
-        } else {
-          const err = await resp.text();
-          status.textContent = 'Error: ' + err;
-          status.style.color = 'var(--red)';
-        }
-      } catch (e) {
-        status.textContent = 'Error: ' + e.message;
-        status.style.color = 'var(--red)';
-      }
-    }
+async function lgtmReview(sessionId) {
+  try {
+    await fetch('/review/api/lgtm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+  } catch(e) {}
+  await refreshFast();
+}
+</script>
+<script>
+// ─── Config page ──────────────────────────────────────────────────────────────
+let configLoaded = false;
 
-    function renderConfigFiles(files) {
-      const container = document.getElementById('config-files-container');
-      container.innerHTML = files.map(f => {
-        const escapedPath = f.path.replace(/'/g, "\\'");
-        return `
-          <div class="file-card">
-            <div class="file-info">
-              <div class="file-name">${esc(f.name)}</div>
-              <div class="file-path">${esc(f.path)}</div>
-              ${!f.exists ? '<div class="file-missing">File does not exist</div>' : ''}
-            </div>
-            ${f.exists ? `<button onclick="openFile('${escapedPath}')">Open in Editor</button>` : ''}
-          </div>
-        `;
+async function loadConfig() {
+  if (configLoaded) return;
+  configLoaded = true;
+
+  const [brRes, lsRes, filesRes] = await Promise.all([
+    safeFetch('/api/config'),
+    safeFetch('/api/llama-swap-config'),
+    safeFetch('/api/config-files'),
+  ]);
+
+  const brTa = document.getElementById('config-br-textarea');
+  const lsTa = document.getElementById('config-ls-textarea');
+
+  if (brRes) {
+    if (brTa) brTa.value = typeof brRes === 'string' ? brRes : (brRes.content || JSON.stringify(brRes, null, 2));
+  }
+  if (lsRes) {
+    if (lsTa) lsTa.value = typeof lsRes === 'string' ? lsRes : (lsRes.content || JSON.stringify(lsRes, null, 2));
+  }
+
+  const filesEl = document.getElementById('config-files-list');
+  if (filesEl && filesRes) {
+    const files = Array.isArray(filesRes) ? filesRes : (filesRes.files || []);
+    if (files.length === 0) {
+      filesEl.innerHTML = '<div style="color:var(--textMute);font-size:12px">No config files found.</div>';
+    } else {
+      filesEl.innerHTML = files.map(f => {
+        const name = typeof f === 'string' ? f : (f.name || f.path || String(f));
+        const path = typeof f === 'string' ? f : (f.path || f.name || String(f));
+        return `<div class="file-card" onclick="openEditor('${escHtml(path)}')">
+          <span style="font-size:14px;color:var(--textMute)">⚙</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text)">${escHtml(name)}</span>
+        </div>`;
       }).join('');
     }
+  }
+}
 
-    async function openFile(path) {
-      try {
-        await fetch('/api/open-editor', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({path: path})
-        });
-      } catch (_) {}
-    }
-  </script>
+async function saveConfig() {
+  const ta = document.getElementById('config-br-textarea');
+  const msgEl = document.getElementById('config-br-msg');
+  if (!ta || !msgEl) return;
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ta.value }),
+    });
+    msgEl.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+    msgEl.textContent = r.ok ? 'Saved.' : 'Error: ' + r.status;
+  } catch(e) {
+    msgEl.style.color = 'var(--red)';
+    msgEl.textContent = 'Network error.';
+  }
+  setTimeout(() => { msgEl.textContent = ''; }, 3000);
+}
+
+async function saveLlamaSwapConfig() {
+  const ta = document.getElementById('config-ls-textarea');
+  const msgEl = document.getElementById('config-ls-msg');
+  if (!ta || !msgEl) return;
+  try {
+    const r = await fetch('/api/llama-swap-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ta.value }),
+    });
+    msgEl.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+    msgEl.textContent = r.ok ? 'Saved.' : 'Error: ' + r.status;
+  } catch(e) {
+    msgEl.style.color = 'var(--red)';
+    msgEl.textContent = 'Network error.';
+  }
+  setTimeout(() => { msgEl.textContent = ''; }, 3000);
+}
+
+async function openEditor(path) {
+  try {
+    await fetch('/api/open-editor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+  } catch(e) {}
+}
+
+// ─── Polling ──────────────────────────────────────────────────────────────────
+async function refreshFast() {
+  const [evRes, sesRes, stRes, infRes] = await Promise.all([
+    safeFetch('/api/routing-events'),
+    safeFetch('/review/api/sessions'),
+    safeFetch('/api/routing-stats'),
+    safeFetch('/api/inference-status'),
+  ]);
+
+  if (evRes) allEvents = Array.isArray(evRes.events) ? evRes.events : (Array.isArray(evRes) ? evRes : []);
+  if (sesRes) allSessions = Array.isArray(sesRes.sessions) ? sesRes.sessions : (Array.isArray(sesRes) ? sesRes : []);
+  if (stRes) statsData = stRes;
+  if (infRes) inferenceStatus = infRes;
+
+  if (activeView === 'stream') renderStream();
+  if (activeView === 'reviews') renderReviews();
+  else renderReviews(); // always update badge
+
+  updateSankey();
+  updateKPI();
+}
+
+async function refreshHealth() {
+  const res = await safeFetch('/api/service-health');
+  if (res) {
+    healthData = res;
+    updateHealth();
+  }
+}
+
+async function refreshSlow() {
+  const [verRes, bridgeRes] = await Promise.all([
+    safeFetch('/api/versions'),
+    safeFetch('/api/bridge-status'),
+  ]);
+  if (verRes) { versionsData = verRes; updateVersions(); }
+  if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+// Keyboard shortcut ⌘K / Ctrl+K → focus search
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    const inp = document.getElementById('search-input');
+    if (inp) inp.focus();
+  }
+});
+
+// Initial load
+refreshFast();
+refreshHealth();
+refreshSlow();
+
+// Poll intervals
+setInterval(refreshFast, 3000);
+setInterval(refreshHealth, 10000);
+setInterval(refreshSlow, 30000);
+</script>
 </body>
 </html>

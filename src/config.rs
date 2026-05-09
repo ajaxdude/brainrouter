@@ -1,3 +1,5 @@
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -8,6 +10,9 @@ pub struct BrainrouterConfig {
     pub manifest: ManifestConfig,
     pub llama_swap: LlamaSwapConfig,
     pub bonsai: BonsaiConfig,
+    /// Shared model storage directory settings.
+    #[serde(default)]
+    pub models: ModelsConfig,
     #[serde(default)]
     pub review: ReviewConfig,
     /// Bridge transports (Discord, Signal) — optional, disabled by default.
@@ -64,6 +69,86 @@ pub struct BonsaiConfig {
     pub model_path: PathBuf,
 }
 
+/// Shared model storage directory configuration.
+///
+/// Controls where models live on disk and whether non-owner users may add or
+/// delete files in that directory.
+///
+/// ```yaml
+/// models:
+///   path: /opt/models      # default
+///   shared_write: false    # default — only the directory owner can add/delete
+/// ```
+///
+/// When `shared_write: false` (the default) the directory is created with
+/// permissions `root:aistack 750` — members of the `aistack` group can read
+/// and traverse but cannot write.  When `shared_write: true` the directory
+/// gets `root:aistack 770` — all `aistack` members can add and delete models.
+///
+/// `bonsai.model_path` may contain the literal token `${models_path}` which
+/// is expanded to this path at config-load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    /// Absolute path to the shared model directory.
+    #[serde(default = "default_models_path")]
+    pub path: PathBuf,
+
+    /// When true, all members of the `aistack` group may add and delete models.
+    /// When false (default), only the directory owner (typically root or papa)
+    /// may write; group members can only read.
+    #[serde(default)]
+    pub shared_write: bool,
+}
+
+fn default_models_path() -> PathBuf {
+    PathBuf::from("/opt/models")
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        ModelsConfig {
+            path: default_models_path(),
+            shared_write: false,
+        }
+    }
+}
+
+impl ModelsConfig {
+    /// Return the Unix permission mode for the models directory.
+    ///
+    /// - `shared_write: false` → `0o750`  (owner rwx, group r-x, others ---)
+    /// - `shared_write: true`  → `0o770`  (owner rwx, group rwx, others ---)
+    pub fn dir_mode(&self) -> u32 {
+        if self.shared_write { 0o770 } else { 0o750 }
+    }
+
+    /// Apply the configured permissions to `path` (and recursively to all
+    /// sub-directories).  Silently succeeds if the path does not exist yet —
+    /// directory creation is the installer's job, not the daemon's.
+    pub fn apply_permissions(&self) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let mode = self.dir_mode();
+        apply_dir_mode(&self.path, mode)
+    }
+}
+
+/// Recursively set the Unix permission bits on `dir` and all sub-directories.
+fn apply_dir_mode(dir: &Path, mode: u32) -> Result<()> {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to chmod {:o} on {}", mode, dir.display()))?;
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            apply_dir_mode(&entry.path(), mode)?;
+        }
+    }
+    Ok(())
+}
+
 /// Configuration for the review service and escalation dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
@@ -108,12 +193,35 @@ impl BrainrouterConfig {
 }
 
 /// Load and validate the brainrouter configuration from a YAML file.
+///
+/// `bonsai.model_path` supports one substitution token:
+///   `${models_path}` — expanded to the value of `models.path` (default `/opt/models`).
+///
+/// Example:
+/// ```yaml
+/// models:
+///   path: /mnt/nas/models
+/// bonsai:
+///   model_path: "${models_path}/bonsai/Bonsai-8B-Q4_K_M.gguf"
+/// ```
 pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    let config: BrainrouterConfig = serde_yaml::from_str(&contents)
+    let mut config: BrainrouterConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("Failed to parse YAML config: {}", path.display()))?;
+
+    // Expand ${models_path} in bonsai.model_path.
+    // This lets users write a single `models.path` and reference it everywhere
+    // without repeating the absolute prefix.
+    {
+        let models_path_str = config.models.path.to_string_lossy().into_owned();
+        let raw = config.bonsai.model_path.to_string_lossy().into_owned();
+        if raw.contains("${models_path}") {
+            let expanded = raw.replace("${models_path}", &models_path_str);
+            config.bonsai.model_path = PathBuf::from(expanded);
+        }
+    }
 
     // Validate manifest.base_url
     if config.manifest.base_url.is_empty() {
@@ -144,7 +252,7 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
         bail!("llama_swap.fallback_model must not be empty");
     }
 
-    // Validate bonsai.model_path exists
+    // Validate bonsai.model_path exists (after token expansion).
     if !config.bonsai.model_path.exists() {
         bail!(
             "Bonsai model path does not exist: {}",

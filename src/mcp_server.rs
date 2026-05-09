@@ -175,7 +175,69 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
 async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result<Value> {
     match tool {
         "request_review" => {
-            http_uds_request(socket_path, "POST", "/review/api/request", args).await
+            // Use the non-blocking async endpoint so we don't hold a 5-minute
+            // HTTP connection open on the UDS socket. Instead we:
+            //   1. POST /review/api/request-async → get session ID immediately
+            //   2. Poll GET /review/api/sessions/:id every 5s until terminal status
+            //   3. Return the same shape as the old blocking endpoint
+            //
+            // Terminal statuses: approved, needs_revision, escalated, failed.
+            // We poll for up to 30 minutes (360 × 5s) before giving up.
+            let start_resp = http_uds_request(
+                socket_path, "POST", "/review/api/request-async", args,
+            )
+            .await?;
+
+            let session_id = start_resp
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .context("request-async response missing sessionId")?
+                .to_string();
+
+            // Validate before using in a URL path.
+            if !session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("Invalid sessionId returned by daemon: {:?}", session_id);
+            }
+
+            let poll_path = format!("/review/api/sessions/{}", session_id);
+            const TERMINAL: &[&str] = &["approved", "needs_revision", "escalated", "failed"];
+            const POLL_INTERVAL_SECS: u64 = 5;
+            const MAX_POLLS: u32 = 360; // 30 minutes
+
+            for _ in 0..MAX_POLLS {
+                tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+                let detail = http_uds_request(
+                    socket_path, "GET", &poll_path, serde_json::json!({}),
+                )
+                .await?;
+
+                let status = detail
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if TERMINAL.contains(&status) {
+                    // Normalise to the shape the old blocking endpoint returned.
+                    return Ok(serde_json::json!({
+                        "status": status,
+                        "feedback": detail.get("llm_feedback").or_else(|| detail.get("human_feedback")).unwrap_or(&serde_json::Value::Null),
+                        "sessionId": session_id,
+                        "iterationCount": detail.get("iteration_count").unwrap_or(&serde_json::Value::Null),
+                        "reviewerType": detail.get("reviewer_type").unwrap_or(&serde_json::Value::Null),
+                    }));
+                }
+            }
+
+            bail!(
+                "Review timed out after {} minutes. Session {} is still in progress.                  Check /review/api/sessions/{} for status.",
+                MAX_POLLS as u64 * POLL_INTERVAL_SECS / 60,
+                session_id,
+                session_id
+            )
         }
         "get_session_list" => {
             http_uds_request(socket_path, "GET", "/review/api/sessions", json!({})).await

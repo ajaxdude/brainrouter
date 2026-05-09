@@ -30,9 +30,32 @@ llama_swap:
   #   - "your-local-model-key"
 
 bonsai:
-  # Absolute path to the Bonsai GGUF file (Q4_K_M recommended, Q6_K_L for higher accuracy)
-  # Download: huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" --local-dir ~/models/bonsai
-  model_path: "/path/to/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
+  # Absolute path to the Bonsai GGUF file.
+  # You may use ${models_path} as a shorthand for the models.path value below.
+  # Download: huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \
+  #             --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" \
+  #             --local-dir /opt/models/bonsai
+  model_path: "${models_path}/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
+
+# Shared model storage directory.
+# All fields are optional — defaults shown.
+models:
+  # Where GGUF model files live on this machine.
+  # Default: /opt/models
+  path: /opt/models
+
+  # Who may add or delete files in this directory.
+  #
+  #   false (default) — only the directory owner (e.g. root or papa) can write;
+  #                     other aistack members can read/traverse but not modify.
+  #                     Permissions: root:aistack 750
+  #
+  #   true            — all aistack group members may add and delete models.
+  #                     Permissions: root:aistack 770
+  #
+  # This setting controls what the installer writes; the brainrouter daemon
+  # itself does not modify files in this directory.
+  shared_write: false
 
 # Review loop configuration (all fields optional — defaults shown)
 # review:

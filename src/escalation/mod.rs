@@ -5,6 +5,7 @@
 //!   GET  /review/session/:id             — session detail (HTML)
 //!   POST /review/session/:id/resolve     — human submits feedback
 //!   POST /review/api/request             — MCP: start review (blocks until done)
+//!   POST /review/api/request-async       — MCP: start review, return session ID immediately
 //!   POST /review/api/resolve             — MCP: resolve session with feedback
 //!   POST /review/api/continue            — MCP: additional LLM review rounds
 //!   POST /review/api/lgtm               — MCP: quick-approve a session
@@ -69,6 +70,12 @@ pub async fn handle_review_request(
         // JSON API — MCP: start review (long-running, blocks until loop completes)
         ("POST", "/review/api/request") => {
             handle_request_review(req, review_service, cwd).await
+        }
+
+        // JSON API — MCP: start review non-blocking, return session ID immediately.
+        // The caller should poll GET /review/api/sessions/:id until terminal status.
+        ("POST", "/review/api/request-async") => {
+            handle_request_review_async(req, review_service, cwd).await
         }
 
         // JSON API — continue iterating (additional LLM rounds, no human feedback needed)
@@ -173,6 +180,65 @@ async fn handle_request_review(
         })),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// POST /review/api/request-async — Non-blocking variant of handle_request_review.
+///
+/// Creates the session and spawns the review loop in the background, then
+/// returns immediately with `{ "sessionId": "…", "status": "pending" }`.
+/// The caller must poll GET /review/api/sessions/:id until status is terminal.
+async fn handle_request_review_async(
+    req: Request<Incoming>,
+    review_service: Arc<ReviewService>,
+    cwd: String,
+) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Failed to read body: {}", e)),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ReviewRequest {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        summary: String,
+        details: Option<String>,
+        #[serde(rename = "conversationHistory", default)]
+        conversation_history: Vec<String>,
+        cwd: Option<String>,
+    }
+
+    let body: ReviewRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)),
+    };
+
+    let candidate_cwd = body.cwd.unwrap_or(cwd);
+    let mut safe_cwd = candidate_cwd;
+    if safe_cwd.len() > 4096 {
+        let boundary = (0..=4096).rev().find(|&i| safe_cwd.is_char_boundary(i)).unwrap_or(0);
+        safe_cwd.truncate(boundary);
+    }
+    let is_valid = !safe_cwd.contains('\0')
+        && !safe_cwd.is_empty()
+        && safe_cwd.starts_with('/')
+        && !std::path::Path::new(&safe_cwd).components().any(|c| matches!(c, std::path::Component::ParentDir));
+    if !is_valid {
+        safe_cwd = String::new();
+    }
+
+    let session_id = review_service.start_review_async(
+        body.task_id,
+        body.summary,
+        body.details,
+        body.conversation_history,
+        safe_cwd,
+    );
+
+    json_ok(&serde_json::json!({
+        "sessionId": session_id,
+        "status": "pending"
+    }))
 }
 
 /// POST /review/api/resolve — MCP thin client calls this to resolve a session.
