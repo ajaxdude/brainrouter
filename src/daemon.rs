@@ -186,6 +186,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
             std::fs::canonicalize(&p).unwrap_or(p)
         },
+        tcp_addr: tcp_addr.to_string(),
     });
 
     // Start bridge transports if configured
@@ -201,10 +202,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Runs in background — non-fatal if llama-swap is not yet up.
     {
         let ls_url = state.llama_swap_url.clone();
+        let own_addr = tcp_addr.to_string();
         tokio::spawn(async move {
             // Give llama-swap a moment to come up after boot.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            match server::sync_omp_models(&ls_url).await {
+            match server::sync_omp_models(&ls_url, &own_addr).await {
                 Ok(n) => tracing::info!(model_count = n, "Auto-synced OMP models.yml on startup"),
                 Err(e) => tracing::warn!(error = %e, "Failed to auto-sync OMP models.yml (llama-swap may not be ready)"),
             }

@@ -105,6 +105,9 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Path to the llama-swap config file.
     pub llama_swap_config_path: PathBuf,
+    /// TCP address this daemon is listening on (e.g. "127.0.0.1:9099").
+    /// Used to write the correct port into ~/.omp/agent/models.yml.
+    pub tcp_addr: String,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -426,7 +429,7 @@ async fn handle_request(
         }
 
         ("POST", "/api/models/sync-omp") => {
-            match sync_omp_models(&state.llama_swap_url).await {
+            match sync_omp_models(&state.llama_swap_url, &state.tcp_addr).await {
                 Ok(count) => {
                     let resp = json_response(StatusCode::OK, &serde_json::json!({
                         "synced": true,
@@ -1488,7 +1491,7 @@ async fn handle_llama_swap_models(
 /// `~/.omp/agent/models.yml`. Preserves all other provider sections.
 ///
 /// Returns the total number of models written to the brainrouter section.
-pub async fn sync_omp_models(llama_swap_url: &str) -> anyhow::Result<usize> {
+pub async fn sync_omp_models(llama_swap_url: &str, tcp_addr: &str) -> anyhow::Result<usize> {
     let home = home_dir();
     // Refuse to write to /root — brainrouter is a user-facing daemon and
     // should not modify root's home directory.
@@ -1515,13 +1518,14 @@ pub async fn sync_omp_models(llama_swap_url: &str) -> anyhow::Result<usize> {
         .unwrap_or_default();
 
     // All filesystem + YAML work runs off the async executor.
-    tokio::task::spawn_blocking(move || write_omp_models_yml(&home, &model_ids))
+    let tcp_addr_owned = tcp_addr.to_string();
+    tokio::task::spawn_blocking(move || write_omp_models_yml(&home, &model_ids, &tcp_addr_owned))
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {}", e))?
 }
 
 /// Blocking: read models.yml, merge brainrouter models, write atomically.
-fn write_omp_models_yml(home: &str, model_ids: &[String]) -> anyhow::Result<usize> {
+fn write_omp_models_yml(home: &str, model_ids: &[String], tcp_addr: &str) -> anyhow::Result<usize> {
     let models_path = format!("{}/.omp/agent/models.yml", home);
     let path = std::path::Path::new(&models_path);
 
@@ -1565,7 +1569,7 @@ fn write_omp_models_yml(home: &str, model_ids: &[String]) -> anyhow::Result<usiz
 
     // Build the brainrouter provider entry.
     let mut br_provider = serde_yaml::Mapping::new();
-    br_provider.insert(ykey("baseUrl"), yval("http://127.0.0.1:9099/v1"));
+    br_provider.insert(ykey("baseUrl"), yval(&format!("http://{}/v1", tcp_addr)));
     br_provider.insert(ykey("api"), yval("openai-completions"));
     br_provider.insert(ykey("auth"), yval("none"));
     br_provider.insert(ykey("models"), serde_yaml::Value::Sequence(models));
@@ -1796,7 +1800,7 @@ mod tests {
         // Sync with some fake model IDs
         let result = write_omp_models_yml(tmp.to_str().unwrap(), &[
             "auto".to_string(), "local".to_string(), "my-model-27b".to_string(),
-        ]);
+        ], "127.0.0.1:9099");
         assert!(result.is_ok());
         let count = result.unwrap();
         assert_eq!(count, 4); // auto + local + cloud + my-model-27b
@@ -1806,6 +1810,7 @@ mod tests {
         assert!(content.contains("manifest"), "manifest provider should be preserved");
         assert!(content.contains("brainrouter"), "brainrouter provider should exist");
         assert!(content.contains("my-model-27b"), "synced model should be present");
+        assert!(content.contains("http://127.0.0.1:9099/v1"), "brainrouter baseUrl must use the daemon's tcp_addr");
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);

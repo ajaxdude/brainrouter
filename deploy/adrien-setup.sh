@@ -116,6 +116,14 @@ if ! run_as /usr/local/bin/bun pm ls -g 2>/dev/null | grep -q '@oh-my-pi/pi-codi
 else
     skip "oh-my-pi already installed for $TARGET"
 fi
+# Always chown ~/.bun/ to ensure ownership is correct even if a prior root-run
+# corrupted it (bun writes dirs as the calling user, but sudo sometimes creates
+# intermediate dirs as root, leaving pi_natives .node files unreadable/unwritable
+# by adrien → errno EACCES when OMP tries to extract or load the native module).
+if [[ -d "$TARGET_HOME/.bun" ]]; then
+    chown -R $TARGET:$TARGET_GID "$TARGET_HOME/.bun"
+    ok ".bun ownership fixed for $TARGET"
+fi
 
 # ── 7. toolbox container ──────────────────────────────────────────────────────
 log "7. toolbox container (llama-vulkan-radv)"

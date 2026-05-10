@@ -153,6 +153,15 @@ else
     skip "aistack group does not exist yet (created by install.sh when models: is configured)"
 fi
 
+# ── Fix .bun ownership ────────────────────────────────────────────────────────
+log "Fix .bun ownership (prevent errno -13 on OMP launch)"
+if [[ -d "$TARGET_HOME/.bun" ]]; then
+    chown -R $TARGET:$TARGET_GID "$TARGET_HOME/.bun"
+    ok ".bun ownership corrected for $TARGET"
+else
+    warn ".bun directory not found at $TARGET_HOME/.bun — is oh-my-pi installed?"
+fi
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 log "Verify"
 sleep 3

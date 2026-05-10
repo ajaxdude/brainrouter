@@ -72,6 +72,12 @@ else
     sudo -u adrien HOME=/home/adrien /usr/local/bin/bun install -g @oh-my-pi/pi-coding-agent 2>&1 | tail -5
     ok "oh-my-pi installed for adrien"
 fi
+# Fix .bun ownership — a prior root-invoked bun may have created files owned by root,
+# causing pi_natives to fail with EACCES (errno -13) when OMP loads its native module.
+if [[ -d /home/adrien/.bun ]]; then
+    chown -R adrien:adrien /home/adrien/.bun
+    ok ".bun ownership corrected for adrien"
+fi
 
 # ── 4. Full adrien brainrouter setup ─────────────────────────────────────────
 
