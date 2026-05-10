@@ -187,6 +187,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             std::fs::canonicalize(&p).unwrap_or(p)
         },
         tcp_addr: tcp_addr.to_string(),
+        routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
     });
 
     // Start bridge transports if configured

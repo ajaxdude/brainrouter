@@ -61,6 +61,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use tracing::{debug, error, info, warn};
 use std::sync::LazyLock;
 
@@ -108,6 +109,9 @@ pub struct AppState {
     /// TCP address this daemon is listening on (e.g. "127.0.0.1:9099").
     /// Used to write the correct port into ~/.omp/agent/models.yml.
     pub tcp_addr: String,
+    /// Global routing override: 0=auto (Bonsai), 1=force_cloud, 2=force_local.
+    /// Written by POST /api/routing-mode, read before every chat completion.
+    pub routing_mode: Arc<AtomicU8>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -179,7 +183,11 @@ async fn handle_request(
     // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
     let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
     let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
-        || (method == "POST" && (path == "/api/config" || path == "/api/llama-swap-config" || path == "/api/open-editor" || path == "/api/models/sync-omp"));
+        || (method == "POST" && (
+            path == "/api/config" || path == "/api/llama-swap-config"
+            || path == "/api/open-editor" || path == "/api/models/sync-omp"
+            || path == "/api/routing-mode" || path == "/api/review-config"
+        ));
 
     if is_destructive {
         if !is_local {
@@ -455,6 +463,27 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── Routing mode override API ─────────────────────────────────────────
+        ("GET", "/api/routing-mode") => {
+            let mode = match state.routing_mode.load(AtomicOrdering::Relaxed) {
+                1 => "cloud",
+                2 => "local",
+                _ => "auto",
+            };
+            let resp = json_response(StatusCode::OK, &serde_json::json!({ "mode": mode }));
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/routing-mode") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let mode_str = val.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+            let code: u8 = match mode_str { "cloud" => 1, "local" => 2, _ => 0 };
+            state.routing_mode.store(code, AtomicOrdering::Relaxed);
+            let resp = json_response(StatusCode::OK, &serde_json::json!({ "mode": mode_str }));
+            into_unsync(resp)
+        }
+
  // __ Config API _______________________________________________________
         ("GET", "/api/config") => {
             match std::fs::read_to_string(&state.config_path) {
@@ -663,7 +692,18 @@ async fn handle_chat_completion(
     cwd: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
-    let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    // Apply global routing override from dashboard — only when the harness
+    // sends model="auto" (i.e. no explicit model preference). Specific model
+    // selections like "brainrouter/qwen-coder" or "cloud" are always honoured.
+    let is_auto = matches!(request.model.as_str(), "auto" | "" | "brainrouter/auto");
+    if is_auto {
+        match state.routing_mode.load(AtomicOrdering::Relaxed) {
+            1 => request.model = "cloud".to_string(),
+            2 => request.model = "local".to_string(),
+            _ => {}
+        }
+    }
     let provider_response = state.router.route_tagged(request, None, cwd).await?.0;
 
     match provider_response {
@@ -694,7 +734,16 @@ async fn handle_anthropic_messages(
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
     let model = anthropic_req.model.clone();
-    let oai_request = anthropic_to_openai(anthropic_req);
+    let mut oai_request = anthropic_to_openai(anthropic_req);
+    // Apply global routing override — only for auto-routing requests.
+    let is_auto = matches!(oai_request.model.as_str(), "auto" | "" | "brainrouter/auto");
+    if is_auto {
+        match state.routing_mode.load(AtomicOrdering::Relaxed) {
+            1 => oai_request.model = "cloud".to_string(),
+            2 => oai_request.model = "local".to_string(),
+            _ => {}
+        }
+    }
     let provider_response = state.router.route_tagged(oai_request, None, cwd).await?.0;
 
     match provider_response {
