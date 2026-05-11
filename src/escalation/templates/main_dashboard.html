@@ -559,36 +559,47 @@ function miniFlowHtml(t) {
 function reviewHtml(sess, eventId) {
   if (!sess) return '';
   const st = sess.status;
+  // Don't render review block until the review has actually run.
   if (st === 'pending') return '';
 
-  const feedbackBg = st === 'escalated' ? 'var(--redDim)' : 'var(--amberDim)';
-  const feedbackBorder = st === 'escalated' ? 'var(--red)' : 'var(--amber)';
-  const reviewSt = st === 'needs_revision' ? 'reviewing' : st;
+  // Parse reviewer name from review_model: "cloud-direct → manifest (claude-opus-4-6)"
+  // We want the part in parens if present, otherwise the whole string.
+  const rawModel = sess.review_model || '';
+  const parenMatch = rawModel.match(/\(([^)]+)\)$/);
+  const reviewerName = parenMatch ? parenMatch[1] : rawModel;
 
-  const iterText = sess.iteration_count != null ? `iter ${sess.iteration_count}/5` : '';
-  const byText = sess.review_model ? `by ${sess.review_model}` : '';
-  const metaParts = [iterText, byText].filter(Boolean).join(' · ');
+  const iters = sess.iteration_count != null ? sess.iteration_count : 0;
+  const iterLabel = iters === 0 ? '1 pass' : `${iters + 1} passes`;
 
-  const feedback = sess.llm_feedback || sess.summary || '';
+  // Status-dependent colours.
+  const isApproved  = st === 'approved';
+  const isEscalated = st === 'escalated';
+  const accentColor  = isApproved ? 'var(--green)' : isEscalated ? 'var(--red)' : 'var(--amber)';
+  const accentBg     = isApproved ? 'var(--greenDim)' : isEscalated ? 'var(--redDim)' : 'var(--amberDim)';
+
+  // Feedback text: prefer llm_feedback (the actual review prose) over summary.
+  const feedback = sess.llm_feedback || '';
+  const summaryText = sess.summary || '';
 
   let actionHtml = '';
-  if (st === 'escalated') {
-    actionHtml = `<div style="margin-left:36px;margin-top:10px;display:flex;gap:6px">
+  if (isEscalated) {
+    actionHtml = `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
       <button class="br-btn" style="background:var(--redDim);color:var(--red);border-color:rgba(255,107,107,0.35)" onclick="sendFeedback('${sess.id}')">Send Feedback</button>
       <button class="br-btn" style="background:var(--amberDim);color:var(--amber);border-color:rgba(245,177,74,0.35)" onclick="continueReview('${sess.id}')">Continue iterating</button>
       <button class="br-btn" style="background:var(--greenDim);color:var(--green);border-color:rgba(34,211,154,0.35)" onclick="lgtmReview('${sess.id}')">LGTM</button>
     </div>`;
   }
 
-  return `<div style="border-top:1px solid var(--border);background:var(--bg2);padding:12px 16px 14px;position:relative">
-    <div style="position:absolute;left:30px;top:-1px;width:24px;height:14px;border-left:1px dashed var(--borderHi);border-bottom:1px dashed var(--borderHi);border-bottom-left-radius:6px"></div>
-    <div style="display:flex;align-items:center;gap:10px;margin-left:36px;flex-wrap:wrap">
-      <span style="font-size:10px;color:var(--textMute);font-family:'JetBrains Mono',monospace;letter-spacing:1px">↳ REVIEW</span>
-      ${statusPill(reviewSt)}
-      ${metaParts ? `<span style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace">${metaParts}</span>` : ''}
-      ${st === 'escalated' ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace">HUMAN NEEDED</span>` : ''}
+  return `<div style="border-top:1px solid var(--border);background:var(--bg2);padding:10px 16px 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+      <span style="font-size:10px;letter-spacing:1px;color:${accentColor};font-family:'JetBrains Mono',monospace;font-weight:600">↳ REVIEW</span>
+      ${statusPill(isApproved ? 'approved' : st === 'needs_revision' ? 'reviewing' : st)}
+      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${escHtml(reviewerName)}</span>
+      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">· ${iterLabel}</span>
+      ${isEscalated ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace;font-weight:600">HUMAN NEEDED</span>` : ''}
     </div>
-    ${feedback ? `<div style="margin-left:36px;margin-top:8px;padding:10px;background:${feedbackBg};border-left:2px solid ${feedbackBorder};border-radius:4px;font-size:12px;color:var(--text);line-height:1.5">${escHtml(feedback)}</div>` : ''}
+    ${summaryText ? `<div style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-bottom:6px;padding:6px 8px;background:var(--bg3);border-radius:4px;line-height:1.4"><strong style="color:var(--textDim)">Task:</strong> ${escHtml(summaryText.slice(0, 180))}${summaryText.length > 180 ? '…' : ''}</div>` : ''}
+    ${feedback ? `<div style="font-size:12px;color:var(--text);line-height:1.55;padding:8px 10px;background:${accentBg};border-left:2px solid ${accentColor};border-radius:4px;white-space:pre-wrap;word-break:break-word">${escHtml(feedback)}</div>` : ''}
     ${actionHtml}
   </div>`;
 }
@@ -635,28 +646,28 @@ function groupEvents(events) {
   return groups.sort((a,b) => new Date(b.latestTs) - new Date(a.latestTs));
 }
 
-// Progress: 0% = prompt just sent, 100% = sent for review / completed.
+// Progress: simple and honest.
+// success=true means inference finished → 100% unless actively in review.
+// review status layered on top for review-tracked requests.
 function requestProgress(group, inf) {
   const sess = group.session;
-  // If we have a review session: map status to progress.
   if (sess) {
-    if (sess.status === 'approved') return 100;
-    if (sess.status === 'needs_revision') return 90;
-    if (sess.status === 'escalated') return 85;
-    if (sess.status === 'pending') return 75; // sent for review, awaiting verdict
+    if (sess.status === 'approved')       return 100;
+    if (sess.status === 'needs_revision') return 60;  // sent back for work
+    if (sess.status === 'escalated')      return 60;
+    if (sess.status === 'pending')        return 90;  // inference done, review in flight
   }
-  // Base progress from the latest event.
   const last = group.events[group.events.length - 1];
   if (!last) return 0;
-  if (last.success) return sess ? 80 : 70; // completed but no review
-  if (last.error) return 5; // failed early
-  // Infer from inference tracker if this looks like the active request.
-  if (inf && inf.state !== 'idle' && inf.state !== 'loading') {
-    const phasePct = { classifying: 10, cloud_waiting: 25, cloud_streaming: 60,
-                       local_waiting: 25, local_streaming: 60, ready: 70 };
-    return phasePct[inf.state] || 15;
+  if (last.success) return 100;   // inference complete, no review step → done
+  if (last.error)   return 0;
+  // Still inferring — use live tracker state if this is the active request.
+  if (inf && !['idle','loading'].includes(inf.state)) {
+    const phasePct = { classifying: 10, cloud_waiting: 20, cloud_streaming: 55,
+                       local_waiting: 20, local_streaming: 55, ready: 85 };
+    return phasePct[inf.state] || 10;
   }
-  return 5; // just sent
+  return 5;
 }
 
 function progressBar(pct, isLive) {
@@ -695,47 +706,36 @@ function renderGroup(group) {
     ? `<div style="margin-top:8px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(latest.error)}</div>`
     : '';
 
-  // Sub-cards: routing hops, shown only when live or there were retries/fallbacks.
-  const showHops = isLive || evs.length > 1;
-  const hopsHtml = showHops ? evs.map((e, i) => {
-    const rc = (e._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
-    const icon = e.success ? '✓' : (i === evs.length - 1 && isLive ? '…' : '✗');
-    const iconColor = e.success ? 'var(--green)' : (i === evs.length - 1 && isLive ? 'var(--amber)' : 'var(--red)');
-    return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim)">
-      <span style="color:${iconColor};width:12px;text-align:center;flex-shrink:0">${icon}</span>
-      <span style="color:${rc}">${escHtml(e._route || '—')}</span>
-      <span style="color:var(--textMute)">→</span>
-      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(e._displayModel || '—')}</span>
-      <span style="margin-left:auto;color:var(--textMute);flex-shrink:0">${fmtLatency(e.latency_ms)}</span>
-    </div>`;
-  }).join('') : '';
+  // Hops summary — one compact line, never expanded rows.
+  const hopCount = evs.length;
+  let hopSummary = '';
+  if (hopCount > 1) {
+    const routes = [...new Set(evs.map(e => (e._route || '').includes('cloud') ? 'cloud' : 'local'))];
+    hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${routes.join(' → ')} · ${lat}</div>`;
+  }
 
   return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
     ${isLive ? '<div class="shimmer-bar"></div>' : ''}
-    <header style="padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
-      <div style="width:28px;height:28px;border-radius:8px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:13px;flex-shrink:0">${src.glyph}</div>
+    <header style="padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
+      <div style="width:24px;height:24px;border-radius:6px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${src.glyph}</div>
       <div style="flex:1;min-width:0">
-        <div style="font-size:12px;color:var(--text)">
-          <span style="color:${src.color};font-weight:600">${src.label}</span>
-          ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
-        </div>
-        <div style="font-size:10px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-top:1px">${age}${evs.length > 1 ? ' · ' + evs.length + ' hops' : ''}</div>
+        <span style="color:${src.color};font-weight:600;font-size:12px">${src.label}</span>
+        ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
       </div>
       ${statusPill(st)}
     </header>
     ${progressBar(pct, isLive)}
-    <div style="padding:12px 16px;display:grid;grid-template-columns:1fr 180px;gap:12px">
-      <div>
-        <div style="font-size:13px;color:var(--text);line-height:1.55">${prompt}</div>
-        ${errHtml}
-        ${showHops ? `<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px">${hopsHtml}</div>` : ''}
-      </div>
-      <div style="display:flex;flex-direction:column;gap:6px;padding:10px;background:var(--bg2);border-radius:6px;font-size:11px;font-family:'JetBrains Mono',monospace">
-        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">route</span><span style="color:${routeColor};text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(displayEv._route || '—')}</span></div>
-        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">model</span><span style="color:${routeColor};text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(displayEv._displayModel)}</span></div>
-        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">latency</span><span style="color:${latColor}">${lat}</span></div>
-        <div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--textMute)">progress</span><span style="color:var(--green)">${pct}%</span></div>
-      </div>
+    <div style="padding:10px 16px 4px">
+      <div style="font-size:13px;color:var(--text);line-height:1.5">${prompt}</div>
+      ${errHtml}
+      ${hopSummary}
+    </div>
+    <div style="padding:4px 16px 10px;display:flex;gap:8px;align-items:center;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">
+      <span style="color:${routeColor}">${escHtml(displayEv._route || '—')}</span>
+      <span>·</span>
+      <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
+      ${hopCount === 1 ? `<span style="opacity:0.6">· ${lat}</span>` : ''}
+      <span style="margin-left:auto;opacity:0.6">${age}</span>
     </div>
     ${reviewHtml(sess, latest.id)}
   </article>`;
