@@ -134,7 +134,32 @@ textarea { resize: vertical; }
 <nav id="sidebar" style="width:224px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;font-size:13px;color:var(--text);flex-shrink:0;overflow:hidden">
   <!-- Logo -->
   <div style="padding:20px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10">
-    <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:var(--bg);flex-shrink:0">br</div>
+    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 240 240" style="flex-shrink:0;border-radius:6px">
+      <defs>
+        <radialGradient id="dash-bg" cx="50%" cy="35%" r="80%"><stop offset="0%" stop-color="#1b2a44"/><stop offset="100%" stop-color="#070b15"/></radialGradient>
+        <radialGradient id="dash-fill" cx="50%" cy="38%" r="70%"><stop offset="0%" stop-color="#ffd8dd"/><stop offset="55%" stop-color="#f5a3ad"/><stop offset="100%" stop-color="#c9727d"/></radialGradient>
+        <radialGradient id="dash-shadow" cx="50%" cy="45%" r="55%"><stop offset="0%" stop-color="#a8525d" stop-opacity=".55"/><stop offset="100%" stop-color="#a8525d" stop-opacity="0"/></radialGradient>
+        <radialGradient id="dash-sheen" cx="30%" cy="20%" r="35%"><stop offset="0%" stop-color="#fff" stop-opacity=".7"/><stop offset="100%" stop-color="#fff" stop-opacity="0"/></radialGradient>
+        <clipPath id="dash-body"><path d="M120 28C162 28 196 54 200 94 214 100 214 122 200 128 206 156 184 180 156 184 150 198 132 204 120 200 108 204 90 198 84 184 56 180 34 156 40 128 26 122 26 100 40 94 44 54 78 28 120 28Z"/></clipPath>
+        <clipPath id="dash-circle"><circle cx="120" cy="120" r="116"/></clipPath>
+      </defs>
+      <circle cx="120" cy="120" r="118" fill="url(#dash-bg)"/>
+      <circle cx="120" cy="120" r="114" fill="none" stroke="#388BFD" stroke-width="3" opacity=".9"/>
+      <g clip-path="url(#dash-circle)" transform="translate(120 120) scale(.92) translate(-120 -124)">
+        <path d="M120 28C162 28 196 54 200 94 214 100 214 122 200 128 206 156 184 180 156 184 150 198 132 204 120 200 108 204 90 198 84 184 56 180 34 156 40 128 26 122 26 100 40 94 44 54 78 28 120 28Z" fill="url(#dash-fill)" stroke="#7a2f3a" stroke-width="2.5"/>
+        <path d="M120 28C162 28 196 54 200 94 214 100 214 122 200 128 206 156 184 180 156 184 150 198 132 204 120 200 108 204 90 198 84 184 56 180 34 156 40 128 26 122 26 100 40 94 44 54 78 28 120 28Z" fill="url(#dash-sheen)"/>
+        <g clip-path="url(#dash-body)" stroke="#7a2f3a" stroke-width="2" fill="none" stroke-linecap="round">
+          <path d="M120 30C118 60 122 86 120 110M90 50C78 64 76 82 86 96M60 78C54 92 56 108 68 118M74 104C66 116 66 130 78 140M96 78C92 92 98 104 108 108M150 50C162 64 164 82 154 96M180 78C186 92 184 108 172 118M166 104C174 116 174 130 162 140M144 78C148 92 142 104 132 108M100 140C108 146 116 146 122 142M140 140C132 146 126 146 122 142"/>
+        </g>
+        <ellipse cx="120" cy="150" rx="44" ry="22" fill="url(#dash-shadow)"/>
+        <g fill="#2a1418"><path d="M92 134C104 128 116 134 118 144 112 140 102 140 94 142Z"/><path d="M148 134C136 128 124 134 122 144 128 140 138 140 146 142Z"/></g>
+        <ellipse cx="106" cy="152" rx="7.5" ry="5.5" fill="#fff6f0"/><circle cx="107.5" cy="153" r="3.2" fill="#2a1418"/><circle cx="108.3" cy="152.2" r="1" fill="#fff"/>
+        <ellipse cx="134" cy="152" rx="7.5" ry="5.5" fill="#fff6f0"/><circle cx="132.5" cy="153" r="3.2" fill="#2a1418"/><circle cx="133.3" cy="152.2" r="1" fill="#fff"/>
+        <g fill="none" stroke="#3a1218" stroke-width="2.5" stroke-linecap="round"><path d="M108 172C114 168 126 168 132 172"/><path d="M116 171L116 175" stroke-width="1.8"/><path d="M124 171L124 175" stroke-width="1.8"/></g>
+        <ellipse cx="94" cy="166" rx="6" ry="3" fill="#ef7f8c" opacity=".55"/>
+        <ellipse cx="146" cy="166" rx="6" ry="3" fill="#ef7f8c" opacity=".55"/>
+      </g>
+    </svg>
     <div>
       <div style="font-weight:600;letter-spacing:0.2px">brainrouter</div>
       <div style="font-size:10px;color:var(--textMute);font-family:'JetBrains Mono',monospace" id="ver-brainrouter">v—</div>
@@ -199,15 +224,23 @@ textarea { resize: vertical; }
   <!-- Bridges -->
   <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Bridges</div>
   <div style="padding:0 12px;display:flex;flex-direction:column;gap:4px">
-    <div id="bridge-discord-row" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;border-radius:6px">
+    <div id="bridge-discord-row" style="display:none;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px">
       <span id="dot-discord" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
       <span style="color:var(--textDim);flex:1">discord</span>
-      <span id="bridge-discord-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+      <span id="bridge-discord-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px"></span>
+      <button id="toggle-discord" onclick="toggleBridge('discord')" title="Enable / disable Discord bridge"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-discord-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
     </div>
-    <div id="bridge-signal-row" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;border-radius:6px">
+    <div id="bridge-signal-row" style="display:none;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px">
       <span id="dot-signal" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
       <span style="color:var(--textDim);flex:1">signal</span>
-      <span id="bridge-signal-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+      <span id="bridge-signal-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px"></span>
+      <button id="toggle-signal" onclick="toggleBridge('signal')" title="Enable / disable Signal bridge"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-signal-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
     </div>
   </div>
 
@@ -982,6 +1015,45 @@ function updateVersions() {
   }
 }
 
+function applyBridgeToggle(name, enabled) {
+  const btn = document.getElementById('toggle-' + name);
+  const thumb = document.getElementById('toggle-' + name + '-thumb');
+  if (!btn || !thumb) return;
+  if (enabled) {
+    btn.style.background = 'var(--green)';
+    thumb.style.left = '14px';
+  } else {
+    btn.style.background = 'var(--textMute)';
+    thumb.style.left = '2px';
+  }
+}
+
+async function toggleBridge(name) {
+  const btn = document.getElementById('toggle-' + name);
+  if (!btn) return;
+  // Derive new state from current visual (thumb position is source of truth during optimistic update).
+  const thumb = document.getElementById('toggle-' + name + '-thumb');
+  const currentlyEnabled = thumb && thumb.style.left === '14px';
+  const newEnabled = !currentlyEnabled;
+  // Optimistic UI update.
+  applyBridgeToggle(name, newEnabled);
+  try {
+    const r = await fetch('/api/bridges/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bridge: name, enabled: newEnabled }),
+    });
+    if (!r.ok) {
+      // Revert on failure.
+      applyBridgeToggle(name, currentlyEnabled);
+      console.warn('Bridge toggle failed', await r.text());
+    }
+  } catch (e) {
+    applyBridgeToggle(name, currentlyEnabled);
+    console.warn('Bridge toggle error', e);
+  }
+}
+
 function updateBridges() {
   const b = bridgeData;
   if (!b) return;
@@ -990,13 +1062,13 @@ function updateBridges() {
   const discRow = document.getElementById('bridge-discord-row');
   if (disc) {
     updateDot('discord', disc.connected);
+    applyBridgeToggle('discord', disc.enabled !== false);
     const meta = document.getElementById('bridge-discord-meta');
     if (meta) {
-      const msgs = disc.messages_handled != null ? disc.messages_handled + ' msg' : '—';
-      const uptime = disc.uptime_secs != null ? fmtUptime(disc.uptime_secs) : '';
-      const err = disc.last_error ? ' ⚠' : '';
-      meta.textContent = [msgs, uptime].filter(Boolean).join(' · ') + err;
-      if (disc.last_error) meta.title = disc.last_error;
+      const msgs = disc.messages_handled > 0 ? disc.messages_handled + ' msg' : '';
+      const err = disc.last_error ? '⚠' : '';
+      meta.textContent = [msgs, err].filter(Boolean).join(' ');
+      meta.title = disc.last_error || '';
     }
     if (discRow) discRow.style.display = 'flex';
   } else {
@@ -1007,13 +1079,13 @@ function updateBridges() {
   const sigRow = document.getElementById('bridge-signal-row');
   if (sig) {
     updateDot('signal', sig.connected);
+    applyBridgeToggle('signal', sig.enabled !== false);
     const meta = document.getElementById('bridge-signal-meta');
     if (meta) {
-      const msgs = sig.messages_handled != null ? sig.messages_handled + ' msg' : '—';
-      const uptime = sig.uptime_secs != null ? fmtUptime(sig.uptime_secs) : '';
-      const err = sig.last_error ? ' ⚠' : '';
-      meta.textContent = [msgs, uptime].filter(Boolean).join(' · ') + err;
-      if (sig.last_error) meta.title = sig.last_error;
+      const msgs = sig.messages_handled > 0 ? sig.messages_handled + ' msg' : '';
+      const err = sig.last_error ? '⚠' : '';
+      meta.textContent = [msgs, err].filter(Boolean).join(' ');
+      meta.title = sig.last_error || '';
     }
     if (sigRow) sigRow.style.display = 'flex';
   } else {

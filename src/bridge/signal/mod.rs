@@ -591,24 +591,28 @@ impl SignalService {
             loop {
                 match receive_messages(&account).await {
                     Ok(msgs) => {
-                        for (reply_to, content, is_group) in msgs {
-                            handle_message(
-                                &reply_to,
-                                &content,
-                                is_group,
-                                sessions.clone(),
-                                channel_models.clone(),
-                                &account,
-                                &prefix,
-                                &llama_swap_url,
-                                &omp_path,
-                                &work_dir,
-                                timeout_secs,
-                                &default_model,
-                                &model_aliases,
-                                &manager,
-                            )
-                            .await;
+                        if manager.signal_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            for (reply_to, content, is_group) in msgs {
+                                handle_message(
+                                    &reply_to,
+                                    &content,
+                                    is_group,
+                                    sessions.clone(),
+                                    channel_models.clone(),
+                                    &account,
+                                    &prefix,
+                                    &llama_swap_url,
+                                    &omp_path,
+                                    &work_dir,
+                                    timeout_secs,
+                                    &default_model,
+                                    &model_aliases,
+                                    &manager,
+                                )
+                                .await;
+                            }
+                        } else {
+                            tracing::debug!("Signal bridge paused (disabled via dashboard); skipping {} message(s)", msgs.len());
                         }
                     }
                     Err(e) => warn!("Signal receive error: {e}"),

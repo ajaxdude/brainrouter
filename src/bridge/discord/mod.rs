@@ -142,6 +142,7 @@ struct DiscordHandler {
     model_aliases: HashMap<String, String>,
     omp_root: PathBuf,
     work_dirs: WorkdirMap,
+    manager: std::sync::Arc<super::BridgeManager>,
 }
 
 type SessionMap = Arc<Mutex<HashMap<String, String>>>;
@@ -168,6 +169,11 @@ impl EventHandler for DiscordHandler {
             "Discord message event"
         );
         if msg.author.bot {
+            return;
+        }
+        // Skip dispatch when disabled via the dashboard toggle.
+        if !self.manager.discord_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("Discord bridge paused (disabled via dashboard); ignoring message");
             return;
         }
 
@@ -839,6 +845,7 @@ pub async fn start(
     aliases_config: &str,
     timeout_secs: u64,
     default_model: &str,
+    manager: std::sync::Arc<super::BridgeManager>,
 ) -> anyhow::Result<()> {
     let token = discord_config
         .token
@@ -882,6 +889,7 @@ pub async fn start(
         model_aliases,
         omp_root,
         work_dirs,
+        manager,
     };
 
     let mut client = ClientBuilder::new(

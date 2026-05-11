@@ -82,6 +82,7 @@ pub use signal::SignalConfig;
 /// Status snapshot for a single transport.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportStatus {
+    pub enabled: bool,
     pub connected: bool,
     pub uptime_secs: u64,
     pub messages_handled: u64,
@@ -109,6 +110,10 @@ pub struct BridgeManager {
     signal_connected: std::sync::atomic::AtomicBool,
     discord_last_error: std::sync::Mutex<Option<String>>,
     signal_last_error: std::sync::Mutex<Option<String>>,
+    /// Dashboard-controlled pause flag. When false the transport skips dispatch.
+    pub discord_enabled: std::sync::atomic::AtomicBool,
+    /// Dashboard-controlled pause flag. When false the transport skips dispatch.
+    pub signal_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl BridgeManager {
@@ -121,6 +126,8 @@ impl BridgeManager {
             signal_connected: std::sync::atomic::AtomicBool::new(false),
             discord_last_error: std::sync::Mutex::new(None),
             signal_last_error: std::sync::Mutex::new(None),
+            discord_enabled: std::sync::atomic::AtomicBool::new(true),
+            signal_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -154,12 +161,14 @@ impl BridgeManager {
         let uptime = self.start_time.elapsed().as_secs();
 
         let discord = {
+            let enabled = self.discord_enabled.load(Ordering::Relaxed);
             let connected = self.discord_connected.load(Ordering::Relaxed);
             let messages = self.discord_messages.load(Ordering::Relaxed);
             let last_error = self.discord_last_error.lock().unwrap().clone();
-            // Only report discord status if it was ever active.
-            if connected || messages > 0 || last_error.is_some() {
+            // Report if ever active OR if the enabled flag has been toggled.
+            if connected || messages > 0 || last_error.is_some() || !enabled {
                 Some(TransportStatus {
+                    enabled,
                     connected,
                     uptime_secs: uptime,
                     messages_handled: messages,
@@ -171,11 +180,13 @@ impl BridgeManager {
         };
 
         let signal = {
+            let enabled = self.signal_enabled.load(Ordering::Relaxed);
             let connected = self.signal_connected.load(Ordering::Relaxed);
             let messages = self.signal_messages.load(Ordering::Relaxed);
             let last_error = self.signal_last_error.lock().unwrap().clone();
-            if connected || messages > 0 || last_error.is_some() {
+            if connected || messages > 0 || last_error.is_some() || !enabled {
                 Some(TransportStatus {
+                    enabled,
                     connected,
                     uptime_secs: uptime,
                     messages_handled: messages,
@@ -234,7 +245,7 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
                 tokio::spawn(async move {
                     info!("starting Discord bridge transport");
                     mgr.set_discord_connected(true);
-                    if let Err(e) = discord::start(&dcfg, &omp_path, &work_dir, &aliases, timeout, &default_model).await {
+                    if let Err(e) = discord::start(&dcfg, &omp_path, &work_dir, &aliases, timeout, &default_model, Arc::clone(&mgr)).await {
                         mgr.set_discord_connected(false);
                         mgr.set_discord_error(e.to_string());
                         warn!("Discord bridge exited with error: {e}");

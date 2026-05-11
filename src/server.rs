@@ -187,6 +187,7 @@ async fn handle_request(
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
             || path == "/api/routing-mode" || path == "/api/review-config"
+            || path == "/api/bridges/toggle"
         ));
 
     if is_destructive {
@@ -460,6 +461,32 @@ async fn handle_request(
         ("GET", "/api/bridge-status") => {
             let status = state.bridge_manager.status();
             let resp = json_response(StatusCode::OK, &status);
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/bridges/toggle") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let bridge = val.get("bridge").and_then(|v| v.as_str()).unwrap_or("");
+            let enabled = val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            match bridge {
+                "discord" => {
+                    state.bridge_manager.discord_enabled
+                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                }
+                "signal" => {
+                    state.bridge_manager.signal_enabled
+                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    let resp = json_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorResponse { error: format!("Unknown bridge: {bridge}") },
+                    );
+                    return Ok(into_unsync(resp));
+                }
+            }
+            let resp = json_response(StatusCode::OK, &serde_json::json!({ "ok": true, "bridge": bridge, "enabled": enabled }));
             into_unsync(resp)
         }
 
