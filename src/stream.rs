@@ -87,33 +87,52 @@ where
     }
 }
 
-/// A stream that applies a per-chunk timeout.
-/// If no item arrives within `duration`, the stream yields a "stalled" error.
+/// A stream that applies two separate timeouts:
 ///
-/// The sleep deadline is deferred until the first `Pending` poll, so the
-/// timeout counts from the first actual wait — not from construction.
+/// * **`first_chunk_timeout`** — how long we wait for the *very first* SSE byte.
+///   Long prompts spend minutes in prefill before emitting anything; this must be
+///   large enough to survive that phase (e.g. 600 s for a 37k-token prompt at
+///   ~85 tok/s prefill).
+/// * **`stall_timeout`** — how long we tolerate silence *between* chunks once
+///   generation has started.  180 s is generous but still catches genuinely hung
+///   connections.
+///
+/// The sleep deadline is deferred until the first `Pending` poll, so neither
+/// timer burns wall-clock time during construction or while the inner stream is
+/// immediately ready.
 #[pin_project]
 pub struct TimeoutStream<S: Stream> {
     #[pin]
     stream: S,
     #[pin]
     sleep: Sleep,
-    duration: Duration,
+    /// Timeout applied between chunks *after* the first one has arrived.
+    stall_timeout: Duration,
+    /// Timeout applied waiting for the *first* chunk (covers prefill on long prompts).
+    first_chunk_timeout: Duration,
     timed_out: bool,
+    /// `false` until the first `Pending` poll; we arm the sleep lazily.
     started: bool,
+    /// `true` once the inner stream has yielded at least one item.
+    first_chunk_received: bool,
 }
 
 impl<S: Stream> TimeoutStream<S>
 where
     S: Stream<Item = Result<Bytes>>,
 {
-    pub fn new(stream: S, duration: Duration) -> Self {
+    /// Create a `TimeoutStream` with separate first-chunk and inter-chunk timeouts.
+    pub fn new(stream: S, first_chunk_timeout: Duration, stall_timeout: Duration) -> Self {
+        // Prime the sleep with the first-chunk timeout; it will be lazily armed on
+        // the first `Pending` poll.
         Self {
             stream,
-            sleep: sleep(duration),
-            duration,
+            sleep: sleep(first_chunk_timeout),
+            stall_timeout,
+            first_chunk_timeout,
             timed_out: false,
             started: false,
+            first_chunk_received: false,
         }
     }
 }
@@ -131,35 +150,44 @@ where
             return Poll::Ready(None);
         }
 
-        // 1. Try to get the next item from the inner stream
         match this.stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
-                // Item received! Reset the timeout for the next chunk.
-                this.sleep.reset(tokio::time::Instant::now() + *this.duration);
+                // First chunk has arrived — switch to the inter-chunk stall timeout.
+                *this.first_chunk_received = true;
+                this.sleep.reset(tokio::time::Instant::now() + *this.stall_timeout);
                 Poll::Ready(Some(item))
             }
-            Poll::Ready(None) => {
-                // Stream ended normally
-                Poll::Ready(None)
-            }
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => {
-                // Lazily arm the timer on first pending poll so the
-                // deadline counts from now, not from construction.
+                // Lazily arm the sleep on the first pending poll.
                 if !*this.started {
                     *this.started = true;
-                    this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.duration);
+                    let deadline = tokio::time::Instant::now()
+                        + if *this.first_chunk_received {
+                            *this.stall_timeout
+                        } else {
+                            *this.first_chunk_timeout
+                        };
+                    this.sleep.as_mut().reset(deadline);
                 }
-                // Check if the timeout has elapsed
                 match this.sleep.poll(cx) {
                     Poll::Ready(_) => {
-                        // Timeout elapsed!
                         *this.timed_out = true;
-                        Poll::Ready(Some(Err(anyhow::anyhow!("Stream stalled"))))
+                        let msg = if *this.first_chunk_received {
+                            format!(
+                                "Stream stalled: no chunk for {}s",
+                                this.stall_timeout.as_secs()
+                            )
+                        } else {
+                            format!(
+                                "Stream stalled: no first chunk within {}s \
+                                 (prompt may be too long for prefill budget)",
+                                this.first_chunk_timeout.as_secs()
+                            )
+                        };
+                        Poll::Ready(Some(Err(anyhow::anyhow!("{}", msg))))
                     }
-                    Poll::Pending => {
-                        // Still waiting for either an item or the timeout
-                        Poll::Pending
-                    }
+                    Poll::Pending => Poll::Pending,
                 }
             }
         }

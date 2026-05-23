@@ -25,12 +25,14 @@ use futures_util::{stream as fstream, StreamExt};
 use std::{sync::Arc, time::{Duration, Instant}};
 use tracing::{debug, info, warn};
 
-/// Stream chunk inactivity threshold. If no chunk is received for this long,
-/// the stream is considered stalled and failed. Set high enough to cover cold
-/// model loads (35B+ models can take 20-30s before the first token after load)
-/// while still catching genuinely hung connections.
-const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum time to wait for the first SSE byte from a provider.
+/// Long prompts (37k+ tokens) can spend 7+ minutes in prefill at ~85 tok/s;
+/// this must comfortably exceed that worst case.
+const TTFT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Maximum silence between consecutive SSE chunks once generation has started.
+/// 180 s is generous but still catches genuinely hung connections.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Provider health-tracker keys. Used for circuit breaking.
 const MANIFEST_KEY: &str = "manifest";
 const LLAMA_SWAP_KEY: &str = "llama-swap";
@@ -479,7 +481,7 @@ fn sanitize_assistant_messages(messages: &mut [ChatMessage]) {
 async fn peek_manifest_model(
     mut stream: crate::provider::SseStream,
 ) -> (crate::provider::SseStream, String) {
-    let first = match tokio::time::timeout(STREAM_STALL_TIMEOUT, stream.next()).await {
+    let first = match tokio::time::timeout(TTFT_TIMEOUT, stream.next()).await {
         Ok(Some(Ok(chunk))) => chunk,
         Ok(Some(Err(e))) => {
             let err_stream: crate::provider::SseStream =
@@ -489,7 +491,7 @@ async fn peek_manifest_model(
         Ok(None) => return (Box::pin(fstream::empty()), "manifest".to_string()),
         Err(_elapsed) => {
             // First chunk timed out — surface as a stall error
-            let err: anyhow::Error = anyhow!("Manifest stream stalled before first chunk ({}s timeout)", STREAM_STALL_TIMEOUT.as_secs());
+            let err: anyhow::Error = anyhow!("Manifest stream stalled before first chunk ({}s timeout)", TTFT_TIMEOUT.as_secs());
             let err_stream: crate::provider::SseStream =
                 Box::pin(fstream::once(async move { Err(err) }).chain(stream));
             return (err_stream, "manifest".to_string());
@@ -533,7 +535,7 @@ fn extract_model_from_sse_chunk(chunk: &bytes::Bytes) -> Option<String> {
 fn wrap_with_timeout(
     stream: crate::provider::SseStream,
 ) -> ProviderResponse {
-    let timeout_stream = TimeoutStream::new(stream, STREAM_STALL_TIMEOUT);
+    let timeout_stream = TimeoutStream::new(stream, TTFT_TIMEOUT, STREAM_STALL_TIMEOUT);
     ProviderResponse::Stream(Box::pin(timeout_stream))
 }
 
