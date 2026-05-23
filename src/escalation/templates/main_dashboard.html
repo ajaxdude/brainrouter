@@ -646,28 +646,63 @@ function groupEvents(events) {
   return groups.sort((a,b) => new Date(b.latestTs) - new Date(a.latestTs));
 }
 
-// Progress: simple and honest.
-// success=true means inference finished → 100% unless actively in review.
-// review status layered on top for review-tracked requests.
+// Progress percentage for a request card.
+//
+// Phase bands (so the bar always moves left-to-right):
+//   0–5%   : idle / error
+//   5–30%  : model loading (inf.state='loading', inf.progress=0–1)
+//   30%    : prefill in progress (local_processing, no decoded tokens yet)
+//   30–85% : generation (local_generating, inf.progress=n_decoded/max)
+//   55%    : generation running but max_tokens unknown
+//   75%    : cloud streaming
+//   90%    : review pending
+//   60%    : needs_revision / escalated
+//   100%   : done
 function requestProgress(group, inf) {
   const sess = group.session;
   if (sess) {
     if (sess.status === 'approved')       return 100;
-    if (sess.status === 'needs_revision') return 60;  // sent back for work
+    if (sess.status === 'needs_revision') return 60;
     if (sess.status === 'escalated')      return 60;
     if (sess.status === 'pending')        return 90;  // inference done, review in flight
   }
   const last = group.events[group.events.length - 1];
   if (!last) return 0;
-  if (last.success) return 100;   // inference complete, no review step → done
-  if (last.error)   return 0;
-  // Still inferring — use live tracker state if this is the active request.
-  if (inf && !['idle','loading'].includes(inf.state)) {
-    const phasePct = { classifying: 10, cloud_waiting: 20, cloud_streaming: 55,
-                       local_waiting: 20, local_streaming: 55, ready: 85 };
-    return phasePct[inf.state] || 10;
+  if (last.error) return 0;
+
+  // Live inference — check this BEFORE treating success=true as done.
+  // success=true is set when the provider *accepts* the request (stream starts),
+  // not when the full response is delivered.  If inference is still running,
+  // use the real live state.
+  const liveState = inf && !['idle', 'ready'].includes(inf.state) ? inf.state : null;
+
+  if (!liveState && last.success) return 100;  // stream finished, nothing live
+
+  if (!liveState) return 5;  // error/stall before acceptance
+
+  const p = typeof inf.progress === 'number' ? inf.progress : null;  // 0.0–1.0 or null
+
+  switch (liveState) {
+    case 'loading':
+      // Model weight loading: 5–30%.
+      return 5 + (p !== null ? p * 25 : 0);
+
+    case 'local_processing':
+      // Prefill phase: GPU is processing the prompt, no tokens emitted yet.
+      // progress is null here; hold at 30% to show we're past loading.
+      return 30;
+
+    case 'local_generating':
+      // Token generation.  If we have a decoded/max ratio, map 30–85%.
+      // If max_tokens is unknown (p===null), fall back to 55%.
+      return p !== null ? Math.round(30 + p * 55) : 55;
+
+    case 'local_waiting':  return 25;
+    case 'classifying':    return 10;
+    case 'cloud_waiting':  return 20;
+    case 'cloud_streaming':return 75;
+    default:               return 10;
   }
-  return 5;
 }
 
 function progressBar(pct, isLive) {
