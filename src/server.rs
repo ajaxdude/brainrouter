@@ -83,12 +83,17 @@ use crate::routing_events::RoutingEvents;
 use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
-use crate::stream::{KeepaliveStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
+use crate::stream::{DeferredStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
 const FAVICON_SVG: &[u8] = include_bytes!("escalation/templates/favicon.svg");
 const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
+
+/// Maximum time the DeferredStream will wait for a provider stream before
+/// giving up.  Aligned with the TTFT_TIMEOUT in router.rs (600 s) so model
+/// loading + prefill for large local models (qwen3-27b-mtp) can complete.
+const DEFERRED_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Shared state passed to all request handlers
 pub struct AppState {
@@ -112,6 +117,9 @@ pub struct AppState {
     /// Global routing override: 0=auto (Bonsai), 1=force_cloud, 2=force_local.
     /// Written by POST /api/routing-mode, read before every chat completion.
     pub routing_mode: Arc<AtomicU8>,
+    /// Cached result of the last version check.  Populated by a background
+    /// task in daemon.rs; the HTTP handler reads this without blocking.
+    pub versions_cache: Arc<tokio::sync::watch::Receiver<serde_json::Value>>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -374,17 +382,9 @@ async fn handle_request(
 
         // ── System versions API ───────────────────────────────────────────────
         ("GET", "/api/versions") => {
-            match handle_versions().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Error getting versions: {}", e);
-                    let resp = json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse { error: format!("Internal error: {}", e) },
-                    );
-                    into_unsync(resp)
-                }
-            }
+            let data = state.versions_cache.borrow().clone();
+            let resp = json_response(StatusCode::OK, &data);
+            into_unsync(resp)
         }
 
         ("POST", "/api/upgrade/llama-swap") => {
@@ -731,22 +731,28 @@ async fn handle_chat_completion(
             _ => {}
         }
     }
-    let provider_response = state.router.route_tagged(request, None, cwd).await?.0;
+    // Spawn routing in a background task so we can return SSE headers immediately.
+    // This prevents OMP's "first event" timeout from firing while llama-swap loads
+    // a model (which can take minutes for large models like qwen3-27b-mtp).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = state.router.route_tagged(request, None, cwd).await;
+        let stream_result = result.map(|(resp, _info)| match resp {
+            ProviderResponse::Stream(s) => s,
+        });
+        let _ = tx.send(stream_result.map_err(Into::into));
+    });
 
-    match provider_response {
-        ProviderResponse::Stream(stream) => {
-            let ka_stream = KeepaliveStream::new(stream, KEEPALIVE_INTERVAL, StreamFormat::OpenAi);
-            let safe_stream = SafeStream::new(ka_stream, StreamFormat::OpenAi);
-            let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .header("cache-control", "no-cache")
-                .header("connection", "keep-alive")
-                .body(stream_body.boxed_unsync())?;
-            Ok(response)
-        }
-    }
+    let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::OpenAi);
+    let safe_stream = SafeStream::new(deferred, StreamFormat::OpenAi);
+    let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(stream_body.boxed_unsync())?;
+    Ok(response)
 }
 
 /// Handle POST /v1/messages (Anthropic Messages API)
@@ -771,23 +777,27 @@ async fn handle_anthropic_messages(
             _ => {}
         }
     }
-    let provider_response = state.router.route_tagged(oai_request, None, cwd).await?.0;
+    // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = state.router.route_tagged(oai_request, None, cwd).await;
+        let stream_result = result.map(|(resp, _info)| match resp {
+            ProviderResponse::Stream(s) => s,
+        });
+        let _ = tx.send(stream_result.map_err(Into::into));
+    });
 
-    match provider_response {
-        ProviderResponse::Stream(stream) => {
-            let adapted = AnthropicSseAdapter::new(stream, model);
-            let ka_stream = KeepaliveStream::new(adapted, KEEPALIVE_INTERVAL, StreamFormat::Anthropic);
-            let safe_stream = SafeStream::new(ka_stream, StreamFormat::Anthropic);
-            let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .header("cache-control", "no-cache")
-                .header("connection", "keep-alive")
-                .body(stream_body.boxed_unsync())?;
-            Ok(response)
-        }
-    }
+    let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::Anthropic);
+    let adapted = AnthropicSseAdapter::new(Box::pin(deferred), model);
+    let safe_stream = SafeStream::new(adapted, StreamFormat::Anthropic);
+    let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(stream_body.boxed_unsync())?;
+    Ok(response)
 }
 
 /// Poll llama-swap and the active model's llama-server for inference status.

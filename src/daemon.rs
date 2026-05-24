@@ -188,6 +188,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         },
         tcp_addr: tcp_addr.to_string(),
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        versions_cache: {
+            // Channel stays open for the process lifetime.  A background task
+            // could later call tx.send() to refresh; for now the endpoint
+            // returns the initial Null value (same as before this field existed).
+            let (tx, rx) = tokio::sync::watch::channel(serde_json::Value::Null);
+            // Leak the sender so the receiver never sees a closed channel.
+            // AppState lives for the entire process, so there is no cleanup to miss.
+            Box::leak(Box::new(tx));
+            std::sync::Arc::new(rx)
+        },
     });
 
     // Start bridge transports if configured

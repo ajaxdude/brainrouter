@@ -284,3 +284,112 @@ where
         }
     }
 }
+
+/// A stream that emits keepalive frames while waiting for a provider stream to
+/// be resolved.  This is critical for local models (e.g. qwen3-27b-mtp) where
+/// llama-swap may spend minutes loading model weights before returning the HTTP
+/// response.  Without this, the OMP client's "first event" timeout fires
+/// because brainrouter blocks on `route_tagged` and never sends SSE headers.
+///
+/// Usage: spawn the routing future, pass the `oneshot::Receiver` here, and
+/// return this stream immediately so the client gets SSE headers + keepalives.
+pub struct DeferredStream {
+    state: DeferredState,
+    sleep: Pin<Box<Sleep>>,
+    /// Absolute deadline after which we give up waiting for the provider stream.
+    deadline: Pin<Box<Sleep>>,
+    interval: Duration,
+    format: StreamFormat,
+}
+
+enum DeferredState {
+    /// Waiting for the routing future to resolve.
+    Waiting(tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>),
+    /// The provider stream has arrived; forward it.
+    Streaming(crate::provider::SseStream),
+    /// The receiver was dropped or errored; emit one error then end.
+    Done,
+}
+
+impl DeferredStream {
+    pub fn new(
+        rx: tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>,
+        interval: Duration,
+        max_wait: Duration,
+        format: StreamFormat,
+    ) -> Self {
+        Self {
+            state: DeferredState::Waiting(rx),
+            sleep: Box::pin(sleep(interval)),
+            deadline: Box::pin(sleep(max_wait)),
+            interval,
+            format,
+        }
+    }
+}
+
+impl Stream for DeferredStream {
+    type Item = Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            match &mut this.state {
+                DeferredState::Waiting(rx) => {
+                    // Check if the provider stream is ready.
+                    match Pin::new(rx).poll(cx) {
+                        Poll::Ready(Ok(Ok(stream))) => {
+                            this.state = DeferredState::Streaming(stream);
+                            continue; // poll the new stream immediately
+                        }
+                        Poll::Ready(Ok(Err(e))) => {
+                            this.state = DeferredState::Done;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        Poll::Ready(Err(_)) => {
+                            // Sender dropped without sending — routing task panicked or was cancelled.
+                            this.state = DeferredState::Done;
+                            return Poll::Ready(Some(Err(anyhow::anyhow!(
+                                "Routing task terminated without producing a stream"
+                            ))));
+                        }
+                        Poll::Pending => {
+                            // Check absolute deadline first.
+                            if this.deadline.as_mut().poll(cx).is_ready() {
+                                this.state = DeferredState::Done;
+                                return Poll::Ready(Some(Err(anyhow::anyhow!(
+                                    "Routing timed out waiting for provider stream"
+                                ))));
+                            }
+                            // Still waiting. Emit keepalive if the interval elapsed.
+                            match this.sleep.as_mut().poll(cx) {
+                                Poll::Ready(_) => {
+                                    this.sleep
+                                        .as_mut()
+                                        .reset(tokio::time::Instant::now() + this.interval);
+                                    let bytes = match this.format {
+                                        StreamFormat::OpenAi => {
+                                            Bytes::from_static(KEEPALIVE_OPENAI)
+                                        }
+                                        StreamFormat::Anthropic => {
+                                            Bytes::from_static(KEEPALIVE_ANTHROPIC)
+                                        }
+                                    };
+                                    return Poll::Ready(Some(Ok(bytes)));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                    }
+                }
+                DeferredState::Streaming(stream) => {
+                    return stream.as_mut().poll_next(cx);
+                }
+                DeferredState::Done => {
+                    return Poll::Ready(None);
+                }
+            }
+        }
+    }
+}

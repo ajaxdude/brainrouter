@@ -694,8 +694,12 @@ function requestProgress(group, inf) {
 
     case 'local_generating':
       // Token generation.  If we have a decoded/max ratio, map 30–85%.
-      // If max_tokens is unknown (p===null), fall back to 55%.
-      return p !== null ? Math.round(30 + p * 55) : 55;
+      // If max_tokens is unknown (p===null), use n_decoded with a heuristic
+      // default of 2048 tokens to compute a reasonable progress estimate.
+      if (p !== null) return Math.round(30 + p * 55);
+      const n = typeof inf.n_decoded === 'number' ? inf.n_decoded : 0;
+      const estMax = 2048;  // heuristic default for unknown max_tokens
+      return Math.round(30 + Math.min(n / estMax, 1) * 55);
 
     case 'local_waiting':  return 25;
     case 'classifying':    return 10;
