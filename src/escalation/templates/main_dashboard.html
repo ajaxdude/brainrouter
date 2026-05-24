@@ -1021,9 +1021,17 @@ function updateVersions() {
   const lsEl = document.getElementById('ver-llama-swap');
   if (lsEl && v.llama_swap) lsEl.textContent = v.llama_swap.slice(0, 12);
   const lsUpg = document.getElementById('upg-llama-swap');
-  if (lsUpg && v.llama_swap && v.llama_swap_latest && v.llama_swap !== v.llama_swap_latest) {
-    lsUpg.style.display = 'inline';
-    lsUpg.title = 'Update available: ' + v.llama_swap_latest;
+  if (lsUpg) {
+    lsUpg.style.display = 'none';
+    if (v.llama_swap_latest) {
+      // Normalize both: strip leading 'v', trim, take first whitespace-delimited token.
+      const cur = (v.llama_swap || '').replace(/^v/i, '').split(/\s/)[0];
+      const lat = v.llama_swap_latest.replace(/^v/i, '').split(/\s/)[0];
+      if (cur && lat && cur !== lat) {
+        lsUpg.style.display = 'inline';
+        lsUpg.title = 'Update available: ' + v.llama_swap_latest;
+      }
+    }
   }
 
   // llama.cpp toolbox
@@ -1035,21 +1043,30 @@ function updateVersions() {
   const toolEl = document.getElementById('ver-toolbox');
   if (toolEl && v.toolbox_image_ver) toolEl.textContent = 'v' + v.toolbox_image_ver + (v.toolbox_image_created ? ' · ' + v.toolbox_image_created : '');
   const toolUpg = document.getElementById('upg-toolbox');
-  if (toolUpg && v.toolbox_image_ver && v.toolbox_latest && v.toolbox_image_ver !== v.toolbox_latest) {
-    toolUpg.style.display = 'inline';
-    toolUpg.title = 'Update available: v' + v.toolbox_latest;
+  if (toolUpg) {
+    toolUpg.style.display = 'none';
+    if (v.toolbox_image_created && v.toolbox_latest) {
+      // Both are ISO date strings (YYYY-MM-DD). Compare dates, not version numbers.
+      if (v.toolbox_latest > v.toolbox_image_created) {
+        toolUpg.style.display = 'inline';
+        toolUpg.title = 'Update available: ' + v.toolbox_latest;
+      }
+    }
   }
 
   // manifest
   const mEl = document.getElementById('ver-manifest');
   if (mEl && v.manifest) mEl.textContent = v.manifest.slice(0, 18);
   const mUpg = document.getElementById('upg-manifest');
-  if (mUpg && v.manifest_latest) {
-    // manifest_latest is a date; manifest is "date · hash". Compare dates.
-    const curDate = (v.manifest || '').split(' ')[0];
-    if (curDate && v.manifest_latest > curDate) {
-      mUpg.style.display = 'inline';
-      mUpg.title = 'Update available: ' + v.manifest_latest;
+  if (mUpg) {
+    mUpg.style.display = 'none';
+    if (v.manifest_latest) {
+      // manifest_latest is a date; manifest is "date · hash". Compare dates.
+      const curDate = (v.manifest || '').split(' ')[0];
+      if (curDate && v.manifest_latest > curDate) {
+        mUpg.style.display = 'inline';
+        mUpg.title = 'Update available: ' + v.manifest_latest;
+      }
     }
   }
 }
