@@ -376,7 +376,21 @@ async fn handle_request(
         }
 
         ("POST", "/api/restart/brainrouter") => {
-            let resp = restart_service("brainrouter").await;
+            // Brainrouter restarts itself: send a 200 immediately, then
+            // schedule the actual restart after a short delay so the HTTP
+            // response reaches the client before this process is killed.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let _ = tokio::process::Command::new("systemctl")
+                    .args(["--user", "restart", "brainrouter"])
+                    .output()
+                    .await;
+            });
+            let resp = json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "service": "brainrouter",
+                "message": "brainrouter restarting"
+            }));
             into_unsync(resp)
         }
 

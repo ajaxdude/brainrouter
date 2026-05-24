@@ -1188,9 +1188,26 @@ async function restartService(svc) {
   try {
     await fetch('/api/restart/' + svc, { method: 'POST' });
   } catch(e) {}
+  if (svc === 'brainrouter') {
+    // brainrouter restarts itself — wait for it to come back, then reload.
+    if (btn) btn.textContent = '↻ Waiting for restart...';
+    const start = Date.now();
+    const poll = async () => {
+      while (Date.now() - start < 30000) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+          const r = await fetch('/api/service-health', { signal: AbortSignal.timeout(3000) });
+          if (r.ok) { location.reload(); return; }
+        } catch(e) {}
+      }
+      if (btn) { btn.disabled = false; btn.textContent = '↻ Restart brainrouter'; }
+    };
+    poll();
+    return;
+  }
   if (btn) {
     btn.disabled = false;
-    const labels = { 'llama-swap': 'Restart Local Stack', 'manifest': 'Restart Manifest', 'brainrouter': 'Restart brainrouter' };
+    const labels = { 'llama-swap': 'Restart Local Stack', 'manifest': 'Restart Manifest' };
     btn.textContent = '↻ ' + (labels[svc] || svc);
   }
   setTimeout(refreshHealth, 2000);
