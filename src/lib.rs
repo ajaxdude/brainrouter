@@ -1,3 +1,4 @@
+pub mod bonsai_server;
 pub mod anthropic;
 pub mod bridge;
 pub mod classifier;

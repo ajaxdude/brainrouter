@@ -67,7 +67,19 @@ pub struct LlamaSwapConfig {
 pub struct BonsaiConfig {
     /// Path to the Bonsai GGUF model file.
     pub model_path: PathBuf,
+    /// Port for the external llama-server process.
+    #[serde(default = "default_bonsai_port")]
+    pub server_port: u16,
+    /// Path to the PrismML fork llama-server binary.
+    #[serde(default = "default_fork_path")]
+    pub fork_path: PathBuf,
 }
+fn default_bonsai_port() -> u16 { 9200 }
+fn default_fork_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(format!("{}/.local/share/brainrouter/llama-prism/llama-server", home))
+}
+
 
 /// Shared model storage directory configuration.
 ///

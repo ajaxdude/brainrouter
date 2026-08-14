@@ -1,24 +1,11 @@
 //! Bonsai-powered query classifier.
 //!
-//! At request time, brainrouter feeds the user's last message to Bonsai 8B,
-//! which decides whether the query is complex enough to warrant cloud routing
-//! (via Manifest) or simple enough to handle locally on llama-swap.
+//! At request time, brainrouter sends the user's last message to the Bonsai
+//! 27B llama-server (PrismML fork), which replies with "cloud" or "local".
 
 use crate::types::ChatCompletionRequest;
-use anyhow::{Context, Result};
-use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_backend::LlamaBackend,
-    llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
-    sampling::LlamaSampler,
-    send_logs_to_tracing, LogOptions,
-};
-use std::{
-    num::NonZeroU32,
-    path::Path,
-    sync::Arc,
-};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 /// Decision returned by the classifier for an incoming request.
@@ -30,69 +17,36 @@ pub enum RoutingDecision {
     Local { model: String },
 }
 
-/// Embedded Bonsai classifier. Holds the model and backend in Arcs so they can
-/// be shared across blocking-thread inference invocations.
-pub struct Classifier {
-    model: Arc<LlamaModel>,
-    backend: Arc<LlamaBackend>,
-    /// Default local model used when the request asks for "auto" but Bonsai
-    /// chooses local routing without a specific suggestion.
-    default_local_model: String,
-}
-
 /// Maximum tokens to generate during classification. We only need one word.
 const CLASSIFY_MAX_TOKENS: usize = 10;
 /// Truncate the user message to this many characters before classifying.
-/// Keeps the prompt short so classification stays under ~200ms.
 const USER_MSG_TRUNCATE: usize = 800;
-/// Context window for the classifier — small, since prompts are short.
-const CLASSIFIER_CTX_SIZE: u32 = 2048;
+
+/// External Bonsai classifier. Sends prompts to a running llama-server process.
+pub struct Classifier {
+    /// Base URL of the Bonsai llama-server (e.g. http://127.0.0.1:9200).
+    server_url: String,
+    /// Default local model used when the request asks for "auto" but Bonsai
+    /// chooses local routing without a specific suggestion.
+    default_local_model: String,
+    /// Shared HTTP client.
+    http: Client,
+}
 
 impl Classifier {
-    /// Load the Bonsai model from disk. Blocking; call once at startup.
-    pub fn new(model_path: &Path, default_local_model: String) -> Result<Self> {
-        let backend =
-            LlamaBackend::init().context("Failed to initialize llama.cpp backend")?;
-
-        // Route llama.cpp output through tracing. Info-level chatter (tensor
-        // dump, metadata) is suppressed in normal operation. Warnings and
-        // errors still surface. Use RUST_LOG=debug to see full load detail.
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-
-        // Offload to GPU. AMD Strix Halo with Vulkan handles this fine.
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
-
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .with_context(|| {
-                format!("Failed to load Bonsai model from {}", model_path.display())
-            })?;
-
-        Ok(Self {
-            model: Arc::new(model),
-            backend: Arc::new(backend),
+    /// Create a classifier pointing at the external Bonsai llama-server.
+    pub fn new(server_url: String, default_local_model: String) -> Self {
+        Self {
+            server_url,
             default_local_model,
-        })
+            http: Client::new(),
+        }
     }
 
-    /// Classify a request asynchronously. Inference runs on a blocking thread
-    /// so it doesn't stall the tokio runtime.
-    ///
-    /// On any error, defaults to `Cloud` — the safe default that preserves
-    /// quality at the cost of an extra hop.
+    /// Classify a request asynchronously via the external llama-server.
+    /// On any error, defaults to Cloud — the safe default.
     pub async fn classify_async(&self, request: ChatCompletionRequest) -> RoutingDecision {
-        let model = Arc::clone(&self.model);
-        let backend = Arc::clone(&self.backend);
-        let default_local = self.default_local_model.clone();
         let requested_model = request.model.clone();
-
-        // Determine whether the user explicitly requested a model. If they
-        // did NOT request "auto" or "brainrouter/auto", we still let Bonsai
-        // classify — the requested model only matters when the decision is
-        // Local and we need to pick a name.
-        let user_requested_specific = !matches!(
-            requested_model.as_str(),
-            "auto" | "brainrouter/auto" | "brainrouter" | ""
-        );
 
         let last_user_msg = extract_last_user_message(&request);
         if last_user_msg.is_empty() {
@@ -100,35 +54,75 @@ impl Classifier {
             return RoutingDecision::Cloud;
         }
 
-        let result = tokio::task::spawn_blocking(move || {
-            classify_blocking(&model, &backend, &last_user_msg)
-        })
-        .await;
+        let server_url = self.server_url.clone();
+        let http = self.http.clone();
+        let result = http
+            .post(format!("{}/v1/chat/completions", server_url))
+            .json(&ChatCompletionInput {
+                model: "bonsai".to_string(),
+                messages: vec![
+                    ChatMessageInput {
+                        role: "system".to_string(),
+                        content: format!(
+                            "You are a routing classifier. Reply with exactly one word: \"cloud\" for complex tasks (architecture, debugging large systems, multi-step reasoning, refactoring) or \"local\" for simple tasks (short answers, simple questions, single-line code, explanations). Output nothing else."
+                        ),
+                    },
+                    ChatMessageInput {
+                        role: "user".to_string(),
+                        content: format!(
+                            "Classify this request: {}",
+                            last_user_msg
+                        ),
+                    },
+                ],
+                max_tokens: Some(CLASSIFY_MAX_TOKENS),
+                temperature: Some(0.0),
+                stop: Some(vec!["\n".to_string()]),
+            })
+            .send()
+            .await;
 
         let raw = match result {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!("Classifier inference failed: {:#}; defaulting to Cloud", e);
-                return RoutingDecision::Cloud;
-            }
+            Ok(resp) => match resp.text().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Classifier HTTP response read failed: {}; defaulting to Cloud", e);
+                    return RoutingDecision::Cloud;
+                }
+            },
             Err(e) => {
-                warn!("Classifier task panicked: {}; defaulting to Cloud", e);
+                warn!("Classifier HTTP request failed: {}; defaulting to Cloud", e);
                 return RoutingDecision::Cloud;
             }
         };
 
-        let decision = parse_decision(&raw);
-        debug!(raw = %raw.trim(), ?decision, "Bonsai classification");
+        // Parse the llama-server response: extract the first choice's message content
+        let parsed = match serde_json::from_str::<ChatCompletionResponse>(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Classifier response parse failed (raw={:?}): {}; defaulting to Cloud", raw, e);
+                return RoutingDecision::Cloud;
+            }
+        };
+
+        let choice_text = parsed.choices.first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+
+        let decision = parse_decision(choice_text);
+        debug!(raw = %choice_text.trim(), ?decision, "Bonsai classification");
 
         match decision {
             ParsedDecision::Cloud => RoutingDecision::Cloud,
             ParsedDecision::Local => {
-                // Pick the model name: prefer the user's explicit choice if any,
-                // otherwise fall back to the configured default.
+                let user_requested_specific = !matches!(
+                    requested_model.as_str(),
+                    "auto" | "brainrouter/auto" | "brainrouter" | ""
+                );
                 let model = if user_requested_specific {
                     requested_model
                 } else {
-                    default_local
+                    self.default_local_model.clone()
                 };
                 RoutingDecision::Local { model }
             }
@@ -136,7 +130,7 @@ impl Classifier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 enum ParsedDecision {
     Cloud,
     Local,
@@ -146,9 +140,10 @@ enum ParsedDecision {
 /// character: 'l' or 'L' → Local, anything else → Cloud (safe default).
 fn parse_decision(raw: &str) -> ParsedDecision {
     let trimmed = raw.trim_start();
-    match trimmed.chars().next() {
-        Some('l') | Some('L') => ParsedDecision::Local,
-        _ => ParsedDecision::Cloud,
+    if trimmed.starts_with('l') || trimmed.starts_with('L') {
+        ParsedDecision::Local
+    } else {
+        ParsedDecision::Cloud
     }
 }
 
@@ -170,7 +165,6 @@ fn extract_last_user_message(request: &ChatCompletionRequest) -> String {
     };
 
     if raw.len() > USER_MSG_TRUNCATE {
-        // Truncate at a UTF-8 char boundary
         let mut end = USER_MSG_TRUNCATE;
         while !raw.is_char_boundary(end) && end > 0 {
             end -= 1;
@@ -181,87 +175,39 @@ fn extract_last_user_message(request: &ChatCompletionRequest) -> String {
     }
 }
 
-/// Synchronous classification inference. Runs on a blocking thread.
-fn classify_blocking(
-    model: &LlamaModel,
-    backend: &LlamaBackend,
-    user_message: &str,
-) -> Result<String> {
-    let prompt = format!(
-        "<|im_start|>system\n\
-/no_think\n\
-You are a routing classifier. Reply with exactly one word: \"cloud\" for complex \
-tasks (architecture, debugging large systems, multi-step reasoning, refactoring) \
-or \"local\" for simple tasks (short answers, simple questions, single-line code, \
-explanations). Output nothing else.<|im_end|>\n\
-<|im_start|>user\n\
-Classify this request: {}<|im_end|>\n\
-<|im_start|>assistant\n\
-<think>\n</think>\n",
-        user_message
-    );
-
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(4);
-
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(CLASSIFIER_CTX_SIZE))
-        .with_n_threads(n_threads)
-        .with_n_threads_batch(n_threads);
-
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .context("Failed to create classifier llama context")?;
-
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .context("Failed to tokenize classifier prompt")?;
-
-    let mut batch = LlamaBatch::new(tokens.len().max(8), 1);
-    let last_index = tokens.len() as i32 - 1;
-    for (i, token) in (0_i32..).zip(tokens) {
-        batch
-            .add(token, i, &[0], i == last_index)
-            .context("Failed to add token to batch")?;
-    }
-    ctx.decode(&mut batch)
-        .context("Failed to decode classifier prompt")?;
-
-    let mut sampler = LlamaSampler::greedy();
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut out = String::new();
-
-    let mut n_cur = batch.n_tokens();
-    for _ in 0..CLASSIFY_MAX_TOKENS {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if token == model.token_eos() {
-            break;
-        }
-
-        let piece = model
-            .token_to_piece(token, &mut decoder, false, None)
-            .context("Failed to decode token")?;
-        out.push_str(&piece);
-
-        // Stop early if we already have a clear word
-        if out.trim().len() >= 5 {
-            break;
-        }
-
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .context("Failed to add token to batch")?;
-        n_cur += 1;
-        ctx.decode(&mut batch)
-            .context("Failed to decode classifier token")?;
-    }
-
-    Ok(out)
+#[derive(Serialize)]
+struct ChatCompletionInput {
+    model: String,
+    messages: Vec<ChatMessageInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
+
+#[derive(Serialize)]
+struct ChatMessageInput {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: Message,
+}
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    content: Option<String>,
+}
+
 
 #[cfg(test)]
 mod tests {

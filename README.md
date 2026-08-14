@@ -4,7 +4,7 @@
   <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
 </p>
 
-A speed-first Rust proxy that sits between your AI coding harness and your LLMs. A local 8B classifier (Bonsai) decides in under 200 ms whether each request goes to cloud (via Manifest) or local inference (via llama-swap). Automatic fallback, system-prompt rewriting for local models, and an MCP-triggered iterative code-review loop that runs entirely on your own hardware.
+A speed-first Rust proxy that sits between your AI coding harness and your LLMs. An external Bonsai 27B classifier decides in under 500 ms whether each request goes to cloud (via Manifest) or local inference (via llama-swap). Automatic fallback, system-prompt rewriting for local models, and an MCP-triggered iterative code-review loop that runs entirely on your own hardware.
 
 ```
 coding harness (omp / claude / vibe / opencode / codex / droid)
@@ -26,7 +26,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 ```
 
 - **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
-- **Three routing modes.** `auto` uses Bonsai classification (<200 ms). `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest.
+- **Three routing modes.** `auto` uses Bonsai classification (<500 ms). `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest.
 - **Local prompt rewriting.** OMP's 15–20 K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
 - **Manifest handles cloud failover.** Manifest runs locally in Docker and picks the right cloud provider (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with its own automatic fallbacks.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
@@ -62,7 +62,7 @@ The script installs (idempotent — safe to re-run):
 - **System packages** — git, golang, toolbox, docker, vulkan headers
 - **bun** — JavaScript runtime for oh-my-pi, installed system-wide
 - **oh-my-pi** — installed for every human user via bun
-- **Bonsai Q4_K_M** — downloaded to `/opt/models/bonsai/` (~5.2 GB)
+- **Bonsai 27B BF16** — downloaded to `/mnt/models/prism/` (~7.3 GB), runs as an external llama-server process on port 9200
 - **Manifest** — cloud LLM router running as a system Docker service on port 3001
 - **llama-swap** — local model runner as a system Docker service on port 8081
 - **brainrouter** — compiled and installed to `/usr/local/bin/brainrouter`
@@ -131,8 +131,9 @@ llama_swap:
   fallback_model: "your-local-model"  # must match a key in /opt/ai/llama-swap/config.yaml
 
 bonsai:
-  model_path: "/opt/models/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
-```
+  model_path: "/mnt/models/prism/Bonsai-27B-dspark-bf16.gguf"  # GGUF model for classification
+  server_port: 9200  # port for the external llama-server process
+  fork_path: "/home/papa/.local/share/brainrouter/llama-prism/llama-server"  # PrismML fork binary
 
 The Manifest API key lives in `/etc/brainrouter/env` (readable by the `aistack` group — all human
 users are added to it by `install.sh`):
@@ -652,7 +653,7 @@ src/
 |---|---|---|
 | **Manifest** | Cloud LLM router — provider selection, failover, cost tracking | `http://localhost:3001` |
 | **llama-swap** | Local model runner — spawns llama-server on demand | `http://localhost:8081` |
-| **Bonsai** | In-process classifier — no HTTP hop | loaded from `model_path` |
+| **Bonsai** | External classifier — llama-server on port 9200 (PrismML fork) | `http://127.0.0.1:9200` |
 
 ### Tests
 

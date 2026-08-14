@@ -11,6 +11,7 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
 use brainrouter::{
+    bonsai_server::BonsaiServer,
     classifier::Classifier,
     config,
     health::HealthTracker,
@@ -66,16 +67,21 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         fallback_model = %config.llama_swap.fallback_model,
         "Starting brainrouter daemon"
     );
-
-    // Load Bonsai classifier. Blocking but happens once at startup.
-    info!("Loading Bonsai classifier from {}...", config.bonsai.model_path.display());
-    let classifier = Classifier::new(
-        &config.bonsai.model_path,
-        config.llama_swap.fallback_model.clone(),
+    let bonsai_server = BonsaiServer::start(
+        config.bonsai.fork_path.clone(),
+        config.bonsai.model_path.clone(),
+        config.bonsai.server_port,
     )
-    .context("Failed to initialize Bonsai classifier")?;
+    .await
+    .context("Failed to start Bonsai llama-server")?;
+
+    // Create classifier pointing at the external server
+    let classifier = Classifier::new(
+        bonsai_server.url().to_string(),
+        config.llama_swap.fallback_model.clone(),
+    );
     let classifier = Arc::new(classifier);
-    info!("Bonsai classifier loaded");
+    info!("Bonsai classifier ready");
 
     // Manifest provider (cloud)
     let manifest_api_key = config.resolve_manifest_api_key();
@@ -172,6 +178,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Bridge manager (status tracking for Discord/Signal transports)
     let bridge_manager = Arc::new(brainrouter::bridge::BridgeManager::new());
 
+    let (versions_tx, versions_rx) = tokio::sync::watch::channel(serde_json::Value::Null);
+    let versions_tx = Arc::new(versions_tx);
+
     let state = Arc::new(AppState {
         router,
         session_manager,
@@ -188,17 +197,22 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         },
         tcp_addr: tcp_addr.to_string(),
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        versions_cache: {
-            // Channel stays open for the process lifetime.  A background task
-            // could later call tx.send() to refresh; for now the endpoint
-            // returns the initial Null value (same as before this field existed).
-            let (tx, rx) = tokio::sync::watch::channel(serde_json::Value::Null);
-            // Leak the sender so the receiver never sees a closed channel.
-            // AppState lives for the entire process, so there is no cleanup to miss.
-            Box::leak(Box::new(tx));
-            std::sync::Arc::new(rx)
-        },
+        versions_cache: Arc::new(versions_rx),
     });
+
+    // Background task: compute versions once, then refresh every 30 minutes.
+    {
+        let tx = Arc::clone(&versions_tx);
+        tokio::spawn(async move {
+            let data = server::compute_versions_json().await;
+            let _ = tx.send_replace(data);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                let data = server::compute_versions_json().await;
+                let _ = tx.send_replace(data);
+            }
+        });
+    }
 
     // Start bridge transports if configured
     if let Some(ref bridge_config) = config.bridge {

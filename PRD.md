@@ -45,13 +45,13 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 A single Rust daemon that:
 
 1. **Routes in three modes:**
-   - `auto` -- Bonsai 8B classifies every query in <200ms and routes to cloud or local.
+   - `auto` -- Bonsai 27B classifies every query in <200ms and routes to cloud or local.
    - `local` -- Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap.
    - `cloud` -- Bypasses Bonsai, routes directly to Manifest.
 2. **Falls back automatically** when Manifest stalls or fails -- no manual intervention.
 3. **Reviews code locally (by default)** using the same routing infrastructure, exposing an MCP tool that every harness can call. Users can explicitly override Bonsai's routing via the dashboard to force local or cloud review.
 4. **Manages system state** via the dashboard, allowing one-click upgrades of llama-swap and resets of the llama.cpp toolbox environment.
-5. **Explicit review control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 8B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
+5. **Explicit review control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 27B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
@@ -62,9 +62,9 @@ A single Rust daemon that:
 
 ### Bonsai as classifier, not a responder
 
-Bonsai 8B is embedded in-process via `llama-cpp-2` on Vulkan. It runs synchronously on a blocking thread so it doesn't hold up the async server. It outputs exactly one word: `cloud` or `local`. This classification happens on every request before any network call goes out. Cold classification cost: <200ms on GPU (AMD Strix Halo, Radeon 8060S, 6.3 GB VRAM).
+Bonsai 27B runs as an external llama-server process (PrismML fork of llama.cpp) on a dedicated port (default 9200). brainrouter launches it at startup, waits for its `/health` endpoint, then sends classification prompts via HTTP to `http://127.0.0.1:{port}/v1/chat/completions`. The response is parsed for "cloud" or "local". Classification latency: ~500ms on GPU (AMD Strix Halo, Radeon 8060S, 6.3 GB VRAM).
 
-Bonsai was chosen specifically because it is purpose-trained to understand task complexity and model capability -- not as a general assistant. Using it only for routing preserves 113 GB of VRAM for llama-swap models.
+Bonsai was chosen specifically because it is purpose-trained to understand task complexity and model capability -- not as a general assistant. Using it only for routing preserves VRAM for llama-swap models.
 
 ### Manifest handles all cloud routing
 
@@ -199,10 +199,11 @@ When installed via `install.sh` on a shared Fedora machine:
 
 #### bonsai.*
 
-| Field | Type | Default | Description |
+| Field | Type | Required | Description |
 |---|---|---|---|
-| `model_path` | `PathBuf` | *(required)* | Path to the Bonsai GGUF file. Validated: must exist at startup |
-
+| `model_path` | `PathBuf` | *(required)* | Path to the Bonsai GGUF model file. Validated: must exist at startup |
+| `server_port` | `u16` | `9200` | Port for the external llama-server process |
+| `fork_path` | `PathBuf` | *(default path)* | Path to the PrismML fork binary |
 #### review.*
 
 | Field | Type | Default | Description |
@@ -293,7 +294,6 @@ When installed via `install.sh` on a shared Fedora machine:
 | `MAX_EVENTS` | `500` | Maximum routing events kept in memory for dashboard feed |
 | `CLASSIFY_MAX_TOKENS` | `10` | Maximum tokens for Bonsai classification response |
 | `USER_MSG_TRUNCATE` | `800 chars` | Truncation limit for user message sent to classifier |
-| `CLASSIFIER_CTX_SIZE` | `2048` | Context window size for Bonsai classifier |
 | `Discord chunk size` | `1500 chars` | Maximum message length per Discord message |
 | `Signal chunk size` | `4000 chars` | Maximum message length per Signal message |
 | `Signal poll interval` | `3s` | Polling interval for Signal CLI message retrieval |
