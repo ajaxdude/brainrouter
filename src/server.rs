@@ -114,6 +114,9 @@ pub struct AppState {
     /// TCP address this daemon is listening on (e.g. "127.0.0.1:9099").
     /// Used to write the correct port into ~/.omp/agent/models.yml.
     pub tcp_addr: String,
+    /// Runtime control of the Bonsai classifier llama-server (dashboard
+    /// start/stop). Also read by the classifier for its enabled flag.
+    pub bonsai: Arc<crate::bonsai_server::BonsaiControl>,
     /// Global routing override: 0=auto (Bonsai), 1=force_cloud, 2=force_local.
     /// Written by POST /api/routing-mode, read before every chat completion.
     pub routing_mode: Arc<AtomicU8>,
@@ -196,6 +199,7 @@ async fn handle_request(
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
             || path == "/api/routing-mode" || path == "/api/review-config"
             || path == "/api/bridges/toggle"
+            || path == "/api/bonsai/toggle" || path == "/api/models/flush"
         ));
 
     if is_destructive {
@@ -525,16 +529,59 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── Bonsai classifier server API ────────────────────────────────────
+        ("GET", "/api/bonsai") => {
+            let enabled = state.bonsai.is_running();
+            let healthy = if enabled { state.bonsai.healthy().await } else { false };
+            let resp = json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": enabled,
+                "healthy": healthy,
+                "url": state.bonsai.url(),
+            }));
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/bonsai/toggle") => {
+            match state.bonsai.toggle().await {
+                Ok(running) => {
+                    let resp = json_response(StatusCode::OK, &serde_json::json!({
+                        "enabled": running,
+                        "message": if running {
+                            "Bonsai classifier server started"
+                        } else {
+                            "Bonsai classifier server stopped — auto routing defaults to cloud until re-enabled"
+                        },
+                    }));
+                    into_unsync(resp)
+                }
+                Err(e) => {
+                    error!(error = %e, "Bonsai toggle failed");
+                    let resp = json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse { error: format!("Bonsai toggle failed: {}", e) },
+                    );
+                    into_unsync(resp)
+                }
+            }
+        }
+
+        // ── Flush models API (free VRAM) ────────────────────────────────────
+        ("POST", "/api/models/flush") => {
+            let resp = flush_models(&state.llama_swap_url).await;
+            into_unsync(resp)
+        }
+
+
  // __ Config API _______________________________________________________
         ("GET", "/api/config") => {
             match std::fs::read_to_string(&state.config_path) {
                 Ok(yaml) => {
-                    let resp = Response::builder()
+                    
+                    Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/yaml; charset=utf-8")
                         .body(Full::new(Bytes::from(yaml)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
-                        .unwrap();
-                    resp
+                        .unwrap()
                 }
                 Err(e) => {
                     let resp = json_response(
@@ -591,12 +638,12 @@ async fn handle_request(
         ("GET", "/api/llama-swap-config") => {
             match std::fs::read_to_string(&state.llama_swap_config_path) {
                 Ok(yaml) => {
-                    let resp = Response::builder()
+                    
+                    Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/yaml; charset=utf-8")
                         .body(Full::new(Bytes::from(yaml)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
-                        .unwrap();
-                    resp
+                        .unwrap()
                 }
                 Err(e) => {
                     let resp = json_response(
@@ -754,7 +801,7 @@ async fn handle_chat_completion(
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });
-        let _ = tx.send(stream_result.map_err(Into::into));
+        let _ = tx.send(stream_result);
     });
 
     let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::OpenAi);
@@ -798,7 +845,7 @@ async fn handle_anthropic_messages(
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });
-        let _ = tx.send(stream_result.map_err(Into::into));
+        let _ = tx.send(stream_result);
     });
 
     let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::Anthropic);
@@ -1077,6 +1124,47 @@ async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
     Some((is_proc, n_decoded))
 }
 
+/// Unload every model llama-swap currently holds in memory (VRAM), without
+/// restarting the service. Proxies to llama-swap's `POST /api/models/unload`.
+async fn flush_models(llama_swap_url: &str) -> Response<Full<Bytes>> {
+    let url = format!("{}/api/models/unload", llama_swap_url.trim_end_matches('/'));
+    info!(%url, "Flushing all llama-swap models");
+    match VERSION_CLIENT
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!("llama-swap flushed all models");
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "status": "ok",
+                    "message": "all llama-swap models unloaded from memory"
+                }),
+            )
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "llama-swap flush rejected");
+            json_response(
+                StatusCode::BAD_GATEWAY,
+                &ErrorResponse { error: format!("llama-swap returned {}: {}", status, body.trim()) },
+            )
+        }
+        Err(e) => {
+            warn!(error = %e, "llama-swap unreachable during flush");
+            json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse { error: format!("llama-swap unreachable: {}", e) },
+            )
+        }
+    }
+}
+
+
 /// Restart the llama.cpp toolbox by restarting llama-swap.
 /// llama-swap manages the toolbox container lifecycle; restarting it
 /// kills the current model and lets llama-swap spawn fresh on next request.
@@ -1152,54 +1240,38 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
     }
 }
 
-/// Get current versions of llama-swap and llama-server (toolbox).
-async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
+/// Compute local versions and "latest available" metadata for the /api/versions endpoint.
+/// Called periodically by a background task in daemon.rs.
+pub async fn compute_versions_json() -> serde_json::Value {
     use tokio::process::Command;
 
-    // 1. Get llama-swap version
-    // --version is reliable in all current llama-swap releases; the fragile
-    // `strings` binary-scraping fallback has been removed.
-    let swap_out = Command::new(home_bin("llama-swap"))
-            .arg("--version")
+    // 1. llama-swap version
+    let swap_ver = Command::new(home_bin("llama-swap"))
+        .arg("--version")
         .output()
-        .await;
-    
-    let mut swap_ver = match swap_out {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().replace("version: ", "").to_string()
-        }
-        _ => String::new(),
-    };
-    
-    if swap_ver.is_empty() {
-        swap_ver = "unknown".to_string();
-    }
+        .await
+        .ok()
+        .and_then(|out| {
+            out.status.success().then(|| {
+                String::from_utf8_lossy(&out.stdout).trim()
+                    .replace("version: ", "")
+                    .to_string()
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
-    // 2. Get llama.cpp version from toolbox container image.
-    // Using 'podman run' directly on the image is more reliable than 'toolbox run'
-    // which depends on a specific persistent container being in a startable state.
-    //
-    // IMPORTANT: use spawn() + kill_on_drop(true) rather than output() so that if
-    // the 15-second timeout fires, the podman/conmon child processes are killed
-    // immediately instead of becoming orphans attached to the service cgroup.
+    // 2. llama.cpp version from toolbox container image.
     const PODMAN_VERSION_TIMEOUT_SECS: u64 = 15;
     let toolbox_ver = {
         let child = Command::new("podman")
             .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
-            .kill_on_drop(true)  // ensures child is killed if the future is dropped on timeout
+            .kill_on_drop(true)
             .output();
         match tokio::time::timeout(std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS), child).await {
             Ok(Ok(out)) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let combined = format!("{}{}", stdout, stderr);
-                // Note: podman run may exit non-zero if no GPU is found (ggml_vulkan error)
-                // but still output the version on stdout/stderr.
+                let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
                 if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
-                    line.replace("version:", "")
-                        .replace("built with", "")
-                        .trim()
-                        .to_string()
+                    line.replace("version:", "").replace("built with", "").trim().to_string()
                 } else if let Some(line) = combined.lines().find(|l| l.contains('(') && l.contains(')') && !l.contains("Error")) {
                     line.replace("built with", "").trim().to_string()
                 } else {
@@ -1210,15 +1282,14 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
                 error!(error = %e, "Failed to execute podman run for version check");
                 "unknown".to_string()
             }
-            Err(_elapsed) => {
-                // kill_on_drop(true) above ensures the child is killed when this future is dropped.
+            Err(_) => {
                 warn!(timeout_secs = PODMAN_VERSION_TIMEOUT_SECS, "podman run timed out during llama.cpp version check");
                 "unknown".to_string()
             }
         }
     };
 
-    // 3. Get toolbox container image version (OCI label, e.g. "43") and created date
+    // 3. Toolbox container image version and created date
     let (toolbox_image_ver, toolbox_image_created) = {
         let ver_out = Command::new("podman")
             .args(["image", "inspect",
@@ -1230,7 +1301,6 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
             Ok(o) => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if let Some((ver, created)) = s.split_once('\t') {
-                    // created looks like "2026-04-23 21:07:32.123 +0000 UTC" — take first 10 chars
                     let date = created.trim().get(..10).unwrap_or("").to_string();
                     (ver.trim().to_string(), date)
                 } else {
@@ -1241,24 +1311,19 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         }
     };
 
-    // 4. Get locally running Manifest image digest (short SHA256)
+    // 4. Locally running Manifest image info
     let manifest_ver = {
         let out = Command::new("docker")
             .args(["inspect", "--format",
                    "{{index .Config.Labels \"org.opencontainers.image.created\"}} {{slice .Id 7 19}}",
-                   // slice .Id 7 19: full ID is "sha256:<hex>"; skip the 7-char prefix
-                   // to get a 12-char short hash, e.g. "abc123456789"
                    "manifest-manifest-1"])
             .output()
             .await;
         match out {
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                // Format: "2026-04-15T22:47:22.44554494Z abc123456789"
-                // Show as "Apr 15 · abc123"
                 if let Some((date_part, hash)) = s.split_once(' ') {
-                    let date = date_part.get(..10).unwrap_or(date_part);
-                    format!("{} · {}", date, hash)
+                    format!("{} · {}", date_part.get(..10).unwrap_or(date_part), hash)
                 } else {
                     s
                 }
@@ -1267,14 +1332,14 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         }
     };
 
-    // 5. Get remote Manifest digest to compare for update notification
+    // 5. Remote "latest available" versions (GitHub / Docker Hub)
     let (llama_swap_latest, manifest_latest, toolbox_latest) = tokio::join!(
-        check_latest_llama_swap(),
-        check_latest_manifest(),
-        check_latest_toolbox(),
+        fetch_latest_llama_swap(),
+        fetch_latest_manifest(),
+        fetch_latest_toolbox(),
     );
 
-    let data = serde_json::json!({
+    serde_json::json!({
         "brainrouter": env!("CARGO_PKG_VERSION"),
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
@@ -1284,33 +1349,26 @@ async fn handle_versions() -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error
         "llama_swap_latest": llama_swap_latest.unwrap_or_default(),
         "manifest_latest": manifest_latest.unwrap_or_default(),
         "toolbox_latest": toolbox_latest.unwrap_or_default(),
-    });
-
-    let resp = json_response(StatusCode::OK, &data);
-    Ok(into_unsync(resp))
+    })
 }
 
-async fn check_latest_llama_swap() -> Option<String> {
+async fn fetch_latest_llama_swap() -> Option<String> {
     let resp = VERSION_CLIENT.get("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     data.get("tag_name").and_then(|v| v.as_str()).map(|v| v.trim_start_matches('v').to_string())
 }
 
-/// Fetch the remote manifest Docker Hub tag's last-pushed date (used as a proxy for
-/// "new version available"). Returns the ISO date string (first 10 chars) or None.
-async fn check_latest_manifest() -> Option<String> {
+async fn fetch_latest_manifest() -> Option<String> {
     let resp = VERSION_CLIENT.get("https://hub.docker.com/v2/repositories/manifestdotbuild/manifest/tags/latest")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
-    // tag_last_pushed looks like "2026-04-23T23:27:27.60508Z"
     data.get("tag_last_pushed")
         .and_then(|v| v.as_str())
         .map(|s| s.get(..10).unwrap_or(s).to_string())
 }
 
-/// Fetch the remote toolbox image tag's last-pushed date.
-async fn check_latest_toolbox() -> Option<String> {
+async fn fetch_latest_toolbox() -> Option<String> {
     let resp = VERSION_CLIENT.get("https://hub.docker.com/v2/repositories/kyuz0/amd-strix-halo-toolboxes/tags/vulkan-radv")
         .send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;

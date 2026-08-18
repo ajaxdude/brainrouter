@@ -322,14 +322,13 @@ pub fn parse_omp_json_output(
                     }
                 }
                 // Record model-level errors only when content was empty.
-                if content.is_empty() {
-                    if msg.get("stopReason").and_then(|v| v.as_str()) == Some("error") {
+                if content.is_empty()
+                    && msg.get("stopReason").and_then(|v| v.as_str()) == Some("error") {
                         if let Some(err_msg) = msg.get("errorMessage").and_then(|v| v.as_str()) {
                             let first_line = err_msg.lines().next().unwrap_or(err_msg);
                             model_error.get_or_insert_with(|| first_line.to_string());
                         }
                     }
-                }
             }
             _ => {}
         }

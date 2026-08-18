@@ -7,6 +7,8 @@ use crate::types::ChatCompletionRequest;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Decision returned by the classifier for an incoming request.
 #[derive(Debug, Clone)]
@@ -31,21 +33,32 @@ pub struct Classifier {
     default_local_model: String,
     /// Shared HTTP client.
     http: Client,
+    /// Shared "Bonsai server is on" flag. When the dashboard stops the
+    /// llama-server this is cleared and classification skips HTTP, returning
+    /// the safe Cloud default.
+    enabled: Arc<AtomicBool>,
 }
 
 impl Classifier {
     /// Create a classifier pointing at the external Bonsai llama-server.
-    pub fn new(server_url: String, default_local_model: String) -> Self {
+    /// `enabled` is the shared flag flipped by `BonsaiControl` when the
+    /// server is started or stopped at runtime.
+    pub fn new(server_url: String, default_local_model: String, enabled: Arc<AtomicBool>) -> Self {
         Self {
             server_url,
             default_local_model,
             http: Client::new(),
+            enabled,
         }
     }
 
     /// Classify a request asynchronously via the external llama-server.
     /// On any error, defaults to Cloud — the safe default.
     pub async fn classify_async(&self, request: ChatCompletionRequest) -> RoutingDecision {
+        if !self.enabled.load(Ordering::Relaxed) {
+            debug!("Bonsai server is off; defaulting to Cloud");
+            return RoutingDecision::Cloud;
+        }
         let requested_model = request.model.clone();
 
         let last_user_msg = extract_last_user_message(&request);

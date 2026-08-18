@@ -6,10 +6,11 @@ use bytes::Bytes;
 use futures_util::{pin_mut, stream, StreamExt};
 use tokio::time;
 
-/// OpenAI keepalive is a real empty-delta `data:` SSE frame so the SDK yields
-/// it to the application-level iterator (SDK silently drops comment lines).
+/// OpenAI keepalive is a real `data:` SSE frame carrying a newline delta —
+/// the SDK yields it to the application-level iterator (SDK silently drops
+/// comment lines and some SDK versions filter zero-length content).
 const KEEPALIVE_OPENAI: &[u8] =
-    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null}]}\n\n";
 
 /// Anthropic keepalive is an SSE comment line — Anthropic SDK and OMP treat
 /// comment lines as ignorable heartbeats.

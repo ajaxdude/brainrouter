@@ -129,7 +129,6 @@ async fn send_chunked(ctx: &Context, channel_id: ChannelId, text: &str) {
 struct HandlerConfig {
     prefix: String,
     omp_path: String,
-    omp_work_dir: String,
     omp_timeout_secs: u64,
     default_model: String,
 }
@@ -879,7 +878,6 @@ pub async fn start(
         config: HandlerConfig {
             prefix,
             omp_path: omp_path.to_string(),
-            omp_work_dir: work_dir.to_string(),
             omp_timeout_secs: timeout_secs,
             default_model: default_model.to_string(),
         },

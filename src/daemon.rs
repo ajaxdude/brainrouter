@@ -11,7 +11,7 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
 use brainrouter::{
-    bonsai_server::BonsaiServer,
+    bonsai_server::BonsaiControl,
     classifier::Classifier,
     config,
     health::HealthTracker,
@@ -67,7 +67,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         fallback_model = %config.llama_swap.fallback_model,
         "Starting brainrouter daemon"
     );
-    let bonsai_server = BonsaiServer::start(
+    let bonsai_control = BonsaiControl::start(
         config.bonsai.fork_path.clone(),
         config.bonsai.model_path.clone(),
         config.bonsai.server_port,
@@ -77,8 +77,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     // Create classifier pointing at the external server
     let classifier = Classifier::new(
-        bonsai_server.url().to_string(),
+        bonsai_control.url(),
         config.llama_swap.fallback_model.clone(),
+        bonsai_control.enabled(),
     );
     let classifier = Arc::new(classifier);
     info!("Bonsai classifier ready");
@@ -189,6 +190,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         llama_swap_url,
         manifest_url,
         bridge_manager: Arc::clone(&bridge_manager),
+        bonsai: Arc::new(bonsai_control),
         config_path: std::fs::canonicalize(&config_path).unwrap_or(config_path.clone()),
         llama_swap_config_path: {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());

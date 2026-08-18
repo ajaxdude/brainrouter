@@ -5,7 +5,7 @@
 **Binary:** `target/release/brainrouter`
 **Config:** `brainrouter.yaml` + `/etc/brainrouter/env` (multi-user) or `~/.config/brainrouter/.env` (single-user)
 **Repository:** https://github.com/ajaxdude/brainrouter
-**Tests:** 74 tests across the codebase
+**Tests:** 89 tests across the codebase
 
 ---
 
@@ -50,7 +50,7 @@ A single Rust daemon that:
    - `cloud` -- Bypasses Bonsai, routes directly to Manifest.
 2. **Falls back automatically** when Manifest stalls or fails -- no manual intervention.
 3. **Reviews code locally (by default)** using the same routing infrastructure, exposing an MCP tool that every harness can call. Users can explicitly override Bonsai's routing via the dashboard to force local or cloud review.
-4. **Manages system state** via the dashboard, allowing one-click upgrades of llama-swap and resets of the llama.cpp toolbox environment.
+4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal.
 5. **Explicit review control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 27B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
@@ -62,7 +62,7 @@ A single Rust daemon that:
 
 ### Bonsai as classifier, not a responder
 
-Bonsai 27B runs as an external llama-server process (PrismML fork of llama.cpp) on a dedicated port (default 9200). brainrouter launches it at startup, waits for its `/health` endpoint, then sends classification prompts via HTTP to `http://127.0.0.1:{port}/v1/chat/completions`. The response is parsed for "cloud" or "local". Classification latency: ~500ms on GPU (AMD Strix Halo, Radeon 8060S, 6.3 GB VRAM).
+Bonsai 27B runs as an external llama-server process (PrismML fork of llama.cpp) on a dedicated port (default 9200). brainrouter launches it at startup, waits for its `/health` endpoint, then sends classification prompts via HTTP to `http://127.0.0.1:{port}/v1/chat/completions`. The response is parsed for "cloud" or "local". Classification latency: ~500ms on GPU (AMD Strix Halo, Radeon 8060S, 6.3 GB VRAM). The process lifecycle is owned by `BonsaiControl`: the dashboard can stop or start it at runtime (`POST /api/bonsai/toggle`) to free VRAM. While stopped, the classifier's shared `enabled` flag is off, so `auto` routing skips classification and defaults to the safe Cloud choice.
 
 Bonsai was chosen specifically because it is purpose-trained to understand task complexity and model capability -- not as a general assistant. Using it only for routing preserves VRAM for llama-swap models.
 
@@ -125,6 +125,7 @@ The MCP server needs to know the caller's working directory. On Linux, brainrout
 | Daemon startup | `src/daemon.rs` | Load config, create all services, validate environment, start server |
 | HTTP server | `src/server.rs` | Route `/v1/*`, `/review/*`, `/api/*`, and `/dashboard` |
 | Classifier | `src/classifier.rs` | Bonsai-based cloud/local decision |
+| Bonsai server lifecycle | `src/bonsai_server.rs` | `BonsaiServer`: spawn, 60s health poll, SIGTERM→SIGKILL stop. `BonsaiControl`: runtime start/stop from the dashboard, shared enabled flag for the classifier |
 | Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
 | Prompt rewriter | `src/prompt_rewriter.rs` | System prompt rewriting for local mode (strips OMP bloat, injects anti-loop prompt) |
 | Anthropic shim | `src/anthropic.rs` | `/v1/messages` to `/v1/chat/completions` translation; strict SSE state machine |
@@ -195,6 +196,7 @@ When installed via `install.sh` on a shared Fedora machine:
 |---|---|---|---|
 | `base_url` | `String` | *(required)* | URL of the llama-swap instance |
 | `fallback_model` | `String` | *(required)* | Model key to use when Manifest fails or Bonsai picks local. Must match a key in llama-swap config |
+| `local_models` | `Vec<String>?` | `[]` | Explicit llama-swap model keys; a request using one of them as `model=` routes straight to llama-swap, bypassing Bonsai |
 | `local_system_prompt` | `String?` | `None` | Path to a custom system prompt file for `model=local` mode. Built-in lean prompt used if absent |
 
 #### bonsai.*
@@ -204,6 +206,13 @@ When installed via `install.sh` on a shared Fedora machine:
 | `model_path` | `PathBuf` | *(required)* | Path to the Bonsai GGUF model file. Validated: must exist at startup |
 | `server_port` | `u16` | `9200` | Port for the external llama-server process |
 | `fork_path` | `PathBuf` | *(default path)* | Path to the PrismML fork binary |
+#### models.*
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `path` | `PathBuf` | `/opt/models` | Shared GGUF model directory; `${models_path}` inside `bonsai.model_path` expands to this value |
+| `shared_write` | `bool` | `false` | When true, all `aistack` group members may add/delete models (dir mode `770`); when false, only the owner can write (mode `750`) |
+
 #### review.*
 
 | Field | Type | Default | Description |
@@ -486,6 +495,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `POST` | `/api/review-config` | Update review configuration |
 | `GET` | `/api/models/llama-swap` | List models available in llama-swap |
 | `GET` | `/api/bridge-status` | Bridge transport status (Discord/Signal) |
+| `GET` | `/api/bonsai` | Bonsai classifier server state (`enabled`, `healthy`, `url`) |
 
 ### Destructive Management Endpoints (localhost + CSRF only)
 
@@ -498,6 +508,8 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `POST` | `/api/upgrade/llama-swap` | One-click upgrade llama-swap |
 | `POST` | `/api/upgrade/manifest` | One-click upgrade Manifest |
 | `POST` | `/api/upgrade/toolbox` | One-click upgrade llama.cpp toolbox |
+| `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier llama-server to free or reclaim VRAM; while stopped, `auto` routing defaults to Cloud |
+| `POST` | `/api/models/flush` | Unload all models from llama-swap memory (frees VRAM) without restarting the service |
 
 ### Review Endpoints
 
@@ -578,8 +590,9 @@ Resolve a review session with feedback.
 | llama-swap returns error / 404 | HTTP status code | Error returned to caller; next request may load a different model |
 | llama-swap circuit open | Health tracker (3 failures) | Error: no backend available. 60s cooldown before retry |
 | Both circuits open | Health tracker | Error returned to caller; both providers on 60s cooldown |
-| Bonsai inference fails | Rust error from llama-cpp-2 | Default to `Cloud` (safe default -- preserves quality) |
-| Bonsai OOM / crash | `spawn_blocking` panic caught | Default to `Cloud` |
+| Bonsai inference fails | HTTP error or timeout from the external llama-server | Default to `Cloud` (safe default -- preserves quality) |
+| Bonsai server OOM / crash | Process exits; next health probe fails | Default to `Cloud` until the server is started again from the dashboard |
+| Bonsai server stopped from dashboard | Shared `enabled` flag cleared before kill | `auto` routing skips classification and defaults to `Cloud` |
 | Daemon not running when MCP connects | UDS connect error | `brainrouter mcp` exits with a clear error message |
 | Review LLM returns unparseable JSON | JSON parse failure in review_loop | Retry within iteration; count as iteration attempt |
 | Review hits max iterations | Iteration counter | Escalate to human via dashboard UI |
@@ -632,7 +645,7 @@ The daemon refuses to start if validation fails, with descriptive error messages
 ## What This Is Not
 
 - **Not a provider adapter.** brainrouter does not implement Anthropic, OpenAI, Google, or any cloud provider API. Manifest handles that.
-- **Not a model runner.** brainrouter does not spawn llama-server processes. llama-swap handles that.
+- **Not a model runner.** brainrouter does not serve chat models -- it only spawns the single classifier llama-server for Bonsai. llama-swap handles local model serving.
 - **Not an auth layer.** brainrouter is localhost-only with no authentication on the proxy boundary. Credentials live in provider configs (Manifest dashboard, llama-swap config).
 - **Not a conversation store.** Chat history is managed by the harness. brainrouter is stateless for proxy calls; review sessions are in-memory and lost on daemon restart.
 - **Not a chat application.** The Discord/Signal bridges are thin wrappers around the `omp` CLI, not standalone chat bots with their own reasoning.

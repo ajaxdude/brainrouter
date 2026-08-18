@@ -196,14 +196,14 @@ where
 
 /// Interval at which keepalive frames are emitted when the inner stream is
 /// idle. Chosen to be well below any reasonable client-side stream-idle watchdog
-/// (OMP defaults to 120 s; we ping every 15 s).
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// (OMP defaults to 120 s; we ping every 5 s).
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An SSE comment used as a keepalive for Anthropic-format streams.
 /// Anthropic SDK and OMP both treat comment lines as ignorable heartbeats.
 const KEEPALIVE_ANTHROPIC: &[u8] = b": ping\n\n";
 
-/// An empty-delta OpenAI SSE chunk used as a keepalive for OpenAI-format streams.
+/// An OpenAI keepalive frame used for OpenAI-format streams.
 ///
 /// OMP's `iterateWithIdleTimeout` races `iterator.next()` against a wall-clock
 /// timer. The openai SDK's SSE parser silently discards comment lines and never
@@ -211,9 +211,12 @@ const KEEPALIVE_ANTHROPIC: &[u8] = b": ping\n\n";
 /// We must emit a valid `data:` frame that the SDK will parse into a
 /// `ChatCompletionChunk` and yield, which resets OMP's idle watchdog.
 ///
-/// An empty string delta is safe: the provider code skips zero-length content.
+/// A newline delta is used instead of empty string: some SDK versions filter
+/// zero-length content before yielding, causing the keepalive to be invisible
+/// to the idle timer. The cost: the newline is real content, so a long idle
+/// pause inserts a stray blank line into the accumulated response output.
 const KEEPALIVE_OPENAI: &[u8] =
-    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null}]}\n\n";
 
 /// A stream wrapper that emits a periodic keepalive frame while the inner stream
 /// is idle (`Poll::Pending`). Once the inner stream yields data or terminates this

@@ -384,9 +384,8 @@ fn repair_truncated_json(s: &str) -> String {
     }
     // Count unmatched quotes (ignoring escaped ones)
     let mut in_string = false;
-    let mut chars = result.chars().peekable();
     let mut prev = ' ';
-    while let Some(c) = chars.next() {
+    for c in result.chars() {
         if c == '"' && prev != '\\' {
             in_string = !in_string;
         }

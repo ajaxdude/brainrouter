@@ -1,26 +1,36 @@
 //! External Bonsai llama-server process management.
 //!
-//! Launches the PrismML fork binary, waits for readiness, and provides
-//! the HTTP endpoint for the classifier to call.
+//! [`BonsaiControl`] owns the classifier's llama-server lifecycle: it is
+//! started at daemon boot and can be stopped/restarted at runtime from the
+//! dashboard (`POST /api/bonsai/toggle`) to free VRAM. While stopped, the
+//! classifier's `enabled` flag is off and routing falls back to the safe
+//! Cloud default.
 
-use anyhow::Result;
-use std::{path::PathBuf, time::Duration};
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-/// Manages the external Bonsai llama-server process.
+/// Shared HTTP client for /health probes.
+static HEALTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
+/// One live Bonsai llama-server process.
 pub struct BonsaiServer {
     /// The HTTP base URL the classifier should call (e.g. http://127.0.0.1:9200).
     url: String,
-    /// Tokio task handle — kept alive to keep the task (and child process) running.
-    #[allow(dead_code)]
-    handle: tokio::task::JoinHandle<()>,
-    /// Tokio task abort handle — used to kill the child process.
-    abort: tokio::task::AbortHandle,
+    /// OS pid of the llama-server process (kill target).
+    pid: u32,
+    /// Wait task — completes when the child process is reaped.
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BonsaiServer {
     /// Launch the external llama-server binary and wait for it to be healthy.
+    /// If the health poll fails, the just-spawned process is killed so it is
+    /// never orphaned.
     pub async fn start(
         fork_path: PathBuf,
         model_path: PathBuf,
@@ -42,45 +52,48 @@ impl BonsaiServer {
             );
         }
 
-        let server_port = server_port as i32;
+        // Spawn synchronously so the pid is known before the wait task takes
+        // ownership of the child handle.
+        let mut child = Command::new(&fork_path)
+            .arg("--model")
+            .arg(model_path.as_os_str())
+            .arg("--port")
+            .arg(server_port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--threads")
+            .arg(num_cpus::get().to_string())
+            .spawn()
+            .with_context(|| format!("Failed to spawn llama-server at {}", fork_path.display()))?;
+        let pid = child.id().unwrap_or(0);
 
         let handle = tokio::spawn(async move {
-            let mut child = Command::new(fork_path)
-                .arg("--model")
-                .arg(model_path.as_os_str())
-                .arg("--port")
-                .arg(server_port.to_string())
-                .arg("--host")
-                .arg("127.0.0.1")
-                .arg("--threads")
-                .arg(num_cpus::get().to_string())
-                .spawn()
-                .expect("Failed to spawn llama-server");
-
             let result = child.wait().await;
-            if let Err(e) = result {
-                warn!("llama-server exited with error: {}", e);
-            } else {
-                info!("llama-server exited normally");
+            match result {
+                Ok(status) => info!(pid, status = %status, "Bonsai llama-server exited"),
+                Err(e) => warn!(pid, error = %e, "Bonsai llama-server wait failed"),
             }
         });
 
-        let abort = handle.abort_handle();
+        let server = Self { url, pid, handle: Some(handle) };
 
-        // Wait for health endpoint
-        Self::poll_health(&url).await?;
+        // Wait for health endpoint; kill the process we just spawned if it
+        // never comes up.
+        if let Err(e) = Self::poll_health(&server.url).await {
+            server.stop().await;
+            return Err(e);
+        }
 
-        Ok(Self { url, handle, abort })
+        Ok(server)
     }
 
     /// Poll the /health endpoint until the server is ready (up to 60s).
     async fn poll_health(url: &str) -> Result<()> {
-        let http = reqwest::Client::new();
         let health_url = format!("{}/health", url);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(60);
 
         loop {
-            match http.get(&health_url).send().await {
+            match HEALTH_CLIENT.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     info!("Bonsai llama-server is healthy");
                     return Ok(());
@@ -92,7 +105,7 @@ impl BonsaiServer {
                 Err(e) => debug!("Bonsai health check failed (still starting): {}", e),
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 anyhow::bail!("Bonsai llama-server did not become healthy within 60 seconds");
             }
 
@@ -100,21 +113,152 @@ impl BonsaiServer {
         }
     }
 
-    /// HTTP base URL for the classifier to call.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Shut down the server process.
-    pub async fn stop(self) {
-        self.abort.abort();
-        // Drop the struct (Drop will also try to abort, but that's harmless)
+    /// Shut down the server process: SIGTERM, escalating to SIGKILL after 5 s.
+    /// Blocks until the process is reaped.
+    pub async fn stop(mut self) {
+        info!(pid = self.pid, "Stopping Bonsai llama-server (SIGTERM)");
+        kill_pid(self.pid, libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(self.pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if pid_alive(self.pid) {
+            warn!(pid = self.pid, "Bonsai llama-server ignored SIGTERM; sending SIGKILL");
+            kill_pid(self.pid, libc::SIGKILL);
+            // Give the wait task a moment to reap the child.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
     }
 }
 
 impl Drop for BonsaiServer {
     fn drop(&mut self) {
-        self.abort.abort();
-        // Non-async: can't await, but the task will eventually clean up
+        // Best-effort: don't orphan the process when dropped without stop()
+        // (e.g. daemon shutdown).
+        kill_pid(self.pid, libc::SIGTERM);
+    }
+}
+
+fn kill_pid(pid: u32, sig: i32) {
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, sig);
+    }
+}
+
+/// Signal-0 existence check.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Runtime-controllable Bonsai llama-server lifecycle.
+///
+/// Held by `AppState` behind an `Arc`. The dashboard can stop it to free VRAM
+/// and start it again later. The classifier reads [`Self::enabled`] before
+/// every request; when off it skips HTTP and returns the safe Cloud default.
+pub struct BonsaiControl {
+    fork_path: PathBuf,
+    model_path: PathBuf,
+    port: u16,
+    server: Mutex<Option<BonsaiServer>>,
+    /// Serializes start/stop so concurrent toggles cannot double-spawn.
+    op_lock: tokio::sync::Mutex<()>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl BonsaiControl {
+    /// Build the control and start the server (initial state: on).
+    pub async fn start(fork_path: PathBuf, model_path: PathBuf, port: u16) -> Result<Self> {
+        let control = Self {
+            fork_path,
+            model_path,
+            port,
+            server: Mutex::new(None),
+            op_lock: tokio::sync::Mutex::new(()),
+            enabled: Arc::new(AtomicBool::new(false)),
+        };
+        control.start_server().await?;
+        Ok(control)
+    }
+
+    /// HTTP base URL for the classifier to call (constant for this daemon).
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// True while the llama-server process is running.
+    pub fn is_running(&self) -> bool {
+        self.server.lock().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    /// Shared enabled flag — read by the classifier before every request.
+    pub fn enabled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.enabled)
+    }
+
+    /// Start the llama-server if it is not already running.
+    pub async fn start_server(&self) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+        if self.is_running() {
+            return Ok(());
+        }
+        let server = BonsaiServer::start(
+            self.fork_path.clone(),
+            self.model_path.clone(),
+            self.port,
+        )
+        .await?;
+        *self.server.lock().map_err(|_| anyhow::anyhow!("Bonsai control mutex poisoned"))? = Some(server);
+        self.enabled.store(true, Ordering::SeqCst);
+        info!(port = self.port, "Bonsai classifier server started");
+        Ok(())
+    }
+
+    /// Stop the llama-server (frees VRAM). No-op if already stopped.
+    pub async fn stop_server(&self) -> Result<()> {
+        let Some(server) = self.server.lock().map_err(|_| anyhow::anyhow!("Bonsai control mutex poisoned"))?.take()
+        else {
+            self.enabled.store(false, Ordering::SeqCst);
+            return Ok(());
+        };
+        // Disable classification before killing so in-flight requests don't
+        // wait on a dying server.
+        self.enabled.store(false, Ordering::SeqCst);
+        server.stop().await;
+        info!(port = self.port, "Bonsai classifier server stopped");
+        Ok(())
+    }
+
+    /// Toggle the server. Returns the new running state.
+    pub async fn toggle(&self) -> Result<bool> {
+        if self.is_running() {
+            self.stop_server().await?;
+            Ok(false)
+        } else {
+            self.start_server().await?;
+            Ok(true)
+        }
+    }
+
+    /// Probe /health with a short timeout. False when stopped or unreachable.
+    pub async fn healthy(&self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        HEALTH_CLIENT
+            .get(format!("{}/health", self.url()))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 }

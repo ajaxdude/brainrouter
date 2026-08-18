@@ -31,6 +31,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Manifest handles cloud failover.** Manifest runs locally in Docker and picks the right cloud provider (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with its own automatic fallbacks.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
 - **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
+- **VRAM control.** The dashboard can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
 
 ---
 
@@ -351,6 +352,9 @@ The header row shows current installed versions of:
 - **llama.cpp** — the llama-server build inside the toolbox container
 - **Manifest** — the running Docker container (image date · short hash)
 - **toolbox** — the OCI image version label
+- **bonsai** — classifier server state: `on`, `off`, or `down`
+
+Click the **bonsai** row to stop or start the classifier's llama-server. Stopping frees its GPU memory; while stopped, `auto` routing defaults to cloud until it is started again.
 
 When a newer version is available (checked against GitHub / Docker Hub on each poll), an orange **`component → new-version`** button appears. Click it to upgrade. Each button is labelled so you know exactly what will be updated.
 
@@ -364,6 +368,7 @@ Four restart buttons in the top nav:
 | **Restart llama.cpp** | Refreshes the toolbox container (runs configured restart script) |
 | **Restart Manifest** | `docker compose restart manifest` |
 | **Restart brainrouter** | `systemctl --user restart brainrouter` — page reloads after 3 s |
+| **⏏ Flush Models** | Unloads every model from llama-swap memory (frees VRAM) without restarting; models reload on next request |
 
 ### Review sessions tab
 
@@ -511,10 +516,17 @@ manifest:
 llama_swap:
   base_url: "http://localhost:8081/v1"   # required
   fallback_model: "my-model"             # required — must match a key in llama-swap config
+  local_models: ["my-model", "other"]    # optional — model keys that bypass Bonsai when used directly
   local_system_prompt: "/path/to/prompt.md"  # optional — override built-in lean prompt
 
 bonsai:
-  model_path: "/path/to/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"  # required — absolute path
+  model_path: "/mnt/models/prism/Bonsai-27B-dspark-bf16.gguf"  # required — absolute path
+  server_port: 9200                                    # external llama-server port (default)
+  fork_path: "/path/to/llama-server"                   # PrismML fork binary (default ~/.local/share/brainrouter/llama-prism/llama-server)
+
+models:
+  path: /opt/models                                    # shared GGUF dir; ${models_path} expands to this
+  shared_write: false                                  # true = all aistack members can add/delete models
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
@@ -589,6 +601,9 @@ All on `http://127.0.0.1:9099`.
 | `POST` | `/api/upgrade/manifest` | Pull latest Manifest image and recreate container |
 | `POST` | `/api/upgrade/toolbox` | Pull latest toolbox image and recreate container |
 | `POST` | `/api/restart/:service` | Restart `llama-swap`, `manifest`, `llama-cpp`, or `brainrouter` |
+| `GET` | `/api/bonsai` | Bonsai classifier server state (`enabled`, `healthy`) |
+| `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier to free/reclaim VRAM |
+| `POST` | `/api/models/flush` | Unload all models from llama-swap memory (no restart) |
 
 #### Review
 
@@ -610,8 +625,8 @@ All on `http://127.0.0.1:9099`.
 src/
   main.rs            	-- clap dispatcher (serve | mcp | install)
   daemon.rs          	-- startup: loads Bonsai, wires state, starts server
-  server.rs          	-- hyper HTTP router
-  classifier.rs      	-- Bonsai 8B classifier (Cloud/Local decision)
+  classifier.rs      	-- Cloud/Local decision via external Bonsai server
+  bonsai_server.rs    	-- Bonsai llama-server lifecycle (spawn, health, dashboard toggle)
   router.rs          	-- routes to Manifest or llama-swap; circuit breaker; fallback
   prompt_rewriter.rs 	-- system prompt rewriter for local mode
   anthropic.rs       	-- Anthropic <> OpenAI protocol translation
@@ -661,5 +676,5 @@ src/
 cargo test
 ```
 
-74 tests across the codebase: circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
+89 tests across the codebase: circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
 

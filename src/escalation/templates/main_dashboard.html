@@ -209,6 +209,11 @@ textarea { resize: vertical; }
       <span id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
       <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 5px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer">↑</span>
     </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:pointer" title="Bonsai classifier server — click to stop/start" onclick="toggleBonsai()">
+      <span id="dot-bonsai" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">bonsai</span>
+      <span id="ver-bonsai" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+    </div>
   </div>
 
   <!-- Routing Mode -->
@@ -250,6 +255,7 @@ textarea { resize: vertical; }
     <button class="sidebar-btn" onclick="restartService('manifest')">↻ Restart Manifest</button>
     <button class="sidebar-btn" onclick="restartService('brainrouter')">↻ Restart brainrouter</button>
     <button class="sidebar-btn" onclick="syncModels()">⇄ Sync Models</button>
+    <button class="sidebar-btn" onclick="flushModels()" title="Unload all models from memory (frees VRAM)">⏏ Flush Models</button>
   </div>
 </nav>
 <!-- MAIN COLUMN -->
@@ -368,6 +374,7 @@ const STATUS_MAP = {
 // ─── State ───────────────────────────────────────────────────────────────────
 let allEvents = [], allSessions = [], activeFilter = 'all', activeView = 'stream';
 let inferenceStatus = null, healthData = {}, versionsData = {}, bridgeData = {}, statsData = {};
+let bonsaiData = null, bonsaiBusy = false;
 let searchQuery = '', currentRoutingMode = 'auto';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1011,6 +1018,62 @@ function updateHealth() {
   if (cppEl && h.llama_cpp === 'loading') cppEl.textContent = 'loading…';
 }
 
+// ─── Bonsai server toggle / model flush ──────────────────────────────────────
+function applyBonsaiUI(b) {
+  const txt = document.getElementById('ver-bonsai');
+  if (!b) { updateDot('bonsai', false); if (txt) txt.textContent = '—'; return; }
+  if (!b.enabled) {
+    updateDot('bonsai', false);
+    if (txt) txt.textContent = 'off';
+  } else if (b.healthy) {
+    updateDot('bonsai', true);
+    if (txt) txt.textContent = 'on';
+  } else {
+    updateDot('bonsai', false);
+    if (txt) txt.textContent = 'down';
+  }
+}
+
+async function refreshBonsai() {
+  const res = await safeFetch('/api/bonsai');
+  if (res) {
+    bonsaiData = res;
+    if (!bonsaiBusy) applyBonsaiUI(res);
+  }
+}
+
+async function toggleBonsai() {
+  if (bonsaiBusy) return;
+  const starting = !(bonsaiData && bonsaiData.enabled);
+  if (starting && !confirm('Start the Bonsai classifier? It loads a large model into GPU memory.')) return;
+  if (!starting && !confirm('Stop the Bonsai classifier server?\nAuto routing will default to cloud until re-enabled.')) return;
+  bonsaiBusy = true;
+  const txt = document.getElementById('ver-bonsai');
+  if (txt) txt.textContent = starting ? 'starting…' : 'stopping…';
+  updateDot('bonsai', false);
+  try {
+    const r = await fetch('/api/bonsai/toggle', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) console.warn('Bonsai toggle failed', j.error || r.status);
+  } catch (e) { console.warn('Bonsai toggle error', e); }
+  bonsaiBusy = false;
+  await refreshBonsai();
+  applyBonsaiUI(bonsaiData);
+}
+
+async function flushModels() {
+  if (!confirm('Unload ALL models currently in memory (llama-swap)?\nThis frees GPU/VRAM; models reload on next request.')) return;
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '⏏ Flushing...'; }
+  try {
+    const r = await fetch('/api/models/flush', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) alert('Flush failed: ' + (j.error || r.status));
+  } catch (e) {}
+  if (btn) { btn.disabled = false; btn.textContent = '⏏ Flush Models'; }
+  setTimeout(refreshHealth, 2000);
+}
+
 function updateVersions() {
   const v = versionsData;
   if (!v) return;
@@ -1401,12 +1464,14 @@ document.addEventListener('keydown', (e) => {
 refreshFast();
 refreshHealth();
 refreshSlow();
+refreshBonsai();
 // Fetch current routing mode from server (persists across page refreshes until daemon restart)
 safeFetch('/api/routing-mode').then(r => { if (r && r.mode) { currentRoutingMode = r.mode; applyRoutingModeUI(r.mode); } });
 
 // Poll intervals
 setInterval(refreshFast, 3000);
 setInterval(refreshHealth, 10000);
+setInterval(refreshBonsai, 10000);
 setInterval(refreshSlow, 30000);
 </script>
 </body>
