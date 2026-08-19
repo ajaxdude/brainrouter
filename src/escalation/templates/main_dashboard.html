@@ -131,7 +131,7 @@ textarea { resize: vertical; }
 <body>
 <div id="app" style="display:flex;height:100vh;overflow:hidden">
 <!-- SIDEBAR -->
-<nav id="sidebar" style="width:224px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;font-size:13px;color:var(--text);flex-shrink:0;overflow:hidden">
+<nav id="sidebar" style="width:224px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;font-size:13px;color:var(--text);flex-shrink:0;overflow-y:auto">
   <!-- Logo -->
   <div style="padding:20px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10">
     <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 240 240" style="flex-shrink:0;border-radius:6px">
@@ -186,44 +186,99 @@ textarea { resize: vertical; }
   <!-- System Health -->
   <div style="padding:8px 18px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:8px;text-transform:uppercase">System Health</div>
   <div style="padding:0 12px;display:flex;flex-direction:column;gap:2px">
-    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="click to upgrade" onclick="upgradeIfAvailable('llama-swap')">
-      <span id="dot-llama-swap" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">llama-swap</span>
-      <span id="ver-llama-swap" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
-      <span id="upg-llama-swap" style="display:none;font-size:9px;padding:1px 5px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer">↑</span>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="llama-swap — model manager proxying to per-model llama-server instances" onclick="upgradeIfAvailable('llama-swap')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-llama-swap" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">llama-swap</span>
+        <span id="upg-llama-swap" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+      </div>
+      <div id="ver-llama-swap" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px">
-      <span id="dot-llama-cpp" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">llama.cpp</span>
-      <span id="ver-llama-cpp" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="llama.cpp — the production toolbox engine that serves local models. NOT the Bonsai classifier (that has its own fork, shown below)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-llama-cpp" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">llama.cpp</span>
+      </div>
+      <div id="ver-llama-cpp" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="click to upgrade" onclick="upgradeIfAvailable('toolbox')">
-      <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">toolbox</span>
-      <span id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
-      <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 5px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer">↑</span>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="toolboxes — the container image hosting the llama.cpp engine" onclick="upgradeIfAvailable('toolbox')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">toolboxes</span>
+        <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+      </div>
+      <div id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="click to upgrade" onclick="upgradeIfAvailable('manifest')">
-      <span id="dot-manifest" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">manifest</span>
-      <span id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
-      <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 5px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer">↑</span>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="manifest — the cloud LLM endpoint" onclick="upgradeIfAvailable('manifest')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-manifest" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">manifest</span>
+        <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+      </div>
+      <div id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:pointer" title="Bonsai classifier server — click to stop/start" onclick="toggleBonsai()">
-      <span id="dot-bonsai" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">bonsai</span>
-      <span id="ver-bonsai" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px">—</span>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="bonsai — the cloud/local classifier. Runs on a separate PrismML fork of llama.cpp (its own binary, not the toolbox engine)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-bonsai" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">bonsai</span>
+        <button id="toggle-bonsai" onclick="toggleBonsai()" title="Enable / disable the Bonsai classifier (required for auto routing)"
+          style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+          <span id="toggle-bonsai-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+        </button>
+      </div>
+      <div id="ver-bonsai" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
   </div>
+
+  <!-- All toolboxes -->
+  <div id="toolbox-list" style="padding:0 12px;display:flex;flex-direction:column;gap:2px"></div>
 
   <!-- Routing Mode -->
   <div style="padding:12px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:12px;text-transform:uppercase">Routing</div>
   <div style="padding:0 12px 8px">
-    <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden">
-      <button id="mode-auto"  class="mode-btn active" onclick="setRoutingMode('auto')"  style="flex:1;all:unset;cursor:pointer;padding:5px 0;font-size:11px;text-align:center;background:var(--bg3);color:var(--green);font-family:'JetBrains Mono',monospace;border-right:1px solid var(--border)">auto</button>
-      <button id="mode-cloud" class="mode-btn"        onclick="setRoutingMode('cloud')" style="flex:1;all:unset;cursor:pointer;padding:5px 0;font-size:11px;text-align:center;color:var(--textMute);font-family:'JetBrains Mono',monospace;border-right:1px solid var(--border)">cloud</button>
-      <button id="mode-local" class="mode-btn"        onclick="setRoutingMode('local')" style="flex:1;all:unset;cursor:pointer;padding:5px 0;font-size:11px;text-align:center;color:var(--textMute);font-family:'JetBrains Mono',monospace">local</button>
+    <div style="display:flex;gap:6px">
+      <button id="mode-auto"  class="mode-btn active" onclick="setRoutingMode('auto')"  style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--green);font-family:'JetBrains Mono',monospace">auto</button>
+      <button id="mode-cloud" class="mode-btn"        onclick="setRoutingMode('cloud')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">cloud</button>
+      <button id="mode-local" class="mode-btn"        onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">local</button>
     </div>
+  </div>
+
+  <!-- Thinking budget (nudge) + local tuning -->
+  <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Thinking budget</div>
+  <div style="padding:0 12px;display:flex;flex-direction:column;gap:7px">
+    <div style="display:flex;align-items:center;gap:8px" title="Nudge — inject a per-request reasoning budget into auto-routed local requests (llama.cpp-nudge fork). Off → normal local routing">
+      <span style="color:var(--textDim);font-size:11px;flex:1">nudge</span>
+      <button id="toggle-nudge" onclick="toggleNudge()" title="Enable / disable thinking-budget nudging"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-nudge-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px" title="Reasoning tier: auto = Bonsai picks local/deep per request; local = tight budget; deep = full budget">
+      <span style="color:var(--textDim);font-size:11px;width:44px;flex-shrink:0">tier</span>
+      <div style="flex:1;display:flex;gap:4px">
+        <button id="tier-auto"  class="tier-btn active" onclick="setNudgeTier('auto')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'JetBrains Mono',monospace">auto</button>
+        <button id="tier-local" class="tier-btn"        onclick="setNudgeTier('local')" style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">local</button>
+        <button id="tier-deep"  class="tier-btn"        onclick="setNudgeTier('deep')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">deep</button>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px" title="Context window passed to llama-swap (rewrites the config and restarts the local stack)">
+      <span style="color:var(--textDim);font-size:11px;width:44px;flex-shrink:0">context</span>
+      <select id="ctx-select" onchange="setContextSize(this.value)" title="auto = stock 128k (--fit default)" style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-size:11px;font-family:'JetBrains Mono',monospace;outline:none">
+        <option value="131072">auto (128k)</option>
+        <option value="16384">16k</option>
+        <option value="24576">24k</option>
+        <option value="32768">32k</option>
+        <option value="65536">64k</option>
+      </select>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward the incoming prompt untouched">
+      <span style="color:var(--textDim);font-size:11px;flex:1">rewrite prompts</span>
+      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--green);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:14px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
+    <div id="nudge-budgets" style="font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding-left:2px"></div>
   </div>
 
   <!-- Bridges -->
@@ -724,7 +779,7 @@ function progressBar(pct, isLive) {
   </div>`;
 }
 
-function renderGroup(group) {
+function renderGroup(group, index) {
   const evs = group.events;
   const latest = evs[evs.length - 1];
   const first  = evs[0];
@@ -769,6 +824,8 @@ function renderGroup(group) {
         ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
       </div>
       ${statusPill(st)}
+      <button onclick="dismissCard(${index})" title="Hide this card"
+        style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
     </header>
     ${progressBar(pct, isLive)}
     <div style="padding:10px 16px 4px">
@@ -917,6 +974,10 @@ function updateKPI() {
 </script>
 <script>
 // ─── Render stream ────────────────────────────────────────────────────────────
+// Groups dismissed via the card X button (in-memory, per page load).
+let dismissedKeys = new Set();
+let renderedGroups = [];
+
 function renderStream() {
   const list = document.getElementById('card-list');
   if (!list) return;
@@ -926,6 +987,7 @@ function renderStream() {
   // Group into one card per logical request, then filter each group.
   const groups = groupEvents(enriched);
   const filtered = groups.filter(g => {
+    if (dismissedKeys.has(g.key)) return false;  // user dismissed this card
     // A group matches if any of its events matches the filter.
     return g.events.some(t => matchesFilter(t) && matchesSearch(t));
   });
@@ -935,10 +997,19 @@ function renderStream() {
       ? 'No routing events yet. Events appear here as requests flow through brainrouter.'
       : 'No events match the current filter.';
     list.innerHTML = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center;line-height:1.7">${msg}</div>`;
+    renderedGroups = [];
     return;
   }
 
-  list.innerHTML = filtered.map(g => renderGroup(g)).join('');
+  renderedGroups = filtered;
+  list.innerHTML = filtered.map((g, i) => renderGroup(g, i)).join('');
+}
+
+function dismissCard(index) {
+  const g = renderedGroups[index];
+  if (!g) return;
+  dismissedKeys.add(g.key);
+  renderStream();
 }
 
 // ─── Render reviews view ──────────────────────────────────────────────────────
@@ -1018,19 +1089,36 @@ function updateHealth() {
   if (cppEl && h.llama_cpp === 'loading') cppEl.textContent = 'loading…';
 }
 
+// ─── Generic pill toggle (discord/signal-style switch) ───────────────────────
+function applyToggle(name, enabled) {
+  const btn = document.getElementById('toggle-' + name);
+  const thumb = document.getElementById('toggle-' + name + '-thumb');
+  if (!btn || !thumb) return;
+  btn.style.background = enabled ? 'var(--green)' : 'var(--textMute)';
+  thumb.style.left = enabled ? '14px' : '2px';
+}
+
 // ─── Bonsai server toggle / model flush ──────────────────────────────────────
+function bonsaiIsOn() {
+  return !!(bonsaiData && bonsaiData.enabled && bonsaiData.healthy);
+}
+
 function applyBonsaiUI(b) {
   const txt = document.getElementById('ver-bonsai');
-  if (!b) { updateDot('bonsai', false); if (txt) txt.textContent = '—'; return; }
+  applyToggle('bonsai', !!(b && b.enabled && b.healthy));
+  if (!txt) return;
+  if (!b) { updateDot('bonsai', false); txt.textContent = '—'; return; }
+  const fork = (versionsData && versionsData.bonsai_fork && versionsData.bonsai_fork !== 'unknown')
+    ? versionsData.bonsai_fork.slice(0, 22) : '';
   if (!b.enabled) {
     updateDot('bonsai', false);
-    if (txt) txt.textContent = 'off';
+    txt.textContent = fork ? 'off · ' + fork : 'off';
   } else if (b.healthy) {
     updateDot('bonsai', true);
-    if (txt) txt.textContent = 'on';
+    txt.textContent = fork ? 'on · ' + fork : 'on';
   } else {
     updateDot('bonsai', false);
-    if (txt) txt.textContent = 'down';
+    txt.textContent = 'starting…';
   }
 }
 
@@ -1042,23 +1130,39 @@ async function refreshBonsai() {
   }
 }
 
-async function toggleBonsai() {
+// Wait until Bonsai reaches the desired state (model load can take a while).
+async function waitBonsai(healthy, ms) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    await refreshBonsai();
+    if (bonsaiIsOn() === healthy) return bonsaiIsOn();
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  await refreshBonsai();
+  return bonsaiIsOn();
+}
+
+async function setBonsai(on) {
   if (bonsaiBusy) return;
-  const starting = !(bonsaiData && bonsaiData.enabled);
-  if (starting && !confirm('Start the Bonsai classifier? It loads a large model into GPU memory.')) return;
-  if (!starting && !confirm('Stop the Bonsai classifier server?\nAuto routing will default to cloud until re-enabled.')) return;
   bonsaiBusy = true;
   const txt = document.getElementById('ver-bonsai');
-  if (txt) txt.textContent = starting ? 'starting…' : 'stopping…';
+  if (txt) txt.textContent = on ? 'starting…' : 'stopping…';
   updateDot('bonsai', false);
   try {
     const r = await fetch('/api/bonsai/toggle', { method: 'POST' });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) console.warn('Bonsai toggle failed', j.error || r.status);
   } catch (e) { console.warn('Bonsai toggle error', e); }
+  await waitBonsai(on, 120000);
   bonsaiBusy = false;
-  await refreshBonsai();
   applyBonsaiUI(bonsaiData);
+}
+
+async function toggleBonsai() {
+  const turningOn = !bonsaiIsOn();
+  if (turningOn && !confirm('Start the Bonsai classifier? It loads a large model into GPU memory.')) return;
+  if (!turningOn && !confirm('Stop the Bonsai classifier server?\nAuto routing will default to cloud until re-enabled.')) return;
+  await setBonsai(turningOn);
 }
 
 async function flushModels() {
@@ -1132,19 +1236,9 @@ function updateVersions() {
       }
     }
   }
-}
 
-function applyBridgeToggle(name, enabled) {
-  const btn = document.getElementById('toggle-' + name);
-  const thumb = document.getElementById('toggle-' + name + '-thumb');
-  if (!btn || !thumb) return;
-  if (enabled) {
-    btn.style.background = 'var(--green)';
-    thumb.style.left = '14px';
-  } else {
-    btn.style.background = 'var(--textMute)';
-    thumb.style.left = '2px';
-  }
+  // Re-render the bonsai row so a freshly fetched fork version shows up.
+  applyBonsaiUI(bonsaiData);
 }
 
 async function toggleBridge(name) {
@@ -1155,7 +1249,7 @@ async function toggleBridge(name) {
   const currentlyEnabled = thumb && thumb.style.left === '14px';
   const newEnabled = !currentlyEnabled;
   // Optimistic UI update.
-  applyBridgeToggle(name, newEnabled);
+  applyToggle(name, newEnabled);
   try {
     const r = await fetch('/api/bridges/toggle', {
       method: 'POST',
@@ -1164,11 +1258,11 @@ async function toggleBridge(name) {
     });
     if (!r.ok) {
       // Revert on failure.
-      applyBridgeToggle(name, currentlyEnabled);
+      applyToggle(name, currentlyEnabled);
       console.warn('Bridge toggle failed', await r.text());
     }
   } catch (e) {
-    applyBridgeToggle(name, currentlyEnabled);
+    applyToggle(name, currentlyEnabled);
     console.warn('Bridge toggle error', e);
   }
 }
@@ -1181,7 +1275,7 @@ function updateBridges() {
   const discRow = document.getElementById('bridge-discord-row');
   if (disc) {
     updateDot('discord', disc.connected);
-    applyBridgeToggle('discord', disc.enabled !== false);
+    applyToggle('discord', disc.enabled !== false);
     const meta = document.getElementById('bridge-discord-meta');
     if (meta) {
       const msgs = disc.messages_handled > 0 ? disc.messages_handled + ' msg' : '';
@@ -1198,7 +1292,7 @@ function updateBridges() {
   const sigRow = document.getElementById('bridge-signal-row');
   if (sig) {
     updateDot('signal', sig.connected);
-    applyBridgeToggle('signal', sig.enabled !== false);
+    applyToggle('signal', sig.enabled !== false);
     const meta = document.getElementById('bridge-signal-meta');
     if (meta) {
       const msgs = sig.messages_handled > 0 ? sig.messages_handled + ' msg' : '';
@@ -1213,6 +1307,20 @@ function updateBridges() {
 }
 
 async function setRoutingMode(mode) {
+  // Auto routing needs the Bonsai classifier; block (and offer to start it)
+  // if it's off, so the mode can't be left in a no-brain state.
+  if (mode === 'auto' && !bonsaiIsOn()) {
+    const startNow = confirm('Auto routing requires the Bonsai classifier to be on.\n\nStart it now?');
+    if (startNow) {
+      await setBonsai(true);
+      if (!bonsaiIsOn()) {
+        alert('Bonsai did not come up yet. Try auto routing again once it shows "on".');
+        return;
+      }
+    } else {
+      return;
+    }
+  }
   try {
     await fetch('/api/routing-mode', {
       method: 'POST',
@@ -1234,6 +1342,127 @@ function applyRoutingModeUI(mode) {
     btn.style.color = active ? (colors[m] || 'var(--text)') : 'var(--textMute)';
     btn.style.fontWeight = active ? '600' : '400';
   });
+}
+
+// ─── Nudge (thinking budget) controls ────────────────────────────────────────
+let nudgeData = null;
+
+function applyNudgeUI(n) {
+  if (!n) return;
+  applyToggle('nudge', !!n.enabled);
+  const tier = n.tier || 'auto';
+  const colors = { auto: 'var(--green)', local: 'var(--cyan)', deep: 'var(--violet)' };
+  ['auto','local','deep'].forEach(t => {
+    const btn = document.getElementById('tier-' + t);
+    if (!btn) return;
+    const active = t === tier;
+    btn.style.background = active ? 'var(--bg3)' : 'transparent';
+    btn.style.color = active ? colors[t] : 'var(--textMute)';
+    btn.style.fontWeight = active ? '600' : '400';
+  });
+  const el = document.getElementById('nudge-budgets');
+  if (el && n.budgets) {
+    el.textContent = 'budgets: local ' + n.budgets.local + ' · deep ' + n.budgets.deep + (n.enabled ? '' : ' · nudge off');
+    el.title = n.model_key ? 'nudge model: ' + n.model_key : 'no nudge model key set (brainrouter.yaml)';
+  }
+}
+
+async function setNudgeTier(tier) {
+  try {
+    const r = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tier }),
+    });
+    if (r.ok && nudgeData) { nudgeData.tier = tier; applyNudgeUI(nudgeData); }
+  } catch(e) {}
+}
+
+async function toggleNudge() {
+  const currentlyOn = !!(nudgeData && nudgeData.enabled);
+  const next = !currentlyOn;
+  if (next && !confirm('Enable thinking-budget nudging?\nAuto-routed local requests will use the nudge model with a per-request reasoning budget (Bonsai picks local/deep tier when tier is "auto").')) return;
+  applyToggle('nudge', next);
+  try {
+    const r = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (!r.ok) { applyToggle('nudge', currentlyOn); console.warn('Nudge toggle failed', r.status); }
+    else if (nudgeData) { nudgeData.enabled = next; applyNudgeUI(nudgeData); }
+  } catch(e) { applyToggle('nudge', currentlyOn); }
+}
+
+// ─── Context size (llama-swap --fit-ctx) ─────────────────────────────────────
+let contextData = null;
+
+function applyContextUI(c) {
+  const sel = document.getElementById('ctx-select');
+  if (!sel || !c) return;
+  const v = String(c.value || 131072);
+  const has = Array.from(sel.options).some(o => o.value === v);
+  sel.value = has ? v : '131072';
+}
+
+async function setContextSize(value) {
+  const v = Number(value);
+  const label = v === 131072 ? 'auto (128k, stock default)' : v + ' tokens';
+  if (!confirm('Set the local context window to ' + label + '?\n\nThis rewrites the llama-swap config and restarts the local stack (models reload on the next request).')) {
+    refreshSlow();  // snap the select back
+    return;
+  }
+  try {
+    const r = await fetch('/api/context', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: v }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) alert('Context change failed: ' + (j.error || r.status));
+  } catch(e) {}
+  setTimeout(refreshSlow, 2000);
+}
+
+// ─── Prompt rewrite toggle (local pass-through) ──────────────────────────────
+let rewriteData = null;
+
+function applyRewriteUI(r) {
+  if (r) applyToggle('rewrite', !!r.enabled);
+}
+
+async function togglePromptRewrite() {
+  const currentlyOn = !!(rewriteData && rewriteData.enabled);
+  const next = !currentlyOn;
+  applyToggle('rewrite', next);
+  try {
+    const r = await fetch('/api/prompt-rewrite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (!r.ok) { applyToggle('rewrite', currentlyOn); console.warn('Rewrite toggle failed', r.status); }
+    else rewriteData = { enabled: next };
+  } catch(e) { applyToggle('rewrite', currentlyOn); }
+}
+
+// ─── Toolboxes list (all llama-* containers) ─────────────────────────────────
+let toolboxesData = null;
+
+function renderToolboxes() {
+  const el = document.getElementById('toolbox-list');
+  if (!el) return;
+  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
+  if (boxes.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = boxes.map(tb => {
+    const color = tb.running ? 'var(--green)' : 'var(--textMute)';
+    const sub = [tb.status, tb.created ? 'built ' + tb.created : ''].filter(Boolean).join(' · ');
+    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px" title="${escHtml(tb.name)} — ${escHtml(sub)}">
+      <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
+      <span style="color:var(--textDim);flex:1">${escHtml(tb.short_name || tb.name)}</span>
+      <span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${tb.running ? 'up' : 'down'}</span>
+    </div>`;
+  }).join('');
 }
 
 async function upgradeIfAvailable(svc) {
@@ -1442,12 +1671,20 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, ctxRes, rewriteRes, tbRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
+    safeFetch('/api/nudge'),
+    safeFetch('/api/context'),
+    safeFetch('/api/prompt-rewrite'),
+    safeFetch('/api/toolboxes'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
+  if (nudgeRes) { nudgeData = nudgeRes; applyNudgeUI(nudgeRes); }
+  if (ctxRes) { contextData = ctxRes; applyContextUI(ctxRes); }
+  if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
+  if (tbRes) { toolboxesData = tbRes; renderToolboxes(); }
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────

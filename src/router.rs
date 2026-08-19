@@ -11,7 +11,8 @@
 //!      applied in server.rs where the wire format (OpenAI/Anthropic) is known.
 
 use crate::{
-    classifier::{Classifier, RoutingDecision},
+    classifier::{BudgetTier, Classifier, RoutingDecision},
+    config::NudgeBudgets,
     health::HealthTracker,
     inference_state::{InferenceTracker, Phase},
     prompt_rewriter,
@@ -22,6 +23,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use futures_util::{stream as fstream, StreamExt};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{sync::Arc, time::{Duration, Instant}};
 use tracing::{debug, info, warn};
 
@@ -79,6 +81,16 @@ pub struct Router {
     local_system_prompt: Option<String>,
     /// Dashboard inference progress tracker.
     pub inference_tracker: Arc<InferenceTracker>,
+    /// Reasoning budgets per tier (nudge). Injected as
+    /// `reasoning_budget_tokens` on auto-routed local requests when nudge is on.
+    nudge_budgets: NudgeBudgets,
+    /// Runtime nudge master switch (shared with dashboard).
+    nudge_enabled: Arc<AtomicBool>,
+    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = local, 2 = deep.
+    nudge_tier: Arc<AtomicU8>,
+    /// Runtime prompt-rewrite toggle. When off, local routes forward the
+    /// incoming messages untouched (no system-prompt rewrite).
+    prompt_rewrite: Arc<AtomicBool>,
 }
 
 pub struct RouterArgs {
@@ -92,6 +104,10 @@ pub struct RouterArgs {
     pub routing_events: Arc<RoutingEvents>,
     pub local_system_prompt: Option<String>,
     pub inference_tracker: Arc<InferenceTracker>,
+    pub nudge_budgets: NudgeBudgets,
+    pub nudge_enabled: Arc<AtomicBool>,
+    pub nudge_tier: Arc<AtomicU8>,
+    pub prompt_rewrite: Arc<AtomicBool>,
 }
 
 impl Router {
@@ -106,6 +122,51 @@ impl Router {
             routing_events: args.routing_events,
             local_system_prompt: args.local_system_prompt,
             inference_tracker: args.inference_tracker,
+            nudge_budgets: args.nudge_budgets,
+            nudge_enabled: args.nudge_enabled,
+            nudge_tier: args.nudge_tier,
+            prompt_rewrite: args.prompt_rewrite,
+        }
+    }
+
+    /// Rewrite the system prompt for local routing, unless the dashboard
+    /// prompt-rewrite toggle is off (pass-through mode).
+    fn maybe_rewrite_local(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        if !self.prompt_rewrite.load(Ordering::Relaxed) {
+            return messages;
+        }
+        prompt_rewriter::rewrite_for_local(messages, self.local_system_prompt.as_deref())
+    }
+
+    /// Inject the per-request reasoning budget for auto-routed local requests
+    /// when nudge is enabled. The field flows through the request's flattened
+    /// `extra` map into llama-swap and on to the nudge fork's
+    /// `oaicompat_chat_params_parse`. A client-supplied value is never
+    /// overridden, and direct/explicit model requests never reach this path.
+    fn inject_nudge_budget(&self, request: &mut ChatCompletionRequest, tier: BudgetTier) {
+        if !self.nudge_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let tier = match self.nudge_tier.load(Ordering::Relaxed) {
+            1 => BudgetTier::Local,
+            2 => BudgetTier::Deep,
+            _ => tier,
+        };
+        let budget = match tier {
+            BudgetTier::Local => self.nudge_budgets.local,
+            BudgetTier::Deep => self.nudge_budgets.deep,
+        };
+        if !request.extra.is_object() {
+            request.extra = serde_json::json!({});
+        }
+        if let serde_json::Value::Object(map) = &mut request.extra {
+            if map.insert(
+                "reasoning_budget_tokens".to_string(),
+                serde_json::json!(budget),
+            ).is_none()
+            {
+                debug!(budget, ?tier, "Injected per-request reasoning budget");
+            }
         }
     }
 
@@ -130,10 +191,7 @@ impl Router {
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
                 tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
-                request.messages = prompt_rewriter::rewrite_for_local(
-                    request.messages,
-                    self.local_system_prompt.as_deref(),
-                );
+                request.messages = self.maybe_rewrite_local(request.messages);
                 request.model = self.fallback_model.clone();
                 ("local-direct", self.route_local(request).await)
             }
@@ -150,10 +208,7 @@ impl Router {
                     if !specific.is_empty() {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
-                        request.messages = prompt_rewriter::rewrite_for_local(
-                            request.messages,
-                            self.local_system_prompt.as_deref(),
-                        );
+                        request.messages = self.maybe_rewrite_local(request.messages);
                         request.model = specific.to_string();
                         ("local-specific", self.route_local(request).await)
                     } else {
@@ -169,9 +224,10 @@ impl Router {
                                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                                 ("cloud", self.route_cloud(request).await)
                             }
-                            RoutingDecision::Local { model } => {
+                            RoutingDecision::Local { model, tier } => {
                                 tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                                 request.model = model;
+                                self.inject_nudge_budget(&mut request, tier);
                                 ("local", self.route_local(request).await)
                             }
                         }
@@ -182,10 +238,7 @@ impl Router {
                     // choice is authoritative.
                     info!(model = %requested_model, "Known local model — routing directly to llama-swap");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    request.messages = prompt_rewriter::rewrite_for_local(
-                        request.messages,
-                        self.local_system_prompt.as_deref(),
-                    );
+                    request.messages = self.maybe_rewrite_local(request.messages);
                     // request.model is already correct (it's the llama-swap model key)
                     ("local-specific", self.route_local(request).await)
                 } else {
@@ -201,9 +254,10 @@ impl Router {
                             tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                             ("cloud", self.route_cloud(request).await)
                         }
-                        RoutingDecision::Local { model } => {
+                        RoutingDecision::Local { model, tier } => {
                             tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                             request.model = model;
+                            self.inject_nudge_budget(&mut request, tier);
                             ("local", self.route_local(request).await)
                         }
                     }

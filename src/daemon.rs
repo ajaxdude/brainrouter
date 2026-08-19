@@ -75,11 +75,20 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     .await
     .context("Failed to start Bonsai llama-server")?;
 
+    // Nudge (per-request reasoning budget) runtime state — shared between the
+    // classifier, the router, and the dashboard API.
+    let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llama_swap.nudge.enabled));
+    let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)); // 0 = Bonsai picks
+    let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let context_value = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(131072));
+
     // Create classifier pointing at the external server
     let classifier = Classifier::new(
         bonsai_control.url(),
         config.llama_swap.fallback_model.clone(),
         bonsai_control.enabled(),
+        Arc::clone(&nudge_enabled),
+        config.llama_swap.nudge.model_key.clone(),
     );
     let classifier = Arc::new(classifier);
     info!("Bonsai classifier ready");
@@ -151,6 +160,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         routing_events: Arc::clone(&routing_events),
         local_system_prompt,
         inference_tracker: Arc::clone(&inference_tracker),
+        nudge_budgets: config.llama_swap.nudge.budgets,
+        nudge_enabled: Arc::clone(&nudge_enabled),
+        nudge_tier: Arc::clone(&nudge_tier),
+        prompt_rewrite: Arc::clone(&prompt_rewrite),
     }));
 
     // Session manager (in-memory; ephemeral per process lifetime)
@@ -200,17 +213,23 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         tcp_addr: tcp_addr.to_string(),
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         versions_cache: Arc::new(versions_rx),
+        nudge_enabled,
+        nudge_tier,
+        nudge_model_key: config.llama_swap.nudge.model_key.clone(),
+        nudge_budgets: config.llama_swap.nudge.budgets,
+        prompt_rewrite,
+        context_value,
     });
 
     // Background task: compute versions once, then refresh every 30 minutes.
     {
         let tx = Arc::clone(&versions_tx);
         tokio::spawn(async move {
-            let data = server::compute_versions_json().await;
+            let data = server::compute_versions_json(&config.bonsai.fork_path).await;
             let _ = tx.send_replace(data);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
-                let data = server::compute_versions_json().await;
+                let data = server::compute_versions_json(&config.bonsai.fork_path).await;
                 let _ = tx.send_replace(data);
             }
         });

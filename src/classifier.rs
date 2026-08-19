@@ -1,7 +1,9 @@
 //! Bonsai-powered query classifier.
 //!
 //! At request time, brainrouter sends the user's last message to the Bonsai
-//! 27B llama-server (PrismML fork), which replies with "cloud" or "local".
+//! 27B llama-server (PrismML fork), which replies with "cloud", "local", or
+//! "deep". "deep" routes local with the full reasoning budget when nudge is
+//! enabled (voidsurfer/llama.cpp-nudge); "local" uses the tighter budget.
 
 use crate::types::ChatCompletionRequest;
 use reqwest::Client;
@@ -15,8 +17,20 @@ use std::sync::Arc;
 pub enum RoutingDecision {
     /// Forward to Manifest (cloud router). Request model is rewritten to "auto".
     Cloud,
-    /// Forward directly to llama-swap with this specific model name.
-    Local { model: String },
+    /// Forward to llama-swap with the given model key.
+    ///
+    /// `tier` is the reasoning-budget tier picked by the classifier; it only
+    /// matters when nudge is enabled (the router injects the matching budget).
+    Local { model: String, tier: BudgetTier },
+}
+
+/// Reasoning-budget tier for auto-routed local requests (nudge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetTier {
+    /// Simple task — tight thinking budget.
+    Local,
+    /// Complex task that should stay local — full thinking budget.
+    Deep,
 }
 
 /// Maximum tokens to generate during classification. We only need one word.
@@ -37,18 +51,34 @@ pub struct Classifier {
     /// llama-server this is cleared and classification skips HTTP, returning
     /// the safe Cloud default.
     enabled: Arc<AtomicBool>,
+    /// Shared nudge master switch (dashboard/config). When on, auto-routed
+    /// local requests use the nudge model key so per-request budgets apply.
+    nudge_enabled: Arc<AtomicBool>,
+    /// llama-swap model key that runs the nudge fork (started with
+    /// `--reasoning-budget-enable`). `None` → fall back to the default model.
+    nudge_model_key: Option<String>,
 }
 
 impl Classifier {
     /// Create a classifier pointing at the external Bonsai llama-server.
     /// `enabled` is the shared flag flipped by `BonsaiControl` when the
-    /// server is started or stopped at runtime.
-    pub fn new(server_url: String, default_local_model: String, enabled: Arc<AtomicBool>) -> Self {
+    /// server is started or stopped at runtime. `nudge_enabled` is the
+    /// runtime nudge master switch; `nudge_model_key` is the llama-swap key
+    /// that runs the nudge fork (used only when nudge is enabled).
+    pub fn new(
+        server_url: String,
+        default_local_model: String,
+        enabled: Arc<AtomicBool>,
+        nudge_enabled: Arc<AtomicBool>,
+        nudge_model_key: Option<String>,
+    ) -> Self {
         Self {
             server_url,
             default_local_model,
             http: Client::new(),
             enabled,
+            nudge_enabled,
+            nudge_model_key,
         }
     }
 
@@ -77,7 +107,7 @@ impl Classifier {
                     ChatMessageInput {
                         role: "system".to_string(),
                         content: format!(
-                            "You are a routing classifier. Reply with exactly one word: \"cloud\" for complex tasks (architecture, debugging large systems, multi-step reasoning, refactoring) or \"local\" for simple tasks (short answers, simple questions, single-line code, explanations). Output nothing else."
+                            "You are a routing classifier. Reply with exactly one word: \"cloud\" for complex tasks that need the cloud (large architecture, multi-system debugging, heavy refactoring), \"local\" for simple tasks (short answers, simple questions, single-line code, quick explanations), or \"deep\" for complex tasks that should still run locally (focused multi-step reasoning, moderate debugging). Output nothing else."
                         ),
                     },
                     ChatMessageInput {
@@ -127,36 +157,47 @@ impl Classifier {
 
         match decision {
             ParsedDecision::Cloud => RoutingDecision::Cloud,
-            ParsedDecision::Local => {
+            ParsedDecision::Local | ParsedDecision::Deep => {
+                let tier = match decision {
+                    ParsedDecision::Deep => BudgetTier::Deep,
+                    _ => BudgetTier::Local,
+                };
                 let user_requested_specific = !matches!(
                     requested_model.as_str(),
                     "auto" | "brainrouter/auto" | "brainrouter" | ""
                 );
                 let model = if user_requested_specific {
                     requested_model
+                } else if self.nudge_enabled.load(Ordering::Relaxed) {
+                    // Nudge on: use the fork key so per-request budgets apply.
+                    self.nudge_model_key
+                        .clone()
+                        .unwrap_or_else(|| self.default_local_model.clone())
                 } else {
                     self.default_local_model.clone()
                 };
-                RoutingDecision::Local { model }
+                RoutingDecision::Local { model, tier }
             }
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 enum ParsedDecision {
     Cloud,
     Local,
+    Deep,
 }
 
 /// Parse Bonsai's raw output into a decision. Looks at the first non-whitespace
-/// character: 'l' or 'L' → Local, anything else → Cloud (safe default).
+/// character: 'l'/'L' → Local, 'd'/'D' → Deep, anything else → Cloud (safe
+/// default).
 fn parse_decision(raw: &str) -> ParsedDecision {
     let trimmed = raw.trim_start();
-    if trimmed.starts_with('l') || trimmed.starts_with('L') {
-        ParsedDecision::Local
-    } else {
-        ParsedDecision::Cloud
+    match trimmed.chars().next() {
+        Some('l') | Some('L') => ParsedDecision::Local,
+        Some('d') | Some('D') => ParsedDecision::Deep,
+        _ => ParsedDecision::Cloud,
     }
 }
 
@@ -231,7 +272,7 @@ mod tests {
         assert!(matches!(parse_decision("cloud"), ParsedDecision::Cloud));
         assert!(matches!(parse_decision("Cloud"), ParsedDecision::Cloud));
         assert!(matches!(parse_decision("  cloud "), ParsedDecision::Cloud));
-        // Anything not starting with l/L defaults to Cloud
+        // Anything not starting with l/L/d/D defaults to Cloud
         assert!(matches!(parse_decision("xyz"), ParsedDecision::Cloud));
         assert!(matches!(parse_decision(""), ParsedDecision::Cloud));
     }
@@ -242,5 +283,13 @@ mod tests {
         assert!(matches!(parse_decision("Local"), ParsedDecision::Local));
         assert!(matches!(parse_decision("  local"), ParsedDecision::Local));
         assert!(matches!(parse_decision("l"), ParsedDecision::Local));
+    }
+
+    #[test]
+    fn parse_deep() {
+        assert!(matches!(parse_decision("deep"), ParsedDecision::Deep));
+        assert!(matches!(parse_decision("Deep"), ParsedDecision::Deep));
+        assert!(matches!(parse_decision("  deep"), ParsedDecision::Deep));
+        assert!(matches!(parse_decision("d"), ParsedDecision::Deep));
     }
 }

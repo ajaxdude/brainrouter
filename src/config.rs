@@ -60,6 +60,69 @@ pub struct LlamaSwapConfig {
     /// If absent, the built-in lean prompt is used.
     #[serde(default)]
     pub local_system_prompt: Option<String>,
+
+    /// Optional reasoning-budget nudge settings (voidsurfer/llama.cpp-nudge
+    /// fork). When enabled, auto-routed local requests are sent to
+    /// `model_key` — a llama-swap entry that must be launched with
+    /// `--reasoning-budget-enable` — carrying a per-request
+    /// `reasoning_budget_tokens` field chosen from `budgets` by Bonsai's tier
+    /// ("local" vs "deep") or the dashboard tier override.
+    #[serde(default)]
+    pub nudge: NudgeConfig,
+}
+
+/// Reasoning-budget nudge settings. The master switch can also be flipped at
+/// runtime from the dashboard (`POST /api/nudge`); `budgets` come from here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NudgeConfig {
+    /// Master switch. Off → normal local routing (no model key swap, no budget
+    /// injection).
+    #[serde(default)]
+    pub enabled: bool,
+    /// llama-swap model key that runs the nudge fork. When set and nudge is
+    /// on, auto-local requests use this key instead of `fallback_model`.
+    #[serde(default)]
+    pub model_key: Option<String>,
+    /// Per-tier reasoning budgets (tokens).
+    #[serde(default)]
+    pub budgets: NudgeBudgets,
+}
+
+impl Default for NudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_key: None,
+            budgets: NudgeBudgets::default(),
+        }
+    }
+}
+
+/// Per-tier reasoning budgets (tokens) injected as `reasoning_budget_tokens`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NudgeBudgets {
+    /// "local" tier (simple tasks) — tight budget.
+    #[serde(default = "default_nudge_budget_local")]
+    pub local: u32,
+    /// "deep" tier (complex local tasks) — full budget.
+    #[serde(default = "default_nudge_budget_deep")]
+    pub deep: u32,
+}
+
+fn default_nudge_budget_local() -> u32 {
+    10240
+}
+fn default_nudge_budget_deep() -> u32 {
+    12288
+}
+
+impl Default for NudgeBudgets {
+    fn default() -> Self {
+        Self {
+            local: default_nudge_budget_local(),
+            deep: default_nudge_budget_deep(),
+        }
+    }
 }
 
 /// Configuration for the embedded Bonsai classifier model.

@@ -47,7 +47,7 @@ fn config_file_list(home: &str, config_path: &std::path::Path, llama_swap_config
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -61,7 +61,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 use tracing::{debug, error, info, warn};
 use std::sync::LazyLock;
 
@@ -107,22 +107,36 @@ pub struct AppState {
     pub manifest_url: String,
     /// Bridge transport manager (Discord, Signal status tracking).
     pub bridge_manager: Arc<crate::bridge::BridgeManager>,
-    /// Path to the brainrouter.yaml config file.
+    /// Path to brainrouter's own config file (used by the config UI and
+    /// the self-restart endpoint).
     pub config_path: PathBuf,
-    /// Path to the llama-swap config file.
+    /// Path to llama-swap's config file (used by the restart-local-stack
+    /// endpoint and the context-size setter).
     pub llama_swap_config_path: PathBuf,
-    /// TCP address this daemon is listening on (e.g. "127.0.0.1:9099").
-    /// Used to write the correct port into ~/.omp/agent/models.yml.
+    /// Our own TCP listen address (for the "open dashboard" button).
     pub tcp_addr: String,
     /// Runtime control of the Bonsai classifier llama-server (dashboard
     /// start/stop). Also read by the classifier for its enabled flag.
     pub bonsai: Arc<crate::bonsai_server::BonsaiControl>,
-    /// Global routing override: 0=auto (Bonsai), 1=force_cloud, 2=force_local.
-    /// Written by POST /api/routing-mode, read before every chat completion.
-    pub routing_mode: Arc<AtomicU8>,
-    /// Cached result of the last version check.  Populated by a background
-    /// task in daemon.rs; the HTTP handler reads this without blocking.
-    pub versions_cache: Arc<tokio::sync::watch::Receiver<serde_json::Value>>,
+    /// Runtime routing mode: 0 = auto (Bonsai), 1 = cloud, 2 = local.
+    /// Read by the proxy handlers to force-rewrite `request.model`.
+    pub routing_mode: std::sync::Arc<AtomicU8>,
+    /// Cached version/upgrade-check data (refreshed every 30 min).
+    pub versions_cache: std::sync::Arc<tokio::sync::watch::Receiver<serde_json::Value>>,
+    /// Runtime nudge master switch (initialized from `llama_swap.nudge.enabled`).
+    pub nudge_enabled: Arc<AtomicBool>,
+    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = local, 2 = deep.
+    pub nudge_tier: Arc<AtomicU8>,
+    /// Nudge model key from config (static; runtime changes use the config UI).
+    pub nudge_model_key: Option<String>,
+    /// Per-tier reasoning budgets from config.
+    pub nudge_budgets: crate::config::NudgeBudgets,
+    /// Runtime prompt-rewrite toggle (default on). When off, local routes
+    /// forward the incoming prompt untouched.
+    pub prompt_rewrite: Arc<AtomicBool>,
+    /// Last applied llama-swap context size (tokens); 131072 = the stock
+    /// `--fit` default.
+    pub context_value: Arc<AtomicU64>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -200,6 +214,8 @@ async fn handle_request(
             || path == "/api/routing-mode" || path == "/api/review-config"
             || path == "/api/bridges/toggle"
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
+            || path == "/api/nudge" || path == "/api/prompt-rewrite"
+            || path == "/api/context"
         ));
 
     if is_destructive {
@@ -559,6 +575,147 @@ async fn handle_request(
                     let resp = json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &ErrorResponse { error: format!("Bonsai toggle failed: {}", e) },
+                    );
+                    into_unsync(resp)
+                }
+            }
+        }
+
+        // ── Nudge (thinking budget) API ─────────────────────────────────────
+        ("GET", "/api/nudge") => {
+            let tier = match state.nudge_tier.load(AtomicOrdering::Relaxed) {
+                1 => "local",
+                2 => "deep",
+                _ => "auto",
+            };
+            let resp = json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "enabled": state.nudge_enabled.load(AtomicOrdering::Relaxed),
+                    "tier": tier,
+                    "model_key": state.nudge_model_key,
+                    "budgets": {
+                        "local": state.nudge_budgets.local,
+                        "deep": state.nudge_budgets.deep,
+                    },
+                }),
+            );
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/nudge") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                state.nudge_enabled.store(enabled, AtomicOrdering::Relaxed);
+            }
+            if let Some(tier) = val.get("tier").and_then(|v| v.as_str()) {
+                let t = match tier {
+                    "local" => 1,
+                    "deep" => 2,
+                    _ => 0,
+                };
+                state.nudge_tier.store(t, AtomicOrdering::Relaxed);
+            }
+            let resp = json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.nudge_enabled.load(AtomicOrdering::Relaxed),
+                "tier": match state.nudge_tier.load(AtomicOrdering::Relaxed) {
+                    1 => "local",
+                    2 => "deep",
+                    _ => "auto",
+                },
+            }));
+            into_unsync(resp)
+        }
+
+        // ── Prompt-rewrite toggle API (local pass-through mode) ─────────────
+        ("GET", "/api/prompt-rewrite") => {
+            let resp = json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
+                }),
+            );
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/prompt-rewrite") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                state.prompt_rewrite.store(enabled, AtomicOrdering::Relaxed);
+            }
+            let resp = json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
+            }));
+            into_unsync(resp)
+        }
+
+        // ── Toolboxes API (all llama-* toolbox containers) ──────────────────
+        ("GET", "/api/toolboxes") => {
+            let resp = toolboxes_list().await;
+            into_unsync(resp)
+        }
+
+        // ── Context size API (rewrites llama-swap ctx flags, then restart) ──
+        ("GET", "/api/context") => {
+            let value = state.context_value.load(AtomicOrdering::Relaxed);
+            let resp = json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "value": value,
+                    "auto": value == 131072,
+                }),
+            );
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/context") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            match val.get("value").and_then(|v| v.as_u64()) {
+                Some(v) if v >= 2048 && v <= 262144 => match apply_llama_swap_context(&state.llama_swap_config_path, v) {
+                    Ok(replacements) if replacements > 0 => {
+                        state.context_value.store(v, AtomicOrdering::Relaxed);
+                        // Restart llama-swap after the response is sent (same
+                        // delayed pattern as the brainrouter self-restart).
+                        tokio::spawn(async {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let _ = restart_service("llama-swap").await;
+                        });
+                        let resp = json_response(StatusCode::OK, &serde_json::json!({
+                            "ok": true,
+                            "value": v,
+                            "replacements": replacements,
+                            "note": "llama-swap config updated; restarting local stack",
+                        }));
+                        into_unsync(resp)
+                    }
+                    Ok(_) => {
+                        let resp = json_response(
+                            StatusCode::BAD_REQUEST,
+                            &ErrorResponse {
+                                error: "no ctx flags found in llama-swap config".into(),
+                            },
+                        );
+                        into_unsync(resp)
+                    }
+                    Err(e) => {
+                        let resp = json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &ErrorResponse {
+                                error: format!("failed to update llama-swap context: {}", e),
+                            },
+                        );
+                        into_unsync(resp)
+                    }
+                },
+                _ => {
+                    let resp = json_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorResponse {
+                            error: "value must be an integer between 2048 and 262144".into(),
+                        },
                     );
                     into_unsync(resp)
                 }
@@ -1240,9 +1397,119 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
     }
 }
 
+/// List all `llama-*` toolbox containers for the dashboard "Toolboxes" section.
+/// Shows every toolbox the user has (radv, radv-performance, nudge, rocm, ...)
+/// with its image, running state, and image build date — not just the default
+/// vulkan-radv one.
+pub async fn toolboxes_list() -> Response<Full<Bytes>> {
+    use tokio::process::Command;
+    let containers = Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"])
+        .output()
+        .await;
+    let images = Command::new("podman")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}\t{{.Created}}"])
+        .output()
+        .await;
+
+    // image ref -> created date (YYYY-MM-DD)
+    let mut image_created: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(o) = images {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some((refname, created)) = line.split_once('\t') {
+                let date = created.trim().get(..10).unwrap_or("").to_string();
+                image_created.insert(refname.to_string(), date);
+            }
+        }
+    }
+
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    if let Ok(o) = containers {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.splitn(3, '\t');
+            let (Some(name), Some(image), Some(status)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            // Only llama-* toolboxes (skip comfyui, ds4, etc.).
+            if !name.starts_with("llama-") {
+                continue;
+            }
+            list.push(serde_json::json!({
+                "name": name,
+                "short_name": name.strip_prefix("llama-").unwrap_or(name),
+                "image": image,
+                "running": status.starts_with("Up"),
+                "status": status,
+                "created": image_created.get(image).cloned().unwrap_or_default(),
+            }));
+        }
+    }
+    list.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    json_response(StatusCode::OK, &serde_json::json!({ "toolboxes": list }))
+}
+
+/// Rewrite the llama.cpp context flags in the llama-swap config to `value`.
+/// Replaces every `--fit-ctx N` and `-c N` occurrence, preserving the rest of
+/// the file (including comments and other model entries). Returns the number
+/// of replacements made.
+pub fn apply_llama_swap_context(path: &std::path::Path, value: u64) -> anyhow::Result<usize> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut replacements = 0usize;
+    let mut out = String::with_capacity(contents.len());
+    for (i, line) in contents.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let (l1, c1) = replace_ctx_flag(line, "--fit-ctx", value);
+        let (l2, c2) = replace_ctx_flag(&l1, "-c", value);
+        replacements += c1 + c2;
+        out.push_str(&l2);
+    }
+    std::fs::write(path, out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(replacements)
+}
+
+/// Replace the numeric value following every real occurrence of `flag` in a
+/// single line with `value`. A real occurrence has a word boundary before it
+/// (start-of-line or whitespace) and a run of digits after it — so `-ctk`,
+/// `-ctv`, and `--cache-ram` are never touched. Returns (new_line, count).
+fn replace_ctx_flag(line: &str, flag: &str, value: u64) -> (String, usize) {
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut count = 0usize;
+    let mut rest = line;
+    while let Some(idx) = rest.find(flag) {
+        let before_ok = idx == 0 || rest.as_bytes()[idx - 1].is_ascii_whitespace();
+        let after = &rest[idx + flag.len()..];
+        let trimmed_after = after.trim_start();
+        let pad_len = after.len() - trimmed_after.len();
+        let digit_end = trimmed_after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(trimmed_after.len());
+        let has_digits = digit_end > 0;
+        if before_ok && has_digits {
+            out.push_str(&rest[..idx]);
+            out.push_str(flag);
+            out.push_str(&after[..pad_len]); // keep original spacing
+            out.push_str(&value.to_string());
+            out.push_str(&trimmed_after[digit_end..]);
+            count += 1;
+            rest = &trimmed_after[digit_end..];
+        } else {
+            out.push_str(&rest[..idx + flag.len()]);
+            rest = &rest[idx + flag.len()..];
+        }
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
 /// Compute local versions and "latest available" metadata for the /api/versions endpoint.
 /// Called periodically by a background task in daemon.rs.
-pub async fn compute_versions_json() -> serde_json::Value {
+pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
     use tokio::process::Command;
 
     // 1. llama-swap version
@@ -1331,6 +1598,31 @@ pub async fn compute_versions_json() -> serde_json::Value {
             _ => "unknown".to_string(),
         }
     };
+    // 4b. Bonsai classifier fork (PrismML llama.cpp) — the binary that serves
+    //     the classifier, distinct from the toolbox llama-server above.
+    let bonsai_fork_ver = {
+        let out = Command::new(bonsai_fork_path)
+            .arg("--version")
+            .output()
+            .await;
+        match out {
+            Ok(o) => {
+                let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                combined
+                    .lines()
+                    .find(|l| l.contains("version:"))
+                    .map(|l| {
+                        let s = l.replace("version:", "").trim().to_string();
+                        s.split("built with").next().unwrap_or(&s).trim().to_string()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            }
+            Err(e) => {
+                warn!(error = %e, path = %bonsai_fork_path.display(), "Failed to read Bonsai fork version");
+                "unknown".to_string()
+            }
+        }
+    };
 
     // 5. Remote "latest available" versions (GitHub / Docker Hub)
     let (llama_swap_latest, manifest_latest, toolbox_latest) = tokio::join!(
@@ -1343,6 +1635,7 @@ pub async fn compute_versions_json() -> serde_json::Value {
         "brainrouter": env!("CARGO_PKG_VERSION"),
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
+        "bonsai_fork": bonsai_fork_ver,
         "toolbox_image_ver": toolbox_image_ver,
         "toolbox_image_created": toolbox_image_created,
         "manifest": manifest_ver,
