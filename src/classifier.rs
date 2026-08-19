@@ -121,6 +121,10 @@ impl Classifier {
                 max_tokens: Some(CLASSIFY_MAX_TOKENS),
                 temperature: Some(0.0),
                 stop: Some(vec!["\n".to_string()]),
+                // The Bonsai chat template has thinking mode on by default;
+                // the thinking preamble would eat the whole 10-token
+                // classification budget before the one-word answer.
+                chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
             })
             .send()
             .await;
@@ -239,6 +243,8 @@ struct ChatCompletionInput {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
