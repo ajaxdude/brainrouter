@@ -4,7 +4,7 @@
   <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
 </p>
 
-A speed-first Rust proxy that sits between your AI coding harness and your LLMs. An external Bonsai 27B classifier decides in under 500 ms whether each request goes to cloud (via Manifest) or local inference (via llama-swap). Automatic fallback, system-prompt rewriting for local models, and an MCP-triggered iterative code-review loop that runs entirely on your own hardware.
+A speed-first Rust proxy that sits between your AI coding harness and your LLMs. An external Bonsai classifier (off by default) decides in under 500 ms whether each request goes to cloud (via Manifest, off by default) or local inference (via llama-swap). Automatic fallback, system-prompt rewriting for local models, a headless CLI with total dashboard parity, and an MCP-triggered iterative code-review loop.
 
 ```
 coding harness (omp / claude / vibe / opencode / codex / droid)
@@ -13,17 +13,23 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
   brainrouter :9099
         │
   ┌─────┼──────────────────────────────────────────────────┐
-  │     ├─ model=auto  → Bonsai classifies query           │
-  │     │    Cloud ──── Manifest :3001                     │
+  │     ├─ model=auto  → Bonsai classifies query (if on)   │
+  │     │    Cloud ──── Manifest :3001 (if enabled)        │
   │     │    Local ──── llama-swap :8081                   │
   │     ├─ model=local → rewrite prompt → llama-swap       │
-  │     └─ model=cloud → Manifest (direct)                 │
+  │     └─ model=cloud → Manifest (if enabled) → fallback  │
   └─────────────────────────────────────────────────────────┘
         │
   on Manifest fail ───── llama-swap fallback_model
         │
   on task complete ────── review loop → local LLM → dashboard
+        │
+  headless ───────────── brainrouter cli (total parity)
 ```
+
+- **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
+- **Three routing modes.** `auto` uses Bonsai classification (<500 ms) when the classifier is on; with it off (the default), `auto` goes straight to local. `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest (also off by default).
+- **Off by default, opt in.** Fresh installs run fully local with a single hop — no Bonsai model download, no Manifest stack, no cloud API key required.
 
 - **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
 - **Three routing modes.** `auto` uses Bonsai classification (<500 ms). `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest.
@@ -31,7 +37,8 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Manifest handles cloud failover.** Manifest runs locally in Docker and picks the right cloud provider (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with its own automatic fallbacks.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
 - **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
-- **VRAM control.** The dashboard can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
+- **Headless CLI.** `brainrouter cli` mirrors every dashboard action from the terminal: status, versions, Bonsai/nudge/context/routing toggles, restarts, upgrades, config, and the full review lifecycle. See the [Headless CLI](#headless-cli-brainrouter-cli) section.
+- **VRAM control.** The dashboard or CLI can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
 
 ---
 
@@ -124,14 +131,27 @@ sudo systemctl restart llama-swap
 # /etc/brainrouter/brainrouter.yaml (shared for all users)
 
 manifest:
+  # Cloud routing is OFF by default. Set enabled: true to route cloud traffic
+  # to your Manifest instance.
+  enabled: false
   base_url: "http://localhost:3001/v1"
-  api_key_env: MANIFEST_API_KEY  # key lives in /etc/brainrouter/env
+  api_key_env: MANIFEST_API_KEY  # name of the env var, key lives in /etc/brainrouter/env
 
 llama_swap:
   base_url: "http://localhost:8081/v1"
   fallback_model: "your-local-model"  # must match a key in /opt/ai/llama-swap/config.yaml
+  # Optional: thinking-budget nudge for local routes (off by default)
+  # nudge:
+  #   enabled: true
+  #   budgets:
+  #     local: 10240
+  #     deep: 12288
 
 bonsai:
+  # Classifier is OFF by default. Set enabled: true and point model_path at a
+  # GGUF to run the external classifier server; auto-routing then hops
+  # Bonsai → cloud/local. While off, auto goes straight to local.
+  enabled: false
   model_path: "/mnt/models/prism/Bonsai-27B-dspark-bf16.gguf"  # GGUF model for classification
   server_port: 9200  # port for the external llama-server process
   fork_path: "/home/papa/.local/share/brainrouter/llama-prism/llama-server"  # PrismML fork binary
@@ -354,7 +374,7 @@ The header row shows current installed versions of:
 - **toolbox** — the OCI image version label
 - **bonsai** — classifier server state: `on`, `off`, or `down`
 
-Click the **bonsai** row to stop or start the classifier's llama-server. Stopping frees its GPU memory; while stopped, `auto` routing defaults to cloud until it is started again.
+Click the **bonsai** row to stop or start the classifier's llama-server. Stopping frees its GPU memory; while stopped (or disabled in config), `auto` routing skips classification and defaults to local — no cloud hop — until it is started again.
 
 When a newer version is available (checked against GitHub / Docker Hub on each poll), an orange **`component → new-version`** button appears. Click it to upgrade. Each button is labelled so you know exactly what will be updated.
 
@@ -391,6 +411,92 @@ Changes take effect immediately for new review requests. The setting persists ac
 
 ---
 
+## Headless CLI (`brainrouter cli`)
+
+Everything the dashboard can do is available from the terminal — total parity, no browser needed. `brainrouter cli` is a thin client that forwards each command to the running daemon over its Unix socket (default) or TCP (`--url`). It never loads Bonsai and never runs the review loop itself, so it stays instant.
+
+```bash
+# Point at the daemon (only needed when the socket isn't the default)
+brainrouter cli --socket /run/user/1000/brainrouter.sock status
+brainrouter cli --url http://127.0.0.1:9099 status
+```
+
+All output is pretty-printed JSON. `config show` / `config set` print and write raw YAML instead.
+
+### Health and telemetry
+
+```bash
+brainrouter cli status          # llama-swap, manifest, llama.cpp, toolbox + cloud-fallback
+brainrouter cli versions         # installed + latest for every component
+brainrouter cli inference        # loaded model, state, slot progress
+brainrouter cli events           # recent routing decisions
+brainrouter cli stats            # aggregated routing stats
+brainrouter cli models           # proxy model list (auto/local/cloud + keys)
+brainrouter cli models --llama-swap   # raw llama-swap model list
+```
+
+### Routing controls
+
+```bash
+brainrouter cli bonsai status            # classifier state (enabled/healthy)
+brainrouter cli bonsai on                # start the classifier server (frees cloud hops)
+brainrouter cli bonsai off               # stop it, free VRAM — auto routing goes local
+brainrouter cli bonsai toggle
+
+brainrouter cli nudge status             # thinking-budget nudge state
+brainrouter cli nudge on | off | toggle
+brainrouter cli nudge tier auto          # Bonsai picks local/deep
+brainrouter cli nudge tier local         # inject local budget
+brainrouter cli nudge tier deep          # inject deep budget
+
+brainrouter cli prompt-rewrite on | off  # local system-prompt rewriting (pass-through off)
+brainrouter cli context status           # current llama-swap context size
+brainrouter cli context set auto         # 131072 tokens
+brainrouter cli context set 65536        # range 2048–262144
+brainrouter cli routing-mode status
+brainrouter cli routing-mode set local   # auto | cloud | local
+
+brainrouter cli bridges status
+brainrouter cli bridges toggle discord true
+brainrouter cli bridges toggle signal false
+```
+
+### Operations
+
+```bash
+brainrouter cli toolboxes                # list llama-* toolbox containers
+brainrouter cli restart llama-swap       # llama-swap | llama-cpp | manifest | brainrouter
+brainrouter cli upgrade llama-swap       # llama-swap | manifest | toolbox
+brainrouter cli flush-models             # unload every model (frees VRAM)
+brainrouter cli sync-omp                 # live llama-swap models → OMP models.yml
+brainrouter cli config-files             # config files the daemon manages
+brainrouter cli config show              # current brainrouter.yaml (raw YAML)
+brainrouter cli config set ./new.yaml    # replace it; "-" reads stdin
+brainrouter cli llama-swap-config show   # llama-swap's config.yaml
+brainrouter cli llama-swap-config set ./config.yaml
+```
+
+### Reviews
+
+```bash
+brainrouter cli review list                     # all sessions
+brainrouter cli review get <sessionId>          # one session
+# Blocking request — prints progress, polls every 5 s, 30-minute cap:
+brainrouter cli review request feature-20260819-001 "Added CLI with total dashboard parity" \
+    --cwd /home/papa/ai/projects/brainrouter
+# Fire-and-forget, then poll yourself:
+brainrouter cli review request feature-20260819-001 "…" --cwd /path/to/project --async
+brainrouter cli review continue <sessionId>     # extra LLM rounds (keeps context)
+brainrouter cli review lgtm <sessionId>         # quick-approve
+brainrouter cli review resolve <sessionId> "feedback text"
+```
+
+Session IDs are validated before use in URLs (alphanumeric + `-`/`_`), so `review get` can't path-traverse.
+
+> **Headless workflow:** run `brainrouter serve` via systemd, then drive everything else from the CLI — no dashboard required. `brainrouter cli restart brainrouter` restarts the daemon itself; the CLI reconnects on the next call.
+
+---
+
 ## MCP code review guide
 
 The review tool is exposed over MCP so any harness can call it after completing a task.
@@ -412,7 +518,7 @@ The review tool is exposed over MCP so any harness can call it after completing 
 | `summary` | yes | 2–3 sentences: what changed, why, and any assumptions |
 | `details` | no | Additional technical context |
 | `conversationHistory` | no | Array of strings — recent conversation for context |
-| `cwd` | no (strongly recommended) | Absolute path to the project directory — required for accurate git diff; falls back to peer-cred-resolved cwd if omitted |
+| `cwd` | yes (CLI defaults to its own directory) | Absolute path to the project directory — required for accurate git diff. An invalid cwd (relative, `..`, empty) is rejected with HTTP 400, never silently replaced |
 
 ### Calling the review tool (agent instruction)
 
@@ -510,6 +616,7 @@ Long responses are automatically chunked (1500 chars for Discord, 4000 chars for
 
 ```yaml
 manifest:
+  enabled: false                        # cloud routing off by default
   base_url: "http://localhost:3001/v1"   # required
   api_key_env: MANIFEST_API_KEY          # optional — name of env var holding mnfst_* key
 
@@ -518,9 +625,14 @@ llama_swap:
   fallback_model: "my-model"             # required — must match a key in llama-swap config
   local_models: ["my-model", "other"]    # optional — model keys that bypass Bonsai when used directly
   local_system_prompt: "/path/to/prompt.md"  # optional — override built-in lean prompt
+  nudge:
+    enabled: false                       # thinking-budget injection off by default
+    model_key: "my-model"                # optional — which local model receives the budget
+    budgets: { local: 10240, deep: 12288 }
 
 bonsai:
-  model_path: "/mnt/models/prism/Bonsai-27B-dspark-bf16.gguf"  # required — absolute path
+  enabled: false                         # classifier off by default; auto → local while off
+  model_path: "/mnt/models/prism/Bonsai-27B-dspark-bf16.gguf"  # required when enabled
   server_port: 9200                                    # external llama-server port (default)
   fork_path: "/path/to/llama-server"                   # PrismML fork binary (default ~/.local/share/brainrouter/llama-prism/llama-server)
 
@@ -568,6 +680,7 @@ bridge:
 | Command | Description |
 |---|---|
 | `brainrouter serve` | HTTP proxy daemon. Listens on TCP `:9099` and UDS `/run/user/$UID/brainrouter.sock` |
+| `brainrouter cli` | Headless control plane — total dashboard parity over the daemon REST API. See [Headless CLI](#headless-cli-brainrouter-cli) |
 | `brainrouter mcp` | MCP stdio server. Spawned by harnesses; forwards tool calls to the daemon over UDS |
 | `brainrouter install <harness>` | Idempotently patches harness config. Harnesses: `omp`, `vibe`, `opencode`, `codex`, `droid`, `claude`, `pi` |
 
@@ -603,7 +716,17 @@ All on `http://127.0.0.1:9099`.
 | `POST` | `/api/restart/:service` | Restart `llama-swap`, `manifest`, `llama-cpp`, or `brainrouter` |
 | `GET` | `/api/bonsai` | Bonsai classifier server state (`enabled`, `healthy`) |
 | `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier to free/reclaim VRAM |
+| `GET/POST` | `/api/nudge` | Thinking-budget nudge state / update `{enabled, tier}` |
+| `GET/POST` | `/api/prompt-rewrite` | Prompt-rewrite state / update `{enabled}` |
+| `GET/POST` | `/api/context` | llama-swap context size / set `{value}` |
+| `GET/POST` | `/api/routing-mode` | Routing override / set `{mode}` |
+| `GET/POST` | `/api/bridges/toggle` | Bridge status / toggle `{bridge, enabled}` |
+| `GET` | `/api/toolboxes` | List llama-* toolbox containers |
 | `POST` | `/api/models/flush` | Unload all models from llama-swap memory (no restart) |
+| `POST` | `/api/models/sync-omp` | Sync llama-swap models into OMP's models.yml |
+| `GET` | `/api/config-files` | Config files the daemon manages |
+| `GET/POST` | `/api/config` | brainrouter.yaml read (YAML) / write |
+| `GET/POST` | `/api/llama-swap-config` | llama-swap config.yaml read (YAML) / write |
 
 #### Review
 
@@ -613,17 +736,22 @@ All on `http://127.0.0.1:9099`.
 | `GET` | `/review/session/:id` | Session detail |
 | `GET` | `/review/api/sessions` | JSON session list |
 | `GET` | `/review/api/sessions/:id` | JSON session detail |
-| `POST` | `/review/api/request` | Start a review. Body: `{taskId, summary, details?}` |
+| `POST` | `/review/api/request-async` | Start a review, return `sessionId` immediately. Body: `{taskId, summary, details?, cwd?}` |
+| `POST` | `/review/api/request` | Legacy blocking variant — still routed, no client uses it |
 | `POST` | `/review/api/resolve` | Resolve a review session. Body: `{sessionId, feedback}` |
-| `POST` | `/review/api/continue` | Continue a review iteration |
+| `POST` | `/review/api/continue` | Continue a review iteration (seeds prior turns; waits on human if it escalates) |
 | `POST` | `/review/api/lgtm` | Quick-approve a review session |
 | `POST` | `/review/session/:id/resolve` | Human resolve. Body: `{feedback: "lgtm"}` |
+
+All `/review/api/*` POSTs go through the same loopback-only + Origin-check gate as the other management endpoints.
 
 ### Architecture
 
 ```
 src/
-  main.rs            	-- clap dispatcher (serve | mcp | install)
+  main.rs            	-- clap dispatcher (serve | cli | mcp | install)
+  cli.rs             	-- headless CLI: every dashboard action over the daemon REST API
+  daemon_client.rs   	-- shared thin HTTP client (UDS + TCP) used by cli and mcp
   daemon.rs          	-- startup: loads Bonsai, wires state, starts server
   classifier.rs      	-- Cloud/Local decision via external Bonsai server
   bonsai_server.rs    	-- Bonsai llama-server lifecycle (spawn, health, dashboard toggle)

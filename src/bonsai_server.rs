@@ -92,17 +92,24 @@ impl BonsaiServer {
         let health_url = format!("{}/health", url);
         let deadline = Instant::now() + Duration::from_secs(60);
 
+        const HEALTH_TIMEOUT_SECS: u64 = 10;
+
         loop {
-            match HEALTH_CLIENT.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
+            // HEALTH_CLIENT has no default timeout, so bound each request: a
+            // wedged llama-server that accepts-but-never-responds must not
+            // hang boot indefinitely — the 60s deadline only runs between polls.
+            let check = HEALTH_CLIENT.get(&health_url).send();
+            match tokio::time::timeout(std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS), check).await {
+                Ok(Ok(resp)) if resp.status().is_success() => {
                     info!("Bonsai llama-server is healthy");
                     return Ok(());
                 }
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     let status = resp.status();
                     debug!("Bonsai health returned {}: {}", status, status.canonical_reason().unwrap_or(""));
                 }
-                Err(e) => debug!("Bonsai health check failed (still starting): {}", e),
+                Ok(Err(e)) => debug!("Bonsai health check failed (still starting): {}", e),
+                Err(_) => debug!("Bonsai health check timed out (still starting)"),
             }
 
             if Instant::now() >= deadline {
@@ -166,7 +173,7 @@ fn pid_alive(pid: u32) -> bool {
 /// every request; when off it skips HTTP and returns the safe Cloud default.
 pub struct BonsaiControl {
     fork_path: PathBuf,
-    model_path: PathBuf,
+    model_path: Option<PathBuf>,
     port: u16,
     server: Mutex<Option<BonsaiServer>>,
     /// Serializes start/stop so concurrent toggles cannot double-spawn.
@@ -174,12 +181,18 @@ pub struct BonsaiControl {
     enabled: Arc<AtomicBool>,
 }
 
+/// Default PrismML fork llama-server binary path (mirrors config.rs).
+fn default_fork_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(format!("{}/.local/share/brainrouter/llama-prism/llama-server", home))
+}
+
 impl BonsaiControl {
     /// Build the control and start the server (initial state: on).
     pub async fn start(fork_path: PathBuf, model_path: PathBuf, port: u16) -> Result<Self> {
         let control = Self {
             fork_path,
-            model_path,
+            model_path: Some(model_path),
             port,
             server: Mutex::new(None),
             op_lock: tokio::sync::Mutex::new(()),
@@ -187,6 +200,20 @@ impl BonsaiControl {
         };
         control.start_server().await?;
         Ok(control)
+    }
+
+    /// Build the control in the disabled state (bonsai.enabled: false).
+    /// No llama-server is spawned and the classifier flag starts off; the
+    /// dashboard/CLI can still start it later via `toggle`.
+    pub async fn disabled(port: u16) -> Self {
+        Self {
+            fork_path: default_fork_path(),
+            model_path: None,
+            port,
+            server: Mutex::new(None),
+            op_lock: tokio::sync::Mutex::new(()),
+            enabled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// HTTP base URL for the classifier to call (constant for this daemon).
@@ -210,9 +237,13 @@ impl BonsaiControl {
         if self.is_running() {
             return Ok(());
         }
+        let model_path = self
+            .model_path
+            .clone()
+            .context("Cannot start Bonsai: bonsai.model_path is not configured")?;
         let server = BonsaiServer::start(
             self.fork_path.clone(),
-            self.model_path.clone(),
+            model_path,
             self.port,
         )
         .await?;

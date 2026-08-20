@@ -53,6 +53,7 @@ fn session_update_status_and_feedback() {
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: None,
             review_model: None,
+            llm_turns: None,
         },
     );
 
@@ -82,6 +83,7 @@ fn session_human_feedback_goes_to_correct_field() {
             reviewer_type: Some(ReviewerType::Human),
             escalation_reason: None,
             review_model: None,
+            llm_turns: None,
         },
     );
 
@@ -111,6 +113,7 @@ fn session_escalation_reason_stored() {
             reviewer_type: Some(ReviewerType::Llm),
             escalation_reason: Some(EscalationReason::MaxIterations),
             review_model: None,
+            llm_turns: None,
         },
     );
 
@@ -176,6 +179,7 @@ fn update_nonexistent_session_is_noop() {
             reviewer_type: None,
             escalation_reason: None,
             review_model: None,
+            llm_turns: None,
         },
     );
 }

@@ -10,9 +10,13 @@
 #   Manifest failure → llama-swap fallback_model
 
 manifest:
+  # Manifest is OFF by default. Set enabled: true to route cloud traffic to
+  # your Manifest instance (docker compose, default port 2099).
+  enabled: false
   # URL of your Manifest instance (docker compose, default port 2099)
   base_url: "http://localhost:2099/v1"
-  # Name of the env var holding your Manifest API key (mnfst_* format)
+  # Name of the env var holding your Manifest API key (mnfst_* format),
+  # NOT the key itself — the daemon does std::env::var(api_key_env).
   api_key_env: MANIFEST_API_KEY
 
 llama_swap:
@@ -30,6 +34,10 @@ llama_swap:
   #   - "your-local-model-key"
 
 bonsai:
+  # Bonsai classifier is OFF by default — auto-routing goes straight to local
+  # (llama-swap). Set enabled: true and point model_path at a GGUF to run the
+  # external classifier server; model=auto then hops Bonsai → cloud/local.
+  enabled: false
   # Absolute path to the Bonsai GGUF file.
   # You may use ${models_path} as a shorthand for the models.path value below.
   # Download: huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \

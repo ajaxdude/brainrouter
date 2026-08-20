@@ -96,11 +96,14 @@ fn install_omp(bin: &Path, yes: bool) -> Result<()> {
 fn install_vibe(_bin: &PathBuf, _yes: bool) -> Result<()> {
     println!("Add this snippet to ~/.vibe/config.toml:");
     println!();
-    println!("{}", VIBE_SNIPPET);
+    println!("{}", vibe_snippet());
     Ok(())
 }
 
-const VIBE_SNIPPET: &str = r#"[[providers]]
+fn vibe_snippet() -> String {
+    let socket = uds_socket_path();
+    format!(
+        r#"[[providers]]
 name = "brainrouter"
 api_base = "http://127.0.0.1:9099/v1"
 api_style = "openai"
@@ -112,8 +115,11 @@ provider = "brainrouter"
 alias = "auto"
 
 mcp_servers = [
-  { name = "brainrouter", command = "brainrouter", args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"] },
-]"#;
+  {{ name = "brainrouter", command = "brainrouter", args = ["mcp", "--socket", "{}"] }},
+]"#,
+        socket
+    )
+}
 
 // ─── OpenCode ─────────────────────────────────────────────────────────────────
 
@@ -149,11 +155,14 @@ fn install_opencode(bin: &Path, yes: bool) -> Result<()> {
 fn install_codex(_bin: &PathBuf, _yes: bool) -> Result<()> {
     println!("Add this snippet to ~/.codex/config.toml:");
     println!();
-    println!("{}", CODEX_SNIPPET);
+    println!("{}", codex_snippet());
     Ok(())
 }
 
-const CODEX_SNIPPET: &str = r#"model = "auto"
+fn codex_snippet() -> String {
+    let socket = uds_socket_path();
+    format!(
+        r#"model = "auto"
 model_provider = "brainrouter"
 
 [model_providers.brainrouter]
@@ -163,7 +172,10 @@ env_key = "BRAINROUTER_API_KEY"
 
 [mcp_servers.brainrouter]
 command = "brainrouter"
-args = ["mcp", "--socket", "/run/user/$UID/brainrouter.sock"]"#;
+args = ["mcp", "--socket", "{}"]"#,
+        socket
+    )
+}
 
 // ─── Droid ────────────────────────────────────────────────────────────────────
 
@@ -249,7 +261,7 @@ fn install_claude(bin: &Path, yes: bool, shell_rc: bool) -> Result<()> {
 
 fn print_pi_instructions() {
     println!("Pi uses extensions, not MCP. See configs/harness/pi.md for instructions.");
-    println!("Review API: http://127.0.0.1:9099/review/api/request");
+    println!("Review API: http://127.0.0.1:9099/review/api/request-async");
     println!("Dashboard:  http://127.0.0.1:9099/review/");
 }
 
@@ -261,13 +273,13 @@ fn home_path(rel: &str) -> PathBuf {
 }
 
 fn uds_socket_path() -> String {
-    // Prefer runtime uid from XDG_RUNTIME_DIR or construct from UID
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{}/brainrouter.sock", xdg);
-    }
-    // Fall back to UID-based path
-    let uid = unsafe { libc::getuid() };
-    format!("/run/user/{}/brainrouter.sock", uid)
+    // Must match the daemon's own default exactly — install writes MCP
+    // configs for the socket the daemon actually creates. When
+    // XDG_RUNTIME_DIR is unset (e.g. systemd --user-less headless setups)
+    // the daemon falls back to /run/brainrouter.sock, not /run/user/$UID.
+    brainrouter::config::default_socket_path()
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn read_json_or_empty(path: &PathBuf) -> serde_json::Value {

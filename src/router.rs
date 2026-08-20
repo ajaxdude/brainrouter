@@ -71,6 +71,7 @@ impl RouteInfo {
 pub struct Router {
     classifier: Arc<Classifier>,
     manifest: Arc<OpenAiProvider>,
+    manifest_enabled: bool,
     llama_swap: Arc<OpenAiProvider>,
     fallback_model: String,
     /// Model keys known to belong to llama-swap. Requests for these bypass Bonsai.
@@ -96,6 +97,9 @@ pub struct Router {
 pub struct RouterArgs {
     pub classifier: Arc<Classifier>,
     pub manifest: Arc<OpenAiProvider>,
+    /// Whether the cloud backend (Manifest) is enabled. Off → cloud requests
+    /// skip Manifest and fall straight back to llama-swap.
+    pub manifest_enabled: bool,
     pub llama_swap: Arc<OpenAiProvider>,
     pub fallback_model: String,
     /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
@@ -115,6 +119,7 @@ impl Router {
         Self {
             classifier: args.classifier,
             manifest: args.manifest,
+            manifest_enabled: args.manifest_enabled,
             llama_swap: args.llama_swap,
             fallback_model: args.fallback_model,
             local_models: args.local_models,
@@ -160,11 +165,12 @@ impl Router {
             request.extra = serde_json::json!({});
         }
         if let serde_json::Value::Object(map) = &mut request.extra {
-            if map.insert(
-                "reasoning_budget_tokens".to_string(),
-                serde_json::json!(budget),
-            ).is_none()
-            {
+            // A client-supplied value is authoritative — never override it.
+            if !map.contains_key("reasoning_budget_tokens") {
+                map.insert(
+                    "reasoning_budget_tokens".to_string(),
+                    serde_json::json!(budget),
+                );
                 debug!(budget, ?tier, "Injected per-request reasoning budget");
             }
         }
@@ -330,7 +336,12 @@ impl Router {
         // Manifest expects "auto" — it does its own model selection.
         request.model = "auto".to_string();
 
-        if self.health.is_healthy(MANIFEST_KEY) {
+        if !self.manifest_enabled {
+            warn!(
+                provider = MANIFEST_KEY,
+                "Manifest is disabled (manifest.enabled: false) — cloud request falls back to llama-swap"
+            );
+        } else if self.health.is_healthy(MANIFEST_KEY) {
             info!(provider = MANIFEST_KEY, "Attempting Manifest");
             match self.manifest.chat_completion(request.clone()).await {
                 Ok(ProviderResponse::Stream(stream)) => {

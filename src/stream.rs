@@ -20,8 +20,10 @@ pub enum StreamFormat {
 /// A stream wrapper that catches errors and yields a final SSE error chunk
 /// before ending gracefully, avoiding "unexpected socket closure" errors.
 ///
-/// Intended to be the outer wrapper for streaming responses:
-/// `SafeStream::new(KeepaliveStream::new(TimeoutStream::new(raw_stream, ...), ...), format)`
+/// Actual layering in server.rs:
+/// `SafeStream::new(DeferredStream::new(rx, ...), format)` where DeferredStream
+/// keepalives while waiting for the provider stream AND wraps the resolved
+/// stream in `KeepaliveStream` so keepalives continue during generation.
 #[pin_project]
 pub struct SafeStream<S: Stream> {
     #[pin]
@@ -308,8 +310,9 @@ pub struct DeferredStream {
 enum DeferredState {
     /// Waiting for the routing future to resolve.
     Waiting(tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>),
-    /// The provider stream has arrived; forward it.
-    Streaming(crate::provider::SseStream),
+    /// The provider stream has arrived; forward it (keepalive-wrapped so idle
+    /// generation still pings the client).
+    Streaming(Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>),
     /// The receiver was dropped or errored; emit one error then end.
     Done,
 }
@@ -343,7 +346,17 @@ impl Stream for DeferredStream {
                     // Check if the provider stream is ready.
                     match Pin::new(rx).poll(cx) {
                         Poll::Ready(Ok(Ok(stream))) => {
-                            this.state = DeferredState::Streaming(stream);
+                            // Keepalives must continue during generation: the
+                            // provider stream can stall for tens of seconds
+                            // between chunks (slow prefill, long tool pauses)
+                            // and client-side idle watchdogs (OMP: 120 s) can
+                            // fire before the 180 s inter-chunk stall error.
+                            let keepalive = KeepaliveStream::new(
+                                stream,
+                                this.interval,
+                                this.format,
+                            );
+                            this.state = DeferredState::Streaming(Box::pin(keepalive));
                             continue; // poll the new stream immediately
                         }
                         Poll::Ready(Ok(Err(e))) => {

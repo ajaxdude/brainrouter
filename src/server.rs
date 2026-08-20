@@ -105,6 +105,8 @@ pub struct AppState {
     pub llama_swap_url: String,
     /// Manifest base URL for health checking.
     pub manifest_url: String,
+    /// Whether the cloud backend (Manifest) is enabled from config.
+    pub manifest_enabled: bool,
     /// Bridge transport manager (Discord, Signal status tracking).
     pub bridge_manager: Arc<crate::bridge::BridgeManager>,
     /// Path to brainrouter's own config file (used by the config UI and
@@ -216,6 +218,10 @@ async fn handle_request(
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
             || path == "/api/context"
+            // Review API is destructive too: it spawns reviews (arbitrary
+            // project paths read into cloud prompts) and can approve/resolve
+            // sessions. Gate it like the rest.
+            || path.starts_with("/review/api/")
         ));
 
     if is_destructive {
@@ -375,7 +381,13 @@ async fn handle_request(
 
         // ── Service health API ────────────────────────────────────────────────
         ("GET", "/api/service-health") => {
-            let resp = service_health(&state.llama_swap_url, &state.manifest_url, &state.routing_events).await;
+            let resp = service_health(
+                &state.llama_swap_url,
+                &state.manifest_url,
+                &state.routing_events,
+                state.manifest_enabled,
+            )
+            .await;
             into_unsync(resp)
         }
 
@@ -889,15 +901,30 @@ async fn handle_request(
                             );
                             into_unsync(resp)
                         } else {
+                            // Headless-friendly: fail loudly instead of returning
+                            // "ok" with nothing opened (no silent `let _ =`).
                             use std::process::Stdio;
-                            let _ = tokio::process::Command::new("xdg-open")
+                            match tokio::process::Command::new("xdg-open")
                                 .arg(file_path)
                                 .stdin(Stdio::null())
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
-                                .spawn();
-                            let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
-                            into_unsync(resp)
+                                .spawn()
+                            {
+                                Ok(_) => {
+                                    let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
+                                    into_unsync(resp)
+                                }
+                                Err(e) => {
+                                    let resp = json_response(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        &ErrorResponse {
+                                            error: format!("xdg-open is not available: {}", e),
+                                        },
+                                    );
+                                    into_unsync(resp)
+                                }
+                            }
                         }
                     }
                 }
@@ -1132,16 +1159,16 @@ async fn inference_status(
     }
 }
 
-/// Probe all four services and return their health status.
+/// Probe the services and return their health status.
 /// Called by the dashboard every 10s to render status dots.
-/// Probe all four services and return their health status.
 /// States: "healthy", "unhealthy", "idle" (service up but no model loaded),
-/// "loading" (model is loading).
+/// "loading" (model is loading), "disabled" (Bonsai/Manifest off in config).
 /// Also reports whether the last cloud request fell back to local.
 async fn service_health(
     llama_swap_url: &str,
     manifest_url: &str,
     routing_events: &RoutingEvents,
+    manifest_enabled: bool,
 ) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
@@ -1222,7 +1249,9 @@ async fn service_health(
 
     json_response(StatusCode::OK, &serde_json::json!({
         "llama_swap": if swap_ok { "healthy" } else { "unhealthy" },
-        "manifest": if manifest_ok { "healthy" } else { "unhealthy" },
+        "manifest": if !manifest_enabled {
+            "disabled"
+        } else if manifest_ok { "healthy" } else { "unhealthy" },
         "llama_cpp": llama_cpp_state,
         "toolbox": llama_cpp_state,
         "cloud_fallback": cloud_fallback,
@@ -1468,8 +1497,13 @@ pub fn apply_llama_swap_context(path: &std::path::Path, value: u64) -> anyhow::R
         replacements += c1 + c2;
         out.push_str(&l2);
     }
-    std::fs::write(path, out)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    // Write to a temp file then rename so a crash mid-write can't corrupt the
+    // live llama-swap config.
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &out)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename over {}", path.display()))?;
     Ok(replacements)
 }
 
@@ -1512,20 +1546,21 @@ fn replace_ctx_flag(line: &str, flag: &str, value: u64) -> (String, usize) {
 pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
     use tokio::process::Command;
 
-    // 1. llama-swap version
-    let swap_ver = Command::new(home_bin("llama-swap"))
-        .arg("--version")
-        .output()
-        .await
-        .ok()
-        .and_then(|out| {
-            out.status.success().then(|| {
+    // 1. llama-swap version (timeout so a hung binary can't freeze the task)
+    const LOCAL_VERSION_TIMEOUT_SECS: u64 = 5;
+    let swap_ver = {
+        let child = Command::new(home_bin("llama-swap"))
+            .arg("--version")
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(LOCAL_VERSION_TIMEOUT_SECS), child).await {
+            Ok(Ok(out)) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim()
                     .replace("version: ", "")
                     .to_string()
-            })
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+            }
+            _ => "unknown".to_string(),
+        }
+    };
 
     // 2. llama.cpp version from toolbox container image.
     const PODMAN_VERSION_TIMEOUT_SECS: u64 = 15;
@@ -1558,14 +1593,22 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
 
     // 3. Toolbox container image version and created date
     let (toolbox_image_ver, toolbox_image_created) = {
-        let ver_out = Command::new("podman")
+        let inspect = Command::new("podman")
             .args(["image", "inspect",
                    "--format", "{{index .Labels \"org.opencontainers.image.version\"}}\t{{.Created}}",
                    "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"])
-            .output()
-            .await;
+            .output();
+        let ver_out = match tokio::time::timeout(
+            std::time::Duration::from_secs(LOCAL_VERSION_TIMEOUT_SECS),
+            inspect,
+        )
+        .await
+        {
+            Ok(Ok(o)) => Some(o),
+            _ => None,
+        };
         match ver_out {
-            Ok(o) => {
+            Some(o) => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if let Some((ver, created)) = s.split_once('\t') {
                     let date = created.trim().get(..10).unwrap_or("").to_string();
@@ -1574,20 +1617,28 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
                     (s, String::new())
                 }
             }
-            Err(_) => (String::new(), String::new()),
+            None => (String::new(), String::new()),
         }
     };
 
     // 4. Locally running Manifest image info
     let manifest_ver = {
-        let out = Command::new("docker")
+        let inspect = Command::new("docker")
             .args(["inspect", "--format",
                    "{{index .Config.Labels \"org.opencontainers.image.created\"}} {{slice .Id 7 19}}",
                    "manifest-manifest-1"])
-            .output()
-            .await;
+            .output();
+        let out = match tokio::time::timeout(
+            std::time::Duration::from_secs(LOCAL_VERSION_TIMEOUT_SECS),
+            inspect,
+        )
+        .await
+        {
+            Ok(Ok(o)) => Some(o),
+            _ => None,
+        };
         match out {
-            Ok(o) if o.status.success() => {
+            Some(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if let Some((date_part, hash)) = s.split_once(' ') {
                     format!("{} · {}", date_part.get(..10).unwrap_or(date_part), hash)
@@ -1601,12 +1652,20 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
     // 4b. Bonsai classifier fork (PrismML llama.cpp) — the binary that serves
     //     the classifier, distinct from the toolbox llama-server above.
     let bonsai_fork_ver = {
-        let out = Command::new(bonsai_fork_path)
+        let version = Command::new(bonsai_fork_path)
             .arg("--version")
-            .output()
-            .await;
+            .output();
+        let out = match tokio::time::timeout(
+            std::time::Duration::from_secs(LOCAL_VERSION_TIMEOUT_SECS),
+            version,
+        )
+        .await
+        {
+            Ok(Ok(o)) => Some(o),
+            _ => None,
+        };
         match out {
-            Ok(o) => {
+            Some(o) => {
                 let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
                 combined
                     .lines()
@@ -1617,8 +1676,8 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
                     })
                     .unwrap_or_else(|| "unknown".to_string())
             }
-            Err(e) => {
-                warn!(error = %e, path = %bonsai_fork_path.display(), "Failed to read Bonsai fork version");
+            None => {
+                warn!(path = %bonsai_fork_path.display(), "Failed to read Bonsai fork version (missing or timed out)");
                 "unknown".to_string()
             }
         }
@@ -1674,6 +1733,14 @@ async fn upgrade_llama_swap() -> Response<Full<Bytes>> {
     info!("Upgrading llama-swap from GitHub releases...");
 
     let target_bin = home_bin("llama-swap");
+    // home_bin falls back to the bare name when ~/.local/bin lacks the binary;
+    // the extract step writes "{target_bin}.tmp" + rename, which MUST be an
+    // absolute path or it resolves against the daemon's cwd. Pin it here.
+    let target_bin = if std::path::Path::new(&target_bin).is_absolute() {
+        target_bin
+    } else {
+        format!("{}/.local/bin/llama-swap", home_dir())
+    };
 
     // 1. Fetch the latest release metadata from GitHub API
     let client = reqwest::Client::builder()

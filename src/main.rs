@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod cli;
 mod daemon;
 mod install;
 mod mcp_server;
@@ -28,6 +29,8 @@ enum Command {
     Serve(daemon::ServeArgs),
     /// Run the MCP stdio server (forwards tool calls to the daemon)
     Mcp(mcp_server::McpArgs),
+    /// Headless CLI: control the running daemon (total dashboard parity)
+    Cli(cli::CliArgs),
     /// Install brainrouter into a coding harness config
     Install(install::InstallArgs),
 }
@@ -50,6 +53,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve(args) => daemon::run(args).await,
         Command::Mcp(args) => mcp_server::run(args).await,
+        Command::Cli(args) => cli::run(args).await,
         Command::Install(args) => {
             install::run(args)?;
             Ok(())

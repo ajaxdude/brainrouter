@@ -53,6 +53,7 @@ pub async fn run_loop(
     task_id: &str,
     summary: &str,
     details: Option<&str>,
+    initial_history: &[String],
     router: &Arc<Router>,
     sessions: &Arc<SessionManager>,
     config: &crate::config::ReviewConfig,
@@ -62,7 +63,8 @@ pub async fn run_loop(
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();
     let mut escalation_reason: Option<EscalationReason> = None;
-    let mut session_history: Vec<String> = Vec::new();
+    // Seed with any prior turns so a "continue" run keeps the review's context.
+    let mut session_history: Vec<String> = initial_history.to_vec();
 
     while iteration_count < config.max_iterations {
         iteration_count += 1;
@@ -103,6 +105,7 @@ pub async fn run_loop(
                         reviewer_type: Some(ReviewerType::Llm),
                         escalation_reason: Some(EscalationReason::LlmError),
                         review_model: None,
+                        llm_turns: Some(session_history.clone()),
                     },
                 );
                 break;
@@ -138,6 +141,7 @@ pub async fn run_loop(
                                     None
                                 },
                                 review_model: Some(review_model),
+                                llm_turns: Some(session_history.clone()),
                             },
                         );
 
@@ -169,6 +173,7 @@ pub async fn run_loop(
                                     reviewer_type: Some(ReviewerType::Llm),
                                     escalation_reason: Some(EscalationReason::LlmError),
                                     review_model: Some(review_model),
+                                    llm_turns: Some(session_history.clone()),
                                 },
                             );
                         } else {
@@ -196,6 +201,7 @@ pub async fn run_loop(
                 reviewer_type: Some(ReviewerType::Llm),
                 escalation_reason: Some(EscalationReason::MaxIterations),
                 review_model: None,
+                llm_turns: Some(session_history.clone()),
             },
         );
     }

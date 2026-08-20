@@ -67,13 +67,23 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         fallback_model = %config.llama_swap.fallback_model,
         "Starting brainrouter daemon"
     );
-    let bonsai_control = BonsaiControl::start(
-        config.bonsai.fork_path.clone(),
-        config.bonsai.model_path.clone(),
-        config.bonsai.server_port,
-    )
-    .await
-    .context("Failed to start Bonsai llama-server")?;
+    let bonsai_control = if config.bonsai.enabled {
+        let model_path = config
+            .bonsai
+            .model_path
+            .clone()
+            .context("bonsai.enabled is true but bonsai.model_path is not set")?;
+        BonsaiControl::start(
+            config.bonsai.fork_path.clone(),
+            model_path,
+            config.bonsai.server_port,
+        )
+        .await
+        .context("Failed to start Bonsai llama-server")?
+    } else {
+        warn!("Bonsai classifier is disabled (bonsai.enabled: false) — auto-routed requests go straight to llama-swap. Enable it with `brainrouter cli bonsai on` or set bonsai.enabled: true in brainrouter.yaml.");
+        BonsaiControl::disabled(config.bonsai.server_port).await
+    };
 
     // Nudge (per-request reasoning budget) runtime state — shared between the
     // classifier, the router, and the dashboard API.
@@ -153,6 +163,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let router = Arc::new(Router::new(brainrouter::router::RouterArgs {
         classifier,
         manifest,
+        manifest_enabled: config.manifest.enabled,
         llama_swap,
         fallback_model: config.llama_swap.fallback_model.clone(),
         local_models: config.llama_swap.local_models.clone(),
@@ -192,7 +203,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Bridge manager (status tracking for Discord/Signal transports)
     let bridge_manager = Arc::new(brainrouter::bridge::BridgeManager::new());
 
-    let (versions_tx, versions_rx) = tokio::sync::watch::channel(serde_json::Value::Null);
+    // Seed with an empty object, not null: /api/versions and `brainrouter cli
+    // versions` read this before the first compute completes (up to ~15 s).
+    let (versions_tx, versions_rx) = tokio::sync::watch::channel(serde_json::json!({}));
     let versions_tx = Arc::new(versions_tx);
 
     let state = Arc::new(AppState {
@@ -211,6 +224,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             std::fs::canonicalize(&p).unwrap_or(p)
         },
         tcp_addr: tcp_addr.to_string(),
+        manifest_enabled: config.manifest.enabled,
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         versions_cache: Arc::new(versions_rx),
         nudge_enabled,

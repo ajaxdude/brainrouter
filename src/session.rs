@@ -67,6 +67,9 @@ pub struct Session {
     pub summary: String,
     pub details: Option<String>,
     pub conversation_history: Vec<String>,
+    /// Accumulated review-loop turns (prompt/response pairs), persisted so a
+    /// "continue" run can seed its history instead of starting from scratch.
+    pub llm_turns: Vec<String>,
     pub llm_feedback: Option<String>,
     pub human_feedback: Option<String>,
     pub escalation_reason: Option<EscalationReason>,
@@ -90,6 +93,7 @@ impl Session {
             summary,
             details,
             conversation_history,
+            llm_turns: Vec::new(),
             llm_feedback: None,
             human_feedback: None,
             escalation_reason: None,
@@ -111,6 +115,8 @@ pub struct SessionUpdate {
     pub escalation_reason: Option<EscalationReason>,
     /// Model/provider string to record on the session (set once on first review iteration).
     pub review_model: Option<String>,
+    /// Full accumulated review-loop history (replaces the session's copy).
+    pub llm_turns: Option<Vec<String>>,
 }
 
 /// Thread-safe in-memory session store.
@@ -185,6 +191,9 @@ impl SessionManager {
             if session.review_model.is_none() {
                 session.review_model = Some(rm);
             }
+        }
+        if let Some(turns) = update.llm_turns {
+            session.llm_turns = turns;
         }
         session.updated_at = chrono::Utc::now().to_rfc3339();
         // Notify any waiter (e.g. start_review blocked on human escalation).

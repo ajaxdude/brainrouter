@@ -25,6 +25,12 @@ pub struct BrainrouterConfig {
 /// cloud routing decisions to Manifest by sending requests with model="auto".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestConfig {
+    /// Master switch for the cloud backend. Off by default: `model=cloud` and
+    /// Bonsai-classified cloud requests skip Manifest and fall back to
+    /// llama-swap. Set `enabled: true` to use the cloud.
+    #[serde(default)]
+    pub enabled: bool,
+
     /// Base URL of the Manifest instance. Example: "http://localhost:2099".
     pub base_url: String,
 
@@ -126,10 +132,20 @@ impl Default for NudgeBudgets {
 }
 
 /// Configuration for the embedded Bonsai classifier model.
+///
+/// Off by default: `brainrouter serve` will not spawn the llama-server and
+/// auto-routed requests go straight to llama-swap (no classification). When
+/// `enabled: true`, `model_path` must point at an existing GGUF file — config
+/// load fails fast if the file is missing so a headless daemon never silently
+/// runs without its classifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BonsaiConfig {
-    /// Path to the Bonsai GGUF model file.
-    pub model_path: PathBuf,
+    /// Master switch for the classifier server. Default off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the Bonsai GGUF model file. Required only when enabled.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
     /// Port for the external llama-server process.
     #[serde(default = "default_bonsai_port")]
     pub server_port: u16,
@@ -289,12 +305,12 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     // Expand ${models_path} in bonsai.model_path.
     // This lets users write a single `models.path` and reference it everywhere
     // without repeating the absolute prefix.
-    {
+    if let Some(model_path) = config.bonsai.model_path.as_ref() {
         let models_path_str = config.models.path.to_string_lossy().into_owned();
-        let raw = config.bonsai.model_path.to_string_lossy().into_owned();
+        let raw = model_path.to_string_lossy().into_owned();
         if raw.contains("${models_path}") {
             let expanded = raw.replace("${models_path}", &models_path_str);
-            config.bonsai.model_path = PathBuf::from(expanded);
+            config.bonsai.model_path = Some(PathBuf::from(expanded));
         }
     }
 
@@ -327,12 +343,18 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
         bail!("llama_swap.fallback_model must not be empty");
     }
 
-    // Validate bonsai.model_path exists (after token expansion).
-    if !config.bonsai.model_path.exists() {
-        bail!(
-            "Bonsai model path does not exist: {}",
-            config.bonsai.model_path.display()
-        );
+    // Validate bonsai.model_path exists (after token expansion) — but only
+    // when the classifier is enabled. Disabled Bonsai needs no model file, so
+    // a headless local-only daemon can run without any GGUF on disk.
+    if config.bonsai.enabled {
+        match config.bonsai.model_path.as_ref() {
+            Some(path) => {
+                if !path.exists() {
+                    bail!("Bonsai model path does not exist: {}", path.display());
+                }
+            }
+            None => bail!("bonsai.enabled is true but bonsai.model_path is not set"),
+        }
     }
 
     Ok(config)

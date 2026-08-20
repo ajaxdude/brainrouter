@@ -114,6 +114,7 @@ impl ReviewService {
             &task_id,
             &summary,
             details.as_deref(),
+            &[],
             &self.router,
             &self.sessions,
             &config_snapshot,
@@ -268,6 +269,7 @@ impl ReviewService {
                 reviewer_type: Some(ReviewerType::Human),
                 escalation_reason: None,
                 review_model: None,
+                llm_turns: None,
             },
         );
 
@@ -286,7 +288,8 @@ impl ReviewService {
             .get_session(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-        // Reset session to pending so the loop can run
+        // Reset session to pending so the loop can run.
+        // llm_turns is preserved — the continuation seeds from it.
         self.sessions.update_session(
             session_id,
             SessionUpdate {
@@ -295,10 +298,16 @@ impl ReviewService {
                 reviewer_type: None,
                 escalation_reason: None,
                 review_model: None,
+                llm_turns: None,
             },
         );
 
         info!(session_id, extra_iterations, "Continuing review with additional iterations");
+
+        // Register the notifier BEFORE running the loop so we cannot miss a
+        // human resolution that lands between the loop returning Escalated
+        // and our first wait (same race-avoidance as start_review).
+        let notifier = self.sessions.register_notifier(session_id);
 
         // Build a config snapshot with the requested iteration count
         let mut config_snapshot = self.get_config();
@@ -309,6 +318,7 @@ impl ReviewService {
             &session.task_id,
             &session.summary,
             session.details.as_deref(),
+            &session.llm_turns,
             &self.router,
             &self.sessions,
             &config_snapshot,
@@ -316,12 +326,63 @@ impl ReviewService {
         )
         .await?;
 
+        let (status, feedback, reviewer_type) = if result.status == ReviewStatus::Escalated {
+            info!(session_id = %session_id, "Continuation escalated — waiting for human resolution");
+            loop {
+                // Register the notified() future BEFORE checking state so we
+                // cannot miss a notification that fires between check and await.
+                let next = notifier.notified();
+                tokio::pin!(next);
+                if let Some(s) = self.sessions.get_session(session_id) {
+                    match s.status {
+                        ReviewStatus::Escalated => {
+                            // Still escalated — wait for the next signal.
+                            next.await;
+                        }
+                        ReviewStatus::Approved => {
+                            info!(session_id = %session_id, "Human approved the continuation");
+                            break (
+                                ReviewStatus::Approved,
+                                s.human_feedback.unwrap_or_else(|| "lgtm".to_string()),
+                                ReviewerType::Human,
+                            );
+                        }
+                        ReviewStatus::NeedsRevision => {
+                            info!(session_id = %session_id, "Human requested revision");
+                            break (
+                                ReviewStatus::NeedsRevision,
+                                s.human_feedback.unwrap_or_default(),
+                                ReviewerType::Human,
+                            );
+                        }
+                        ReviewStatus::Pending => {
+                            // Should not normally happen; wait for the next signal.
+                            next.await;
+                        }
+                    }
+                } else {
+                    // Session was deleted — treat as aborted.
+                    warn!(session_id = %session_id, "Session disappeared while waiting for human");
+                    break (
+                        ReviewStatus::Escalated,
+                        "Session was deleted before human resolved it.".to_string(),
+                        ReviewerType::Human,
+                    );
+                }
+            }
+        } else {
+            (result.status, result.feedback, result.reviewer_type)
+        };
+
+        // Clean up the notifier regardless of outcome.
+        self.sessions.remove_notifier(session_id);
+
         Ok(RequestReviewResult {
-            status: result.status,
-            feedback: result.feedback,
+            status,
+            feedback,
             session_id: result.session_id,
             iteration_count: result.iteration_count,
-            reviewer_type: result.reviewer_type,
+            reviewer_type,
         })
     }
 
@@ -371,6 +432,7 @@ impl ReviewService {
                 &tid,
                 &summ,
                 det.as_deref(),
+                &[],
                 &router,
                 &sessions,
                 &config_snapshot,

@@ -9,6 +9,7 @@
 //! to the daemon socket and dispatches the four tool calls.
 
 use anyhow::{bail, Context, Result};
+use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
 use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -41,6 +42,8 @@ pub async fn run(args: McpArgs) -> Result<()> {
         );
     }
 
+    let client = DaemonClient::new(DaemonEndpoint::Socket(socket.clone()));
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -69,7 +72,7 @@ pub async fn run(args: McpArgs) -> Result<()> {
             }
         };
 
-        let response = handle_message(&socket, msg).await;
+        let response = handle_message(&client, msg).await;
         // Notifications return Value::Null — skip writing a response for them.
         if response.is_null() {
             continue;
@@ -83,7 +86,7 @@ pub async fn run(args: McpArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
+async fn handle_message(client: &DaemonClient, msg: Value) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -98,6 +101,10 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
             // One-way notification — no response.
             Value::Null
         }
+
+        // JSON-RPC liveness check — MUST return {"result":{}} (a response is
+        // required; only *notifications* go unanswered).
+        "ping" => json_result(id, json!({})),
 
         "tools/list" => json_result(id, json!({
             "tools": [
@@ -159,7 +166,7 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
                 .cloned()
                 .unwrap_or(json!({}));
 
-            match dispatch_tool(socket_path, tool_name, arguments).await {
+            match dispatch_tool(client, tool_name, arguments).await {
                 Ok(result) => json_result(id, json!({
                     "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }]
                 })),
@@ -167,12 +174,19 @@ async fn handle_message(socket_path: &PathBuf, msg: Value) -> Value {
             }
         }
 
-        _ => json_error(id, -32601, &format!("Method not found: {}", method)),
+        _ => {
+            if msg.get("id").is_none() {
+                // Unknown *notification*: JSON-RPC forbids responding.
+                Value::Null
+            } else {
+                json_error(id, -32601, &format!("Method not found: {}", method))
+            }
+        }
     }
 }
 
-/// Forward a tool call to the daemon via Unix socket HTTP.
-async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result<Value> {
+/// Forward a tool call to the daemon via the shared thin client.
+async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result<Value> {
     match tool {
         "request_review" => {
             // Use the non-blocking async endpoint so we don't hold a 5-minute
@@ -183,10 +197,7 @@ async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result
             //
             // Terminal statuses: approved, needs_revision, escalated, failed.
             // We poll for up to 30 minutes (360 × 5s) before giving up.
-            let start_resp = http_uds_request(
-                socket_path, "POST", "/review/api/request-async", args,
-            )
-            .await?;
+            let start_resp = client.post_json("/review/api/request-async", args).await?;
 
             let session_id = start_resp
                 .get("sessionId")
@@ -210,10 +221,7 @@ async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result
             for _ in 0..MAX_POLLS {
                 tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
 
-                let detail = http_uds_request(
-                    socket_path, "GET", &poll_path, serde_json::json!({}),
-                )
-                .await?;
+                let detail = client.get_json(&poll_path).await?;
 
                 let status = detail
                     .get("status")
@@ -240,7 +248,7 @@ async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result
             )
         }
         "get_session_list" => {
-            http_uds_request(socket_path, "GET", "/review/api/sessions", json!({})).await
+            client.get_json("/review/api/sessions").await
         }
         "get_session_details" => {
             let session_id = args
@@ -253,74 +261,13 @@ async fn dispatch_tool(socket_path: &PathBuf, tool: &str, args: Value) -> Result
                 bail!("Invalid sessionId: must be alphanumeric, dashes, or underscores");
             }
             let path = format!("/review/api/sessions/{}", session_id);
-            http_uds_request(socket_path, "GET", &path, json!({})).await
+            client.get_json(&path).await
         }
         "resolve_session" => {
-            http_uds_request(socket_path, "POST", "/review/api/resolve", args).await
+            client.post_json("/review/api/resolve", args).await
         }
         _ => bail!("Unknown tool: {}", tool),
     }
-}
-
-/// Make an HTTP request over the Unix domain socket.
-async fn http_uds_request(socket_path: &PathBuf, method: &str, path: &str, body: Value) -> Result<Value> {
-    use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
-
-    let stream = UnixStream::connect(socket_path)
-        .await
-        .with_context(|| format!("Cannot connect to daemon socket at {}", socket_path.display()))?;
-
-    let body_bytes = serde_json::to_vec(&body)?;
-
-    let request = if method == "GET" {
-        format!("{} {} HTTP/1.0\r\nHost: localhost\r\n\r\n", method, path)
-    } else {
-        format!(
-            "{} {} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            method, path, body_bytes.len()
-        )
-    };
-
-    let (mut rx, mut tx) = stream.into_split();
-
-    tx.write_all(request.as_bytes()).await?;
-    if method != "GET" {
-        tx.write_all(&body_bytes).await?;
-    }
-    // Keep tx alive until we finish reading — dropping it before read_to_end
-    // closes the underlying socket (sends FIN) which Hyper treats as a reset.
-    let mut response_bytes = Vec::new();
-    rx.read_to_end(&mut response_bytes).await?;
-    drop(tx);
-
-    // Parse HTTP response
-    let response_str = String::from_utf8_lossy(&response_bytes);
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(0);
-
-    // Check HTTP status code numerically
-    let status_line = response_str.lines().next().unwrap_or("");
-    if status_line.starts_with("HTTP/") {
-        let status_ok = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .map(|code| (200..300).contains(&code))
-            .unwrap_or(false);
-        if !status_ok {
-            let body_preview: String = response_str[body_start..].chars().take(500).collect();
-            bail!("Daemon returned error: {} — body: {}", status_line.trim(), body_preview);
-        }
-    }
-
-    let json_body = &response_bytes[body_start..];
-    let result: Value = serde_json::from_slice(json_body)
-        .with_context(|| "Failed to parse daemon response as JSON".to_string())?;
-
-    Ok(result)
 }
 
 // ─── JSON-RPC helpers ────────────────────────────────────────────────────────

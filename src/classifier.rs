@@ -49,7 +49,7 @@ pub struct Classifier {
     http: Client,
     /// Shared "Bonsai server is on" flag. When the dashboard stops the
     /// llama-server this is cleared and classification skips HTTP, returning
-    /// the safe Cloud default.
+    /// the local default directly (no cloud hop).
     enabled: Arc<AtomicBool>,
     /// Shared nudge master switch (dashboard/config). When on, auto-routed
     /// local requests use the nudge model key so per-request budgets apply.
@@ -86,8 +86,18 @@ impl Classifier {
     /// On any error, defaults to Cloud — the safe default.
     pub async fn classify_async(&self, request: ChatCompletionRequest) -> RoutingDecision {
         if !self.enabled.load(Ordering::Relaxed) {
-            debug!("Bonsai server is off; defaulting to Cloud");
-            return RoutingDecision::Cloud;
+            // No classifier → "auto" means local. Route directly to llama-swap
+            // (Manifest is off by default too) instead of making a pointless
+            // cloud hop that would immediately fall back.
+            debug!("Bonsai server is off; routing auto requests directly to local");
+            let model = if self.nudge_enabled.load(Ordering::Relaxed) {
+                self.nudge_model_key
+                    .clone()
+                    .unwrap_or_else(|| self.default_local_model.clone())
+            } else {
+                self.default_local_model.clone()
+            };
+            return RoutingDecision::Local { model, tier: BudgetTier::Local };
         }
         let requested_model = request.model.clone();
 

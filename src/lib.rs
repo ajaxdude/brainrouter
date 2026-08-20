@@ -1,5 +1,6 @@
 pub mod bonsai_server;
 pub mod anthropic;
+pub mod daemon_client;
 pub mod bridge;
 pub mod classifier;
 pub mod config;

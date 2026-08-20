@@ -4,11 +4,11 @@
 //!   GET  /review/                       — redirect to /dashboard
 //!   GET  /review/session/:id             — session detail (HTML)
 //!   POST /review/session/:id/resolve     — human submits feedback
-//!   POST /review/api/request             — MCP: start review (blocks until done)
-//!   POST /review/api/request-async       — MCP: start review, return session ID immediately
-//!   POST /review/api/resolve             — MCP: resolve session with feedback
-//!   POST /review/api/continue            — MCP: additional LLM review rounds
-//!   POST /review/api/lgtm               — MCP: quick-approve a session
+//!   POST /review/api/request             — legacy: start review (blocks until done; no client uses it)
+//!   POST /review/api/request-async       — start review, return session ID immediately (CLI/MCP)
+//!   POST /review/api/resolve             — resolve session with feedback
+//!   POST /review/api/continue            — additional LLM review rounds
+//!   POST /review/api/lgtm               — quick-approve a session
 //!   GET  /review/api/sessions            — JSON session list
 //!   GET  /review/api/sessions/:id        — JSON session detail
 use bytes::Bytes;
@@ -109,8 +109,9 @@ pub async fn handle_review_request(
     Ok(response)
 }
 
-/// POST /review/api/request — MCP thin client calls this to trigger a review.
+/// POST /review/api/request — legacy blocking review trigger.
 /// Long-running: blocks until the review loop completes.
+/// CLI and the MCP thin client use /review/api/request-async + polling instead.
 async fn handle_request_review(
     req: Request<Incoming>,
     review_service: Arc<ReviewService>,
@@ -164,7 +165,12 @@ async fn handle_request_review(
         && !std::path::Path::new(&safe_cwd).components().any(|c| matches!(c, std::path::Component::ParentDir));
 
     if !is_valid {
-        safe_cwd = String::new();
+        // Reject rather than silently falling back to the daemon's own cwd:
+        // a review would read the WRONG project's PRD and git diff.
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid cwd: must be an absolute path without '..' components",
+        );
     }
 
     match review_service
@@ -224,7 +230,12 @@ async fn handle_request_review_async(
         && safe_cwd.starts_with('/')
         && !std::path::Path::new(&safe_cwd).components().any(|c| matches!(c, std::path::Component::ParentDir));
     if !is_valid {
-        safe_cwd = String::new();
+        // Reject rather than silently falling back to the daemon's own cwd:
+        // a review would read the WRONG project's PRD and git diff.
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid cwd: must be an absolute path without '..' components",
+        );
     }
 
     let session_id = review_service.start_review_async(
