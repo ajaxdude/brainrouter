@@ -72,7 +72,7 @@ pub struct LlamaSwapConfig {
     /// `model_key` — a llama-swap entry that must be launched with
     /// `--reasoning-budget-enable` — carrying a per-request
     /// `reasoning_budget_tokens` field chosen from `budgets` by Bonsai's tier
-    /// ("local" vs "deep") or the dashboard tier override.
+    /// ("light" vs "deep") or the dashboard tier override.
     #[serde(default)]
     pub nudge: NudgeConfig,
 }
@@ -107,15 +107,16 @@ impl Default for NudgeConfig {
 /// Per-tier reasoning budgets (tokens) injected as `reasoning_budget_tokens`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NudgeBudgets {
-    /// "local" tier (simple tasks) — tight budget.
-    #[serde(default = "default_nudge_budget_local")]
-    pub local: u32,
+    /// "light" tier (simple tasks) — tight budget.
+    /// Legacy configs may still spell this `local`; both are accepted.
+    #[serde(default = "default_nudge_budget_light", alias = "local")]
+    pub light: u32,
     /// "deep" tier (complex local tasks) — full budget.
     #[serde(default = "default_nudge_budget_deep")]
     pub deep: u32,
 }
 
-fn default_nudge_budget_local() -> u32 {
+fn default_nudge_budget_light() -> u32 {
     10240
 }
 fn default_nudge_budget_deep() -> u32 {
@@ -125,7 +126,7 @@ fn default_nudge_budget_deep() -> u32 {
 impl Default for NudgeBudgets {
     fn default() -> Self {
         Self {
-            local: default_nudge_budget_local(),
+            light: default_nudge_budget_light(),
             deep: default_nudge_budget_deep(),
         }
     }

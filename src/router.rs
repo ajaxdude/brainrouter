@@ -87,7 +87,7 @@ pub struct Router {
     nudge_budgets: NudgeBudgets,
     /// Runtime nudge master switch (shared with dashboard).
     nudge_enabled: Arc<AtomicBool>,
-    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = local, 2 = deep.
+    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = light, 2 = deep.
     nudge_tier: Arc<AtomicU8>,
     /// Runtime prompt-rewrite toggle. When off, local routes forward the
     /// incoming messages untouched (no system-prompt rewrite).
@@ -153,12 +153,12 @@ impl Router {
             return;
         }
         let tier = match self.nudge_tier.load(Ordering::Relaxed) {
-            1 => BudgetTier::Local,
+            1 => BudgetTier::Light,
             2 => BudgetTier::Deep,
             _ => tier,
         };
         let budget = match tier {
-            BudgetTier::Local => self.nudge_budgets.local,
+            BudgetTier::Light => self.nudge_budgets.light,
             BudgetTier::Deep => self.nudge_budgets.deep,
         };
         if !request.extra.is_object() {

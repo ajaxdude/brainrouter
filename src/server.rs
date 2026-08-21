@@ -127,7 +127,7 @@ pub struct AppState {
     pub versions_cache: std::sync::Arc<tokio::sync::watch::Receiver<serde_json::Value>>,
     /// Runtime nudge master switch (initialized from `llama_swap.nudge.enabled`).
     pub nudge_enabled: Arc<AtomicBool>,
-    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = local, 2 = deep.
+    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = light, 2 = deep.
     pub nudge_tier: Arc<AtomicU8>,
     /// Nudge model key from config (static; runtime changes use the config UI).
     pub nudge_model_key: Option<String>,
@@ -596,7 +596,7 @@ async fn handle_request(
         // ── Nudge (thinking budget) API ─────────────────────────────────────
         ("GET", "/api/nudge") => {
             let tier = match state.nudge_tier.load(AtomicOrdering::Relaxed) {
-                1 => "local",
+                1 => "light",
                 2 => "deep",
                 _ => "auto",
             };
@@ -607,7 +607,7 @@ async fn handle_request(
                     "tier": tier,
                     "model_key": state.nudge_model_key,
                     "budgets": {
-                        "local": state.nudge_budgets.local,
+                        "light": state.nudge_budgets.light,
                         "deep": state.nudge_budgets.deep,
                     },
                 }),
@@ -623,7 +623,8 @@ async fn handle_request(
             }
             if let Some(tier) = val.get("tier").and_then(|v| v.as_str()) {
                 let t = match tier {
-                    "local" => 1,
+                    // "local" is the legacy spelling of the light tier.
+                    "light" | "local" => 1,
                     "deep" => 2,
                     _ => 0,
                 };
@@ -632,7 +633,7 @@ async fn handle_request(
             let resp = json_response(StatusCode::OK, &serde_json::json!({
                 "enabled": state.nudge_enabled.load(AtomicOrdering::Relaxed),
                 "tier": match state.nudge_tier.load(AtomicOrdering::Relaxed) {
-                    1 => "local",
+                    1 => "light",
                     2 => "deep",
                     _ => "auto",
                 },

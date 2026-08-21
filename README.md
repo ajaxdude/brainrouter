@@ -144,7 +144,7 @@ llama_swap:
   # nudge:
   #   enabled: true
   #   budgets:
-  #     local: 10240
+  #     light: 10240
   #     deep: 12288
 
 bonsai:
@@ -421,7 +421,7 @@ brainrouter cli --socket /run/user/1000/brainrouter.sock status
 brainrouter cli --url http://127.0.0.1:9099 status
 ```
 
-All output is pretty-printed JSON. `config show` / `config set` print and write raw YAML instead.
+All output is pretty-printed JSON. `brainrouter-config show` / `set` (alias `config`) print and write raw YAML instead.
 
 ### Health and telemetry
 
@@ -439,17 +439,17 @@ brainrouter cli models --llama-swap   # raw llama-swap model list
 
 ```bash
 brainrouter cli bonsai status            # classifier state (enabled/healthy)
-brainrouter cli bonsai on                # start the classifier server (frees cloud hops)
-brainrouter cli bonsai off               # stop it, free VRAM — auto routing goes local
+brainrouter cli bonsai enable            # start the classifier server (enables cloud hops)
+brainrouter cli bonsai disable           # stop it, free VRAM — auto routing goes local
 brainrouter cli bonsai toggle
 
 brainrouter cli nudge status             # thinking-budget nudge state
-brainrouter cli nudge on | off | toggle
-brainrouter cli nudge tier auto          # Bonsai picks local/deep
-brainrouter cli nudge tier local         # inject local budget
-brainrouter cli nudge tier deep          # inject deep budget
+brainrouter cli nudge enable | disable | toggle
+brainrouter cli nudge tier auto          # Bonsai picks light/deep per request
+brainrouter cli nudge tier light         # inject the tight budget
+brainrouter cli nudge tier deep          # inject the full budget
 
-brainrouter cli prompt-rewrite on | off  # local system-prompt rewriting (pass-through off)
+brainrouter cli prompt-rewrite enable | disable  # local system-prompt rewriting (pass-through off)
 brainrouter cli context status           # current llama-swap context size
 brainrouter cli context set auto         # 131072 tokens
 brainrouter cli context set 65536        # range 2048–262144
@@ -457,8 +457,9 @@ brainrouter cli routing-mode status
 brainrouter cli routing-mode set local   # auto | cloud | local
 
 brainrouter cli bridges status
-brainrouter cli bridges toggle discord true
-brainrouter cli bridges toggle signal false
+brainrouter cli bridges enable discord
+brainrouter cli bridges disable signal
+brainrouter cli bridges toggle signal
 ```
 
 ### Operations
@@ -468,13 +469,15 @@ brainrouter cli toolboxes                # list llama-* toolbox containers
 brainrouter cli restart llama-swap       # llama-swap | llama-cpp | manifest | brainrouter
 brainrouter cli upgrade llama-swap       # llama-swap | manifest | toolbox
 brainrouter cli flush-models             # unload every model (frees VRAM)
-brainrouter cli sync-omp                 # live llama-swap models → OMP models.yml
+brainrouter cli sync-omp                 # push llama-swap models → OMP models.yml (one-way)
 brainrouter cli config-files             # config files the daemon manages
-brainrouter cli config show              # current brainrouter.yaml (raw YAML)
-brainrouter cli config set ./new.yaml    # replace it; "-" reads stdin
+brainrouter cli brainrouter-config show # current brainrouter.yaml (raw YAML); `config` alias works
+brainrouter cli brainrouter-config set ./new.yaml  # replace it; "-" reads stdin
 brainrouter cli llama-swap-config show   # llama-swap's config.yaml
 brainrouter cli llama-swap-config set ./config.yaml
 ```
+
+CLI spelling vs dashboard: `llama-cpp` (CLI value) is the `llama.cpp` row in the dashboard sidebar — same component. `toolbox` (upgrade value) is the `toolboxes` container image.
 
 ### Reviews
 
@@ -628,7 +631,7 @@ llama_swap:
   nudge:
     enabled: false                       # thinking-budget injection off by default
     model_key: "my-model"                # optional — which local model receives the budget
-    budgets: { local: 10240, deep: 12288 }
+    budgets: { light: 10240, deep: 12288 }
 
 bonsai:
   enabled: false                         # classifier off by default; auto → local while off

@@ -3,7 +3,7 @@
 //! At request time, brainrouter sends the user's last message to the Bonsai
 //! 27B llama-server (PrismML fork), which replies with "cloud", "local", or
 //! "deep". "deep" routes local with the full reasoning budget when nudge is
-//! enabled (voidsurfer/llama.cpp-nudge); "local" uses the tighter budget.
+//! enabled (voidsurfer/llama.cpp-nudge); "local" uses the lighter budget.
 
 use crate::types::ChatCompletionRequest;
 use reqwest::Client;
@@ -27,8 +27,8 @@ pub enum RoutingDecision {
 /// Reasoning-budget tier for auto-routed local requests (nudge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetTier {
-    /// Simple task — tight thinking budget.
-    Local,
+    /// Simple task — light thinking budget.
+    Light,
     /// Complex task that should stay local — full thinking budget.
     Deep,
 }
@@ -97,7 +97,7 @@ impl Classifier {
             } else {
                 self.default_local_model.clone()
             };
-            return RoutingDecision::Local { model, tier: BudgetTier::Local };
+            return RoutingDecision::Local { model, tier: BudgetTier::Light };
         }
         let requested_model = request.model.clone();
 
@@ -174,7 +174,7 @@ impl Classifier {
             ParsedDecision::Local | ParsedDecision::Deep => {
                 let tier = match decision {
                     ParsedDecision::Deep => BudgetTier::Deep,
-                    _ => BudgetTier::Local,
+                    _ => BudgetTier::Light,
                 };
                 let user_requested_specific = !matches!(
                     requested_model.as_str(),

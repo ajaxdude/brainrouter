@@ -84,7 +84,7 @@ pub enum CliCommand {
     },
     /// List llama-* toolbox containers
     Toolboxes,
-    /// Restart a service: llama-swap, llama-cpp, manifest, brainrouter
+    /// Restart a service: llama-swap, llama-cpp (dashboard shows "llama.cpp"), manifest, brainrouter
     Restart {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(
             ["llama-swap", "llama-cpp", "manifest", "brainrouter"]
@@ -100,12 +100,14 @@ pub enum CliCommand {
     },
     /// Flush loaded models to free VRAM
     FlushModels,
-    /// Sync live llama-swap models into OMP's models.yml
+    /// Push llama-swap models into OMP's models.yml (one-way sync)
     SyncOmp,
     /// List config files the daemon manages
     ConfigFiles,
-    /// View brainrouter.yaml, or write a new one from a file or stdin
-    Config {
+    /// View brainrouter.yaml, or write a new one from a file or stdin.
+    /// Alias: `config` (short form)
+    #[command(alias = "config")]
+    BrainrouterConfig {
         #[command(subcommand)]
         action: ConfigAction,
     },
@@ -130,10 +132,10 @@ pub enum CliCommand {
 pub enum BonsaiAction {
     /// Current status
     Status,
-    /// Start the classifier server
-    On,
-    /// Stop the classifier server (frees VRAM; auto-routing goes local)
-    Off,
+    /// Enable the classifier server (start it)
+    Enable,
+    /// Disable the classifier server (stop it; frees VRAM; auto-routing goes local)
+    Disable,
     /// Start if stopped, stop if running
     Toggle,
 }
@@ -143,15 +145,15 @@ pub enum NudgeAction {
     /// Current status
     Status,
     /// Enable nudge
-    On,
+    Enable,
     /// Disable nudge
-    Off,
+    Disable,
     /// Toggle the master switch
     Toggle,
-    /// Set the tier override: auto (Bonsai picks), local, deep
+    /// Set the tier override: auto (Bonsai picks), light, deep
     Tier {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(
-            ["auto", "local", "deep"]
+            ["auto", "light", "deep"]
         ))]
         tier: String,
     },
@@ -162,9 +164,9 @@ pub enum PromptRewriteAction {
     /// Current status
     Status,
     /// Enable prompt rewriting for local routes
-    On,
+    Enable,
     /// Disable prompt rewriting (pass-through mode)
-    Off,
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -195,14 +197,26 @@ pub enum RoutingModeAction {
 pub enum BridgesAction {
     /// Current bridge status
     Status,
-    /// Enable or disable a bridge
+    /// Enable a bridge
+    Enable {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
+            ["discord", "signal"]
+        ))]
+        bridge: String,
+    },
+    /// Disable a bridge
+    Disable {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
+            ["discord", "signal"]
+        ))]
+        bridge: String,
+    },
+    /// Start if stopped, stop if running
     Toggle {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new(
             ["discord", "signal"]
         ))]
         bridge: String,
-        /// true = enable, false = disable
-        enabled: bool,
     },
 }
 
@@ -216,8 +230,8 @@ pub enum ConfigAction {
 
 #[derive(Subcommand)]
 pub enum ReviewConfigAction {
-    /// Print the current review config
-    Show,
+    /// Current review configuration
+    Status,
     /// Update fields (partial merge; unspecified fields are kept)
     Update {
         /// Maximum LLM review iterations before human escalation
@@ -326,7 +340,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
         }
         CliCommand::Bonsai { action } => match action {
             BonsaiAction::Status => print_json(&client.get_json("/api/bonsai").await?),
-            BonsaiAction::On => {
+            BonsaiAction::Enable => {
                 let current = client.get_json("/api/bonsai").await?;
                 if current.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
                     print_json(&json!({ "enabled": true, "message": "already running" }));
@@ -334,7 +348,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
                     print_json(&client.post_json("/api/bonsai/toggle", json!({})).await?);
                 }
             }
-            BonsaiAction::Off => {
+            BonsaiAction::Disable => {
                 let current = client.get_json("/api/bonsai").await?;
                 if current.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
                     print_json(&client.post_json("/api/bonsai/toggle", json!({})).await?);
@@ -354,13 +368,13 @@ pub async fn run(args: CliArgs) -> Result<()> {
 
             match action {
                 NudgeAction::Status => print_json(&current),
-                NudgeAction::On => {
+                NudgeAction::Enable => {
                     let resp = client
                         .post_json("/api/nudge", json!({ "enabled": true, "tier": tier }))
                         .await?;
                     print_json(&resp);
                 }
-                NudgeAction::Off => {
+                NudgeAction::Disable => {
                     let resp = client
                         .post_json("/api/nudge", json!({ "enabled": false, "tier": tier }))
                         .await?;
@@ -384,10 +398,10 @@ pub async fn run(args: CliArgs) -> Result<()> {
             PromptRewriteAction::Status => {
                 print_json(&client.get_json("/api/prompt-rewrite").await?);
             }
-            PromptRewriteAction::On => {
+            PromptRewriteAction::Enable => {
                 print_json(&client.post_json("/api/prompt-rewrite", json!({ "enabled": true })).await?);
             }
-            PromptRewriteAction::Off => {
+            PromptRewriteAction::Disable => {
                 print_json(&client.post_json("/api/prompt-rewrite", json!({ "enabled": false })).await?);
             }
         },
@@ -411,9 +425,26 @@ pub async fn run(args: CliArgs) -> Result<()> {
             BridgesAction::Status => {
                 print_json(&client.get_json("/api/bridge-status").await?);
             }
-            BridgesAction::Toggle { bridge, enabled } => {
+            BridgesAction::Enable { bridge } => {
                 print_json(&client
-                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": enabled }))
+                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": true }))
+                    .await?);
+            }
+            BridgesAction::Disable { bridge } => {
+                print_json(&client
+                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": false }))
+                    .await?);
+            }
+            BridgesAction::Toggle { bridge } => {
+                // Read current state so toggle flips it, not just enables it.
+                let current = client.get_json("/api/bridge-status").await?;
+                let enabled = current
+                    .get(&bridge)
+                    .and_then(|b| b.get("enabled"))
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                print_json(&client
+                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": !enabled }))
                     .await?);
             }
         },
@@ -437,14 +468,14 @@ pub async fn run(args: CliArgs) -> Result<()> {
         CliCommand::ConfigFiles => {
             print_json(&client.get_json("/api/config-files").await?);
         }
-        CliCommand::Config { action } => {
+        CliCommand::BrainrouterConfig { action } => {
             run_config_cmd(&client, action, "/api/config", "brainrouter.yaml").await?;
         }
         CliCommand::LlamaSwapConfig { action } => {
             run_config_cmd(&client, action, "/api/llama-swap-config", "llama-swap config.yaml").await?;
         }
         CliCommand::ReviewConfig { action } => match action {
-            ReviewConfigAction::Show => {
+            ReviewConfigAction::Status => {
                 print_json(&client.get_json("/api/review-config").await?);
             }
             ReviewConfigAction::Update { max_iterations, forced_mode, forced_model } => {

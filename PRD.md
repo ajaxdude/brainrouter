@@ -205,8 +205,8 @@ When installed via `install.sh` on a shared Fedora machine:
 | `local_system_prompt` | `String?` | `None` | Path to a custom system prompt file for `model=local` mode. Built-in lean prompt used if absent |
 | `nudge.enabled` | `bool` | `false` | Thinking-budget nudge: inject `reasoning_budget_tokens` into local routes when the client didn't set one |
 | `nudge.model_key` | `String?` | `None` | Local model key that receives the nudge; when `None`, nudge applies to the routing target |
-| `nudge.budgets.local` | `u32` | `10240` | Budget injected when the classifier tier is `local` |
-| `nudge.budgets.deep` | `u32` | `12288` | Budget injected when the classifier tier is `deep` |
+| `nudge.budgets.light` | `u32` | `10240` | Budget injected when the tier is `light`. Legacy configs may use `local` (accepted via serde alias) |
+| `nudge.budgets.deep` | `u32` | `12288` | Budget injected when the tier is `deep` |
 
 #### bonsai.*
 
@@ -279,7 +279,7 @@ When installed via `install.sh` on a shared Fedora machine:
 
 #### `brainrouter cli <command>`
 
-Thin client over the daemon REST API; total dashboard parity. `--socket <path>` selects the daemon UDS (default: `config::default_socket_path`), `--url http://…` talks TCP instead. All output is pretty-printed JSON, except `config show`/`set` which are raw YAML.
+Thin client over the daemon REST API; total dashboard parity. `--socket <path>` selects the daemon UDS (default: `config::default_socket_path`), `--url http://…` talks TCP instead. All output is pretty-printed JSON, except `brainrouter-config show`/`set` (alias `config`) which are raw YAML.
 
 | Command | Description |
 |---|---|
@@ -289,21 +289,21 @@ Thin client over the daemon REST API; total dashboard parity. `--socket <path>` 
 | `events` | Recent routing events feed |
 | `stats` | Aggregated routing statistics |
 | `models [--llama-swap]` | Model list (`/v1/models` view, or raw llama-swap keys with `--llama-swap`) |
-| `bonsai status` / `on` / `off` / `toggle` | Classifier server control (idempotent: `on`/`off` are no-ops when already in that state) |
-| `nudge status` / `on` / `off` / `toggle` / `tier <auto\|local\|deep>` | Thinking-budget nudge control |
-| `prompt-rewrite status` / `on` / `off` | Local prompt-rewrite toggle |
+| `bonsai status` / `enable` / `disable` / `toggle` | Classifier server control (idempotent: `enable`/`disable` are no-ops when already in that state) |
+| `nudge status` / `enable` / `disable` / `toggle` / `tier <auto\|light\|deep>` | Thinking-budget nudge control (`light` = tight budget; legacy API spelling `local` still accepted) |
+| `prompt-rewrite status` / `enable` / `disable` | Local prompt-rewrite toggle |
 | `context status` / `set <tokens\|auto>` | llama-swap context size (auto = 131072; range 2048–262144) |
 | `routing-mode status` / `set <auto\|cloud\|local>` | Routing-mode override |
-| `bridges status` / `toggle <discord\|signal> <true\|false>` | Bridge control |
+| `bridges status` / `enable` / `disable` / `toggle <discord\|signal>` | Bridge control (toggle flips the current state) |
 | `toolboxes` | List llama-* toolbox containers |
-| `restart <llama-swap\|llama-cpp\|manifest\|brainrouter>` | Restart a service |
+| `restart <llama-swap\|llama-cpp\|manifest\|brainrouter>` | Restart a service. `llama-cpp` is the dashboard's `llama.cpp` row; `toolbox` is the `toolboxes` image |
 | `upgrade <llama-swap\|manifest\|toolbox>` | Upgrade a component |
 | `flush-models` | Unload every model from llama-swap (frees VRAM) |
-| `sync-omp` | Sync live llama-swap models into OMP's models.yml |
+| `sync-omp` | Push llama-swap models into OMP's models.yml (one-way) |
 | `config-files` | List config files the daemon manages |
-| `config show` / `set <path\|->` | Read brainrouter.yaml; write one from a file or stdin (`-`) |
+| `brainrouter-config show` / `set <path\|->` | Read brainrouter.yaml; write one from a file or stdin (`-`). Alias: `config` |
 | `llama-swap-config show` / `set <path\|->` | Same for llama-swap's config.yaml |
-| `review-config show` / `update [--max-iterations N] [--forced-mode auto\|cloud\|local] [--forced-model KEY]` | Review service configuration |
+| `review-config status` / `update [--max-iterations N] [--forced-mode auto\|cloud\|local] [--forced-model KEY]` | Review service configuration |
 | `review list` | All review sessions |
 | `review get <sessionId>` | One session's details |
 | `review request <taskId> <summary> [--details TEXT] [--cwd DIR] [--async]` | Request a review; blocks with progress (polls every 5 s, 30-min cap) unless `--async` |
