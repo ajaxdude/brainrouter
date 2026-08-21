@@ -32,6 +32,20 @@ llama_swap:
   #   - "qwen3"
   #   - "mistral-7b"
   #   - "your-local-model-key"
+  # Optional: subs-pool model key. Requests with model=subs or brainrouter/subs
+  # route directly to this llama-swap key, bypassing Bonsai — a multi-slot
+  # pool for subagent traffic (e.g. 4 parallel slots on a bounded context).
+  # Absent → subs requests fall back to normal auto routing.
+  # subs_model: "your-subs-pool-key"
+  # Reasoning-budget nudge (voidsurfer/llama.cpp-nudge fork). When enabled,
+  # auto-routed local requests use model_key carrying a per-request
+  # reasoning_budget_tokens chosen from budgets by Bonsai's tier.
+  # nudge:
+  #   enabled: true
+  #   model_key: "your-nudge-model-key"
+  #   budgets:
+  #     light: 10240
+  #     deep: 12288
 
 bonsai:
   # Bonsai classifier is OFF by default — auto-routing goes straight to local

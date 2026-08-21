@@ -76,6 +76,8 @@ pub struct Router {
     fallback_model: String,
     /// Model keys known to belong to llama-swap. Requests for these bypass Bonsai.
     local_models: Vec<String>,
+    /// Subs-pool model key for `subs`/`brainrouter/subs` requests.
+    subs_model: Option<String>,
     health: Arc<HealthTracker>,
     routing_events: Arc<RoutingEvents>,
     /// Optional custom system prompt for local routing mode.
@@ -104,6 +106,9 @@ pub struct RouterArgs {
     pub fallback_model: String,
     /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
     pub local_models: Vec<String>,
+    /// Subs-pool model key for `subs`/`brainrouter/subs` requests. See
+    /// `LlamaSwapConfig::subs_model`.
+    pub subs_model: Option<String>,
     pub health: Arc<HealthTracker>,
     pub routing_events: Arc<RoutingEvents>,
     pub local_system_prompt: Option<String>,
@@ -123,6 +128,7 @@ impl Router {
             llama_swap: args.llama_swap,
             fallback_model: args.fallback_model,
             local_models: args.local_models,
+            subs_model: args.subs_model,
             health: args.health,
             routing_events: args.routing_events,
             local_system_prompt: args.local_system_prompt,
@@ -207,10 +213,23 @@ impl Router {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 ("cloud-direct", self.route_cloud(request).await)
             }
-            // Auto: existing Bonsai classification
+            // Auto: existing Bonsai classification. Also handles the subs pool
+            // convention (`subs` / `brainrouter/subs`) before falling back.
             _ => {
-                // Check for brainrouter/<specific-model> — direct to llama-swap
-                if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
+                // Subs pool: `subs` or `brainrouter/subs` → subs_model, bypassing
+                // Bonsai. Unconfigured → warn and fall back to auto below.
+                if requested_model == "subs" || requested_model == "brainrouter/subs" {
+                    if let Some(subs) = self.subs_model.clone() {
+                        info!(model = %subs, "Subs pool routing — direct to llama-swap");
+                        tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
+                        request.messages = self.maybe_rewrite_local(request.messages);
+                        request.model = subs;
+                        ("local-subs", self.route_local(request).await)
+                    } else {
+                        warn!("Subs pool requested but llama_swap.subs_model is not configured — falling back to auto");
+                        self.route_auto(request, tracker, max_tokens).await
+                    }
+                } else if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
                     if !specific.is_empty() {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
@@ -219,24 +238,7 @@ impl Router {
                         ("local-specific", self.route_local(request).await)
                     } else {
                         // Empty suffix, treat as auto — fall through to Bonsai
-                        tracker.set(Phase::Classifying, None, None, max_tokens);
-                        let decision = self
-                            .classifier
-                            .classify_async(request.clone())
-                            .await;
-                        info!(?decision, "Bonsai routing decision");
-                        match decision {
-                            RoutingDecision::Cloud => {
-                                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                                ("cloud", self.route_cloud(request).await)
-                            }
-                            RoutingDecision::Local { model, tier } => {
-                                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
-                                request.model = model;
-                                self.inject_nudge_budget(&mut request, tier);
-                                ("local", self.route_local(request).await)
-                            }
-                        }
+                        self.route_auto(request, tracker, max_tokens).await
                     }
                 } else if self.local_models.contains(&requested_model) {
                     // Model is explicitly listed as a local model — route directly
@@ -249,24 +251,7 @@ impl Router {
                     ("local-specific", self.route_local(request).await)
                 } else {
                     // No brainrouter/ prefix, not a known local model — use Bonsai
-                    tracker.set(Phase::Classifying, None, None, max_tokens);
-                    let decision = self
-                        .classifier
-                        .classify_async(request.clone())
-                        .await;
-                    info!(?decision, "Bonsai routing decision");
-                    match decision {
-                        RoutingDecision::Cloud => {
-                            tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                            ("cloud", self.route_cloud(request).await)
-                        }
-                        RoutingDecision::Local { model, tier } => {
-                            tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
-                            request.model = model;
-                            self.inject_nudge_budget(&mut request, tier);
-                            ("local", self.route_local(request).await)
-                        }
-                    }
+                    self.route_auto(request, tracker, max_tokens).await
                 }
             }
         };
@@ -325,6 +310,31 @@ impl Router {
         };
 
         Ok((response, info))
+    }
+
+    /// Auto path: consult the Bonsai classifier and route Cloud or Local.
+    /// Returns the (decision tag, result) pair consumed by `route_tagged`.
+    async fn route_auto(
+        &self,
+        mut request: ChatCompletionRequest,
+        tracker: &Arc<InferenceTracker>,
+        max_tokens: Option<u32>,
+    ) -> (&'static str, Result<(ProviderResponse, RouteInfo)>) {
+        tracker.set(Phase::Classifying, None, None, max_tokens);
+        let decision = self.classifier.classify_async(request.clone()).await;
+        info!(?decision, "Bonsai routing decision");
+        match decision {
+            RoutingDecision::Cloud => {
+                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
+                ("cloud", self.route_cloud(request).await)
+            }
+            RoutingDecision::Local { model, tier } => {
+                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
+                request.model = model;
+                self.inject_nudge_budget(&mut request, tier);
+                ("local", self.route_local(request).await)
+            }
+        }
     }
 
     /// Cloud path: try Manifest first. On error/circuit-open, fall back to

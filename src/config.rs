@@ -67,6 +67,14 @@ pub struct LlamaSwapConfig {
     #[serde(default)]
     pub local_system_prompt: Option<String>,
 
+    /// Optional subs-pool model key. Requests targeting `subs` or
+    /// `brainrouter/subs` route directly to this llama-swap key, bypassing
+    /// Bonsai classification — intended for a multi-slot pool serving
+    /// subagent traffic. Must match an entry in the llama-swap config.
+    /// Absent → `subs` requests fall back to normal auto routing.
+    #[serde(default)]
+    pub subs_model: Option<String>,
+
     /// Optional reasoning-budget nudge settings (voidsurfer/llama.cpp-nudge
     /// fork). When enabled, auto-routed local requests are sent to
     /// `model_key` — a llama-swap entry that must be launched with
@@ -342,6 +350,11 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     }
     if config.llama_swap.fallback_model.is_empty() {
         bail!("llama_swap.fallback_model must not be empty");
+    }
+    if let Some(model) = config.llama_swap.subs_model.as_deref() {
+        if model.is_empty() {
+            bail!("llama_swap.subs_model must not be empty");
+        }
     }
 
     // Validate bonsai.model_path exists (after token expansion) — but only

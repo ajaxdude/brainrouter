@@ -202,6 +202,7 @@ When installed via `install.sh` on a shared Fedora machine:
 | `base_url` | `String` | *(required)* | URL of the llama-swap instance |
 | `fallback_model` | `String` | *(required)* | Model key to use when Manifest fails or Bonsai picks local. Must match a key in llama-swap config |
 | `local_models` | `Vec<String>?` | `[]` | Explicit llama-swap model keys; a request using one of them as `model=` routes straight to llama-swap, bypassing Bonsai |
+| `subs_model` | `String?` | `None` | Subs-pool model key; `model=subs` / `brainrouter/subs` routes here, bypassing Bonsai. Absent → `subs` falls back to auto |
 | `local_system_prompt` | `String?` | `None` | Path to a custom system prompt file for `model=local` mode. Built-in lean prompt used if absent |
 | `nudge.enabled` | `bool` | `false` | Thinking-budget nudge: inject `reasoning_budget_tokens` into local routes when the client didn't set one |
 | `nudge.model_key` | `String?` | `None` | Local model key that receives the nudge; when `None`, nudge applies to the routing target |
@@ -383,6 +384,9 @@ Incoming request (OpenAI or Anthropic format)
   |
   +-- model="brainrouter/<model>" --> prompt_rewriter.rs: rewrite system msgs
   |                               --> llama-swap (specific model)
+  |
+  +-- model="subs" / "brainrouter/subs" --> llama-swap (subs_model, bypassing Bonsai;
+  |     unconfigured → falls back to auto)
   |
   +-- nudge (if enabled): inject reasoning_budget_tokens on local routes
   |     unless the client already supplied one

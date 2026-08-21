@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "brainrouter"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -153,6 +153,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "num_cpus",
+ "parking_lot",
  "pin-project",
  "reqwest",
  "serde",

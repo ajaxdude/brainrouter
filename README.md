@@ -31,10 +31,9 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Three routing modes.** `auto` uses Bonsai classification (<500 ms) when the classifier is on; with it off (the default), `auto` goes straight to local. `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest (also off by default).
 - **Off by default, opt in.** Fresh installs run fully local with a single hop — no Bonsai model download, no Manifest stack, no cloud API key required.
 
-- **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
-- **Three routing modes.** `auto` uses Bonsai classification (<500 ms). `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest.
 - **Local prompt rewriting.** OMP's 15–20 K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
-- **Manifest handles cloud failover.** Manifest runs locally in Docker and picks the right cloud provider (Anthropic, OpenAI, Copilot, Google, Mistral, DeepSeek, etc.) with its own automatic fallbacks.
+- **Subs pool routing.** Requests with `model=subs` or `brainrouter/subs` route to `llama_swap.subs_model` — a multi-slot pool for subagent traffic — bypassing Bonsai entirely.
+- **Manifest cloud failover.** When Manifest is enabled, `cloud` traffic goes through it (runs locally in Docker, picks the cloud provider) and falls back to llama-swap's `fallback_model` on failure.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
 - **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
 - **Headless CLI.** `brainrouter cli` mirrors every dashboard action from the terminal: status, versions, Bonsai/nudge/context/routing toggles, restarts, upgrades, config, and the full review lifecycle. See the [Headless CLI](#headless-cli-brainrouter-cli) section.
@@ -627,6 +626,7 @@ llama_swap:
   base_url: "http://localhost:8081/v1"   # required
   fallback_model: "my-model"             # required — must match a key in llama-swap config
   local_models: ["my-model", "other"]    # optional — model keys that bypass Bonsai when used directly
+  subs_model: "my-subs-pool"             # optional — model=subs / brainrouter/subs routes here, bypassing Bonsai
   local_system_prompt: "/path/to/prompt.md"  # optional — override built-in lean prompt
   nudge:
     enabled: false                       # thinking-budget injection off by default
