@@ -181,6 +181,10 @@ textarea { resize: vertical; }
       <span class="nav-icon">⚙</span>
       <span>Config</span>
     </button>
+    <button class="nav-item" id="nav-models" onclick="switchView('models')">
+      <span class="nav-icon">⬢</span>
+      <span>Models</span>
+    </button>
   </nav>
 
   <!-- System Health -->
@@ -194,30 +198,14 @@ textarea { resize: vertical; }
       </div>
       <div id="ver-llama-swap" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="llama.cpp — the production toolbox engine that serves local models. NOT the Bonsai classifier (that has its own fork, shown below)">
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="llama.cpp — the production toolbox engine that serves local models">
       <div style="display:flex;align-items:center;gap:8px">
         <span id="dot-llama-cpp" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
         <span style="color:var(--textDim);flex:1">llama.cpp</span>
       </div>
       <div id="ver-llama-cpp" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
-    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="toolboxes — the container image hosting the llama.cpp engine" onclick="upgradeIfAvailable('toolbox')">
-      <div style="display:flex;align-items:center;gap:8px">
-        <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-        <span style="color:var(--textDim);flex:1">toolboxes</span>
-        <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
-      </div>
-      <div id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="manifest — the cloud LLM endpoint" onclick="upgradeIfAvailable('manifest')">
-      <div style="display:flex;align-items:center;gap:8px">
-        <span id="dot-manifest" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-        <span style="color:var(--textDim);flex:1">manifest</span>
-        <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
-      </div>
-      <div id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="bonsai — the cloud/local classifier. Runs on a separate PrismML fork of llama.cpp (its own binary, not the toolbox engine)">
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="bonsai — the local classifier. Runs on a separate PrismML fork of llama.cpp (its own binary, not the toolbox engine)">
       <div style="display:flex;align-items:center;gap:8px">
         <span id="dot-bonsai" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
         <span style="color:var(--textDim);flex:1">bonsai</span>
@@ -227,6 +215,22 @@ textarea { resize: vertical; }
         </button>
       </div>
       <div id="ver-bonsai" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="manifest — the cloud LLM endpoint" onclick="upgradeIfAvailable('manifest')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-manifest" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">manifest</span>
+        <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+      </div>
+      <div id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="toolboxes — the container image hosting the llama.cpp engine. The individual toolbox instances are listed directly below." onclick="upgradeIfAvailable('toolbox')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
+        <span style="color:var(--textDim);flex:1">toolboxes</span>
+        <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+      </div>
+      <div id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
     </div>
   </div>
 
@@ -399,6 +403,23 @@ textarea { resize: vertical; }
       </div>
     </div>
 
+    <div id="models-view" style="display:none;max-width:900px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <div style="font-size:13px;font-weight:600">Local models (llama-swap)</div>
+        <div style="margin-left:auto;display:flex;gap:8px">
+          <button onclick="syncModels()" style="font-size:11px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer">Sync to OMP</button>
+          <button onclick="flushModels(true)" style="font-size:11px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--amber);cursor:pointer">⏏ Flush + Reload Group</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
+        Pick a model, copy its <code style="font-family:'JetBrains Mono',monospace">brainrouter/&lt;key&gt;</code> value, and paste it into OMP's model field.
+        brainrouter routes any named model straight to llama-swap — no classifier involved.
+      </div>
+      <div id="models-list" style="display:flex;flex-direction:column;gap:8px">
+        <div style="color:var(--textMute);font-size:12px">Loading...</div>
+      </div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 </div><!-- /app -->
@@ -522,19 +543,21 @@ function switchView(view) {
   document.getElementById('stream-view').style.display   = view === 'stream'  ? 'grid'  : 'none';
   document.getElementById('reviews-view').style.display  = view === 'reviews' ? 'block' : 'none';
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
+  document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
 
-  ['stream','reviews','config'].forEach(v => {
+  ['stream','reviews','config','models'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  const titles = { stream: 'Routing', reviews: 'Reviews', config: 'Config' };
+  const titles = { stream: 'Routing', reviews: 'Reviews', config: 'Config', models: 'Models' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
     stream: 'Live routing events · newest first · polling every 3s',
     reviews: 'Active review sessions',
     config: 'Edit configuration files',
+    models: 'Pick a model, copy its OMP value, and paste it into OMP',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -542,6 +565,7 @@ function switchView(view) {
   filterDiv.style.display = view === 'stream' ? 'flex' : 'none';
 
   if (view === 'config') loadConfig();
+  if (view === 'models') loadModels();
 }
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
@@ -1187,17 +1211,74 @@ async function toggleBonsai() {
   await setBonsai(turningOn);
 }
 
-async function flushModels() {
-  if (!confirm('Unload ALL models currently in memory (llama-swap)?\nThis frees GPU/VRAM; models reload on next request.')) return;
+async function flushModels(reload) {
+  reload = !!reload;
+  const msg = reload
+    ? 'Flush ALL models, then reload the local working set (main + subs)?\nTakes ~1 minute to load.'
+    : 'Unload ALL models currently in memory (llama-swap)?\nThis frees GPU/VRAM; models reload on next request.';
+  if (!confirm(msg)) return;
   const btn = event && event.target;
-  if (btn) { btn.disabled = true; btn.textContent = '⏏ Flushing...'; }
+  if (btn) { btn.disabled = true; btn.textContent = reload ? '↻ Flushing + reloading...' : '⏏ Flushing...'; }
   try {
-    const r = await fetch('/api/models/flush', { method: 'POST' });
+    const r = await fetch('/api/models/flush', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reload })
+    });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) alert('Flush failed: ' + (j.error || r.status));
+    else if (reload) alert('Flushed. Reloaded: ' + ((j.reloaded || []).join(', ') || '(none)'));
   } catch (e) {}
-  if (btn) { btn.disabled = false; btn.textContent = '⏏ Flush Models'; }
-  setTimeout(refreshHealth, 2000);
+  if (btn) { btn.disabled = false; btn.textContent = reload ? '⏏ Flush + Reload Group' : '⏏ Flush Models'; }
+  setTimeout(refreshHealth, reload ? 3000 : 2000);
+}
+
+async function loadModels() {
+  const list = document.getElementById('models-list');
+  if (!list) return;
+  try {
+    const r = await fetch('/api/models/llama-swap');
+    const j = await r.json().catch(() => ({}));
+    const models = (j && j.data) || [];
+    if (!models.length) {
+      list.innerHTML = '<div style="color:var(--textMute);font-size:12px">No models reported by llama-swap.</div>';
+      return;
+    }
+    list.innerHTML = models.map(m => {
+      const key = m.id || m.model || '';
+      const loaded = (m.status && m.status.value === 'loaded') || m.loaded;
+      const dot = loaded ? 'var(--green)' : 'var(--textMute)';
+      const port = m.port ? ' · :' + m.port : '';
+      const val = 'brainrouter/' + key;
+      return '<div style="display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px">'
+        + '<span style="width:8px;height:8px;border-radius:50%;background:' + dot + '"></span>'
+        + '<div style="flex:1;min-width:0">'
+        + '  <div style="font-size:12px;font-weight:600;color:var(--text)">' + key + ' <span style="font-size:10px;color:var(--textMute);font-weight:400">' + (loaded ? 'loaded' : 'unloaded') + port + '</span></div>'
+        + '  <div style="font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--textMute)">' + val + '</div>'
+        + '</div>'
+        + '<button onclick="copyOmpValue(\'' + key + '\')" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;white-space:nowrap">Copy for OMP</button>'
+        + '</div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Failed to load model list.</div>';
+  }
+}
+
+function copyOmpValue(key) {
+  const val = 'brainrouter/' + key;
+  const btn = event && event.target;
+  const done = () => { if (btn) { const t = btn.textContent; btn.textContent = 'Copied ✓'; setTimeout(() => { btn.textContent = t; }, 1200); } };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(val).then(done, () => { fallbackCopy(val); done(); });
+  } else { fallbackCopy(val); done(); }
+}
+
+function fallbackCopy(val) {
+  const ta = document.createElement('textarea');
+  ta.value = val; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  alert('Copy this value: ' + val);
 }
 
 function updateVersions() {

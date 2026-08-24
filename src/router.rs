@@ -140,6 +140,12 @@ impl Router {
         }
     }
 
+    /// Model keys known to belong to llama-swap (from config). Exposed so the
+    /// flush-and-reload path can re-establish the local working set.
+    pub fn local_models(&self) -> &Vec<String> {
+        &self.local_models
+    }
+
     /// Rewrite the system prompt for local routing, unless the dashboard
     /// prompt-rewrite toggle is off (pass-through mode).
     fn maybe_rewrite_local(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -229,6 +235,9 @@ impl Router {
                         warn!("Subs pool requested but llama_swap.subs_model is not configured — falling back to auto");
                         self.route_auto(request, tracker, max_tokens).await
                     }
+                } else if requested_model == "auto" || requested_model == "brainrouter/auto" {
+                    // Explicit "auto" — let the classifier decide (Bonsai off → local).
+                    self.route_auto(request, tracker, max_tokens).await
                 } else if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
                     if !specific.is_empty() {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
@@ -250,8 +259,14 @@ impl Router {
                     // request.model is already correct (it's the llama-swap model key)
                     ("local-specific", self.route_local(request).await)
                 } else {
-                    // No brainrouter/ prefix, not a known local model — use Bonsai
-                    self.route_auto(request, tracker, max_tokens).await
+                    // A named model that isn't a reserved routing token (auto/local/
+                    // cloud/subs). The user picked it explicitly — route Local directly
+                    // to that model in llama-swap. Lets you select any llama-swap model
+                    // without a classifier hop; works even when Bonsai is off.
+                    info!(model = %requested_model, "Named model — routing directly to llama-swap");
+                    tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
+                    request.messages = self.maybe_rewrite_local(request.messages);
+                    ("local-specific", self.route_local(request).await)
                 }
             }
         };

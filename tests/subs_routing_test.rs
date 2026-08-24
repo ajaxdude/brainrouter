@@ -218,3 +218,30 @@ async fn unconfigured_subs_falls_back_to_auto_without_error() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(captured.lock().clone(), vec![FALLBACK_KEY.to_string()]);
 }
+
+#[tokio::test]
+async fn bare_named_model_routes_local_direct_without_classifier() {
+    let (url, captured) = spawn_mock_llama_swap().await;
+    // A model that is NOT in local_models and NOT a reserved routing token
+    // (auto/local/cloud/subs). OMP strips the `brainrouter/` provider prefix
+    // before sending, so the daemon receives the bare key. It must route Local
+    // directly to that model — never to the classifier (which, with a stale
+    // Bonsai flag, used to fall back to Cloud → Nail). Regression guard for
+    // "pick a model in brainrouter, it routes there".
+    let router = make_router(&url, None, vec![]);
+
+    let (resp, info) = router
+        .route_tagged(chat_request("dirk-qwen3.8-27b-q8-nudge"), None, "/tmp".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(info.bonsai_decision, "local-specific");
+    assert_eq!(info.model_key, "dirk-qwen3.8-27b-q8-nudge");
+    drop(resp);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        captured.lock().clone(),
+        vec!["dirk-qwen3.8-27b-q8-nudge".to_string()]
+    );
+}

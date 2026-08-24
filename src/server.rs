@@ -737,7 +737,11 @@ async fn handle_request(
 
         // ── Flush models API (free VRAM) ────────────────────────────────────
         ("POST", "/api/models/flush") => {
-            let resp = flush_models(&state.llama_swap_url).await;
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let reload = val.get("reload").and_then(|v| v.as_bool()).unwrap_or(false);
+            let local_models: Vec<String> = state.router.local_models().to_vec();
+            let resp = flush_models(&state.llama_swap_url, reload, &local_models).await;
             into_unsync(resp)
         }
 
@@ -1313,8 +1317,16 @@ async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
 
 /// Unload every model llama-swap currently holds in memory (VRAM), without
 /// restarting the service. Proxies to llama-swap's `POST /api/models/unload`.
-async fn flush_models(llama_swap_url: &str) -> Response<Full<Bytes>> {
-    let url = format!("{}/api/models/unload", llama_swap_url.trim_end_matches('/'));
+/// When `reload` is set, warm-loads each key in `local_models` afterwards so the
+/// local working set (e.g. the dual-Dirk main + subs group) is resident again
+/// instead of the user hand-starting each model.
+async fn flush_models(
+    llama_swap_url: &str,
+    reload: bool,
+    local_models: &[String],
+) -> Response<Full<Bytes>> {
+    let base = llama_swap_url.trim_end_matches('/').to_string();
+    let url = format!("{}/api/models/unload", base);
     info!(%url, "Flushing all llama-swap models");
     match VERSION_CLIENT
         .post(&url)
@@ -1324,13 +1336,49 @@ async fn flush_models(llama_swap_url: &str) -> Response<Full<Bytes>> {
     {
         Ok(resp) if resp.status().is_success() => {
             info!("llama-swap flushed all models");
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "status": "ok",
-                    "message": "all llama-swap models unloaded from memory"
-                }),
-            )
+            if reload && !local_models.is_empty() {
+                // Re-establish the local working set: warm-load each model so
+                // the dual-Dirk group (main + subs) is resident again.
+                let mut reloaded = Vec::new();
+                for key in local_models {
+                    let warm = format!("{}/v1/chat/completions", base);
+                    let ok = VERSION_CLIENT
+                        .post(&warm)
+                        .timeout(std::time::Duration::from_secs(180))
+                        .json(&serde_json::json!({
+                            "model": key,
+                            "messages": [{"role": "user", "content": "warm"}],
+                            "max_tokens": 1,
+                            "stream": false
+                        }))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    if ok {
+                        info!(model = %key, "reloaded local model after flush");
+                        reloaded.push(key.clone());
+                    } else {
+                        warn!(model = %key, "reload of local model after flush failed");
+                    }
+                }
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "message": "flushed, then reloaded the local working set",
+                        "reloaded": reloaded
+                    }),
+                )
+            } else {
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "message": "all llama-swap models unloaded from memory"
+                    }),
+                )
+            }
         }
         Ok(resp) => {
             let status = resp.status();
