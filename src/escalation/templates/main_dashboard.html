@@ -172,11 +172,6 @@ textarea { resize: vertical; }
       <span class="nav-icon">◉</span>
       <span>Routing</span>
     </button>
-    <button class="nav-item" id="nav-reviews" onclick="switchView('reviews')">
-      <span class="nav-icon">✓</span>
-      <span>Reviews</span>
-      <span id="reviews-count" style="margin-left:auto;font-size:10px;padding:2px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;display:none">0</span>
-    </button>
     <button class="nav-item" id="nav-config" onclick="switchView('config')">
       <span class="nav-icon">⚙</span>
       <span>Config</span>
@@ -241,11 +236,15 @@ textarea { resize: vertical; }
   <div style="padding:12px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:12px;text-transform:uppercase">Routing</div>
   <div style="padding:0 12px 8px">
     <div style="display:flex;gap:6px">
-      <button id="mode-auto"  class="mode-btn active" onclick="setRoutingMode('auto')"  style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--green);font-family:'JetBrains Mono',monospace">auto</button>
+      <button id="mode-auto"  class="mode-btn"        onclick="setRoutingMode('auto')"  style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">auto</button>
       <button id="mode-cloud" class="mode-btn"        onclick="setRoutingMode('cloud')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">cloud</button>
-      <button id="mode-local" class="mode-btn"        onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">local</button>
+      <button id="mode-local" class="mode-btn active" onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--cyan);font-family:'JetBrains Mono',monospace">local</button>
     </div>
     <div id="routing-hint" style="display:none;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding:2px 2px 0;line-height:1.4"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg3);cursor:pointer" onclick="gotoReviews()" title="Show only cards with an active review session">
+      <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim)">▸ reviews</span>
+      <span id="reviews-count" style="margin-left:auto;font-size:10px;padding:2px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;display:none">0</span>
+    </div>
   </div>
 
   <!-- Thinking budget (nudge) + local tuning -->
@@ -261,9 +260,9 @@ textarea { resize: vertical; }
     <div style="display:flex;align-items:center;gap:8px" title="Reasoning tier: auto = Bonsai picks light/deep per request; light = tight budget; deep = full budget">
       <span style="color:var(--textDim);font-size:11px;width:78px;flex-shrink:0">reasoning tier</span>
       <div style="flex:1;display:flex;gap:4px">
-        <button id="tier-auto"  class="tier-btn active" onclick="setNudgeTier('auto')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'JetBrains Mono',monospace">auto</button>
+        <button id="tier-auto"  class="tier-btn"        onclick="setNudgeTier('auto')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">auto</button>
         <button id="tier-light" class="tier-btn"        onclick="setNudgeTier('light')" style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">light</button>
-        <button id="tier-deep"  class="tier-btn"        onclick="setNudgeTier('deep')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">deep</button>
+        <button id="tier-deep"  class="tier-btn active" onclick="setNudgeTier('deep')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);background:var(--bg3);color:var(--violet);font-family:'JetBrains Mono',monospace">deep</button>
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:8px" title="Context window passed to llama-swap (rewrites the config and restarts the local stack)">
@@ -278,9 +277,9 @@ textarea { resize: vertical; }
     </div>
     <div style="display:flex;align-items:center;gap:8px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward the incoming prompt untouched">
       <span style="color:var(--textDim);font-size:11px;flex:1">rewrite prompts</span>
-      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting"
-        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--green);position:relative;flex-shrink:0;transition:background .2s">
-        <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:14px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting (requires Bonsai running)"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
       </button>
     </div>
     <div id="nudge-budgets" style="font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding-left:2px"></div>
@@ -338,6 +337,7 @@ textarea { resize: vertical; }
       <button class="filter-btn" data-filter="live" onclick="setFilter('live')">live</button>
       <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">approved</button>
       <button class="filter-btn" data-filter="escalated" onclick="setFilter('escalated')">escalated</button>
+      <button class="filter-btn" data-filter="reviews" onclick="setFilter('reviews')">reviews</button>
     </div>
   </div>
 
@@ -345,28 +345,31 @@ textarea { resize: vertical; }
   <div id="content" style="flex:1;overflow:auto;padding:24px">
 
     <!-- Stream View -->
-    <div id="stream-view" style="display:grid;grid-template-columns:1fr 320px;gap:24px;align-items:start">
-      <div id="card-list" style="display:flex;flex-direction:column;gap:14px">
-        <div style="color:var(--textMute);font-size:12px;padding:20px 0;text-align:center">Loading...</div>
+    <div id="stream-view" style="display:flex;flex-direction:column;gap:20px">
+      <!-- Sankey panel — full width, click a bar to filter the cards below -->
+      <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · prompts → classification → model → reviewer</span>
+          <span id="sankey-filter-chip" style="display:none;margin-left:auto;align-items:center;gap:6px;font-size:10px;font-family:'JetBrains Mono',monospace;padding:3px 8px;border-radius:99px;background:var(--bg3);border:1px solid var(--border);color:var(--cyan)">
+            <span id="sankey-filter-label"></span>
+            <span onclick="clearSankeyFilter()" style="cursor:pointer;color:var(--textMute)">✕</span>
+          </span>
+        </div>
+        <div id="sankey-container" style="width:100%;overflow:hidden">
+          <svg id="sankey-svg" viewBox="0 0 1100 200" width="100%" style="display:block"></svg>
+        </div>
       </div>
-      <div id="right-rail" style="position:sticky;top:0;display:flex;flex-direction:column;gap:14px">
-        <!-- Sankey panel -->
-        <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
-          <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-bottom:10px;text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · 24h</div>
-          <div id="sankey-container" style="width:100%;overflow:hidden">
-            <svg id="sankey-svg" viewBox="0 0 290 240" width="100%" style="display:block"></svg>
+      <div style="display:grid;grid-template-columns:1fr 320px;gap:24px;align-items:start">
+        <div id="card-list" style="display:flex;flex-direction:column;gap:14px">
+          <div style="color:var(--textMute);font-size:12px;padding:20px 0;text-align:center">Loading...</div>
+        </div>
+        <div id="right-rail" style="position:sticky;top:0;display:flex;flex-direction:column;gap:14px">
+          <!-- KPI grid -->
+          <div id="kpi-grid" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            <!-- filled by updateKPI() -->
           </div>
         </div>
-        <!-- KPI grid -->
-        <div id="kpi-grid" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
-          <!-- filled by updateKPI() -->
-        </div>
       </div>
-    </div>
-
-    <!-- Reviews View -->
-    <div id="reviews-view" style="display:none">
-      <div id="reviews-list" style="display:flex;flex-direction:column;gap:14px"></div>
     </div>
 
     <!-- Config View -->
@@ -540,22 +543,20 @@ function enrichEvents(events, sessions) {
 // ─── View switching ──────────────────────────────────────────────────────────
 function switchView(view) {
   activeView = view;
-  document.getElementById('stream-view').style.display   = view === 'stream'  ? 'grid'  : 'none';
-  document.getElementById('reviews-view').style.display  = view === 'reviews' ? 'block' : 'none';
+  document.getElementById('stream-view').style.display   = view === 'stream'  ? 'flex'  : 'none';
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
   document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
 
-  ['stream','reviews','config','models'].forEach(v => {
+  ['stream','config','models'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  const titles = { stream: 'Routing', reviews: 'Reviews', config: 'Config', models: 'Models' };
+  const titles = { stream: 'Routing', config: 'Config', models: 'Models' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
     stream: 'Live routing events · newest first · polling every 3s',
-    reviews: 'Active review sessions',
     config: 'Edit configuration files',
     models: 'Pick a model, copy its OMP value, and paste it into OMP',
   };
@@ -600,6 +601,7 @@ function matchesFilter(t) {
   if (activeFilter === 'live') return ['queued','generating','reviewing','routing','iterating'].includes(t._status);
   if (activeFilter === 'approved') return t._status === 'approved';
   if (activeFilter === 'escalated') return t._status === 'escalated';
+  if (activeFilter === 'reviews') return t._session && ['pending','needs_revision','escalated'].includes(t._session.status);
   return true;
 }
 </script>
@@ -872,95 +874,220 @@ function renderGroup(group, index) {
 </script>
 <script>
 // ─── Sankey SVG ───────────────────────────────────────────────────────────────
-function buildSankey(stats) {
-  const W = 290, H = 240;
-  const nodeW = 12;
-  const headerH = 20;
-  const usableH = H - headerH - 16;
-  const padBetween = 5;
+// Four columns, built from raw routing events + review sessions:
+//   PROMPT → CLASSIFICATION → MODEL → REVIEWER
+// Prompts and reviews are separate flows: a review iteration is its own
+// prompt-source category, and the reviewer column only carries events that
+// belong to a review session. Clicking any bar filters the card list.
 
-  // Build node data from statsData
-  // Columns: Source | Route | Model
-  // We derive from stats: total, cloud_count, local_count, direct_cloud_count, direct_local_count
-  const total = stats.total || 1;
-  const cloudCount = (stats.cloud_count || 0);
-  const localCount = (stats.local_count || 0);
-  const directCloud = (stats.direct_cloud_count || 0);
-  const cloudAuto = Math.max(0, cloudCount - directCloud);
-  const directLocal = (stats.direct_local_count || 0);
-  const localAuto = Math.max(0, localCount - directLocal);
+const SK_COLS = [
+  { name: 'prompt',  header: 'PROMPT',         x: 16  },
+  { name: 'class',   header: 'CLASSIFICATION', x: 300 },
+  { name: 'model',   header: 'MODEL',          x: 610 },
+  { name: 'review',  header: 'REVIEWER',       x: 920 },
+];
+const SK_W = 12, SK_H = 200, SK_TOP = 22, SK_PAD = 4;
 
-  const safePct = (n) => Math.max(2, (n / Math.max(total, 1)) * usableH);
+let sankeyFilter = { col: null, key: null };
 
-  // Col 0: Source (we only know local, no bridge breakdown)
-  const srcNodes = [{ key: 'all', label: 'All', color: '#22d39a', value: total, y: headerH + 8 }];
-  srcNodes[0].h = usableH;
+// Column 0 — where the prompt came from.
+function skPrompt(e) { return e.session_id ? 'review-iter' : 'prompt'; }
 
-  // Col 1: Route
-  const routes = [];
-  if (directCloud > 0)  routes.push({ key: 'cloud-direct', label: 'cloud-direct', color: '#9d7bff', value: directCloud });
-  if (cloudAuto > 0)    routes.push({ key: 'cloud-auto',   label: 'cloud-auto',   color: '#9d7bff', value: cloudAuto });
-  if (directLocal > 0)  routes.push({ key: 'local-direct', label: 'local-direct', color: '#3ec5ff', value: directLocal });
-  if (localAuto > 0)    routes.push({ key: 'local-auto',   label: 'local-auto',   color: '#3ec5ff', value: localAuto });
+// Column 1 — how the route was decided (the granular classification).
+function skClassification(e) {
+  if (e.session_id) return 'review-iter';
+  // Normalize the "brainrouter/" prefix: brainrouter/local is the reserved
+  // local token, not a named model.
+  const m = (e.requested_model || '').replace(/^brainrouter\//, '');
+  if (m === 'local') return 'direct:local';
+  if (m === 'cloud') return 'direct:cloud';
+  if (m === 'subs') return 'subs-pool';
+  if (m && m !== 'auto') return 'named-model';
+  return 'auto→' + (e.bonsai_decision === 'cloud' ? 'cloud' : 'local');
+}
 
-  if (routes.length === 0) {
-    // No data: placeholder
-    return `<text x="145" y="120" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No data yet</text>`;
+// Column 2 — the model that actually served the request.
+function skModel(e) {
+  if (e.model_key) return e.model_key;
+  if (e.effective_provider) return e.effective_provider.split('/').pop();
+  return 'failed';
+}
+
+// Column 3 — the model that reviewed it (review sessions only).
+function skReviewer(e, sess) {
+  if (!e.session_id || !sess) return null;
+  const raw = sess.review_model || '';
+  const pm = raw.match(/\(([^)]+)\)$/);
+  return (pm ? pm[1] : raw) || 'reviewing';
+}
+
+function skKeysOf(e, sess) {
+  return { c0: skPrompt(e), c1: skClassification(e), c2: skModel(e), c3: skReviewer(e, sess) };
+}
+
+// Does this event match the active Sankey node filter?
+function matchesSankey(t) {
+  if (sankeyFilter.col === null) return true;
+  const k = skKeysOf(t, t._session);
+  return k['c' + sankeyFilter.col] === sankeyFilter.key;
+}
+
+function skColorFor(col, key) {
+  const map = {
+    0: { 'prompt': '#22d39a', 'review-iter': '#f5b14a' },
+    1: {
+      'review-iter': '#f5b14a',
+      'auto→local': '#3ec5ff', 'auto→cloud': '#9d7bff',
+      'direct:local': '#22d39a', 'direct:cloud': '#9d7bff',
+      'subs-pool': '#ff7ac6', 'named-model': '#3ec5ff',
+    },
+    3: {},
+  };
+  if (map[col] && map[col][key]) return map[col][key];
+  if (col === 2) {
+    const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
+    let h = 0;
+    for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+    return palette[h % palette.length];
   }
+  if (col === 3) return '#f5b14a';
+  return '#5a6679';
+}
 
-  const routeTotalH = usableH - (routes.length - 1) * padBetween;
-  let ry = headerH + 8;
-  routes.forEach(n => {
-    n.h = Math.max(6, (n.value / total) * routeTotalH);
-    n.y = ry;
-    ry += n.h + padBetween;
-  });
-
-  const colX = [20, 148];
-  const cols = [
-    { header: 'SOURCE', x: colX[0], nodes: srcNodes },
-    { header: 'ROUTE',  x: colX[1], nodes: routes   },
-  ];
-
-  let svg = '';
-
-  // Headers
-  cols.forEach(c => {
-    svg += `<text x="${c.x}" y="14" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace" letter-spacing="1.5">${c.header}</text>`;
-  });
-
-  // Links: all → each route
-  routes.forEach(rt => {
-    const x1 = colX[0] + nodeW;
-    const x2 = colX[1];
-    const y1 = srcNodes[0].y + srcNodes[0].h / 2;
-    const y2 = rt.y + rt.h / 2;
-    const w  = Math.max(1, rt.h * 0.5);
-    const cx1 = x1 + (x2 - x1) * 0.5;
-    const cx2 = x2 - (x2 - x1) * 0.5;
-    svg += `<path d="M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}" stroke="${rt.color}" stroke-width="${w}" fill="none" opacity="0.32"/>`;
-  });
-
-  // Nodes + labels
-  cols.forEach(c => {
-    c.nodes.forEach(n => {
-      svg += `<rect x="${c.x}" y="${n.y}" width="${nodeW}" height="${n.h}" fill="${n.color}" rx="2"/>`;
-      svg += `<text x="${c.x + nodeW + 6}" y="${n.y + n.h/2 + 3.5}" fill="#e6edf6" font-size="10" font-family="JetBrains Mono, monospace">${n.label}</text>`;
-      svg += `<text x="${c.x + nodeW + 6}" y="${n.y + n.h/2 + 16}" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace">${n.value}</text>`;
-    });
-  });
-
-  return svg;
+function skLabel(key) {
+  return key.length > 24 ? key.slice(0, 23) + '…' : key;
 }
 
 function updateSankey() {
   const svg = document.getElementById('sankey-svg');
   if (!svg) return;
-  if (!statsData || !statsData.total) {
-    svg.innerHTML = `<text x="145" y="120" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
+
+  const sessMap = {};
+  allSessions.forEach(s => { sessMap[s.id] = s; });
+  const events = allEvents.map(e => ({ e, sess: e.session_id ? sessMap[e.session_id] : null }));
+
+  if (events.length === 0) {
+    svg.innerHTML = `<text x="550" y="100" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
     return;
   }
-  svg.innerHTML = buildSankey(statsData);
+
+  const total = events.length;
+  const scale = (SK_H - SK_TOP - 8) / total;
+
+  // Per-column node counts and per-gap link counts.
+  const counts = [new Map(), new Map(), new Map(), new Map()];
+  const linkCounts = [new Map(), new Map(), new Map()];
+  for (const { e, sess } of events) {
+    const k = skKeysOf(e, sess);
+    const chain = [k.c0, k.c1, k.c2];
+    if (k.c3 !== null) chain.push(k.c3);
+    chain.forEach((key, i) => counts[i].set(key, (counts[i].get(key) || 0) + 1));
+    for (let i = 0; i + 1 < chain.length; i++) {
+      const lk = chain[i] + '→' + chain[i + 1];
+      linkCounts[i].set(lk, (linkCounts[i].get(lk) || 0) + 1);
+    }
+  }
+
+  // Node layout: sorted by value, stacked top-down, height ∝ value.
+  const colNodes = counts.map((m, ci) => {
+    const arr = [...m.entries()].map(([key, value]) => ({ key, value, color: skColorFor(ci, key) }));
+    arr.sort((a, b) => b.value - a.value);
+    let y = SK_TOP;
+    arr.forEach(n => { n.h = Math.max(3, n.value * scale); n.y = y; y += n.h + SK_PAD; });
+    return arr;
+  });
+  const nodeAt = colNodes.map(arr => { const m = {}; arr.forEach(n => m[n.key] = n); return m; });
+
+  // Links with per-node output/input offsets (sorted by the far-end y to
+  // reduce crossings).
+  const allLinks = [];
+  linkCounts.forEach((m, i) => m.forEach((value, lk) => {
+    const sep = lk.indexOf('→');
+    allLinks.push({ i, a: lk.slice(0, sep), b: lk.slice(sep + 1), value });
+  }));
+  const byOut = {}, byIn = {};
+  allLinks.forEach(l => {
+    (byOut[l.i + '|' + l.a] = byOut[l.i + '|' + l.a] || []).push(l);
+    (byIn[l.i + '|' + l.b] = byIn[l.i + '|' + l.b] || []).push(l);
+  });
+  Object.values(byOut).forEach(g => {
+    g.sort((x, y) => nodeAt[x.i + 1][x.b].y - nodeAt[y.i + 1][y.b].y);
+    let off = 0;
+    g.forEach(l => { l.w = l.value * scale; l.outY = off + l.w / 2; off += l.w; });
+  });
+  Object.values(byIn).forEach(g => {
+    g.sort((x, y) => nodeAt[x.i][x.a].y - nodeAt[y.i][y.a].y);
+    let off = 0;
+    g.forEach(l => { l.inY = off + l.w / 2; off += l.w; });
+  });
+
+  const sel = (ci, key) => sankeyFilter.col !== null && sankeyFilter.col === ci && sankeyFilter.key === key;
+  const anyFilter = sankeyFilter.col !== null;
+
+  let svgOut = '';
+
+  // Column headers.
+  SK_COLS.forEach(c => {
+    svgOut += `<text x="${c.x}" y="14" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace" letter-spacing="1.5">${c.header}</text>`;
+  });
+
+  // Links (below nodes).
+  allLinks.forEach(l => {
+    const s = nodeAt[l.i][l.a], t = nodeAt[l.i + 1][l.b];
+    const x1 = SK_COLS[l.i].x + SK_W, x2 = SK_COLS[l.i + 1].x;
+    const y1 = s.y + l.outY, y2 = t.y + l.inY;
+    const mx = x1 + (x2 - x1) * 0.5;
+    svgOut += `<path d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" stroke="${t.color}" stroke-width="${Math.max(1, l.w)}" fill="none" opacity="${anyFilter ? 0.1 : 0.28}"/>`;
+  });
+
+  // Nodes + labels.
+  colNodes.forEach((arr, ci) => {
+    const c = SK_COLS[ci];
+    arr.forEach(n => {
+      const isSel = sel(ci, n.key);
+      const op = anyFilter && !isSel ? 0.35 : 1;
+      const stroke = isSel ? `stroke="#ffffff" stroke-width="1.5"` : '';
+      svgOut += `<rect x="${c.x}" y="${n.y}" width="${SK_W}" height="${n.h}" rx="2" fill="${n.color}" opacity="${op}" ${stroke} data-col="${ci}" data-key="${escHtml(n.key)}" style="cursor:pointer"><title>${escHtml(c.name + ': ' + n.key + ' (' + n.value + ') — click to filter')}</title></rect>`;
+      const ty = n.y + Math.min(n.h / 2, 10) + 3.5;
+      svgOut += `<text x="${c.x + SK_W + 6}" y="${ty}" fill="#e6edf6" opacity="${op}" font-size="10" font-family="JetBrains Mono, monospace" pointer-events="none">${escHtml(skLabel(n.key))}</text>`;
+      svgOut += `<text x="${c.x + SK_W + 6}" y="${ty + 11}" fill="#5a6679" opacity="${op}" font-size="9" font-family="JetBrains Mono, monospace" pointer-events="none">${n.value}</text>`;
+    });
+  });
+
+  svg.innerHTML = svgOut;
+
+  // Filter chip.
+  const chip = document.getElementById('sankey-filter-chip');
+  const chipLabel = document.getElementById('sankey-filter-label');
+  if (chip && chipLabel) {
+    if (anyFilter) {
+      chip.style.display = 'inline-flex';
+      chipLabel.textContent = SK_COLS[sankeyFilter.col].name + ': ' + sankeyFilter.key;
+    } else {
+      chip.style.display = 'none';
+    }
+  }
+}
+
+// Click handling via delegation (svg innerHTML is rebuilt every poll).
+document.getElementById('sankey-svg').addEventListener('click', (ev) => {
+  const r = ev.target.closest ? ev.target.closest('rect[data-key]') : null;
+  if (!r) return;
+  const col = parseInt(r.dataset.col, 10);
+  const key = r.dataset.key;
+  if (sankeyFilter.col === col && sankeyFilter.key === key) {
+    sankeyFilter = { col: null, key: null };  // second click clears
+  } else {
+    sankeyFilter = { col, key };
+  }
+  updateSankey();
+  renderStream();
+});
+
+function clearSankeyFilter() {
+  sankeyFilter = { col: null, key: null };
+  updateSankey();
+  renderStream();
 }
 
 // ─── KPI tiles ────────────────────────────────────────────────────────────────
@@ -1015,7 +1142,7 @@ function renderStream() {
   const filtered = groups.filter(g => {
     if (dismissedKeys.has(g.key)) return false;  // user dismissed this card
     // A group matches if any of its events matches the filter.
-    return g.events.some(t => matchesFilter(t) && matchesSearch(t));
+    return g.events.some(t => matchesFilter(t) && matchesSearch(t) && matchesSankey(t));
   });
 
   if (filtered.length === 0) {
@@ -1038,57 +1165,21 @@ function dismissCard(index) {
   renderStream();
 }
 
-// ─── Render reviews view ──────────────────────────────────────────────────────
-function renderReviews() {
-  const list = document.getElementById('reviews-list');
-  if (!list) return;
-
-  const pending = allSessions.filter(s => ['pending','needs_revision','escalated'].includes(s.status));
-
-  // Update badge
+// ─── Review badge (sidebar) + reviews category ───────────────────────────────
+// Reviews are no longer a standalone page: every card in the Routing view
+// renders its review block inline, and the "reviews" filter category shows
+// only cards with an active (pending / needs_revision / escalated) session.
+function updateReviewBadge() {
   const badge = document.getElementById('reviews-count');
-  if (badge) {
-    const active = allSessions.filter(s => ['needs_revision','escalated'].includes(s.status)).length;
-    badge.textContent = active;
-    badge.style.display = active > 0 ? 'inline' : 'none';
-  }
+  if (!badge) return;
+  const active = allSessions.filter(s => ['needs_revision','escalated'].includes(s.status)).length;
+  badge.textContent = active;
+  badge.style.display = active > 0 ? 'inline' : 'none';
+}
 
-  if (pending.length === 0) {
-    list.innerHTML = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center">No active review sessions.</div>`;
-    return;
-  }
-
-  list.innerHTML = pending.map(sess => {
-    const st = sess.status === 'needs_revision' ? 'reviewing' : sess.status;
-    const feedbackBg = sess.status === 'escalated' ? 'var(--redDim)' : 'var(--amberDim)';
-    const feedbackBorder = sess.status === 'escalated' ? 'var(--red)' : 'var(--amber)';
-    const feedback = sess.llm_feedback || sess.summary || '';
-    const age = fmtAge(sess.updated_at);
-    const iterText = sess.iteration_count != null ? `iter ${sess.iteration_count}/5` : '';
-    const byText = sess.review_model ? `by ${sess.review_model}` : '';
-    const meta = [iterText, byText, age].filter(Boolean).join(' · ');
-
-    let actionHtml = '';
-    if (sess.status === 'escalated') {
-      actionHtml = `<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">
-        <button class="br-btn" style="background:var(--redDim);color:var(--red);border-color:rgba(255,107,107,0.35)" onclick="sendFeedback('${sess.id}')">Send Feedback</button>
-        <button class="br-btn" style="background:var(--amberDim);color:var(--amber);border-color:rgba(245,177,74,0.35)" onclick="continueReview('${sess.id}')">Continue iterating</button>
-        <button class="br-btn" style="background:var(--greenDim);color:var(--green);border-color:rgba(34,211,154,0.35)" onclick="lgtmReview('${sess.id}')">LGTM</button>
-      </div>`;
-    }
-
-    return `<div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px">
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
-        <span style="font-size:12px;font-weight:600;font-family:'JetBrains Mono',monospace;color:var(--text)">${escHtml(sess.id)}</span>
-        ${statusPill(st)}
-        <span style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace">${meta}</span>
-        ${sess.status === 'escalated' ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace">HUMAN NEEDED</span>` : ''}
-      </div>
-      ${sess.cwd ? `<div style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-bottom:8px">${escHtml(sess.cwd)}</div>` : ''}
-      ${feedback ? `<div style="padding:10px;background:${feedbackBg};border-left:2px solid ${feedbackBorder};border-radius:4px;font-size:12px;color:var(--text);line-height:1.5">${escHtml(feedback)}</div>` : ''}
-      ${actionHtml}
-    </div>`;
-  }).join('');
+function gotoReviews() {
+  switchView('stream');
+  setFilter('reviews');
 }
 
 // ─── Health / sidebar updates ─────────────────────────────────────────────────
@@ -1534,6 +1625,17 @@ function applyRewriteUI(r) {
 async function togglePromptRewrite() {
   const currentlyOn = !!(rewriteData && rewriteData.enabled);
   const next = !currentlyOn;
+  // Enabling requires the Bonsai classifier to be running (server enforces
+  // the same guard with a 409). Offer to start it first.
+  if (next && !bonsaiIsOn()) {
+    const startNow = confirm('Bonsai is off — prompt rewrite requires the Bonsai classifier to be running.\n\nStart the classifier first?');
+    if (!startNow) return;
+    await setBonsai(true);
+    if (!bonsaiIsOn()) {
+      alert('Bonsai did not come up yet. Start it from the sidebar, then enable prompt rewrite.');
+      return;
+    }
+  }
   applyToggle('rewrite', next);
   try {
     const r = await fetch('/api/prompt-rewrite', {
@@ -1541,8 +1643,13 @@ async function togglePromptRewrite() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: next }),
     });
-    if (!r.ok) { applyToggle('rewrite', currentlyOn); console.warn('Rewrite toggle failed', r.status); }
-    else rewriteData = { enabled: next };
+    if (!r.ok) {
+      applyToggle('rewrite', currentlyOn);
+      const j = await r.json().catch(() => ({}));
+      alert('Prompt rewrite not enabled: ' + (j.error || r.status));
+    } else {
+      rewriteData = { enabled: next };
+    }
   } catch(e) { applyToggle('rewrite', currentlyOn); }
 }
 
@@ -1755,8 +1862,7 @@ async function refreshFast() {
   if (infRes) inferenceStatus = infRes;
 
   if (activeView === 'stream') renderStream();
-  if (activeView === 'reviews') renderReviews();
-  else renderReviews(); // always update badge
+  updateReviewBadge();
 
   updateSankey();
   updateKPI();

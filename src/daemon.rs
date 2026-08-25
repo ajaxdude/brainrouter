@@ -88,8 +88,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Nudge (per-request reasoning budget) runtime state — shared between the
     // classifier, the router, and the dashboard API.
     let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llama_swap.nudge.enabled));
-    let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)); // 0 = Bonsai picks
-    let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)); // deep — Bonsai is off by default, so there is no classifier to pick a tier
+    let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
     let context_value = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(131072));
 
     // Create classifier pointing at the external server
@@ -226,7 +226,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         },
         tcp_addr: tcp_addr.to_string(),
         manifest_enabled: config.manifest.enabled,
-        routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)), // 2 = local — default routing is local
         versions_cache: Arc::new(versions_rx),
         nudge_enabled,
         nudge_tier,

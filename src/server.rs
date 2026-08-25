@@ -642,11 +642,16 @@ async fn handle_request(
         }
 
         // ── Prompt-rewrite toggle API (local pass-through mode) ─────────────
+        // Enabling requires the Bonsai classifier to be running: rewrite is
+        // the classifier-side system-prompt pass, so it has no effect without
+        // Bonsai. Disabling is always allowed.
         ("GET", "/api/prompt-rewrite") => {
+            let bonsai_up = state.bonsai.is_running() && state.bonsai.healthy().await;
             let resp = json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
+                    "bonsai_running": bonsai_up,
                 }),
             );
             into_unsync(resp)
@@ -656,6 +661,13 @@ async fn handle_request(
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                if enabled && !(state.bonsai.is_running() && state.bonsai.healthy().await) {
+                    let resp = json_response(
+                        StatusCode::CONFLICT,
+                        &ErrorResponse { error: "Bonsai classifier is not running — start Bonsai before enabling prompt rewrite".to_string() },
+                    );
+                    return Ok(into_unsync(resp));
+                }
                 state.prompt_rewrite.store(enabled, AtomicOrdering::Relaxed);
             }
             let resp = json_response(StatusCode::OK, &serde_json::json!({
