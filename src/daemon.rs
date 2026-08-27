@@ -95,7 +95,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llama_swap.nudge.enabled));
     let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)); // deep — Bonsai is off by default, so there is no classifier to pick a tier
     let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
-    let context_value = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(131072));
 
     // Create classifier pointing at the external server
     let classifier = Classifier::new(
@@ -238,7 +237,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         nudge_model_key: config.llama_swap.nudge.model_key.clone(),
         nudge_budgets: config.llama_swap.nudge.budgets,
         prompt_rewrite,
-        context_value,
     });
 
     // Background task: compute versions once, then refresh every 30 minutes.

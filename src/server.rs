@@ -47,7 +47,7 @@ fn config_file_list(home: &str, config_path: &std::path::Path, llama_swap_config
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -61,7 +61,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use tracing::{debug, error, info, warn};
 use std::sync::LazyLock;
 
@@ -131,14 +131,10 @@ pub struct AppState {
     pub nudge_tier: Arc<AtomicU8>,
     /// Nudge model key from config (static; runtime changes use the config UI).
     pub nudge_model_key: Option<String>,
-    /// Per-tier reasoning budgets from config.
     pub nudge_budgets: crate::config::NudgeBudgets,
     /// Runtime prompt-rewrite toggle (default on). When off, local routes
     /// forward the incoming prompt untouched.
     pub prompt_rewrite: Arc<AtomicBool>,
-    /// Last applied llama-swap context size (tokens); 131072 = the stock
-    /// `--fit` default.
-    pub context_value: Arc<AtomicU64>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -217,7 +213,6 @@ async fn handle_request(
             || path == "/api/bridges/toggle"
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
-            || path == "/api/context"
             // Review API is destructive too: it spawns reviews (arbitrary
             // project paths read into cloud prompts) and can approve/resolve
             // sessions. Gate it like the rest.
@@ -719,70 +714,6 @@ async fn handle_request(
             into_unsync(resp)
         }
 
-        // ── Context size API (rewrites llama-swap ctx flags, then restart) ──
-        ("GET", "/api/context") => {
-            let value = state.context_value.load(AtomicOrdering::Relaxed);
-            let resp = json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "value": value,
-                    "auto": value == 131072,
-                }),
-            );
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/context") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-            match val.get("value").and_then(|v| v.as_u64()) {
-                Some(v) if v >= 2048 && v <= 262144 => match apply_llama_swap_context(&state.llama_swap_config_path, v) {
-                    Ok(replacements) if replacements > 0 => {
-                        state.context_value.store(v, AtomicOrdering::Relaxed);
-                        // Restart llama-swap after the response is sent (same
-                        // delayed pattern as the brainrouter self-restart).
-                        tokio::spawn(async {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            let _ = restart_service("llama-swap").await;
-                        });
-                        let resp = json_response(StatusCode::OK, &serde_json::json!({
-                            "ok": true,
-                            "value": v,
-                            "replacements": replacements,
-                            "note": "llama-swap config updated; restarting local stack",
-                        }));
-                        into_unsync(resp)
-                    }
-                    Ok(_) => {
-                        let resp = json_response(
-                            StatusCode::BAD_REQUEST,
-                            &ErrorResponse {
-                                error: "no ctx flags found in llama-swap config".into(),
-                            },
-                        );
-                        into_unsync(resp)
-                    }
-                    Err(e) => {
-                        let resp = json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &ErrorResponse {
-                                error: format!("failed to update llama-swap context: {}", e),
-                            },
-                        );
-                        into_unsync(resp)
-                    }
-                },
-                _ => {
-                    let resp = json_response(
-                        StatusCode::BAD_REQUEST,
-                        &ErrorResponse {
-                            error: "value must be an integer between 2048 and 262144".into(),
-                        },
-                    );
-                    into_unsync(resp)
-                }
-            }
-        }
 
         // ── Flush models API (free VRAM) ────────────────────────────────────
         ("POST", "/api/models/flush") => {
@@ -1702,68 +1633,6 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
         }
     }
     map
-}
-
-/// Rewrite the llama.cpp context flags in the llama-swap config to `value`.
-/// Replaces every `--fit-ctx N` and `-c N` occurrence, preserving the rest of
-/// the file (including comments and other model entries). Returns the number
-/// of replacements made.
-pub fn apply_llama_swap_context(path: &std::path::Path, value: u64) -> anyhow::Result<usize> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let mut replacements = 0usize;
-    let mut out = String::with_capacity(contents.len());
-    for (i, line) in contents.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let (l1, c1) = replace_ctx_flag(line, "--fit-ctx", value);
-        let (l2, c2) = replace_ctx_flag(&l1, "-c", value);
-        replacements += c1 + c2;
-        out.push_str(&l2);
-    }
-    // Write to a temp file then rename so a crash mid-write can't corrupt the
-    // live llama-swap config.
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, &out)
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename over {}", path.display()))?;
-    Ok(replacements)
-}
-
-/// Replace the numeric value following every real occurrence of `flag` in a
-/// single line with `value`. A real occurrence has a word boundary before it
-/// (start-of-line or whitespace) and a run of digits after it — so `-ctk`,
-/// `-ctv`, and `--cache-ram` are never touched. Returns (new_line, count).
-fn replace_ctx_flag(line: &str, flag: &str, value: u64) -> (String, usize) {
-    let mut out = String::with_capacity(line.len() + 16);
-    let mut count = 0usize;
-    let mut rest = line;
-    while let Some(idx) = rest.find(flag) {
-        let before_ok = idx == 0 || rest.as_bytes()[idx - 1].is_ascii_whitespace();
-        let after = &rest[idx + flag.len()..];
-        let trimmed_after = after.trim_start();
-        let pad_len = after.len() - trimmed_after.len();
-        let digit_end = trimmed_after
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(trimmed_after.len());
-        let has_digits = digit_end > 0;
-        if before_ok && has_digits {
-            out.push_str(&rest[..idx]);
-            out.push_str(flag);
-            out.push_str(&after[..pad_len]); // keep original spacing
-            out.push_str(&value.to_string());
-            out.push_str(&trimmed_after[digit_end..]);
-            count += 1;
-            rest = &trimmed_after[digit_end..];
-        } else {
-            out.push_str(&rest[..idx + flag.len()]);
-            rest = &rest[idx + flag.len()..];
-        }
-    }
-    out.push_str(rest);
-    (out, count)
 }
 
 /// Compute local versions and "latest available" metadata for the /api/versions endpoint.

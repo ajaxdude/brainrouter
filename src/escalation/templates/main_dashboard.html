@@ -246,11 +246,18 @@ textarea { resize: vertical; }
       <button id="mode-local" class="mode-btn active" onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--cyan);font-family:'JetBrains Mono',monospace">local</button>
     </div>
     <div id="routing-hint" style="display:none;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding:2px 2px 0;line-height:1.4"></div>
-  </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:6px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward incoming prompts untouched">
+      <span style="color:var(--textDim);font-size:11px;flex:1">rewrite prompts</span>
+      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting (applies to managed auto/local routes; direct model picks are untouched)"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
 
-  <!-- Thinking budget (nudge) + local tuning -->
-  <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Thinking budget</div>
-  <div style="padding:0 12px;display:flex;flex-direction:column;gap:7px">
+
+  <!-- Nudge + reasoning tier (grouped) -->
+  <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Nudge</div>
+  <div style="padding:0 12px;display:flex;flex-direction:column;gap:6px">
     <div style="display:flex;align-items:center;gap:8px" title="Nudge — inject a per-request reasoning budget into auto-routed local requests (llama.cpp-nudge fork). Off → normal local routing">
       <span style="color:var(--textDim);font-size:11px;flex:1">nudge</span>
       <button id="toggle-nudge" onclick="toggleNudge()" title="Enable / disable thinking-budget nudging"
@@ -260,29 +267,11 @@ textarea { resize: vertical; }
     </div>
     <div style="display:flex;align-items:center;gap:8px" title="Reasoning tier: auto = Bonsai picks light/deep per request; light = tight budget; deep = full budget">
       <span style="color:var(--textDim);font-size:11px;width:78px;flex-shrink:0">reasoning tier</span>
-      <div style="flex:1;display:flex;gap:4px">
+      <div id="tier-buttons" style="flex:1;display:flex;gap:4px">
         <button id="tier-auto"  class="tier-btn"        onclick="setNudgeTier('auto')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">auto</button>
         <button id="tier-light" class="tier-btn"        onclick="setNudgeTier('light')" style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">light</button>
         <button id="tier-deep"  class="tier-btn active" onclick="setNudgeTier('deep')"  style="all:unset;flex:1;cursor:pointer;padding:4px 0;font-size:10px;text-align:center;border-radius:5px;border:1px solid var(--border);background:var(--bg3);color:var(--violet);font-family:'JetBrains Mono',monospace">deep</button>
       </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px" title="Context window passed to llama-swap (rewrites the config and restarts the local stack)">
-      <span style="color:var(--textDim);font-size:11px;width:88px;flex-shrink:0">context window</span>
-      <select id="ctx-select" onchange="setContextSize(this.value)" title="auto = stock 128k (--fit default)" style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-size:11px;font-family:'JetBrains Mono',monospace;outline:none">
-        <option value="131072">auto (128k)</option>
-        <option value="262144">256k (2×128k)</option>
-        <option value="16384">16k</option>
-        <option value="24576">24k</option>
-        <option value="32768">32k</option>
-        <option value="65536">64k</option>
-      </select>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward the incoming prompt untouched">
-      <span style="color:var(--textDim);font-size:11px;flex:1">rewrite prompts</span>
-      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting (applies to managed auto/local routes; direct model picks are untouched)"
-        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
-        <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
-      </button>
     </div>
     <div id="nudge-budgets" style="font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding-left:2px"></div>
   </div>
@@ -860,14 +849,14 @@ function renderGroup(group, index) {
   const hopCount = evs.length;
   let hopSummary = '';
   if (hopCount > 1) {
-    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('exceeds the available context size') ? ' (ctx too small)' : ''))).join(' → ');
+    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('context') ? ' (ctx too small)' : ''))).join(' → ');
     hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${escHtml(chain)} · ${lat}</div>`;
   } else {
     // Single failed hop: surface the actionable error inline.
     const f = evs.find(e => !e.success && e.error);
     if (f) {
-      const msg = f.error.includes('exceeds the available context size')
-        ? 'request exceeds local context size — lower Context or raise n_ctx in the sidebar'
+      const msg = f.error.includes('context')
+        ? 'request exceeds local context size — adjust n_ctx in the llama-swap model config'
         : f.error;
       hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--red)">${escHtml(msg)}</div>`;
     }
@@ -1272,9 +1261,9 @@ function updateRoutingHint() {
   // Item 8: a recent request blew the local n_ctx — tell the user what to do
   // (lower the context or raise it under Context) instead of a silent ✗.
   const recent = allEvents.slice(-8).find(e =>
-    e.success === false && typeof e.error === 'string' && e.error.includes('exceeds the available context size'));
+    e.success === false && typeof e.error === 'string' && e.error.includes('context'));
   if (recent) {
-    notes.push('local ctx exceeded — lower Context or raise it in the sidebar');
+    notes.push('local ctx exceeded — adjust n_ctx in the llama-swap model config');
   }
   el.textContent = notes.join(' · ');
   el.style.display = notes.length ? 'block' : 'none';
@@ -1605,10 +1594,14 @@ function applyNudgeUI(n) {
   if (!n) return;
   applyToggle('nudge', !!n.enabled);
   const tier = n.tier || 'auto';
+  const off = !n.enabled;
   const colors = { auto: 'var(--green)', light: 'var(--cyan)', deep: 'var(--violet)' };
+  const container = document.getElementById('tier-buttons');
+  if (container) container.style.opacity = off ? '0.35' : '1';
   ['auto','light','deep'].forEach(t => {
     const btn = document.getElementById('tier-' + t);
     if (!btn) return;
+    btn.style.pointerEvents = off ? 'none' : '';
     const active = t === tier;
     btn.style.background = active ? 'var(--bg3)' : 'transparent';
     btn.style.color = active ? colors[t] : 'var(--textMute)';
@@ -1616,7 +1609,7 @@ function applyNudgeUI(n) {
   });
   const el = document.getElementById('nudge-budgets');
   if (el && n.budgets) {
-    el.textContent = 'budgets: light ' + n.budgets.light + ' · deep ' + n.budgets.deep + (n.enabled ? '' : ' · nudge off');
+    el.textContent = n.enabled ? ('budgets: light ' + n.budgets.light + ' · deep ' + n.budgets.deep) : 'nudge off';
     el.title = n.model_key ? 'nudge model: ' + n.model_key : 'no nudge model key set (brainrouter.yaml)';
   }
 }
@@ -1635,6 +1628,7 @@ async function setNudgeTier(tier) {
 let nudgeBusy = false;
 async function toggleNudge() {
   if (nudgeBusy) return;
+  if (currentRoutingMode === 'cloud') { alert('Nudge only works when routing mode is auto or local.'); return; }
   const currentlyOn = !!(nudgeData && nudgeData.enabled);
   const next = !currentlyOn;
   if (next && !confirm('Enable thinking-budget nudging?\nAuto-routed local requests will use the nudge model with a per-request reasoning budget (Bonsai picks light/deep tier when tier is "auto").')) return;
@@ -1652,37 +1646,14 @@ async function toggleNudge() {
     if (fresh) { nudgeData = fresh; applyNudgeUI(fresh); }
   } catch(e) { applyToggle('nudge', currentlyOn); }
   nudgeBusy = false;
-}
+}</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=edit>
+<parameter=i>
+Remove stale context-window error messages
 
-// ─── Context size (llama-swap --fit-ctx) ─────────────────────────────────────
-let contextData = null;
-
-function applyContextUI(c) {
-  const sel = document.getElementById('ctx-select');
-  if (!sel || !c) return;
-  const v = String(c.value || 131072);
-  const has = Array.from(sel.options).some(o => o.value === v);
-  sel.value = has ? v : '131072';
-}
-
-async function setContextSize(value) {
-  const v = Number(value);
-  const label = v === 131072 ? 'auto (128k, stock default)' : v + ' tokens';
-  if (!confirm('Set the local context window to ' + label + '?\n\nThis rewrites the llama-swap config and restarts the local stack (models reload on the next request).')) {
-    refreshSlow();  // snap the select back
-    return;
-  }
-  try {
-    const r = await fetch('/api/context', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value: v }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) alert('Context change failed: ' + (j.error || r.status));
-  } catch(e) {}
-  setTimeout(refreshSlow, 2000);
-}
 
 // ─── Prompt rewrite toggle (local pass-through) ──────────────────────────────
 let rewriteData = null;
@@ -1988,18 +1959,16 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, ctxRes, rewriteRes, tbRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, tbRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
-    safeFetch('/api/context'),
     safeFetch('/api/prompt-rewrite'),
     safeFetch('/api/toolboxes'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
   if (nudgeRes) { nudgeData = nudgeRes; applyNudgeUI(nudgeRes); }
-  if (ctxRes) { contextData = ctxRes; applyContextUI(ctxRes); }
   if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
   if (tbRes) { toolboxesData = tbRes; renderToolboxes(); }
 }
