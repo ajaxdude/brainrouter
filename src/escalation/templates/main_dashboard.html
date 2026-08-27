@@ -545,10 +545,12 @@ function enrichEvents(events, sessions) {
   // cwd+prompt prefix+minute bucket) belongs to one logical request.  Failed
   // hops come before the winner; the card and the sankey HOPS column both
   // render the whole chain from _hops.
-  const chainKey = (e) => e.session_id
-    ? 'sess:' + e.session_id
-    : 'prompt:' + (e.cwd || '') + ':' + (e.prompt_excerpt || '').slice(0, 80) + ':' +
-      (isFinite(new Date(e.timestamp).getTime()) ? Math.floor(new Date(e.timestamp).getTime() / 60000) : 0);
+  const chainKey = (e) => {
+    if (e.session_id) return 'sess:' + e.session_id;
+    const ts = Math.floor(new Date(e.timestamp).getTime() / 60000);
+    return 'prompt:' + (e.cwd || '') + ':' + (e.prompt_excerpt || '').slice(0, 80) + ':' +
+      (isFinite(ts) ? ts : 0);
+  };
   const chains = {};
   enriched.forEach((e, i) => {
     const k = chainKey(e);
