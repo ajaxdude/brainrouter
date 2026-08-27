@@ -1025,23 +1025,21 @@ function updateSankey() {
   const svg = document.getElementById('sankey-svg');
   if (!svg) return;
 
-  const sessMap = {};
-  allSessions.forEach(s => { sessMap[s.id] = s; });
-  const events = allEvents.map(e => ({ e, sess: e.session_id ? sessMap[e.session_id] : null }));
+  const enriched = enrichEvents(allEvents, allSessions);
 
-  if (events.length === 0) {
+  if (enriched.length === 0) {
     svg.innerHTML = `<text x="${SK_TOTAL_W/2}" y="100" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
     return;
   }
 
-  const total = events.length;
+  const total = enriched.length;
   const scale = (SK_H - SK_TOP - 8) / total;
 
   const NC = SK_COLS.length;
   const counts = Array.from({ length: NC }, () => new Map());
   const linkCounts = Array.from({ length: NC - 1 }, () => new Map());
-  for (const { e, sess } of events) {
-    const k = skKeysOf(e, sess);
+  for (const e of enriched) {
+    const k = skKeysOf(e, e._session);
     const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5, k.c6];
     for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
     for (let i = 0; i + 1 < NC; i++) {
@@ -1123,8 +1121,6 @@ function updateSankey() {
     }
   }
 }
-
-// Click handling via delegation (svg innerHTML is rebuilt every poll).
 document.getElementById('sankey-svg').addEventListener('click', (ev) => {
   const r = ev.target.closest ? ev.target.closest('rect[data-key]') : null;
   if (!r) return;
