@@ -180,15 +180,6 @@ fn into_unsync(resp: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, any
     resp.map(|body| body.map_err(|e: Infallible| match e {}).boxed_unsync())
 }
 
-fn html_ok(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    into_unsync(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from_static(html.as_bytes())))
-            .expect("Failed to build HTML response"),
-    )
-}
 
 /// Handle incoming HTTP requests
 async fn handle_request(
@@ -339,7 +330,15 @@ async fn handle_request(
         }
 
         // ── Unified dashboard ──────────────────────────────────────────────────
-        ("GET", "/dashboard") => html_ok(MAIN_DASHBOARD_HTML),
+        ("GET", "/dashboard") => {
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/html; charset=utf-8")
+                .header("cache-control", "no-store")
+                .body(Full::new(Bytes::from_static(MAIN_DASHBOARD_HTML.as_bytes())))
+                .expect("Failed to build HTML response");
+            into_unsync(resp)
+        }
 
         ("GET", "/favicon.ico") | ("GET", "/favicon.svg") | ("GET", "/favicon.png") => {
             let resp = Response::builder()

@@ -1646,13 +1646,7 @@ async function toggleNudge() {
     if (fresh) { nudgeData = fresh; applyNudgeUI(fresh); }
   } catch(e) { applyToggle('nudge', currentlyOn); }
   nudgeBusy = false;
-}</parameter>
-</function>
-</tool_call>
-<tool_call>
-<function=edit>
-<parameter=i>
-Remove stale context-window error messages
+}
 
 
 // ─── Prompt rewrite toggle (local pass-through) ──────────────────────────────
@@ -1662,7 +1656,6 @@ function applyRewriteUI(r) {
   if (r) rewriteData = r;
   applyRewriteLock();
 }
-
 // The rewrite toggle is gated on the classifier: while Bonsai is off it is
 // non-interactive and forced off (the server auto-disables it too).
 function applyRewriteLock() {
