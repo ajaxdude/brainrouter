@@ -51,6 +51,19 @@ pub struct RouteInfo {
     /// response chunk (e.g. "claude-3-7-sonnet-20250219"); falls back to empty string
     /// if the chunk cannot be parsed. For llama-swap this is the model key.
     pub model_key: String,
+    /// Failed hops in the fallback chain (e.g. Manifest down → local).
+    /// The dashboard emits one RouteEvent per entry so multi-hop routes
+    /// render as a hop chain instead of a single collapsed card.
+    pub failed_attempts: Vec<FailedAttempt>,
+}
+
+/// One failed hop in a fallback chain.
+#[derive(Clone)]
+pub struct FailedAttempt {
+    pub stage: Stage,
+    pub provider: String,
+    pub model_key: String,
+    pub error: String,
 }
 
 impl RouteInfo {
@@ -203,15 +216,14 @@ impl Router {
 
         let tracker = &self.inference_tracker;
         let max_tokens = request.max_tokens;
-
         let (bonsai_decision, result) = match requested_model.as_str() {
-            // Direct local: skip Bonsai, rewrite prompt, go to llama-swap
+            // Managed local token: route to the local/fallback model, rewrite prompt.
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
                 tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
                 request.messages = self.maybe_rewrite_local(request.messages);
                 request.model = self.fallback_model.clone();
-                ("local-direct", self.route_local(request).await)
+                ("local-direct", self.route_local(request, true).await)
             }
             // Direct cloud: skip Bonsai, go straight to Manifest
             "cloud" | "brainrouter/cloud" => {
@@ -219,8 +231,8 @@ impl Router {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 ("cloud-direct", self.route_cloud(request).await)
             }
-            // Auto: existing Bonsai classification. Also handles the subs pool
-            // convention (`subs` / `brainrouter/subs`) before falling back.
+            // Managed routing: Bonsai classify + subs pool. Only these tokens get
+            // nudge/bonsai/subs treatment. Direct model keys are authoritative.
             _ => {
                 // Subs pool: `subs` or `brainrouter/subs` → subs_model, bypassing
                 // Bonsai. Unconfigured → warn and fall back to auto below.
@@ -228,9 +240,8 @@ impl Router {
                     if let Some(subs) = self.subs_model.clone() {
                         info!(model = %subs, "Subs pool routing — direct to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
-                        request.messages = self.maybe_rewrite_local(request.messages);
                         request.model = subs;
-                        ("local-subs", self.route_local(request).await)
+                        ("local-subs", self.route_local(request, false).await)
                     } else {
                         warn!("Subs pool requested but llama_swap.subs_model is not configured — falling back to auto");
                         self.route_auto(request, tracker, max_tokens).await
@@ -242,9 +253,8 @@ impl Router {
                     if !specific.is_empty() {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
-                        request.messages = self.maybe_rewrite_local(request.messages);
                         request.model = specific.to_string();
-                        ("local-specific", self.route_local(request).await)
+                        ("local-specific", self.route_local(request, false).await)
                     } else {
                         // Empty suffix, treat as auto — fall through to Bonsai
                         self.route_auto(request, tracker, max_tokens).await
@@ -255,9 +265,8 @@ impl Router {
                     // choice is authoritative.
                     info!(model = %requested_model, "Known local model — routing directly to llama-swap");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    request.messages = self.maybe_rewrite_local(request.messages);
                     // request.model is already correct (it's the llama-swap model key)
-                    ("local-specific", self.route_local(request).await)
+                    ("local-specific", self.route_local(request, false).await)
                 } else {
                     // A named model that isn't a reserved routing token (auto/local/
                     // cloud/subs). The user picked it explicitly — route Local directly
@@ -265,8 +274,7 @@ impl Router {
                     // without a classifier hop; works even when Bonsai is off.
                     info!(model = %requested_model, "Named model — routing directly to llama-swap");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    request.messages = self.maybe_rewrite_local(request.messages);
-                    ("local-specific", self.route_local(request).await)
+                    ("local-specific", self.route_local(request, false).await)
                 }
             }
         };
@@ -283,6 +291,26 @@ impl Router {
                     Phase::LocalStreaming
                 };
                 tracker.set(streaming_phase, Some(info.model_key.clone()), None, max_tokens);
+                // One event per failed hop so the dashboard shows the chain
+                // (e.g. manifest ✗ → local ✓) instead of a single card.
+                let winner_stage = provider_to_stage(&info.effective_provider, bonsai_decision);
+                for f in info.failed_attempts.iter().filter(|f| f.stage != winner_stage) {
+                    self.routing_events.emit(RouteEvent {
+                        id: 0,
+                        timestamp: String::new(),
+                        prompt_excerpt: prompt_excerpt.clone(),
+                        requested_model: requested_model.clone(),
+                        effective_provider: Some(f.provider.clone()),
+                        model_key: f.model_key.clone(),
+                        latency_ms: 0,
+                        stage: f.stage,
+                        success: false,
+                        error: f.error.clone(),
+                        bonsai_decision,
+                        cwd: cwd.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
                 self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
@@ -346,8 +374,9 @@ impl Router {
             RoutingDecision::Local { model, tier } => {
                 tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                 request.model = model;
+                request.messages = self.maybe_rewrite_local(request.messages);
                 self.inject_nudge_budget(&mut request, tier);
-                ("local", self.route_local(request).await)
+                ("local", self.route_local(request, true).await)
             }
         }
     }
@@ -387,6 +416,7 @@ impl Router {
                                 bonsai_decision: "cloud",
                                 effective_provider: Some("manifest".to_string()),
                                 model_key,
+                                failed_attempts: Vec::new(),
                             },
                         ));
                     }
@@ -413,15 +443,26 @@ impl Router {
                 bonsai_decision: "cloud",
                 effective_provider: Some("llama-swap".to_string()),
                 model_key,
+                failed_attempts: vec![FailedAttempt {
+                    stage: Stage::CloudPrimary,
+                    provider: "manifest".to_string(),
+                    model_key: "auto".to_string(),
+                    error: "manifest unavailable (disabled, circuit open, or error)".to_string(),
+                }],
             },
         ))
     }
 
-    /// Local path: go straight to llama-swap. On failure, retry once with the
-    /// fallback model if it differs from what was requested.
+    /// Local path: go straight to llama-swap.
+    ///
+    /// `allow_fallback` gates the retry-with-fallback behavior. Direct model
+    /// selections pass `false` so a failed explicit pick surfaces the error
+    /// instead of silently switching to `fallback_model`. Managed routing
+    /// (auto/bonsai/local tokens) passes `true` to keep the fallback hop.
     async fn route_local(
         &self,
         request: ChatCompletionRequest,
+        allow_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let requested = request.model.clone();
         match self.try_llama_swap(request.clone(), Stage::LocalPrimary).await {
@@ -431,10 +472,11 @@ impl Router {
                     bonsai_decision: "local",
                     effective_provider: Some("llama-swap".to_string()),
                     model_key,
+                    failed_attempts: Vec::new(),
                 },
             )),
             Err(e) => {
-                if requested == self.fallback_model {
+                if !allow_fallback || requested == self.fallback_model {
                     return Err(e);
                 }
                 warn!(
@@ -452,6 +494,12 @@ impl Router {
                         bonsai_decision: "local",
                         effective_provider: Some("llama-swap".to_string()),
                         model_key,
+                        failed_attempts: vec![FailedAttempt {
+                            stage: Stage::LocalPrimary,
+                            provider: "llama-swap".to_string(),
+                            model_key: requested,
+                            error: e.to_string(),
+                        }],
                     },
                 ))
             }

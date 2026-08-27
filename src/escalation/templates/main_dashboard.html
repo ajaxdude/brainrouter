@@ -192,6 +192,7 @@ textarea { resize: vertical; }
         <span id="upg-llama-swap" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
       </div>
       <div id="ver-llama-swap" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
+      <div id="ver-llama-swap-latest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px;padding-left:14px;display:none"></div>
     </div>
     <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="llama.cpp — the production toolbox engine that serves local models">
       <div style="display:flex;align-items:center;gap:8px">
@@ -218,14 +219,18 @@ textarea { resize: vertical; }
         <span id="upg-manifest" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
       </div>
       <div id="ver-manifest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
+      <div id="ver-manifest-latest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px;padding-left:14px;display:none"></div>
     </div>
-    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px;cursor:default" title="toolboxes — the container image hosting the llama.cpp engine. The individual toolbox instances are listed directly below." onclick="upgradeIfAvailable('toolbox')">
+    <div style="display:flex;flex-direction:column;gap:1px;padding:5px 10px;font-size:12px;border-radius:6px" title="One image repo (kyuz0/amd-strix-halo-toolboxes) ships one engine build ('v43') under several tags (vulkan-radv, rocm-7.14, …). Each row below is a separate container running one tag — the image version they share is what v43 refers to.">
       <div style="display:flex;align-items:center;gap:8px">
         <span id="dot-toolbox" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-        <span style="color:var(--textDim);flex:1">toolboxes</span>
-        <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;cursor:pointer" title="Update available">↑</span>
+        <span style="color:var(--textDim);flex:1">toolbox engine</span>
+        <span id="upg-toolbox" style="display:none;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace" title="Update available">↑</span>
+        <button onclick="event.stopPropagation();upgradeToolboxAll()" title="Upgrade ALL toolbox containers to the latest images"
+          style="all:unset;cursor:pointer;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--bg3);color:var(--cyan);border:1px solid var(--border);font-family:'JetBrains Mono',monospace">all ↑</button>
       </div>
       <div id="ver-toolbox" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px;padding-left:14px">—</div>
+      <div id="ver-toolbox-latest" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px;padding-left:14px;display:none"></div>
     </div>
   </div>
 
@@ -241,17 +246,13 @@ textarea { resize: vertical; }
       <button id="mode-local" class="mode-btn active" onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--cyan);font-family:'JetBrains Mono',monospace">local</button>
     </div>
     <div id="routing-hint" style="display:none;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding:2px 2px 0;line-height:1.4"></div>
-    <div style="display:flex;align-items:center;gap:8px;margin-top:8px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg3);cursor:pointer" onclick="gotoReviews()" title="Show only cards with an active review session">
-      <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim)">▸ reviews</span>
-      <span id="reviews-count" style="margin-left:auto;font-size:10px;padding:2px 6px;border-radius:99px;background:var(--amberDim);color:var(--amber);font-family:'JetBrains Mono',monospace;display:none">0</span>
-    </div>
   </div>
 
   <!-- Thinking budget (nudge) + local tuning -->
   <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Thinking budget</div>
   <div style="padding:0 12px;display:flex;flex-direction:column;gap:7px">
     <div style="display:flex;align-items:center;gap:8px" title="Nudge — inject a per-request reasoning budget into auto-routed local requests (llama.cpp-nudge fork). Off → normal local routing">
-      <span style="color:var(--textDim);font-size:11px;flex:1">nudge — thinking budget</span>
+      <span style="color:var(--textDim);font-size:11px;flex:1">nudge</span>
       <button id="toggle-nudge" onclick="toggleNudge()" title="Enable / disable thinking-budget nudging"
         style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
         <span id="toggle-nudge-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
@@ -269,6 +270,7 @@ textarea { resize: vertical; }
       <span style="color:var(--textDim);font-size:11px;width:88px;flex-shrink:0">context window</span>
       <select id="ctx-select" onchange="setContextSize(this.value)" title="auto = stock 128k (--fit default)" style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-size:11px;font-family:'JetBrains Mono',monospace;outline:none">
         <option value="131072">auto (128k)</option>
+        <option value="262144">256k (2×128k)</option>
         <option value="16384">16k</option>
         <option value="24576">24k</option>
         <option value="32768">32k</option>
@@ -277,7 +279,7 @@ textarea { resize: vertical; }
     </div>
     <div style="display:flex;align-items:center;gap:8px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward the incoming prompt untouched">
       <span style="color:var(--textDim);font-size:11px;flex:1">rewrite prompts</span>
-      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting (requires Bonsai running)"
+      <button id="toggle-rewrite" onclick="togglePromptRewrite()" title="Enable / disable local prompt rewriting (applies to managed auto/local routes; direct model picks are untouched)"
         style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
         <span id="toggle-rewrite-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
       </button>
@@ -337,7 +339,6 @@ textarea { resize: vertical; }
       <button class="filter-btn" data-filter="live" onclick="setFilter('live')">live</button>
       <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">approved</button>
       <button class="filter-btn" data-filter="escalated" onclick="setFilter('escalated')">escalated</button>
-      <button class="filter-btn" data-filter="reviews" onclick="setFilter('reviews')">reviews</button>
     </div>
   </div>
 
@@ -349,14 +350,14 @@ textarea { resize: vertical; }
       <!-- Sankey panel — full width, click a bar to filter the cards below -->
       <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · prompts → classification → model → reviewer</span>
+          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · harness → session → prompts → hops → classification → model → reviewer</span>
           <span id="sankey-filter-chip" style="display:none;margin-left:auto;align-items:center;gap:6px;font-size:10px;font-family:'JetBrains Mono',monospace;padding:3px 8px;border-radius:99px;background:var(--bg3);border:1px solid var(--border);color:var(--cyan)">
             <span id="sankey-filter-label"></span>
             <span onclick="clearSankeyFilter()" style="cursor:pointer;color:var(--textMute)">✕</span>
           </span>
         </div>
-        <div id="sankey-container" style="width:100%;overflow:hidden">
-          <svg id="sankey-svg" viewBox="0 0 1100 200" width="100%" style="display:block"></svg>
+        <div id="sankey-container" style="width:100%;overflow-x:auto;overflow-y:auto;min-height:340px;max-height:420px;border:1px solid var(--border);border-radius:8px">
+          <svg id="sankey-svg" viewBox="0 0 1856 200" width="2000" height="200" style="display:block"></svg>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 320px;gap:24px;align-items:start">
@@ -445,6 +446,7 @@ const STATUS_MAP = {
   routing:    { c: '#3ec5ff', l: 'Routing',    pulse: false },
   generating: { c: '#22d39a', l: 'Generating', pulse: true  },
   reviewing:  { c: '#f5b14a', l: 'Reviewing',  pulse: true  },
+  reasoning:  { c: '#9d7bff', l: 'Reasoning',  pulse: true  },
   approved:   { c: '#22d39a', l: 'Approved',   pulse: false },
   escalated:  { c: '#ff6b6b', l: 'Escalated',  pulse: false },
   failed:     { c: '#ff6b6b', l: 'Failed',     pulse: false },
@@ -511,33 +513,52 @@ function deriveRoute(e) {
 
 function deriveStatus(e, sess, inf) {
   if (!e.success && e.error) return 'failed';
+  // Live inference (model still generating) takes precedence over the
+  // session status, so a freshly-completed event doesn't flash "Approved".
+  const live = inf && ['classifying','local_waiting','local_processing','local_generating','cloud_waiting','cloud_streaming','routing'].includes(inf.state);
+  if (live) return (inf.state === 'local_generating' || inf.state === 'cloud_streaming') ? 'reasoning' : 'generating';
   if (sess) {
     const ss = sess.status;
     if (ss === 'escalated') return 'escalated';
     if (ss === 'needs_revision') return 'reviewing';
     if (ss === 'approved') return 'approved';
-    if (ss === 'pending') return e.success ? 'approved' : 'generating';
+    // pending = review in flight (or never requested): not "approved" yet.
+    if (ss === 'pending') return 'reasoning';
   }
-  return e.success ? 'approved' : 'generating';
+  // Completed request, no review session: "approved" is the settled state
+  // (the review gate only exists for requests that actually got one).
+  return 'approved';
 }
 
 function enrichEvents(events, sessions) {
   const sessMap = {};
   sessions.forEach(s => { sessMap[s.id] = s; });
-  return events.map(e => {
-    const sess = e.session_id ? sessMap[e.session_id] : null;
-    const _route = deriveRoute(e);
-    const _status = deriveStatus(e, sess, inferenceStatus);
-    return {
-      ...e,
-      _session: sess,
-      _source: deriveSource(e),
-      _route,
-      _displayModel: e.model_key || (e.effective_provider ? e.effective_provider.split('/').pop() : '—'),
-      _folder: e.cwd ? e.cwd.split('/').filter(Boolean).pop() : '',
-      _status,
-    };
+  const enriched = events.map(e => ({
+    ...e,
+    _session: e.session_id ? sessMap[e.session_id] : null,
+    _source: deriveSource(e),
+    _route: deriveRoute(e),
+    _displayModel: e.model_key || (e.effective_provider ? e.effective_provider.split('/').pop() : '—'),
+    _folder: e.cwd ? e.cwd.split('/').filter(Boolean).pop() : '',
+  }));
+  // Hop chain: every event sharing a conversation (same session_id, or same
+  // cwd+prompt prefix+minute bucket) belongs to one logical request.  Failed
+  // hops come before the winner; the card and the sankey HOPS column both
+  // render the whole chain from _hops.
+  const chainKey = (e) => e.session_id
+    ? 'sess:' + e.session_id
+    : 'prompt:' + (e.cwd || '') + ':' + (e.prompt_excerpt || '').slice(0, 80) + ':' +
+      (isFinite(new Date(e.timestamp).getTime()) ? Math.floor(new Date(e.timestamp).getTime() / 60000) : 0);
+  const chains = {};
+  enriched.forEach((e, i) => {
+    const k = chainKey(e);
+    (chains[k] = chains[k] || []).push(i);
   });
+  Object.values(chains).forEach(idxs => {
+    idxs.sort((a, b) => new Date(enriched[a].timestamp) - new Date(enriched[b].timestamp));
+    idxs.forEach(i => { enriched[i]._hops = idxs.map(j => enriched[j]); });
+  });
+  return enriched.map(e => ({ ...e, _status: deriveStatus(e, e._session, inferenceStatus) }));
 }
 
 // ─── View switching ──────────────────────────────────────────────────────────
@@ -766,7 +787,7 @@ function requestProgress(group, inf) {
   // use the real live state.
   const liveState = inf && !['idle', 'ready'].includes(inf.state) ? inf.state : null;
 
-  if (!liveState && last.success) return 100;  // stream finished, nothing live
+  if (!liveState && last.success) return 95;  // stream finished, nothing live
 
   if (!liveState) return 5;  // error/stall before acceptance
 
@@ -779,17 +800,14 @@ function requestProgress(group, inf) {
 
     case 'local_processing':
       // Prefill phase: GPU is processing the prompt, no tokens emitted yet.
-      // progress is null here; hold at 30% to show we're past loading.
       return 30;
 
     case 'local_generating':
-      // Token generation.  If we have a decoded/max ratio, map 30–85%.
-      // If max_tokens is unknown (p===null), use n_decoded with a heuristic
-      // default of 2048 tokens to compute a reasonable progress estimate.
-      if (p !== null) return Math.round(30 + p * 55);
-      const n = typeof inf.n_decoded === 'number' ? inf.n_decoded : 0;
-      const estMax = 2048;  // heuristic default for unknown max_tokens
-      return Math.round(30 + Math.min(n / estMax, 1) * 55);
+      // Token generation, 30–95%.  inf.progress is now the slot's *total*
+      // n_tokens / max_tokens (monotonic within the request), so the bar
+      // advances incrementally instead of sawtoothing.
+      if (p !== null) return Math.min(Math.round(30 + p * 65), 95);
+      return 30;
 
     case 'local_waiting':  return 25;
     case 'classifying':    return 10;
@@ -835,12 +853,22 @@ function renderGroup(group, index) {
     ? `<div style="margin-top:8px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(latest.error)}</div>`
     : '';
 
-  // Hops summary — one compact line, never expanded rows.
+  // Hops summary — one compact line, never expanded rows.  Failed fallback
+  // hops and the winner render as a single chain (e.g. "2 hops · manifest ✗ → local ✓").
   const hopCount = evs.length;
   let hopSummary = '';
   if (hopCount > 1) {
-    const routes = [...new Set(evs.map(e => (e._route || '').includes('cloud') ? 'cloud' : 'local'))];
-    hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${routes.join(' → ')} · ${lat}</div>`;
+    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('exceeds the available context size') ? ' (ctx too small)' : ''))).join(' → ');
+    hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${escHtml(chain)} · ${lat}</div>`;
+  } else {
+    // Single failed hop: surface the actionable error inline.
+    const f = evs.find(e => !e.success && e.error);
+    if (f) {
+      const msg = f.error.includes('exceeds the available context size')
+        ? 'request exceeds local context size — lower Context or raise n_ctx in the sidebar'
+        : f.error;
+      hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--red)">${escHtml(msg)}</div>`;
+    }
   }
 
   return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
@@ -881,23 +909,54 @@ function renderGroup(group, index) {
 // belong to a review session. Clicking any bar filters the card list.
 
 const SK_COLS = [
-  { name: 'prompt',  header: 'PROMPT',         x: 16  },
-  { name: 'class',   header: 'CLASSIFICATION', x: 300 },
-  { name: 'model',   header: 'MODEL',          x: 610 },
-  { name: 'review',  header: 'REVIEWER',       x: 920 },
+  { name: 'harness', header: 'HARNESS',        x: 16   },
+  { name: 'session', header: 'SESSION',        x: 280  },
+  { name: 'prompt',  header: 'PROMPTS',        x: 544  },
+  { name: 'hops',    header: 'HOPS',           x: 808  },
+  { name: 'class',   header: 'CLASSIFICATION', x: 1072 },
+  { name: 'model',   header: 'MODEL',          x: 1336 },
+  { name: 'review',  header: 'REVIEWER',       x: 1600 },
 ];
 const SK_W = 12, SK_H = 200, SK_TOP = 22, SK_PAD = 4;
-
+const SK_TOTAL_W = 1856;
 let sankeyFilter = { col: null, key: null };
 
-// Column 0 — where the prompt came from.
-function skPrompt(e) { return e.session_id ? 'review-iter' : 'prompt'; }
+// Col 0 — where the request came from.
+function skHarness(e) { return e.requested_model ? 'brainrouter' : '—'; }
 
-// Column 1 — how the route was decided (the granular classification).
+// Col 1 — the conversation/session (events without a session id collapse to 'one-shot').
+function skSession(e) {
+  if (!e.session_id) return 'one-shot';
+  const id = e.session_id;
+  return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+// Col 2 — the prompt shape (what actually hit the router).
+function skPrompt(e) {
+  if (e.session_id) return 'review-iter';
+  const p = (e.prompt_excerpt || '').trim();
+  if (p.length <= 80) return 'short';
+  return 'long';
+}
+
+// Col 3 — hop chain.  A multi-hop request (manifest ✗ → local ✓) renders as a
+// single node named for the chain, so similar hops group into one card.
+function skHops(e) {
+  const chain = e._hops || [e];
+  if (chain.length === 1) {
+    const m = (e.requested_model || '').replace(/^brainrouter\//, '');
+    if (m === 'local') return 'local-direct';
+    if (m === 'cloud') return 'cloud-direct';
+    if (m === 'subs') return 'subs-pool';
+    if (m && m !== 'auto') return 'named';
+    return 'auto';
+  }
+  return chain.map(h => (h.success ? '✓' : '✗') + (h.stage || '?')).join('→');
+}
+
+// Col 4 — how the route was decided.
 function skClassification(e) {
   if (e.session_id) return 'review-iter';
-  // Normalize the "brainrouter/" prefix: brainrouter/local is the reserved
-  // local token, not a named model.
   const m = (e.requested_model || '').replace(/^brainrouter\//, '');
   if (m === 'local') return 'direct:local';
   if (m === 'cloud') return 'direct:cloud';
@@ -906,14 +965,14 @@ function skClassification(e) {
   return 'auto→' + (e.bonsai_decision === 'cloud' ? 'cloud' : 'local');
 }
 
-// Column 2 — the model that actually served the request.
+// Col 5 — the model that served the request.
 function skModel(e) {
   if (e.model_key) return e.model_key;
   if (e.effective_provider) return e.effective_provider.split('/').pop();
   return 'failed';
 }
 
-// Column 3 — the model that reviewed it (review sessions only).
+// Col 6 — the reviewer model (review sessions only; null = no reviewer).
 function skReviewer(e, sess) {
   if (!e.session_id || !sess) return null;
   const raw = sess.review_model || '';
@@ -922,7 +981,10 @@ function skReviewer(e, sess) {
 }
 
 function skKeysOf(e, sess) {
-  return { c0: skPrompt(e), c1: skClassification(e), c2: skModel(e), c3: skReviewer(e, sess) };
+  return {
+    c0: skHarness(e), c1: skSession(e), c2: skPrompt(e), c3: skHops(e),
+    c4: skClassification(e), c5: skModel(e), c6: skReviewer(e, sess),
+  };
 }
 
 // Does this event match the active Sankey node filter?
@@ -934,24 +996,23 @@ function matchesSankey(t) {
 
 function skColorFor(col, key) {
   const map = {
-    0: { 'prompt': '#22d39a', 'review-iter': '#f5b14a' },
-    1: {
+    0: {},
+    1: {},
+    2: { 'prompt': '#22d39a', 'review-iter': '#f5b14a', 'short': '#22d39a', 'long': '#3ec5ff' },
+    3: { 'auto': '#3ec5ff', 'local-direct': '#22d39a', 'cloud-direct': '#9d7bff', 'subs-pool': '#ff7ac6', 'named': '#7dd3fc' },
+    4: {
       'review-iter': '#f5b14a',
       'auto→local': '#3ec5ff', 'auto→cloud': '#9d7bff',
       'direct:local': '#22d39a', 'direct:cloud': '#9d7bff',
       'subs-pool': '#ff7ac6', 'named-model': '#3ec5ff',
     },
-    3: {},
+    6: { 'reviewing': '#f5b14a' },
   };
   if (map[col] && map[col][key]) return map[col][key];
-  if (col === 2) {
-    const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
-    let h = 0;
-    for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
-    return palette[h % palette.length];
-  }
-  if (col === 3) return '#f5b14a';
-  return '#5a6679';
+  const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  return palette[h % palette.length];
 }
 
 function skLabel(key) {
@@ -967,28 +1028,26 @@ function updateSankey() {
   const events = allEvents.map(e => ({ e, sess: e.session_id ? sessMap[e.session_id] : null }));
 
   if (events.length === 0) {
-    svg.innerHTML = `<text x="550" y="100" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
+    svg.innerHTML = `<text x="${SK_TOTAL_W/2}" y="100" fill="#5a6679" font-size="11" font-family="JetBrains Mono, monospace" text-anchor="middle">No routing data yet</text>`;
     return;
   }
 
   const total = events.length;
   const scale = (SK_H - SK_TOP - 8) / total;
 
-  // Per-column node counts and per-gap link counts.
-  const counts = [new Map(), new Map(), new Map(), new Map()];
-  const linkCounts = [new Map(), new Map(), new Map()];
+  const NC = SK_COLS.length;
+  const counts = Array.from({ length: NC }, () => new Map());
+  const linkCounts = Array.from({ length: NC - 1 }, () => new Map());
   for (const { e, sess } of events) {
     const k = skKeysOf(e, sess);
-    const chain = [k.c0, k.c1, k.c2];
-    if (k.c3 !== null) chain.push(k.c3);
-    chain.forEach((key, i) => counts[i].set(key, (counts[i].get(key) || 0) + 1));
-    for (let i = 0; i + 1 < chain.length; i++) {
-      const lk = chain[i] + '→' + chain[i + 1];
+    const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5, k.c6];
+    for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
+    for (let i = 0; i + 1 < NC; i++) {
+      const lk = keys[i] + '→' + keys[i + 1];
       linkCounts[i].set(lk, (linkCounts[i].get(lk) || 0) + 1);
     }
   }
 
-  // Node layout: sorted by value, stacked top-down, height ∝ value.
   const colNodes = counts.map((m, ci) => {
     const arr = [...m.entries()].map(([key, value]) => ({ key, value, color: skColorFor(ci, key) }));
     arr.sort((a, b) => b.value - a.value);
@@ -998,8 +1057,6 @@ function updateSankey() {
   });
   const nodeAt = colNodes.map(arr => { const m = {}; arr.forEach(n => m[n.key] = n); return m; });
 
-  // Links with per-node output/input offsets (sorted by the far-end y to
-  // reduce crossings).
   const allLinks = [];
   linkCounts.forEach((m, i) => m.forEach((value, lk) => {
     const sep = lk.indexOf('→');
@@ -1013,7 +1070,7 @@ function updateSankey() {
   Object.values(byOut).forEach(g => {
     g.sort((x, y) => nodeAt[x.i + 1][x.b].y - nodeAt[y.i + 1][y.b].y);
     let off = 0;
-    g.forEach(l => { l.w = l.value * scale; l.outY = off + l.w / 2; off += l.w; });
+    g.forEach(l => { l.w = l.w || l.value * scale; l.outY = off + l.w / 2; off += l.w; });
   });
   Object.values(byIn).forEach(g => {
     g.sort((x, y) => nodeAt[x.i][x.a].y - nodeAt[y.i][y.a].y);
@@ -1025,13 +1082,9 @@ function updateSankey() {
   const anyFilter = sankeyFilter.col !== null;
 
   let svgOut = '';
-
-  // Column headers.
   SK_COLS.forEach(c => {
     svgOut += `<text x="${c.x}" y="14" fill="#5a6679" font-size="9" font-family="JetBrains Mono, monospace" letter-spacing="1.5">${c.header}</text>`;
   });
-
-  // Links (below nodes).
   allLinks.forEach(l => {
     const s = nodeAt[l.i][l.a], t = nodeAt[l.i + 1][l.b];
     const x1 = SK_COLS[l.i].x + SK_W, x2 = SK_COLS[l.i + 1].x;
@@ -1039,24 +1092,24 @@ function updateSankey() {
     const mx = x1 + (x2 - x1) * 0.5;
     svgOut += `<path d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" stroke="${t.color}" stroke-width="${Math.max(1, l.w)}" fill="none" opacity="${anyFilter ? 0.1 : 0.28}"/>`;
   });
-
-  // Nodes + labels.
   colNodes.forEach((arr, ci) => {
     const c = SK_COLS[ci];
+    const lastCol = ci === NC - 1;
     arr.forEach(n => {
       const isSel = sel(ci, n.key);
       const op = anyFilter && !isSel ? 0.35 : 1;
       const stroke = isSel ? `stroke="#ffffff" stroke-width="1.5"` : '';
       svgOut += `<rect x="${c.x}" y="${n.y}" width="${SK_W}" height="${n.h}" rx="2" fill="${n.color}" opacity="${op}" ${stroke} data-col="${ci}" data-key="${escHtml(n.key)}" style="cursor:pointer"><title>${escHtml(c.name + ': ' + n.key + ' (' + n.value + ') — click to filter')}</title></rect>`;
+      const tx = lastCol ? c.x - 6 : c.x + SK_W + 6;
+      const anchor = lastCol ? 'end' : 'start';
       const ty = n.y + Math.min(n.h / 2, 10) + 3.5;
-      svgOut += `<text x="${c.x + SK_W + 6}" y="${ty}" fill="#e6edf6" opacity="${op}" font-size="10" font-family="JetBrains Mono, monospace" pointer-events="none">${escHtml(skLabel(n.key))}</text>`;
-      svgOut += `<text x="${c.x + SK_W + 6}" y="${ty + 11}" fill="#5a6679" opacity="${op}" font-size="9" font-family="JetBrains Mono, monospace" pointer-events="none">${n.value}</text>`;
+      svgOut += `<text x="${tx}" y="${ty}" fill="#e6edf6" opacity="${op}" font-size="10" font-family="JetBrains Mono, monospace" text-anchor="${anchor}" pointer-events="none">${escHtml(skLabel(n.key))}</text>`;
+      svgOut += `<text x="${tx}" y="${ty + 11}" fill="#5a6679" opacity="${op}" font-size="9" font-family="JetBrains Mono, monospace" text-anchor="${anchor}" pointer-events="none">${n.value}</text>`;
     });
   });
 
   svg.innerHTML = svgOut;
 
-  // Filter chip.
   const chip = document.getElementById('sankey-filter-chip');
   const chipLabel = document.getElementById('sankey-filter-label');
   if (chip && chipLabel) {
@@ -1131,6 +1184,11 @@ function updateKPI() {
 let dismissedKeys = new Set();
 let renderedGroups = [];
 
+// Fingerprint of the last rendered list.  Re-writing innerHTML every 3s
+// nukes any text selection (the "selection de-highlights after ~1s" bug)
+// and resets scroll — so we only touch the DOM when content actually changed.
+let lastStreamHtml = '';
+
 function renderStream() {
   const list = document.getElementById('card-list');
   if (!list) return;
@@ -1145,17 +1203,21 @@ function renderStream() {
     return g.events.some(t => matchesFilter(t) && matchesSearch(t) && matchesSankey(t));
   });
 
+  let html;
   if (filtered.length === 0) {
     const msg = allEvents.length === 0
       ? 'No routing events yet. Events appear here as requests flow through brainrouter.'
       : 'No events match the current filter.';
-    list.innerHTML = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center;line-height:1.7">${msg}</div>`;
+    html = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center;line-height:1.7">${msg}</div>`;
     renderedGroups = [];
-    return;
+  } else {
+    renderedGroups = filtered;
+    html = filtered.map((g, i) => renderGroup(g, i)).join('');
   }
 
-  renderedGroups = filtered;
-  list.innerHTML = filtered.map((g, i) => renderGroup(g, i)).join('');
+  if (html === lastStreamHtml) return;  // nothing changed: keep selection & scroll
+  lastStreamHtml = html;
+  list.innerHTML = html;
 }
 
 function dismissCard(index) {
@@ -1169,18 +1231,6 @@ function dismissCard(index) {
 // Reviews are no longer a standalone page: every card in the Routing view
 // renders its review block inline, and the "reviews" filter category shows
 // only cards with an active (pending / needs_revision / escalated) session.
-function updateReviewBadge() {
-  const badge = document.getElementById('reviews-count');
-  if (!badge) return;
-  const active = allSessions.filter(s => ['needs_revision','escalated'].includes(s.status)).length;
-  badge.textContent = active;
-  badge.style.display = active > 0 ? 'inline' : 'none';
-}
-
-function gotoReviews() {
-  switchView('stream');
-  setFilter('reviews');
-}
 
 // ─── Health / sidebar updates ─────────────────────────────────────────────────
 function updateDot(id, up) {
@@ -1221,6 +1271,13 @@ function updateRoutingHint() {
   const notes = [];
   if (!(bonsaiData && bonsaiData.enabled)) notes.push('auto → local (Bonsai off)');
   if (healthData && healthData.manifest === 'disabled') notes.push('cloud → falls back to local (Manifest off)');
+  // Item 8: a recent request blew the local n_ctx — tell the user what to do
+  // (lower the context or raise it under Context) instead of a silent ✗.
+  const recent = allEvents.slice(-8).find(e =>
+    e.success === false && typeof e.error === 'string' && e.error.includes('exceeds the available context size'));
+  if (recent) {
+    notes.push('local ctx exceeded — lower Context or raise it in the sidebar');
+  }
   el.textContent = notes.join(' · ');
   el.style.display = notes.length ? 'block' : 'none';
 }
@@ -1242,6 +1299,9 @@ function bonsaiIsOn() {
 function applyBonsaiUI(b) {
   const txt = document.getElementById('ver-bonsai');
   applyToggle('bonsai', !!(b && b.enabled && b.healthy));
+  // Prompt rewrite is gated on the classifier — re-evaluate its lock whenever
+  // Bonsai state changes (poll or toggle).
+  applyRewriteLock();
   updateRoutingHint();
   if (!txt) return;
   if (!b) { updateDot('bonsai', false); txt.textContent = '—'; return; }
@@ -1382,12 +1442,15 @@ function updateVersions() {
   const lsEl = document.getElementById('ver-llama-swap');
   if (lsEl && v.llama_swap) lsEl.textContent = v.llama_swap.slice(0, 12);
   const lsUpg = document.getElementById('upg-llama-swap');
+  const lsLatest = document.getElementById('ver-llama-swap-latest');
   if (lsUpg) {
     lsUpg.style.display = 'none';
+    if (lsLatest) lsLatest.style.display = 'none';
     if (v.llama_swap_latest) {
       // Normalize both: strip leading 'v', trim, take first whitespace-delimited token.
       const cur = (v.llama_swap || '').replace(/^v/i, '').split(/\s/)[0];
       const lat = v.llama_swap_latest.replace(/^v/i, '').split(/\s/)[0];
+      if (lsLatest) { lsLatest.textContent = 'latest ' + lat; lsLatest.style.display = 'block'; }
       if (cur && lat && cur !== lat) {
         lsUpg.style.display = 'inline';
         lsUpg.title = 'Update available: ' + v.llama_swap_latest;
@@ -1404,14 +1467,15 @@ function updateVersions() {
   const toolEl = document.getElementById('ver-toolbox');
   if (toolEl && v.toolbox_image_ver) toolEl.textContent = 'v' + v.toolbox_image_ver + (v.toolbox_image_created ? ' · ' + v.toolbox_image_created : '');
   const toolUpg = document.getElementById('upg-toolbox');
-  if (toolUpg) {
-    toolUpg.style.display = 'none';
-    if (v.toolbox_image_created && v.toolbox_latest) {
-      // Both are ISO date strings (YYYY-MM-DD). Compare dates, not version numbers.
-      if (v.toolbox_latest > v.toolbox_image_created) {
-        toolUpg.style.display = 'inline';
-        toolUpg.title = 'Update available: ' + v.toolbox_latest;
-      }
+  const toolLatest = document.getElementById('ver-toolbox-latest');
+  if (toolUpg) toolUpg.style.display = 'none';
+  if (toolLatest) toolLatest.style.display = 'none';
+  if (v.toolbox_image_created && v.toolbox_latest) {
+    if (toolLatest) { toolLatest.textContent = 'latest ' + v.toolbox_latest; toolLatest.style.display = 'block'; }
+    // Both are ISO date strings (YYYY-MM-DD). Compare dates, not version numbers.
+    if (v.toolbox_latest > v.toolbox_image_created) {
+      toolUpg.style.display = 'inline';
+      toolUpg.title = 'Update available: ' + v.toolbox_latest;
     }
   }
 
@@ -1419,15 +1483,16 @@ function updateVersions() {
   const mEl = document.getElementById('ver-manifest');
   if (mEl && v.manifest) mEl.textContent = v.manifest.slice(0, 18);
   const mUpg = document.getElementById('upg-manifest');
-  if (mUpg) {
-    mUpg.style.display = 'none';
-    if (v.manifest_latest) {
-      // manifest_latest is a date; manifest is "date · hash". Compare dates.
-      const curDate = (v.manifest || '').split(' ')[0];
-      if (curDate && v.manifest_latest > curDate) {
-        mUpg.style.display = 'inline';
-        mUpg.title = 'Update available: ' + v.manifest_latest;
-      }
+  const mLatest = document.getElementById('ver-manifest-latest');
+  if (mUpg) mUpg.style.display = 'none';
+  if (mLatest) mLatest.style.display = 'none';
+  if (v.manifest_latest) {
+    if (mLatest) { mLatest.textContent = 'latest ' + v.manifest_latest; mLatest.style.display = 'block'; }
+    // manifest_latest is a date; manifest is "date · hash". Compare dates.
+    const curDate = (v.manifest || '').split(' ')[0];
+    if (curDate && v.manifest_latest > curDate) {
+      mUpg.style.display = 'inline';
+      mUpg.title = 'Update available: ' + v.manifest_latest;
     }
   }
 
@@ -1569,10 +1634,13 @@ async function setNudgeTier(tier) {
   } catch(e) {}
 }
 
+let nudgeBusy = false;
 async function toggleNudge() {
+  if (nudgeBusy) return;
   const currentlyOn = !!(nudgeData && nudgeData.enabled);
   const next = !currentlyOn;
   if (next && !confirm('Enable thinking-budget nudging?\nAuto-routed local requests will use the nudge model with a per-request reasoning budget (Bonsai picks light/deep tier when tier is "auto").')) return;
+  nudgeBusy = true;
   applyToggle('nudge', next);
   try {
     const r = await fetch('/api/nudge', {
@@ -1581,8 +1649,11 @@ async function toggleNudge() {
       body: JSON.stringify({ enabled: next }),
     });
     if (!r.ok) { applyToggle('nudge', currentlyOn); console.warn('Nudge toggle failed', r.status); }
-    else if (nudgeData) { nudgeData.enabled = next; applyNudgeUI(nudgeData); }
+    // Re-read the authoritative state so the next refreshSlow can't snap us back.
+    const fresh = await safeFetch('/api/nudge');
+    if (fresh) { nudgeData = fresh; applyNudgeUI(fresh); }
   } catch(e) { applyToggle('nudge', currentlyOn); }
+  nudgeBusy = false;
 }
 
 // ─── Context size (llama-swap --fit-ctx) ─────────────────────────────────────
@@ -1619,23 +1690,37 @@ async function setContextSize(value) {
 let rewriteData = null;
 
 function applyRewriteUI(r) {
-  if (r) applyToggle('rewrite', !!r.enabled);
+  if (r) rewriteData = r;
+  applyRewriteLock();
 }
 
+// The rewrite toggle is gated on the classifier: while Bonsai is off it is
+// non-interactive and forced off (the server auto-disables it too).
+function applyRewriteLock() {
+  const btn = document.getElementById('toggle-rewrite');
+  const on = !!(rewriteData && rewriteData.enabled);
+  const unlocked = bonsaiIsOn();
+  applyToggle('rewrite', unlocked && on);
+  if (!btn) return;
+  btn.style.opacity = unlocked ? '1' : '0.4';
+  btn.style.cursor = unlocked ? 'pointer' : 'not-allowed';
+  btn.title = unlocked
+    ? 'Enable / disable local prompt rewriting (applies to managed auto/local routes; direct model picks are untouched)'
+    : 'Prompt rewrite requires the Bonsai classifier to be on';
+}
+
+let rewriteBusy = false;
 async function togglePromptRewrite() {
+  if (rewriteBusy) return;
   const currentlyOn = !!(rewriteData && rewriteData.enabled);
   const next = !currentlyOn;
-  // Enabling requires the Bonsai classifier to be running (server enforces
-  // the same guard with a 409). Offer to start it first.
+  // Turning on requires the classifier; turning off is always allowed.
   if (next && !bonsaiIsOn()) {
-    const startNow = confirm('Bonsai is off — prompt rewrite requires the Bonsai classifier to be running.\n\nStart the classifier first?');
-    if (!startNow) return;
-    await setBonsai(true);
-    if (!bonsaiIsOn()) {
-      alert('Bonsai did not come up yet. Start it from the sidebar, then enable prompt rewrite.');
-      return;
-    }
+    applyRewriteLock();
+    alert('Prompt rewrite requires the Bonsai classifier to be on.');
+    return;
   }
+  rewriteBusy = true;
   applyToggle('rewrite', next);
   try {
     const r = await fetch('/api/prompt-rewrite', {
@@ -1648,12 +1733,14 @@ async function togglePromptRewrite() {
       const j = await r.json().catch(() => ({}));
       alert('Prompt rewrite not enabled: ' + (j.error || r.status));
     } else {
-      rewriteData = { enabled: next };
+      // Re-read the authoritative state so the next refreshSlow can't snap us back.
+      const fresh = await safeFetch('/api/prompt-rewrite');
+      rewriteData = fresh || { enabled: next };
+      applyRewriteLock();
     }
   } catch(e) { applyToggle('rewrite', currentlyOn); }
+  rewriteBusy = false;
 }
-
-// ─── Toolboxes list (all llama-* containers) ─────────────────────────────────
 let toolboxesData = null;
 
 function renderToolboxes() {
@@ -1664,10 +1751,21 @@ function renderToolboxes() {
   el.innerHTML = boxes.map(tb => {
     const color = tb.running ? 'var(--green)' : 'var(--textMute)';
     const sub = [tb.status, tb.created ? 'built ' + tb.created : ''].filter(Boolean).join(' · ');
-    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px" title="${escHtml(tb.name)} — ${escHtml(sub)}">
+    const local = tb.local_created || '';
+    const latest = tb.latest_created || '';
+    // Version cell: if an update is available, show latest with a clickable ↑;
+    // otherwise show the installed date. Clicking the arrow upgrades just this box.
+    let ver;
+    if (tb.update_available && latest) {
+      ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${escHtml(latest)}</span>` +
+            `<span onclick="event.stopPropagation();upgradeToolbox(${JSON.stringify(tb.name)})" style="font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:9px;cursor:pointer;padding:0 2px" title="Update available: ${escHtml(latest)}">↑</span>`;
+    } else {
+      ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${local ? escHtml(local) : '—'}</span>`;
+    }
+    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.name)} — ${escHtml(sub)}${tb.update_available ? ' — update available ' + escHtml(latest) : ''}">
       <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
       <span style="color:var(--textDim);flex:1">${escHtml(tb.short_name || tb.name)}</span>
-      <span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${tb.running ? 'up' : 'down'}</span>
+      ${ver}
     </div>`;
   }).join('');
 }
@@ -1677,6 +1775,22 @@ async function upgradeIfAvailable(svc) {
   if (btn) { btn.style.opacity = '0.5'; }
   try { await fetch('/api/upgrade/' + svc, { method: 'POST' }); } catch(e) {}
   if (btn) { btn.style.opacity = '1'; }
+  setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
+}
+
+async function upgradeToolboxAll() {
+  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
+  if (boxes.length === 0) return;
+  if (!confirm('Upgrade ALL toolbox containers (' + boxes.length + ') to the latest images?\nThe local stack will restart. Takes a few minutes.')) return;
+  try { await fetch('/api/upgrade/toolbox', { method: 'POST' }); } catch (e) {}
+  setTimeout(() => { refreshSlow(); refreshHealth(); }, 5000);
+}
+
+async function upgradeToolbox(name) {
+  if (!confirm('Upgrade toolbox "' + name + '" to the latest image?')) return;
+  try {
+    await fetch('/api/upgrade/toolbox/' + encodeURIComponent(name), { method: 'POST' });
+  } catch (e) {}
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
 }
 
@@ -1861,8 +1975,7 @@ async function refreshFast() {
   if (stRes) statsData = stRes;
   if (infRes) inferenceStatus = infRes;
 
-  if (activeView === 'stream') renderStream();
-  updateReviewBadge();
+  updateToolboxes();
 
   updateSankey();
   updateKPI();

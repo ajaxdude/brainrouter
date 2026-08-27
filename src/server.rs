@@ -70,10 +70,10 @@ use std::sync::LazyLock;
 static VERSION_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent("brainrouter")
+        .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .expect("Failed to build HTTP client")
 });
-
 use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
 use crate::escalation;
 use crate::peer_cwd::peer_cwd;
@@ -304,7 +304,8 @@ async fn handle_request(
         }
 
         ("POST", "/v1/chat/completions") => {
-            match handle_chat_completion(req, state, cwd).await {
+            let session_id = extract_session_id(req.headers());
+            match handle_chat_completion(req, state, cwd, session_id).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
@@ -318,7 +319,8 @@ async fn handle_request(
         }
 
         ("POST", "/v1/messages") => {
-            match handle_anthropic_messages(req, state, cwd).await {
+            let session_id = extract_session_id(req.headers());
+            match handle_anthropic_messages(req, state, cwd, session_id).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling Anthropic messages: {}", e);
@@ -444,7 +446,29 @@ async fn handle_request(
         }
 
         ("POST", "/api/upgrade/toolbox") => {
-            let resp = upgrade_toolbox().await;
+            let resp = upgrade_toolbox(
+                "llama-vulkan-radv",
+                "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv",
+            )
+            .await;
+            into_unsync(resp)
+        }
+
+        // Per-container upgrade: /api/upgrade/toolbox/<container-name>. The
+        // image is resolved from whatever the container currently runs.
+        ("POST", p) if p.starts_with("/api/upgrade/toolbox/") => {
+            let name = p.trim_start_matches("/api/upgrade/toolbox/").trim_end_matches('/');
+            let resp = if name.is_empty() {
+                json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                    error: "Missing toolbox container name".into(),
+                })
+            } else if let Some(image) = toolbox_container_image(name).await {
+                upgrade_toolbox(name, &image).await
+            } else {
+                json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+                    error: format!("No such toolbox container: {}", name),
+                })
+            };
             into_unsync(resp)
         }
 
@@ -572,6 +596,12 @@ async fn handle_request(
         ("POST", "/api/bonsai/toggle") => {
             match state.bonsai.toggle().await {
                 Ok(running) => {
+                    // Prompt rewrite is coupled to the classifier: drop it when
+                    // Bonsai goes off so the invariant "rewrite on => Bonsai on"
+                    // holds server-side, not just in the UI.
+                    if !running {
+                        state.prompt_rewrite.store(false, AtomicOrdering::Relaxed);
+                    }
                     let resp = json_response(StatusCode::OK, &serde_json::json!({
                         "enabled": running,
                         "message": if running {
@@ -642,16 +672,14 @@ async fn handle_request(
         }
 
         // ── Prompt-rewrite toggle API (local pass-through mode) ─────────────
-        // Enabling requires the Bonsai classifier to be running: rewrite is
-        // the classifier-side system-prompt pass, so it has no effect without
-        // Bonsai. Disabling is always allowed.
+        // Independent of Bonsai: rewrite_for_local is a standalone local prompt
+        // swap (applied to managed auto/local routes when enabled). Off →
+        // forward the incoming prompt untouched.
         ("GET", "/api/prompt-rewrite") => {
-            let bonsai_up = state.bonsai.is_running() && state.bonsai.healthy().await;
             let resp = json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
-                    "bonsai_running": bonsai_up,
                 }),
             );
             into_unsync(resp)
@@ -660,20 +688,29 @@ async fn handle_request(
         ("POST", "/api/prompt-rewrite") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
-                if enabled && !(state.bonsai.is_running() && state.bonsai.healthy().await) {
-                    let resp = json_response(
-                        StatusCode::CONFLICT,
-                        &ErrorResponse { error: "Bonsai classifier is not running — start Bonsai before enabling prompt rewrite".to_string() },
-                    );
-                    return Ok(into_unsync(resp));
+            // Rewriting the local system prompt is only meaningful with the
+            // classifier driving auto/local routing. Refuse to turn it on while
+            // Bonsai is off; turning off is always allowed.
+            let rejected = match val.get("enabled").and_then(|v| v.as_bool()) {
+                Some(true) if !(state.bonsai.is_running() && state.bonsai.healthy().await) => true,
+                Some(enabled) => {
+                    state.prompt_rewrite.store(enabled, AtomicOrdering::Relaxed);
+                    false
                 }
-                state.prompt_rewrite.store(enabled, AtomicOrdering::Relaxed);
+                None => false,
+            };
+            if rejected {
+                into_unsync(json_response(
+                    StatusCode::CONFLICT,
+                    &ErrorResponse {
+                        error: "Prompt rewrite requires the Bonsai classifier to be on".into(),
+                    },
+                ))
+            } else {
+                into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
+                })))
             }
-            let resp = json_response(StatusCode::OK, &serde_json::json!({
-                "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
-            }));
-            into_unsync(resp)
         }
 
         // ── Toolboxes API (all llama-* toolbox containers) ──────────────────
@@ -974,11 +1011,36 @@ async fn handle_request(
     Ok(response)
 }
 
+/// Extract a client-provided conversation/session id from request headers.
+///
+/// The dashboard uses this (plus a stable hash of the conversation prefix)
+/// to group events per conversation so each one renders as a single card.
+/// If a client ever adds a session header, this picks it up with no code change.
+fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
+    const CANDIDATES: [&str; 6] = [
+        "x-omp-session",
+        "x-session-id",
+        "x-conv-id",
+        "x-conversation-id",
+        "x-client-session",
+        "x-request-conv",
+    ];
+    for name in CANDIDATES {
+        if let Some(v) = headers.get(name) {
+            let s = v.to_str().ok()?.trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
 /// Handle POST /v1/chat/completions
 async fn handle_chat_completion(
     req: Request<Incoming>,
     state: Arc<AppState>,
     cwd: String,
+    session_id: Option<String>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
@@ -998,7 +1060,7 @@ async fn handle_chat_completion(
     // a model (which can take minutes for large models like qwen3-27b-mtp).
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = state.router.route_tagged(request, None, cwd).await;
+        let result = state.router.route_tagged(request, session_id, cwd).await;
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });
@@ -1025,6 +1087,7 @@ async fn handle_anthropic_messages(
     req: Request<Incoming>,
     state: Arc<AppState>,
     cwd: String,
+    session_id: Option<String>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
@@ -1042,7 +1105,7 @@ async fn handle_anthropic_messages(
     // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = state.router.route_tagged(oai_request, None, cwd).await;
+        let result = state.router.route_tagged(oai_request, session_id, cwd).await;
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });
@@ -1091,12 +1154,12 @@ async fn inference_status(
                     // Model is loaded and ready. Check /slots to detect activity
                     // from clients hitting llama-swap directly (bypassing brainrouter).
                     let slot_info = poll_llama_swap_slot(llama_swap_url).await;
-                    let (state, n_decoded) = match &slot_info {
-                        Some((true, 0)) => ("local_processing", 0u64),
-                        Some((true, n)) => ("local_generating", *n),
-                        _ => ("ready", 0),
+                    let (state, n_decoded, n_tokens) = match &slot_info {
+                        Some((true, 0, t)) => ("local_processing", 0u64, *t),
+                        Some((true, n, t)) => ("local_generating", *n, *t),
+                        _ => ("ready", 0, 0),
                     };
-                    let progress = match (n_decoded, snap.max_tokens) {
+                    let progress = match (n_tokens, snap.max_tokens) {
                         (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
                         _ => None,
                     };
@@ -1142,23 +1205,24 @@ async fn inference_status(
                 poll_llama_swap_slot(llama_swap_url),
                 poll_llama_swap_running(llama_swap_url),
             );
-            let (sub_state, n_decoded) = match &slot_info {
-                Some((true, 0)) => ("local_processing", 0u64),
-                Some((true, n)) => ("local_generating", *n),
-                Some((false, _)) if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
-                Some((false, _)) => ("ready", 0),
+            let (sub_state, n_decoded, n_tokens) = match &slot_info {
+                Some((true, 0, t)) => ("local_processing", 0u64, *t),
+                Some((true, n, t)) => ("local_generating", *n, *t),
+                Some((false, _, _)) if snap.phase == Phase::LocalStreaming => ("local_generating", 0, 0),
+                Some((false, _, _)) => ("ready", 0, 0),
                 // Slot poll failed (GPU busy, timeout) — infer from tracker phase.
-                None if snap.phase == Phase::LocalStreaming => ("local_generating", 0),
-                None => ("local_processing", 0),
+                None if snap.phase == Phase::LocalStreaming => ("local_generating", 0, 0),
+                None => ("local_processing", 0, 0),
             };
             // If the slot shows no token generation yet, check if the model is still loading.
             let progress: Option<f32> = if n_decoded == 0 {
-                let proxy = running_info.as_ref().map(|(_, _, _, p)| p.as_str()).unwrap_or("");
+                let proxy = running_info.as_ref().map(|(_, _, _, pr)| pr.as_str()).unwrap_or("");
                 poll_llama_server_health(proxy).await
             } else {
-                // Token generation in progress: use decoded/max_tokens ratio.
-                match (n_decoded, snap.max_tokens) {
-                    (n, Some(max)) if max > 0 => Some(n as f32 / max as f32),
+                // Token generation in progress: slot n_tokens (total decoded so
+                // far) / max_tokens. Monotonic within the request.
+                match (n_tokens, snap.max_tokens) {
+                    (t, Some(max)) if max > 0 => Some(t as f32 / max as f32),
                     _ => None,
                 }
             };
@@ -1169,6 +1233,7 @@ async fn inference_status(
                 "provider": snap.provider,
                 "elapsed_ms": snap.elapsed_ms,
                 "n_decoded": n_decoded,
+                "n_tokens": n_tokens,
                 "max_tokens": snap.max_tokens,
                 "progress": progress,
             }))
@@ -1304,27 +1369,69 @@ async fn poll_llama_server_health(proxy_url: &str) -> Option<f32> {
     }
 }
 
-/// Poll the active llama-server's /slots endpoint for processing state.
-/// Returns (is_processing, n_decoded) if reachable.
-async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64)> {
-    // First get the proxy URL from /running
+/// Poll the active llama-server's /slots endpoint for progress.
+/// Returns (is_active, n_decoded, n_tokens_total).
+///
+/// /slots exposes `n_tokens` = total tokens decoded on the slot, which is
+/// monotonic within a request. The old code read `next_token.n_decoded`,
+/// which only counts tokens in the *current chunk*, so the dashboard
+/// progress bar saw sawtooth jumps instead of steady progress.
+async fn poll_llama_swap_slot(llama_swap_url: &str) -> Option<(bool, u64, u64)> {
     let running_url = format!("{}/running", llama_swap_url);
     let resp = VERSION_CLIENT.get(&running_url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
     let data: serde_json::Value = resp.json().await.ok()?;
     let entry = data.get("running")?.as_array()?.first()?;
-    let proxy = entry.get("proxy")?.as_str()?;
-    // Then poll /slots on the model's port
+    let proxy = entry.get("proxy")?.as_str()?.to_string();
     let slots_url = format!("{}/slots", proxy);
     let resp = VERSION_CLIENT.get(&slots_url).timeout(std::time::Duration::from_secs(2)).send().await.ok()?;
-    let slots: serde_json::Value = resp.json().await.ok()?;
-    let slot = slots.as_array()?.first()?;
-    let is_proc = slot.get("is_processing")?.as_bool()?;
-    let n_decoded = slot
-        .get("next_token")
-        .and_then(|nt| nt.get("n_decoded"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    Some((is_proc, n_decoded))
+    let body = resp.text().await.ok()?;
+    parse_llama_slots(&body)
+}
+
+/// Parse the llama-server /slots payload, returning the active slot's
+/// (is_active, n_decoded, n_ctx).
+///
+/// This llama-server build leaves the top-level `n_tokens`/`n_decoded`
+/// fields null while generating; the live per-request count is
+/// `next_token.n_decoded` (tokens decoded in the current prompt run),
+/// which is monotonic within a request. `is_active` comes from
+/// `is_processing` (with the max `n_prompt_tokens` slot as a fallback
+/// for a slot between chunks).
+fn parse_llama_slots(body: &str) -> Option<(bool, u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    // llama-server serves /slots as a bare JSON array; accept a
+    // {"slots":[...]} wrapper too for older/newer builds.
+    let slots = if v.is_array() {
+        v.as_array()?
+    } else {
+        v.get("slots")?.as_array()?
+    };
+    let mut best: Option<(bool, u64, u64)> = None; // (active, decoded, prompt_tokens)
+    for s in slots {
+        let processing = s.get("is_processing").and_then(|p| p.as_bool()).unwrap_or(false);
+        let prompt = s.get("n_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+        // next_token may be an object or a single-element array depending on
+        // the llama-server build.
+        let decoded = s
+            .get("next_token")
+            .and_then(|nt| if nt.is_array() { nt.as_array()?.first() } else { Some(nt) })
+            .and_then(|nt| nt.get("n_decoded"))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let active = processing || decoded > 0;
+        match &mut best {
+            None => best = Some((active, decoded, prompt)),
+            Some(b) => {
+                // Prefer an active slot; otherwise keep the one furthest
+                // along in prompt tokens (most recently served).
+                if (active && !b.0) || (active == b.0 && prompt > b.2) {
+                    *b = (active, decoded, prompt);
+                }
+            }
+        }
+    }
+    let (active, decoded, _prompt) = best?;
+    Some((active, decoded, decoded))
 }
 
 /// Unload every model llama-swap currently holds in memory (VRAM), without
@@ -1473,45 +1580,25 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(service, %stderr, "Service restart failed");
+            error!(service, %stderr, "systemctl restart returned non-success");
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Restart failed: {}", stderr.trim()),
+                error: format!("Failed to restart {}: {}", service, stderr.trim()),
             })
         }
         Err(e) => {
-            error!(service, error = %e, "Failed to exec systemctl");
+            error!(service, error = %e, "systemctl restart failed");
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec systemctl: {}", e),
+                error: format!("Failed to restart {}: {}", service, e),
             })
         }
     }
 }
-
-/// List all `llama-*` toolbox containers for the dashboard "Toolboxes" section.
-/// Shows every toolbox the user has (radv, radv-performance, nudge, rocm, ...)
-/// with its image, running state, and image build date — not just the default
-/// vulkan-radv one.
 pub async fn toolboxes_list() -> Response<Full<Bytes>> {
     use tokio::process::Command;
     let containers = Command::new("podman")
         .args(["ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"])
         .output()
         .await;
-    let images = Command::new("podman")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}\t{{.Created}}"])
-        .output()
-        .await;
-
-    // image ref -> created date (YYYY-MM-DD)
-    let mut image_created: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Ok(o) = images {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            if let Some((refname, created)) = line.split_once('\t') {
-                let date = created.trim().get(..10).unwrap_or("").to_string();
-                image_created.insert(refname.to_string(), date);
-            }
-        }
-    }
 
     let mut list: Vec<serde_json::Value> = Vec::new();
     if let Ok(o) = containers {
@@ -1532,12 +1619,89 @@ pub async fn toolboxes_list() -> Response<Full<Bytes>> {
                 "image": image,
                 "running": status.starts_with("Up"),
                 "status": status,
-                "created": image_created.get(image).cloned().unwrap_or_default(),
             }));
         }
     }
     list.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+
+    // Enrich each entry with local image creation date + Docker Hub latest
+    // per tag, so the dashboard can show installed vs latest and flag updates.
+    // Local created is read from `podman inspect` (absolute date) per distinct
+    // image; the Hub date is the tag_last_pushed of the image's tag, fetched
+    // once per repo (batched) rather than once per container.
+    let repo_tag_map = hub_toolbox_tag_dates().await;
+    for tb in list.iter_mut() {
+        let image = tb["image"].as_str().unwrap_or("").to_string();
+        // local_created: absolute YYYY-MM-DD the local image was pulled.
+        let local = image_created_date(&image).await.unwrap_or_default();
+        tb["local_created"] = serde_json::Value::String(local.clone());
+
+        // latest_created: Docker Hub push date for this exact tag.
+        let (repo, tag) = split_repo_tag(&image);
+        let latest = repo_tag_map
+            .get(&format!("{}/{}", repo, tag))
+            .cloned()
+            .unwrap_or_default();
+        tb["latest_created"] = serde_json::Value::String(latest.clone());
+
+        // update_available: local image predates the newest Hub push.
+        tb["update_available"] =
+            serde_json::Value::Bool(!local.is_empty() && !latest.is_empty() && local < latest);
+    }
+
     json_response(StatusCode::OK, &serde_json::json!({ "toolboxes": list }))
+}
+
+/// Split a full image reference into (repository, tag). Defaults to `latest`
+/// when no tag is present.
+fn split_repo_tag(image: &str) -> (&str, &str) {
+    match image.rsplit_once(':') {
+        Some((repo, tag)) if !tag.is_empty() => (repo, tag),
+        _ => (image, "latest"),
+    }
+}
+
+/// Absolute creation date (YYYY-MM-DD) of a local image, via podman inspect.
+async fn image_created_date(image: &str) -> Option<String> {
+    let out = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", "{{.Created}}", image])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let created = String::from_utf8_lossy(&out.stdout).to_string();
+    // e.g. "2026-08-26T14:03:11.234Z" -> "2026-08-26"
+    created.trim().get(..10).filter(|s| s.len() == 10).map(|s| s.to_string())
+}
+
+/// Batched Docker Hub map of `repository:tag` -> last-push date (YYYY-MM-DD)
+/// for every toolbox repo currently in use. A single `tags` call per repo
+/// (all tags, capped) instead of one call per container.
+async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let resp = VERSION_CLIENT
+        .get("https://hub.docker.com/v2/repositories/kyuz0/amd-strix-halo-toolboxes/tags?page_size=100")
+        .send()
+        .await
+        .ok();
+    if let Some(r) = resp {
+        if let Ok(data) = r.json::<serde_json::Value>().await {
+            for t in data.get("results").and_then(|v| v.as_array()).into_iter().flatten() {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let pushed = t
+                    .get("tag_last_pushed")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.get(..10))
+                    .unwrap_or("");
+                if !name.is_empty() && !pushed.is_empty() {
+                    map.insert(format!("kyuz0/amd-strix-halo-toolboxes:{}", name), pushed.to_string());
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Rewrite the llama.cpp context flags in the llama-swap config to `value`.
@@ -1980,10 +2144,23 @@ async fn upgrade_manifest() -> Response<Full<Bytes>> {
     }
 }
 
-async fn upgrade_toolbox() -> Response<Full<Bytes>> {
-    info!("Upgrading llama-vulkan-radv toolbox container...");
-    let image = "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv";
-    let container = "llama-vulkan-radv";
+/// Look up the image a podman container is running from (full `docker.io/…`
+/// reference, as listed by `podman ps`).
+async fn toolbox_container_image(container: &str) -> Option<String> {
+    let out = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", "{{.Image}}", container])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let image = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!image.is_empty()).then_some(image)
+}
+
+async fn upgrade_toolbox(container: &str, image: &str) -> Response<Full<Bytes>> {
+    info!(%container, %image, "Upgrading toolbox container...");
 
     // 1. Pull the new image
     let pull = tokio::process::Command::new("podman")

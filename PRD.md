@@ -44,11 +44,12 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 
 A single Rust daemon that:
 
-1. **Routes in three modes:**
+1. **Routes in four modes:**
    - `auto` -- Bonsai classifies every query in <200ms and routes to cloud or local. **Bonsai is off by default**: with it disabled, `auto` routes straight to local (single hop).
-   - `local` -- Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap.
+   - `local` -- Bypasses Bonsai, rewrites the system prompt (strips OMP's 15-20K token bloat down to ~500 tokens with anti-loop directives), routes to llama-swap with the fallback model.
    - `cloud` -- Bypasses Bonsai, routes directly to Manifest. **Manifest is off by default**: with it disabled, `cloud` falls back to llama-swap too.
-2. **Falls back automatically** when Manifest stalls or fails -- no manual intervention. With both Bonsai and Manifest off, every request is a single local hop.
+   - **any other key** (bare or `brainrouter/<key>`) -- a *direct model selection*, routed straight to that llama-swap model with no classifier hop, no prompt rewrite, and **no fallback**. Direct picks are authoritative: if the model fails, the error surfaces to the caller instead of silently switching to another model.
+2. **Falls back automatically** when Manifest stalls or fails (managed routes only) -- no manual intervention, and the dashboard shows every failed hop as a chain (`manifest ✗ → local ✓`). With both Bonsai and Manifest off, every request is a single local hop.
 3. **Reviews code locally (by default)** using the same routing infrastructure, exposing an MCP tool that every harness can call. Users can explicitly override Bonsai's routing via the dashboard to force local or cloud review.
 4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal.
 5. **Explicit review control.** The dashboard provides a "Code Review Mode" selector. In `auto` mode, Bonsai 27B decides the best model for the review. Users can force `cloud` (always Manifest) or `local` (always llama-swap, with a specific model dropdown).
@@ -107,9 +108,11 @@ The SSE adapter follows a strict state machine to guarantee protocol compliance.
 
 Destructive operations (upgrade, restart) are restricted to loopback interfaces (127.0.0.1, ::1) or Unix Domain Sockets. Browser-originated requests to management endpoints are validated against `Origin`/`Referer` headers. Working directory tracking for sessions includes absolute-path enforcement, null-byte rejection, and path-traversal component blocking.
 
-### Prompt rewriting for local models
+### Prompt rewriting for local models (coupled to Bonsai)
 
-When routing to `local` mode, the prompt rewriter strips OMP's 15-20K system prompt down to ~500 tokens. This is necessary because local models have limited context windows and perform poorly with massive system prompts designed for cloud-tier models. The rewriter injects concise anti-loop directives tuned for local model behavior.
+When routing `auto`/`local` to llama-swap, the prompt rewriter strips OMP's 15-20K system prompt down to ~500 tokens. This is necessary because local models have limited context windows and perform poorly with massive system prompts designed for cloud-tier models. The rewriter injects concise anti-loop directives tuned for local model behavior.
+
+The rewrite is coupled to the classifier **server-side**, not just in the UI: turning Bonsai off via the toggle/CLI forces the rewrite flag off with it (the invariant "rewrite on ⇒ Bonsai on" holds in the daemon), and `POST /api/prompt-rewrite` refuses to enable while Bonsai is down. Direct model picks are never rewritten — only managed local routes.
 
 ### Bridge as OMP subprocess
 
@@ -214,9 +217,9 @@ When installed via `install.sh` on a shared Fedora machine:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `enabled` | `bool` | `false` | Classifier is **off by default**. When `false`, `auto` routing goes straight to local (no cloud hop) |
-| `model_path` | `PathBuf?` | *(required when enabled)* | Path to the Bonsai GGUF model file. Only validated when `enabled: true`; a missing file with `enabled: false` does NOT crash startup |
-| `server_port` | `u16` | `9200` | Port for the external llama-server process |
-| `fork_path` | `PathBuf` | *(default path)* | Path to the PrismML fork binary |
+| `model_path` | `PathBuf?` | *(required when enabled)* | Path to the Bonsai GGUF classifier file. On this machine: `/mnt/models/prism/Bonsai-27B-Q1_0.gguf` (PrismML fork of llama.cpp; 1-bit Q1_0 — runs on the bundled fork binary, not stock llama.cpp). Only validated when `enabled: true`; a missing file with `enabled: false` does NOT crash startup |
+| `fork_path` | `PathBuf` | *(default path)* | Path to the PrismML fork `llama-server` binary. On this machine: `/home/papa/.local/share/brainrouter/llama-prism/llama-server` |
+| `server_port` | `u16` | `9200` | Port for the external Bonsai llama-server process |
 #### models.*
 
 | Field | Type | Default | Description |
@@ -229,7 +232,7 @@ When installed via `install.sh` on a shared Fedora machine:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `max_iterations` | `u32` | `5` | Maximum LLM review iterations before escalation to human |
-| `forced_mode` | `String` | `"auto"` | Routing mode override for reviews: `auto`, `cloud`, or `local`. Persisted to `$XDG_CONFIG_HOME/brainrouter/review_state.json` |
+| `forced_mode` | `String` | `"local"` | Routing mode override for reviews: `auto`, `cloud`, or `local`. **Local by default** — reviews are reviewed by a local llama-swap model so a Manifest outage never blocks the review loop and no VRAM is wasted spinning up a cloud hop during active inference. Persisted to `$XDG_CONFIG_HOME/brainrouter/review_state.json`; can be flipped to `cloud`/`auto` live via `brainrouter cli review-config update` or the dashboard |
 | `forced_model` | `String?` | `None` | For `forced_mode=local`, which llama-swap model to use. Persisted to `$XDG_CONFIG_HOME/brainrouter/review_state.json` |
 
 #### bridge.*
@@ -369,24 +372,29 @@ Thin client over the daemon REST API; total dashboard parity. `--socket <path>` 
 ```
 Incoming request (OpenAI or Anthropic format)
   |
-  v server.rs: deserialize, translate if Anthropic
+  v server.rs: deserialize, translate if Anthropic; extract_session_id()
+  |           reads a client conversation header (x-omp-session / x-session-id /
+  |           x-conv-id / x-conversation-id / x-client-session / x-request-conv)
+  |           so the dashboard can group events per conversation
   |
-  v router.rs: match on model field
+  v router.rs: match on model field — only the reserved routing tokens get
+  |           Bonsai/nudge/subs treatment; every other key is a DIRECT model
+  |           selection and is authoritative (bypasses Bonsai entirely)
   |
   +-- model="auto"  --> classifier.rs: Bonsai inference (skipped if bonsai disabled)
   |     +-- Cloud --> manifest (if enabled + healthy) --> llama-swap fallback
-  |     +-- Local --> llama-swap (Bonsai-chosen model)
+  |     +-- Local --> prompt_rewriter.rs (when rewrite on) --> llama-swap (Bonsai-chosen model)
   |
   +-- model="local" --> prompt_rewriter.rs: rewrite system msgs
   |                  --> llama-swap (fallback_model)
   |
   +-- model="cloud" --> manifest (if enabled + healthy) --> llama-swap fallback
   |
-  +-- model="brainrouter/<model>" --> prompt_rewriter.rs: rewrite system msgs
-  |                               --> llama-swap (specific model)
-  |
   +-- model="subs" / "brainrouter/subs" --> llama-swap (subs_model, bypassing Bonsai;
   |     unconfigured → falls back to auto)
+  |
+  +-- model="brainrouter/<key>" or any bare key --> llama-swap (that key), no rewrite,
+  |     no classifier hop; works even when Bonsai is off
   |
   +-- nudge (if enabled): inject reasoning_budget_tokens on local routes
   |     unless the client already supplied one
@@ -402,6 +410,15 @@ Incoming request (OpenAI or Anthropic format)
   |
   v Response streamed to caller
 ```
+
+### Fallback semantics and hop chains
+
+`route_local` takes an `allow_fallback` gate:
+
+- **Managed routing** (`auto`/`local` tokens) passes `allow_fallback: true` — if the chosen local model fails, the router retries once with `fallback_model`.
+- **Direct model picks** (any named/bare key, `subs`, specific-key routes) pass `allow_fallback: false` — a failed explicit selection surfaces the error to the client instead of silently switching models. This is the "memory compaction" fix: a failing `ds4-*` pick used to jump to the subs pool behind the agent's back; direct picks are authoritative.
+
+Every failed hop is recorded in `RouteInfo.failed_attempts` (stage, provider, model_key, error) and the router emits one `RouteEvent` **per failed hop** plus one for the winner. The dashboard therefore renders multi-hop routes as a hop chain (e.g. `manifest ✗ → local ✓`) instead of a single collapsed card; the Sankey's HOPS column shows the chain too.
 
 Both Bonsai and Manifest disabled (the default): `auto` → local, `cloud` → local — every request is a single hop to llama-swap.
 
@@ -544,7 +561,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Redirect to `/dashboard` |
-| `GET` | `/dashboard` | Embedded HTML dashboard with live routing feed, version display, one-click upgrades, review sessions |
+| `GET` | `/dashboard` | Embedded HTML dashboard: live routing feed grouped **per conversation** (client session header, or a stable hash of the conversation prefix when no header is present — each conversation renders as one card), hop-chain rendering for multi-hop fallbacks, Sankey flow diagram (harness → session → prompts → hops → classification → model → reviewer), version display, one-click upgrades, review sessions |
 | `GET` | *(favicon/logo assets)* | Static assets for dashboard UI |
 
 ### Dashboard API
@@ -553,7 +570,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 |---|---|---|
 | `GET` | `/api/routing-events` | Live routing event feed (SSE or polling) |
 | `GET` | `/api/routing-stats` | Aggregate routing statistics |
-| `GET` | `/api/inference-status` | Current inference state, model, elapsed time, token progress |
+| `GET` | `/api/inference-status` | Current inference state, model, elapsed time, token progress. `n_tokens` = total tokens decoded on the llama-server slot (monotonic within a request) — the progress bar is `n_tokens / max_tokens`. Slot data comes from the llama-server `/slots` endpoint (served as a bare JSON array on this build; both shapes are tolerated), with the live per-request count read from `next_token.n_decoded` (object or single-element array) |
 | `GET` | `/api/service-health` | Circuit breaker status for all providers |
 | `GET` | `/api/versions` | Version information for brainrouter and dependencies |
 | `GET` | `/api/review-config` | Current review configuration (mode, model) |
@@ -573,7 +590,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `POST` | `/api/upgrade/llama-swap` | One-click upgrade llama-swap |
 | `POST` | `/api/upgrade/manifest` | One-click upgrade Manifest |
 | `POST` | `/api/upgrade/toolbox` | One-click upgrade llama.cpp toolbox |
-| `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier llama-server to free or reclaim VRAM; while stopped, `auto` routing defaults to Cloud |
+| `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier llama-server to free or reclaim VRAM; while stopped, `auto` routing defaults to Local. Toggling Bonsai **off also turns prompt rewrite off** (server-side coupling — the invariant "rewrite on ⇒ Bonsai on" is enforced in the daemon, not just the UI) |
 | `POST` | `/api/models/flush` | Unload all models from llama-swap memory (frees VRAM) without restarting the service |
 
 ### Review Endpoints
@@ -692,8 +709,12 @@ Working directory tracking (for bridge sessions and review context gathering) en
 Required configuration is validated at daemon startup:
 
 - `manifest.base_url` must start with `http://` or `https://`
-- `bonsai.model_path` must exist on disk
+- `bonsai.model_path` must exist on disk — **only when `bonsai.enabled: true`**; a missing file with Bonsai off does not crash startup (Bonsai can be enabled later at runtime once the model is in place)
 - `llama_swap.fallback_model` is required
+
+### No secrets in the repo (multi-user install)
+
+The Manifest API key (`mnfst_*`) is never committed: it lives in `/etc/brainrouter/env` (shared) or each user's `~/.config/brainrouter/.env`, and configs reference it by **variable name** via `manifest.api_key_env`. Per-user repair scripts in `deploy/*.sh` are machine-local and **gitignored** — they never embed the key; they source it from an existing `.env` on the machine or prompt the admin for it at deploy time.
 
 ### Shared credentials (multi-user install)
 

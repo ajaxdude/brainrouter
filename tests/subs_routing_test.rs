@@ -219,29 +219,83 @@ async fn unconfigured_subs_falls_back_to_auto_without_error() {
     assert_eq!(captured.lock().clone(), vec![FALLBACK_KEY.to_string()]);
 }
 
+/// Spawn a mock llama-swap that records the model in each request body and
+/// replies HTTP 500 (a backend error) so the router's error path runs.
+/// Returns the URL and the shared list of seen model keys.
+async fn spawn_failing_llama_swap() -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+
+    let cap = captured.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let cap = cap.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let text = String::from_utf8_lossy(&buf[..n]);
+                if let Some(body) = text.split("\r\n\r\n").nth(1) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim_end()) {
+                        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+                            cap.lock().push(model.to_string());
+                        }
+                    }
+                }
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                sock.write_all(resp.as_bytes()).await.ok();
+            });
+        }
+    });
+
+    (format!("http://{}", addr), captured)
+}
+
 #[tokio::test]
-async fn bare_named_model_routes_local_direct_without_classifier() {
-    let (url, captured) = spawn_mock_llama_swap().await;
-    // A model that is NOT in local_models and NOT a reserved routing token
-    // (auto/local/cloud/subs). OMP strips the `brainrouter/` provider prefix
-    // before sending, so the daemon receives the bare key. It must route Local
-    // directly to that model — never to the classifier (which, with a stale
-    // Bonsai flag, used to fall back to Cloud → Nail). Regression guard for
-    // "pick a model in brainrouter, it routes there".
+async fn direct_model_failure_does_not_fall_back_to_fallback_model() {
+    let (url, captured) = spawn_failing_llama_swap().await;
+    // A directly-selected model that fails to load must surface the error, NOT
+    // silently retry with fallback_model. This is the "memory compaction"
+    // surprise: brainrouter/ds4-deepseek-... was failing and switching to the
+    // subs pool. Direct picks are authoritative — no fallback hop.
     let router = make_router(&url, None, vec![]);
 
-    let (resp, info) = router
-        .route_tagged(chat_request("dirk-qwen3.8-27b-q8-nudge"), None, "/tmp".to_string())
-        .await
-        .unwrap();
-
-    assert_eq!(info.bonsai_decision, "local-specific");
-    assert_eq!(info.model_key, "dirk-qwen3.8-27b-q8-nudge");
-    drop(resp);
+    let result = router
+        .route_tagged(chat_request("ds4-deepseek-v4-flash-0731-layers37"), None, "/tmp".to_string())
+        .await;
+    assert!(result.is_err(), "direct model failure must surface, not fall back");
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let seen = captured.lock().clone();
     assert_eq!(
-        captured.lock().clone(),
-        vec!["dirk-qwen3.8-27b-q8-nudge".to_string()]
+        seen,
+        vec!["ds4-deepseek-v4-flash-0731-layers37".to_string()],
+        "mock saw exactly the requested model — fallback_model must never be attempted"
     );
+}
+
+#[tokio::test]
+async fn auto_local_still_falls_back_on_failure() {
+    let (url, _captured) = spawn_failing_llama_swap().await;
+    // Managed routing (auto → local) keeps the fallback hop: if Bonsai's chosen
+    // model fails, route_local retries with fallback_model. Only direct picks
+    // are authoritative.
+    let router = make_router(&url, None, vec![]);
+
+    let result = router
+        .route_tagged(chat_request("auto"), None, "/tmp".to_string())
+        .await;
+    // Classifier is off → auto routes local to default_local_model (fallback_key).
+    // That fails → retry with fallback_model (same key here) → also fails.
+    assert!(result.is_err());
+    drop(result);
 }

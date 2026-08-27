@@ -6,3 +6,15 @@
 # Secrets and local config — never commit
 .env
 brainrouter.yaml
+
+# Machine-local repair/verification scripts (already-tracked deploy/*.sh stay
+# in the repo). Never embed secrets here — source keys from an existing .env
+# or prompt the admin at deploy time.
+deploy/fix-*.sh
+deploy/test-*.sh
+deploy/zachary-setup.sh
+sudo-deploy.sh
+# Local investigation notes and scratch configs — machine-specific, not shared.
+config(3).yaml
+phase0-findings.md
+learning.md

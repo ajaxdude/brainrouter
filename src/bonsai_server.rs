@@ -181,12 +181,6 @@ pub struct BonsaiControl {
     enabled: Arc<AtomicBool>,
 }
 
-/// Default PrismML fork llama-server binary path (mirrors config.rs).
-fn default_fork_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(format!("{}/.local/share/brainrouter/llama-prism/llama-server", home))
-}
-
 impl BonsaiControl {
     /// Build the control and start the server (initial state: on).
     pub async fn start(fork_path: PathBuf, model_path: PathBuf, port: u16) -> Result<Self> {
@@ -205,10 +199,18 @@ impl BonsaiControl {
     /// Build the control in the disabled state (bonsai.enabled: false).
     /// No llama-server is spawned and the classifier flag starts off; the
     /// dashboard/CLI can still start it later via `toggle`.
-    pub async fn disabled(port: u16) -> Self {
+    ///
+    /// `fork_path`/`model_path` are retained from config so a later runtime
+    /// `toggle` can start the server — without them `start_server` fails with
+    /// "bonsai.model_path is not configured".
+    pub async fn disabled(
+        fork_path: PathBuf,
+        model_path: Option<PathBuf>,
+        port: u16,
+    ) -> Self {
         Self {
-            fork_path: default_fork_path(),
-            model_path: None,
+            fork_path,
+            model_path,
             port,
             server: Mutex::new(None),
             op_lock: tokio::sync::Mutex::new(()),

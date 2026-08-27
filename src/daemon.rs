@@ -82,7 +82,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .context("Failed to start Bonsai llama-server")?
     } else {
         warn!("Bonsai classifier is disabled (bonsai.enabled: false) — auto-routed requests go straight to llama-swap. Enable it with `brainrouter cli bonsai on` or set bonsai.enabled: true in brainrouter.yaml.");
-        BonsaiControl::disabled(config.bonsai.server_port).await
+        BonsaiControl::disabled(
+            config.bonsai.fork_path.clone(),
+            config.bonsai.model_path.clone(),
+            config.bonsai.server_port,
+        )
+        .await
     };
 
     // Nudge (per-request reasoning budget) runtime state — shared between the

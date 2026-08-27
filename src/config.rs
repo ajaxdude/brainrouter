@@ -270,7 +270,7 @@ fn default_max_iterations() -> u32 {
 }
 
 fn default_review_mode() -> String {
-    "auto".to_string()
+    "local".to_string()
 }
 
 impl Default for ReviewConfig {

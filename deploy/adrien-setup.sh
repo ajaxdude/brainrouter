@@ -30,7 +30,7 @@ TARGET_GID=$(id -g $TARGET)
 PAPA_HOME=/home/papa
 BR_SRC="$PAPA_HOME/ai/projects/brainrouter"
 BR_RELEASE="$BR_SRC/target/release/brainrouter"
-MANIFEST_API_KEY="mnfst_ytpwnQbFC93YpSreS60JOSl1Eos3V9Ime3uunPpiO-g"
+MANIFEST_API_KEY=""  # sourced at .env-write time; never stored in this script
 BRAINROUTER_PORT=9100  # papa uses 9099; each user needs a unique TCP port
 
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -145,8 +145,39 @@ log "8. brainrouter config"
 install -d -o $TARGET -g $TARGET_GID -m 750 "$TARGET_HOME/.config/brainrouter"
 CONFIG="$TARGET_HOME/.config/brainrouter/brainrouter.yaml"
 if [[ ! -f "$CONFIG" ]]; then
-    install -o $TARGET -g $TARGET_GID -m 644 \
-        "$BR_SRC/brainrouter.yaml" "$CONFIG"
+    cat > "$CONFIG" <<BRCONFIG
+# brainrouter.yaml — $TARGET (generated)
+
+manifest:
+  base_url: "http://127.0.0.1:3001/v1"
+  api_key_env: MANIFEST_API_KEY
+
+llama_swap:
+  base_url: "http://127.0.0.1:8081/v1"
+  fallback_model: "qwen3.6-35b-a3b"
+
+bonsai:
+  # Off by default — enable only after confirming the model file exists.
+  # Requires the PrismML fork (fork_path); stock llama.cpp cannot load it.
+  enabled: false
+  model_path: "/mnt/models/prism/Bonsai-27B-Q1_0.gguf"
+  fork_path: "/home/papa/.local/share/brainrouter/llama-prism/llama-server"
+  server_port: 9200
+
+models:
+  path: "/mnt/models"
+  shared_write: false
+
+bridge:
+  omp_path: "${TARGET_HOME}/.bun/bin/omp"
+  work_dir: "${TARGET_HOME}"
+  discord:
+    enabled: false
+  signal:
+    enabled: false
+BRCONFIG
+    chown $TARGET:$TARGET_GID "$CONFIG"
+    chmod 640 "$CONFIG"
     ok "brainrouter.yaml written"
 else
     skip "brainrouter.yaml already exists"
@@ -155,7 +186,27 @@ fi
 # ── 9. .env ───────────────────────────────────────────────────────────────────
 log "9. .env (Manifest API key)"
 ENV_FILE="$TARGET_HOME/.config/brainrouter/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
+# Never store the key in this script: pull from an existing .env on the
+# machine (papa's first), else prompt the admin.
+_find_key() {
+    local f k
+    for f in /home/papa/.config/brainrouter/.env /etc/brainrouter/env; do
+        [[ -r "$f" ]] || continue
+        k=$(grep -m1 '^MANIFEST_API_KEY=mnfst_' "$f" 2>/dev/null | cut -d= -f2-)
+        [[ -n "$k" ]] && { echo "$k"; return 0; }
+    done
+    return 1
+}
+if [[ -f "$ENV_FILE" ]] && grep -q '^MANIFEST_API_KEY=mnfst_' "$ENV_FILE"; then
+    skip ".env already has a valid Manifest key"
+else
+    if MANIFEST_API_KEY=$(_find_key); then
+        log "Manifest API key pulled from existing .env"
+    else
+        read -rsp "Paste MANIFEST_API_KEY (mnfst_*): " MANIFEST_API_KEY
+        echo
+        [[ "$MANIFEST_API_KEY" == mnfst_* ]] || { echo "ERR: key must start with mnfst_"; exit 1; }
+    fi
     cat > "$ENV_FILE" <<ENV
 MANIFEST_API_KEY=$MANIFEST_API_KEY
 PATH=/usr/local/bin:/usr/bin:/bin:$TARGET_HOME/.bun/bin
@@ -163,8 +214,6 @@ ENV
     chown $TARGET:$TARGET_GID "$ENV_FILE"
     chmod 600 "$ENV_FILE"
     ok ".env written with Manifest API key"
-else
-    skip ".env already exists"
 fi
 
 # ── 10. systemd service ───────────────────────────────────────────────────────
