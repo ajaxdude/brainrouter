@@ -9,6 +9,14 @@
 
 set -euo pipefail
 
+# ── Dashboard HTML: syntax-check embedded JS (cargo test can't catch this) ───
+if git diff --cached --name-only | grep -qE '^src/escalation/templates/.*\.html$'; then
+    bash scripts/check-html-js.sh || {
+        echo "pre-commit: dashboard HTML JS syntax check FAILED — commit aborted" >&2
+        exit 1
+    }
+fi
+
 CARGO_TOML="Cargo.toml"
 SENTINEL=".git/BRAINROUTER_VERSION_BUMPED"
 

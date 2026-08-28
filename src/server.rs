@@ -291,7 +291,8 @@ async fn handle_request(
 
         ("POST", "/v1/chat/completions") => {
             let session_id = extract_session_id(req.headers());
-            match handle_chat_completion(req, state, cwd, session_id).await {
+            let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+            match handle_chat_completion(req, state, cwd, session_id, user_agent).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
@@ -306,7 +307,8 @@ async fn handle_request(
 
         ("POST", "/v1/messages") => {
             let session_id = extract_session_id(req.headers());
-            match handle_anthropic_messages(req, state, cwd, session_id).await {
+            let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+            match handle_anthropic_messages(req, state, cwd, session_id, user_agent).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling Anthropic messages: {}", e);
@@ -971,6 +973,7 @@ async fn handle_chat_completion(
     state: Arc<AppState>,
     cwd: String,
     session_id: Option<String>,
+    user_agent: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
@@ -990,7 +993,7 @@ async fn handle_chat_completion(
     // a model (which can take minutes for large models like qwen3-27b-mtp).
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = state.router.route_tagged(request, session_id, cwd).await;
+        let result = state.router.route_tagged(request, session_id, cwd, user_agent).await;
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });
@@ -1018,6 +1021,7 @@ async fn handle_anthropic_messages(
     state: Arc<AppState>,
     cwd: String,
     session_id: Option<String>,
+    user_agent: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
@@ -1035,7 +1039,7 @@ async fn handle_anthropic_messages(
     // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = state.router.route_tagged(oai_request, session_id, cwd).await;
+        let result = state.router.route_tagged(oai_request, session_id, cwd, user_agent).await;
         let stream_result = result.map(|(resp, _info)| match resp {
             ProviderResponse::Stream(s) => s,
         });

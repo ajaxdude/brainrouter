@@ -146,7 +146,7 @@ async fn brainrouter_subs_prefix_routes_to_subs_model() {
     let router = make_router(&url, Some(SUBS_KEY), vec![]);
 
     let (resp, info) = router
-        .route_tagged(chat_request("brainrouter/subs"), None, "/tmp".to_string())
+        .route_tagged(chat_request("brainrouter/subs"), None, "/tmp".to_string(), String::new())
         .await
         .unwrap();
 
@@ -168,7 +168,7 @@ async fn bare_subs_model_also_routes_to_subs_pool() {
     let router = make_router(&url, Some(SUBS_KEY), vec![]);
 
     let (resp, info) = router
-        .route_tagged(chat_request("subs"), None, "/tmp".to_string())
+        .route_tagged(chat_request("subs"), None, "/tmp".to_string(), String::new())
         .await
         .unwrap();
 
@@ -187,7 +187,7 @@ async fn direct_subs_model_key_via_local_models_also_bypasses_bonsai() {
     let router = make_router(&url, None, vec![SUBS_KEY]);
 
     let (resp, info) = router
-        .route_tagged(chat_request(SUBS_KEY), None, "/tmp".to_string())
+        .route_tagged(chat_request(SUBS_KEY), None, "/tmp".to_string(), String::new())
         .await
         .unwrap();
 
@@ -207,7 +207,7 @@ async fn unconfigured_subs_falls_back_to_auto_without_error() {
     let router = make_router(&url, None, vec![]);
 
     let (resp, info) = router
-        .route_tagged(chat_request("brainrouter/subs"), None, "/tmp".to_string())
+        .route_tagged(chat_request("brainrouter/subs"), None, "/tmp".to_string(), String::new())
         .await
         .unwrap();
 
@@ -270,7 +270,7 @@ async fn direct_model_failure_does_not_fall_back_to_fallback_model() {
     let router = make_router(&url, None, vec![]);
 
     let result = router
-        .route_tagged(chat_request("ds4-deepseek-v4-flash-0731-layers37"), None, "/tmp".to_string())
+        .route_tagged(chat_request("ds4-deepseek-v4-flash-0731-layers37"), None, "/tmp".to_string(), String::new())
         .await;
     assert!(result.is_err(), "direct model failure must surface, not fall back");
 
@@ -292,7 +292,7 @@ async fn auto_local_still_falls_back_on_failure() {
     let router = make_router(&url, None, vec![]);
 
     let result = router
-        .route_tagged(chat_request("auto"), None, "/tmp".to_string())
+        .route_tagged(chat_request("auto"), None, "/tmp".to_string(), String::new())
         .await;
     // Classifier is off → auto routes local to default_local_model (fallback_key).
     // That fails → retry with fallback_model (same key here) → also fails.

@@ -209,6 +209,7 @@ impl Router {
         mut request: ChatCompletionRequest,
         session_id: Option<String>,
         cwd: String,
+        user_agent: String,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
@@ -309,6 +310,7 @@ impl Router {
                         bonsai_decision,
                         cwd: cwd.clone(),
                         session_id: session_id.clone(),
+                        user_agent: user_agent.clone(),
                     });
                 }
                 self.routing_events.emit(RouteEvent {
@@ -325,6 +327,7 @@ impl Router {
                     bonsai_decision,
                     cwd: cwd.clone(),
                     session_id: session_id.clone(),
+                    user_agent: user_agent.clone(),
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -347,6 +350,7 @@ impl Router {
                     bonsai_decision,
                     cwd,
                     session_id: session_id.clone(),
+                    user_agent,
                 });
                 return Err(e);
             }

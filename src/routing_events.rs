@@ -58,6 +58,9 @@ pub struct RouteEvent {
     /// Session ID if this route call was for a review loop iteration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// User-Agent header of the calling harness ("" when internal/unknown).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user_agent: String,
 }
 
 /// Thread-safe in-memory circular buffer.
