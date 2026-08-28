@@ -963,9 +963,9 @@ function skModel(e) {
   return 'failed';
 }
 
-// Col 6 — the reviewer model (review sessions only; null = no reviewer).
+// Col 6 — the reviewer model (review sessions only; '—' = no reviewer).
 function skReviewer(e, sess) {
-  if (!e.session_id || !sess) return null;
+  if (!e.session_id || !sess) return '—';
   const raw = sess.review_model || '';
   const pm = raw.match(/\(([^)]+)\)$/);
   return (pm ? pm[1] : raw) || 'reviewing';
@@ -997,7 +997,7 @@ function skColorFor(col, key) {
       'direct:local': '#22d39a', 'direct:cloud': '#9d7bff',
       'subs-pool': '#ff7ac6', 'named-model': '#3ec5ff',
     },
-    6: { 'reviewing': '#f5b14a' },
+    6: { 'reviewing': '#f5b14a', '—': '#5a6679' },
   };
   if (map[col] && map[col][key]) return map[col][key];
   const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
@@ -1027,12 +1027,15 @@ function updateSankey() {
   const NC = SK_COLS.length;
   const counts = Array.from({ length: NC }, () => new Map());
   const linkCounts = Array.from({ length: NC - 1 }, () => new Map());
+  // Node keys may themselves contain '→' (multi-hop HOPS chains), so link
+  // keys must be joined with a separator that cannot occur in any key.
+  const SK_SEP = '\u0001';
   for (const e of enriched) {
     const k = skKeysOf(e, e._session);
     const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5, k.c6];
     for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
     for (let i = 0; i + 1 < NC; i++) {
-      const lk = keys[i] + '→' + keys[i + 1];
+      const lk = keys[i] + SK_SEP + keys[i + 1];
       linkCounts[i].set(lk, (linkCounts[i].get(lk) || 0) + 1);
     }
   }
@@ -1048,7 +1051,7 @@ function updateSankey() {
 
   const allLinks = [];
   linkCounts.forEach((m, i) => m.forEach((value, lk) => {
-    const sep = lk.indexOf('→');
+    const sep = lk.indexOf(SK_SEP);
     allLinks.push({ i, a: lk.slice(0, sep), b: lk.slice(sep + 1), value });
   }));
   const byOut = {}, byIn = {};
@@ -1937,7 +1940,7 @@ async function refreshFast() {
   if (stRes) statsData = stRes;
   if (infRes) inferenceStatus = infRes;
 
-  updateToolboxes();
+  if (activeView === 'stream') renderStream();
 
   updateSankey();
   updateKPI();
