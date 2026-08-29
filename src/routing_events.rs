@@ -61,6 +61,12 @@ pub struct RouteEvent {
     /// User-Agent header of the calling harness ("" when internal/unknown).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_agent: String,
+    /// Stable conversation fingerprint (hash of system prompt + first user
+    /// message). Lets the dashboard group every turn of one harness
+    /// conversation into a single card when the client sends no session id.
+    /// Empty for review-loop events (they carry `session_id` instead).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub conv_id: String,
 }
 
 /// Thread-safe in-memory circular buffer.

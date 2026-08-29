@@ -536,6 +536,7 @@ function enrichEvents(events, sessions) {
   // render the whole chain from _hops.
   const chainKey = (e) => {
     if (e.session_id) return 'sess:' + e.session_id;
+    if (e.conv_id) return 'conv:' + e.conv_id;
     const ts = Math.floor(new Date(e.timestamp).getTime() / 60000);
     return 'prompt:' + (e.cwd || '') + ':' + (e.prompt_excerpt || '').slice(0, 80) + ':' +
       (isFinite(ts) ? ts : 0);
@@ -604,6 +605,7 @@ function matchesSearch(t) {
     t.requested_model || '',
     t.effective_provider || '',
     t.session_id || '',
+    t.conv_id || '',
   ].join(' ').toLowerCase();
   return haystack.includes(searchQuery);
 }
@@ -716,7 +718,9 @@ function escHtml(s) {
 // Group routing events into logical "requests": one card per prompt.
 // Multiple events for the same prompt (retries, review iterations, fallbacks)
 // collapse into a single card. A group is identified by session_id when
-// present, otherwise by (prompt_excerpt + cwd) within a 60s window.
+// present, else by conv_id (the server-side conversation fingerprint — one
+// card for the whole harness conversation), otherwise by (prompt_excerpt +
+// cwd) within a 60s window.
 function groupEvents(events) {
   const groups = []; // { key, events[], session, latestTs }
   const keyMap = {};
@@ -728,6 +732,8 @@ function groupEvents(events) {
     let key;
     if (e.session_id) {
       key = 'sess:' + e.session_id;
+    } else if (e.conv_id) {
+      key = 'conv:' + e.conv_id;
     } else {
       // Time-bucket: round down to nearest 60s to catch retries.
       const bucket = Math.floor(new Date(e.timestamp).getTime() / 60000);
@@ -746,6 +752,30 @@ function groupEvents(events) {
 
   // Return newest-first.
   return groups.sort((a,b) => new Date(b.latestTs) - new Date(a.latestTs));
+}
+
+// Split a conversation group into turns: one turn = one harness request and
+// its retry/fallback hops.  Hops share the prompt text and follow each other
+// within seconds, so a turn is a run of same-prompt events where each event
+// lands within 60s of the previous one (gap-based, so a hop chain that
+// straddles a minute boundary still stays one turn).
+function turnsOf(group) {
+  const turns = [];
+  const byPrompt = {};  // prompt prefix -> { idx: turn index, ts: last timestamp }
+  for (const e of group.events) {
+    const pk = (e.prompt_excerpt || '').slice(0, 80);
+    const ts = new Date(e.timestamp).getTime();
+    const prev = byPrompt[pk];
+    if (!prev || ts - prev.ts > 60000) {
+      byPrompt[pk] = { idx: turns.length, ts };
+      turns.push([]);
+    } else {
+      prev.ts = Math.max(prev.ts, ts);
+    }
+    turns[byPrompt[pk].idx].push(e);
+  }
+  // Newest turn first; within a turn keep chronological (hop) order.
+  return turns.sort((a, b) => new Date(b[b.length - 1].timestamp) - new Date(a[a.length - 1].timestamp));
 }
 
 // Progress percentage for a request card.
@@ -816,6 +846,44 @@ function progressBar(pct, isLive) {
   </div>`;
 }
 
+// One turn (prompt + its hops) rendered as a nested sub-card, used when a
+// conversation group has several turns. Mirrors the single-turn card body but
+// without the outer chrome (border-left, header).
+function renderTurnCard(evs) {
+  const latest = evs[evs.length - 1];
+  const successEv = evs.filter(e => e.success);
+  const displayEv = successEv.length ? successEv[successEv.length - 1] : latest;
+  const routeColor = (displayEv._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
+
+  const totalLatency = evs.reduce((sum, e) => sum + (e.latency_ms || 0), 0);
+  const lat = fmtLatency(totalLatency || latest.latency_ms);
+  const age = fmtAge(latest.timestamp);
+  const prompt = escHtml((latest.prompt_excerpt || '(no prompt)').slice(0, 400));
+
+  const errHtml = (!latest.success && latest.error)
+    ? `<div style="margin-top:6px;padding:8px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:11px;color:var(--text)">${escHtml(latest.error)}</div>`
+    : '';
+
+  let hopSummary = '';
+  if (evs.length > 1) {
+    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗')).join(' → ');
+    hopSummary = `<div style="margin-top:6px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${evs.length} hops · ${escHtml(chain)} · ${lat}</div>`;
+  }
+
+  return `<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg2);padding:10px 12px;margin-bottom:8px">
+    <div style="font-size:12px;color:var(--text);line-height:1.5">${prompt}</div>
+    ${errHtml}
+    ${hopSummary}
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">
+      <span style="color:${routeColor}">${escHtml(displayEv._route || '—')}</span>
+      <span>·</span>
+      <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
+      <span style="opacity:0.6">· ${lat}</span>
+      <span style="margin-left:auto;opacity:0.6">${age}</span>
+    </div>
+  </div>`;
+}
+
 function renderGroup(group, index) {
   const evs = group.events;
   const latest = evs[evs.length - 1];
@@ -837,45 +905,41 @@ function renderGroup(group, index) {
 
   const folder = latest._folder || first._folder || '';
   const age    = fmtAge(group.latestTs);
-  const prompt = escHtml(first.prompt_excerpt || '(no prompt)');
   const pct    = requestProgress(group, inferenceStatus);
 
-  const errHtml = (!latest.success && latest.error)
-    ? `<div style="margin-top:8px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(latest.error)}</div>`
-    : '';
+  // Turns: a conversation group (conv_id) holds every harness turn; each one
+  // renders as a nested sub-card.  A one-turn group renders flat, exactly as
+  // before — no gratuitous nesting for a single request.
+  const turns = turnsOf(group);
 
-  // Hops summary — one compact line, never expanded rows.  Failed fallback
-  // hops and the winner render as a single chain (e.g. "2 hops · manifest ✗ → local ✓").
-  const hopCount = evs.length;
-  let hopSummary = '';
-  if (hopCount > 1) {
-    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('context') ? ' (ctx too small)' : ''))).join(' → ');
-    hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${escHtml(chain)} · ${lat}</div>`;
+  let body;
+  if (turns.length > 1) {
+    body = `<div style="padding:10px 16px 10px">
+      ${turns.map(renderTurnCard).join('')}
+    </div>`;
   } else {
-    // Single failed hop: surface the actionable error inline.
-    const f = evs.find(e => !e.success && e.error);
-    if (f) {
-      const msg = f.error.includes('context')
-        ? 'request exceeds local context size — adjust n_ctx in the llama-swap model config'
-        : f.error;
-      hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--red)">${escHtml(msg)}</div>`;
+    const prompt = escHtml(first.prompt_excerpt || '(no prompt)');
+    const errHtml = (!latest.success && latest.error)
+      ? `<div style="margin-top:8px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(latest.error)}</div>`
+      : '';
+    // Hops summary — one compact line, never expanded rows.  Failed fallback
+    // hops and the winner render as a single chain (e.g. "2 hops · manifest ✗ → local ✓").
+    const hopCount = evs.length;
+    let hopSummary = '';
+    if (hopCount > 1) {
+      const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('context') ? ' (ctx too small)' : ''))).join(' → ');
+      hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${escHtml(chain)} · ${lat}</div>`;
+    } else {
+      // Single failed hop: surface the actionable error inline.
+      const f = evs.find(e => !e.success && e.error);
+      if (f) {
+        const msg = f.error.includes('context')
+          ? 'request exceeds local context size — adjust n_ctx in the llama-swap model config'
+          : f.error;
+        hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--red)">${escHtml(msg)}</div>`;
+      }
     }
-  }
-
-  return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
-    ${isLive ? '<div class="shimmer-bar"></div>' : ''}
-    <header style="padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
-      <div style="width:24px;height:24px;border-radius:6px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${src.glyph}</div>
-      <div style="flex:1;min-width:0">
-        <span style="color:${src.color};font-weight:600;font-size:12px">${src.label}</span>
-        ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
-      </div>
-      ${statusPill(st)}
-      <button onclick="dismissCard(${index})" title="Hide this card"
-        style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
-    </header>
-    ${progressBar(pct, isLive)}
-    <div style="padding:10px 16px 4px">
+    body = `<div style="padding:10px 16px 4px">
       <div style="font-size:13px;color:var(--text);line-height:1.5">${prompt}</div>
       ${errHtml}
       ${hopSummary}
@@ -886,7 +950,24 @@ function renderGroup(group, index) {
       <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
       ${hopCount === 1 ? `<span style="opacity:0.6">· ${lat}</span>` : ''}
       <span style="margin-left:auto;opacity:0.6">${age}</span>
-    </div>
+    </div>`;
+  }
+
+  return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
+    ${isLive ? '<div class="shimmer-bar"></div>' : ''}
+    <header style="padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
+      <div style="width:24px;height:24px;border-radius:6px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${src.glyph}</div>
+      <div style="flex:1;min-width:0">
+        <span style="color:${src.color};font-weight:600;font-size:12px">${src.label}</span>
+        ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
+        ${turns.length > 1 ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px;font-family:'JetBrains Mono',monospace">· ${turns.length} turns</span>` : ''}
+      </div>
+      ${statusPill(st)}
+      <button onclick="dismissCard(${index})" title="Hide this card"
+        style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
+    </header>
+    ${progressBar(pct, isLive)}
+    ${body}
     ${reviewHtml(sess, latest.id)}
   </article>`;
 }
@@ -934,11 +1015,13 @@ function skHarness(e) {
   return name || 'other';
 }
 
-// Col 1 — the conversation/session (events without a session id collapse to 'one-shot').
+// Col 1 — the conversation/session. conv_id (server fingerprint) groups every
+// turn of one harness conversation under one node; events with neither id
+// collapse to 'one-shot'.
 function skSession(e) {
-  if (!e.session_id) return 'one-shot';
-  const id = e.session_id;
-  return id.length > 8 ? id.slice(0, 8) : id;
+  const id = e.session_id || (e.conv_id ? '#' + e.conv_id.slice(0, 8) : '');
+  if (!id) return 'one-shot';
+  return id.length > 9 ? id.slice(0, 9) : id;
 }
 
 // Col 2 — the prompt shape (what actually hit the router).

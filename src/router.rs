@@ -214,6 +214,10 @@ impl Router {
         let start = Instant::now();
         let requested_model = request.model.clone();
         let prompt_excerpt = extract_prompt_excerpt(&request);
+        // Conversation id for dashboard grouping: computed from the ORIGINAL
+        // messages (before any local rewrite) so every turn of one harness
+        // conversation hashes identically.
+        let conv_id = conversation_fingerprint(&request);
 
         let tracker = &self.inference_tracker;
         let max_tokens = request.max_tokens;
@@ -311,6 +315,7 @@ impl Router {
                         cwd: cwd.clone(),
                         session_id: session_id.clone(),
                         user_agent: user_agent.clone(),
+                        conv_id: conv_id.clone(),
                     });
                 }
                 self.routing_events.emit(RouteEvent {
@@ -328,6 +333,7 @@ impl Router {
                     cwd: cwd.clone(),
                     session_id: session_id.clone(),
                     user_agent: user_agent.clone(),
+                    conv_id: conv_id.clone(),
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -351,6 +357,7 @@ impl Router {
                     cwd,
                     session_id: session_id.clone(),
                     user_agent,
+                    conv_id,
                 });
                 return Err(e);
             }
@@ -729,6 +736,54 @@ fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str)
     }
 }
 
+/// Stable per-conversation fingerprint for dashboard grouping.
+///
+/// Harnesses (OMP) send no session header, so without this every turn of one
+/// conversation is a separate dashboard card. The first system message plus
+/// the FIRST user message are identical on every turn of a conversation
+/// (the whole history rides along each request), so hashing that prefix
+/// yields one id for the whole conversation — stable across turns, retries,
+/// and fallbacks. FNV-1a 64-bit: identity only, no security relevance.
+/// "" when the request carries no user message.
+fn conversation_fingerprint(request: &ChatCompletionRequest) -> String {
+    let sys = request.messages.iter().find(|m| m.role == "system").map(|m| message_text(&m.content));
+    let first_user = request.messages.iter().find(|m| m.role == "user").map(|m| message_text(&m.content));
+    let (Some(sys), Some(first_user)) = (sys, first_user) else {
+        return String::new();
+    };
+    if first_user.is_empty() {
+        return String::new();
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for text in [&sys, &first_user] {
+        // Truncate at a char boundary — prompts are full of em dashes and
+        // CJK; a naive byte slice would panic mid-codepoint.
+        let mut end = text.len().min(400);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        for b in text[..end].as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:016x}", h)
+}
+
+/// Flatten a message's content (string or text-part array) to plain text.
+fn message_text(content: &Option<serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
 /// Extract the last user message from the request, truncated to 200 chars.
 /// Mirrors the logic in classifier.rs but with a shorter limit for the event log.
 fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
@@ -762,6 +817,77 @@ fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some(serde_json::Value::String(content.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn asst(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(serde_json::Value::String(content.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn req(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "auto".into(),
+            messages,
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn fingerprint_stable_across_turns_and_differs_per_conversation() {
+        let sysm = sys("SYSTEM PROMPT");
+        let turn1 = req(vec![
+            sysm.clone(),
+            user("first turn"),
+            asst("ok"),
+            user("second turn"),
+        ]);
+        // Same conversation, later turn: fingerprint must match (system + FIRST user unchanged).
+        let mut later = turn1.clone();
+        later.messages.push(asst("ok2"));
+        later.messages.push(user("third turn"));
+        assert_eq!(conversation_fingerprint(&turn1), conversation_fingerprint(&later));
+
+        // Different conversation (different first user message) → different id.
+        let other = req(vec![sysm, user("totally different")]);
+        assert_ne!(conversation_fingerprint(&turn1), conversation_fingerprint(&other));
+
+        // No user message → empty (falls back to old prompt-bucket grouping).
+        assert_eq!(conversation_fingerprint(&req(vec![sys("only system")])), "");
+
+        // Non-ASCII beyond the 400-byte cap: truncation must land on a char
+        // boundary (a naive byte slice panics mid-codepoint).
+        let wide = req(vec![
+            sys(&"系统提示".repeat(200)),
+            user(&format!("Automated capture turn — 用户 — {}", "…".repeat(200))),
+        ]);
+        let fp = conversation_fingerprint(&wide);
+        assert_eq!(fp.len(), 16);
+
+        // Truncation cap must not merge distinct conversations that share
+        // the first 400 bytes: differ inside the cap → different id.
+        let a = req(vec![sys("S"), user(&format!("X{}tail1", "p".repeat(300)))]);
+        let b = req(vec![sys("S"), user(&format!("X{}tail2", "p".repeat(300)))]);
+        assert_ne!(conversation_fingerprint(&a), conversation_fingerprint(&b));
+    }
 
     fn sys(content: &str) -> ChatMessage {
         ChatMessage {
