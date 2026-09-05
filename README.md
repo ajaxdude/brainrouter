@@ -38,6 +38,9 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
 - **Headless CLI.** `brainrouter cli` mirrors every dashboard action from the terminal: status, versions, Bonsai/nudge/context/routing toggles, restarts, upgrades, config, and the full review lifecycle. See the [Headless CLI](#headless-cli-brainrouter-cli) section.
 - **VRAM control.** The dashboard or CLI can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
+- **In-flight request tracker.** The dashboard shows every active request as it runs — elapsed, model, user agent, address, session, bytes received, PP progress, and a live activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button. No need to open the llama-swap UI.
+- **Per-request throughput.** Conversation cards surface averaged prompt-tokens/s (pp) and generation-tokens/s (tg) chips, so you can see how a conversation performs across its turns.
+- **Four-column Sankey.** The flow diagram is HARNESS (Pi / OMP / Opencode / Claude / Droid) → SESSION (OMP session title) → ROUTING (auto / cloud / local / fallback chain) → MODEL (resolved key). Click any node to highlight its start-to-end path; click a conversation card to highlight the matching Sankey path.
 
 ---
 
@@ -362,6 +365,24 @@ The table below the flow panel shows the last 50 routing events, deduplicated:
 - Review iterations within the same session collapse into one row with an `iter N` badge.
 - Hover the **Prompt** cell to see the full prompt excerpt.
 - The **Folder** badge shows which project directory the request came from.
+
+### In-flight request tracker
+
+While a request is running, the dashboard shows it live — no need to open the llama-swap UI. The panel lists every active request with:
+
+- **Cancel** — a per-row button that aborts the in-flight request (the row is removed and the response stream ends)
+- **Elapsed** — how long the request has been running (updates every second)
+- **Model** — the resolved llama-swap model (updated after routing resolves; the requested model until then)
+- **Request** — the endpoint path (`POST /v1/chat/completions` or `POST /v1/messages`)
+- **Activity** — a live label derived from the response bytes: `tool calling` / `reasoning` / `asking a multiple choice question` / `generating`
+- **PP** — prefill progress (0–100%) when the llama-server build exposes slot progress
+- **Address / User-Agent / Session ID / Bytes received** — peer address, client UA, OMP session (or `#conv` hash), and bytes streamed so far
+
+The panel is hidden while no requests are in flight. Card progress bars show the same PP value; once a card settles it shows "Done for now".
+
+### Throughput chips on cards
+
+Each conversation card shows averaged **pp** (prompt tokens/s) and **tg** (generation tokens/s) chips, computed from the OpenAI SSE `usage` chunk at each request's end. Builds whose llama-server does not emit a `usage` chunk leave the chips hidden.
 
 ### Version header and upgrades
 
@@ -706,6 +727,9 @@ All on `http://127.0.0.1:9099`.
 |---|---|---|
 | `GET` | `/api/versions` | Installed versions + latest available |
 | `GET` | `/api/routing-events` | Live routing events feed |
+| `GET` | `/api/inflight` | Active in-flight requests (for the dashboard tracker) |
+| `POST` | `/api/inflight/cancel` | Cancel one in-flight request — body `{id}`; 404 for an unknown id |
+| `GET` | `/api/omp-sessions` | OMP session titles for the Sankey SESSION column |
 | `GET` | `/api/routing-stats` | Routing statistics |
 | `GET` | `/api/service-health` | Service health status per provider |
 | `GET` | `/api/bridge-status` | Bridge transport status (Discord / Signal) |

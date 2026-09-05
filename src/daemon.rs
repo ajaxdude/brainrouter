@@ -24,6 +24,33 @@ use brainrouter::{
     session::SessionManager,
 };
 
+/// Poll llama-swap /running for the active llama-server proxy, then its /slots
+/// array for prefill progress (n_prompt_processed / n_prompt_tokens). Returns
+/// None when the build exposes no /slots or nothing is prefilling.
+async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<(f64, String)> {
+    let running = client.get(format!("{}/running", ls_url))
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.ok()?
+        .json::<serde_json::Value>().await.ok()?;
+    let active_model = running["running"][0]["model"].as_str().unwrap_or("").to_string();
+    let proxy = running["running"][0]["proxy"].as_str()?.to_string();
+    let slots = client.get(format!("{}/slots", proxy))
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.ok()?
+        .json::<serde_json::Value>().await.ok()?;
+    let arr = slots.as_array()?;
+    for slot in arr {
+        let total = slot.get("n_prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let processed = slot.get("n_prompt_processed")
+            .or_else(|| slot.get("n_prompt_tokens_processed"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        if total > 0 {
+            return Some(((processed as f64 / total as f64).clamp(0.0, 1.0), active_model));
+        }
+    }
+    None
+}
+
 /// Arguments for the `serve` subcommand.
 #[derive(Args)]
 pub struct ServeArgs {
@@ -237,6 +264,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         nudge_model_key: config.llama_swap.nudge.model_key.clone(),
         nudge_budgets: config.llama_swap.nudge.budgets,
         prompt_rewrite,
+        inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
     });
 
     // Background task: compute versions once, then refresh every 30 minutes.
@@ -249,6 +277,23 @@ pub async fn run(args: ServeArgs) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
                 let data = server::compute_versions_json(&config.bonsai.fork_path).await;
                 let _ = tx.send_replace(data);
+            }
+        });
+    }
+    // Background task: feed the active llama-server's PP progress into the
+    // in-flight registry so the dashboard progress bar tracks prefill. The
+    // ds4 build exposes no /slots, so this gracefully no-ops there.
+    {
+        let ls_url = state.llama_swap_url.clone();
+        let inflight = Arc::clone(&state.inflight);
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some((frac, model)) = fetch_slots(&client, &ls_url).await else {
+                    continue;
+                };
+                inflight.set_pp_progress_for_model(&model, frac);
             }
         });
     }

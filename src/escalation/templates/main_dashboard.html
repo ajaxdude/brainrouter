@@ -126,6 +126,16 @@ textarea { resize: vertical; }
   cursor: pointer; transition: border-color 0.15s;
 }
 .file-card:hover { border-color: var(--borderHi); }
+  #sankey-svg .nd-dim { opacity:.12; }
+  #sankey-svg .lk { opacity:.28; }
+  #sankey-svg .lk.lk-dim { opacity:.04; }
+  #sankey-svg .lk.lk-hl { opacity:.65; }
+  #inflight-table { width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; font-size:11px }
+  #inflight-table th { text-align:left; color:var(--textMute); font-weight:500; font-size:9px; letter-spacing:1px; text-transform:uppercase; padding:4px 8px; border-bottom:1px solid var(--border) }
+  #inflight-table td { padding:5px 8px; border-bottom:1px solid var(--border); color:var(--textDim); vertical-align:top }
+  #inflight-table tr:last-child td { border-bottom:none }
+  .cancel-btn { all:unset; cursor:pointer; padding:2px 8px; border-radius:5px; font-size:10px; background:var(--redDim); color:var(--red); border:1px solid rgba(255,107,107,.35) }
+  .cancel-btn:hover { background:rgba(255,107,107,.22) }
 </style>
 </head>
 <body>
@@ -326,7 +336,7 @@ textarea { resize: vertical; }
     <div id="filter-btns" style="display:flex;gap:4px">
       <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">all</button>
       <button class="filter-btn" data-filter="live" onclick="setFilter('live')">live</button>
-      <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">approved</button>
+      <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">done</button>
       <button class="filter-btn" data-filter="escalated" onclick="setFilter('escalated')">escalated</button>
     </div>
   </div>
@@ -339,14 +349,29 @@ textarea { resize: vertical; }
       <!-- Sankey panel — full width, click a bar to filter the cards below -->
       <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · harness → session → prompts → hops → classification → model → reviewer</span>
+          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">FLOW · harness → session → routing → model · click a bar to highlight its path</span>
           <span id="sankey-filter-chip" style="display:none;margin-left:auto;align-items:center;gap:6px;font-size:10px;font-family:'JetBrains Mono',monospace;padding:3px 8px;border-radius:99px;background:var(--bg3);border:1px solid var(--border);color:var(--cyan)">
             <span id="sankey-filter-label"></span>
             <span onclick="clearSankeyFilter()" style="cursor:pointer;color:var(--textMute)">✕</span>
           </span>
         </div>
         <div id="sankey-container" style="width:100%;height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px">
-          <svg id="sankey-svg" viewBox="0 0 1856 418" width="2000" height="418" style="display:block"></svg>
+          <svg id="sankey-svg" viewBox="0 0 1232 418" width="1300" height="418" style="display:block"></svg>
+        </div>
+      </div>
+      <!-- In-flight requests (llama-swap parity) -->
+      <div id="inflight-panel" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;display:none">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <span style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;font-family:'JetBrains Mono',monospace">IN-FLIGHT REQUESTS</span>
+          <span id="inflight-count" style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--cyan)"></span>
+        </div>
+        <div style="overflow-x:auto">
+          <table id="inflight-table">
+            <thead><tr>
+              <th></th><th>Elapsed</th><th>Model</th><th>Request</th><th>Activity</th><th>PP</th><th>Address</th><th>User Agent</th><th>Session</th><th>Bytes</th>
+            </tr></thead>
+            <tbody id="inflight-tbody"></tbody>
+          </table>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 320px;gap:24px;align-items:start">
@@ -436,7 +461,7 @@ const STATUS_MAP = {
   generating: { c: '#22d39a', l: 'Generating', pulse: true  },
   reviewing:  { c: '#f5b14a', l: 'Reviewing',  pulse: true  },
   reasoning:  { c: '#9d7bff', l: 'Reasoning',  pulse: true  },
-  approved:   { c: '#22d39a', l: 'Approved',   pulse: false },
+  approved:   { c: '#22d39a', l: 'Done for now', pulse: false },
   escalated:  { c: '#ff6b6b', l: 'Escalated',  pulse: false },
   failed:     { c: '#ff6b6b', l: 'Failed',     pulse: false },
   iterating:  { c: '#f5b14a', l: 'Iterating',  pulse: true  },
@@ -448,6 +473,8 @@ let allEvents = [], allSessions = [], activeFilter = 'all', activeView = 'stream
 let inferenceStatus = null, healthData = {}, versionsData = {}, bridgeData = {}, statsData = {};
 let bonsaiData = null, bonsaiBusy = false;
 let searchQuery = '', currentRoutingMode = 'auto';
+let inflightList = [], ompSessions = null, ompHome = '', pollTick = 0;
+let ompTitleBySlug = {}, inflFetchTs = 0, skCardHi = null;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 async function safeFetch(url) {
@@ -603,6 +630,7 @@ function matchesSearch(t) {
     t._displayModel || '',
     t._folder || '',
     t.requested_model || '',
+    t.routing_class || '',
     t.effective_provider || '',
     t.session_id || '',
     t.conv_id || '',
@@ -838,10 +866,10 @@ function requestProgress(group, inf) {
   }
 }
 
-function progressBar(pct, isLive) {
+function progressBar(pct, isLive, ppId) {
   const color = isLive ? 'var(--green)' : (pct >= 100 ? 'var(--green)' : pct >= 70 ? 'var(--cyan)' : 'var(--textMute)');
   const shimmer = isLive ? 'background-image:linear-gradient(90deg,transparent,rgba(34,211,154,0.35),transparent);background-size:200% 100%;animation:brShimmer 1.8s linear infinite;' : '';
-  return `<div style="height:3px;background:var(--border);border-radius:99px;overflow:hidden;margin:0 16px 0">
+  return `<div${ppId != null ? ` data-pp-id="${ppId}"` : ''} style="height:3px;background:var(--border);border-radius:99px;overflow:hidden;margin:0 16px 0">
     <div style="height:100%;width:${pct}%;background:${color};border-radius:99px;transition:width 0.4s;${shimmer}"></div>
   </div>`;
 }
@@ -890,8 +918,10 @@ function renderGroup(group, index) {
   const first  = evs[0];
   const sess   = group.session;
 
+  // Live request matching this card (by conv_id or session_id).
+  const infReq = inflightFor(group);
   const st = deriveStatus(latest, sess, inferenceStatus);
-  const isLive = ['generating','reviewing','routing','iterating'].includes(st);
+  const isLive = !!infReq || ['generating','reviewing','routing','iterating'].includes(st);
   const src = SOURCES[latest._source] || SOURCES.local;
 
   // Determine the dominant route and model.
@@ -905,7 +935,9 @@ function renderGroup(group, index) {
 
   const folder = latest._folder || first._folder || '';
   const age    = fmtAge(group.latestTs);
-  const pct    = requestProgress(group, inferenceStatus);
+  const pct    = infReq
+    ? Math.max(2, Math.round((typeof infReq.pp_progress === 'number' ? infReq.pp_progress : 0) * 100))
+    : requestProgress(group, inferenceStatus);
 
   // Turns: a conversation group (conv_id) holds every harness turn; each one
   // renders as a nested sub-card.  A one-turn group renders flat, exactly as
@@ -949,11 +981,12 @@ function renderGroup(group, index) {
       <span>·</span>
       <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
       ${hopCount === 1 ? `<span style="opacity:0.6">· ${lat}</span>` : ''}
+      ${tsChips(evs)}
       <span style="margin-left:auto;opacity:0.6">${age}</span>
     </div>`;
   }
 
-  return `<article style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
+  return `<article data-gidx="${index}" style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
     ${isLive ? '<div class="shimmer-bar"></div>' : ''}
     <header style="padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
       <div style="width:24px;height:24px;border-radius:6px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${src.glyph}</div>
@@ -962,11 +995,11 @@ function renderGroup(group, index) {
         ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
         ${turns.length > 1 ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px;font-family:'JetBrains Mono',monospace">· ${turns.length} turns</span>` : ''}
       </div>
-      ${statusPill(st)}
+      ${infReq ? activityPill(infReq) : statusPill(st)}
       <button onclick="dismissCard(${index})" title="Hide this card"
         style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
     </header>
-    ${progressBar(pct, isLive)}
+    ${progressBar(pct, isLive, infReq ? infReq.id : null)}
     ${body}
     ${reviewHtml(sess, latest.id)}
   </article>`;
@@ -981,31 +1014,70 @@ function renderGroup(group, index) {
 // belong to a review session. Clicking any bar filters the card list.
 
 const SK_COLS = [
-  { name: 'harness', header: 'HARNESS',        x: 16   },
-  { name: 'session', header: 'SESSION',        x: 280  },
-  { name: 'prompt',  header: 'PROMPTS',        x: 544  },
-  { name: 'hops',    header: 'HOPS',           x: 808  },
-  { name: 'class',   header: 'CLASSIFICATION', x: 1072 },
-  { name: 'model',   header: 'MODEL',          x: 1336 },
-  { name: 'review',  header: 'REVIEWER',       x: 1600 },
+  { name: 'harness', header: 'HARNESS', x: 16   },
+  { name: 'session', header: 'SESSION', x: 300  },
+  { name: 'routing', header: 'ROUTING', x: 720  },
+  { name: 'model',   header: 'MODEL',   x: 1040 },
 ];
 // SK_H is only the fallback drawing height; updateSankey() measures the
 // container — it stretches bars to fill it, or grows the SVG past it so the
 // container's overflow-y scrollbar takes over.
 const SK_W = 12, SK_H = 420, SK_TOP = 22, SK_PAD = 4;
 const SK_MIN_BAR = 14;  // legible floor: bar + its two label lines
-const SK_TOTAL_W = 1856;
+const SK_TOTAL_W = 1232;
 let sankeyFilter = { col: null, key: null };
+// Every link reachable forward and backward from the selected node (union of
+// all start-to-end paths through it).
+function skComputePath(allLinks, NC) {
+  if (sankeyFilter.col === null) return null;
+  const skSel = sankeyFilter;
+  const links = new Set(), nodes = new Set();
+  nodes.add(skSel.col + '|' + skSel.key);
+  let cur = new Set([skSel.key]);
+  for (let i = skSel.col; i < NC - 1 && cur.size; i++) {
+    const next = new Set();
+    for (const l of allLinks) {
+      if (l.i === i && cur.has(l.a)) {
+        links.add(i + '|' + l.a + '|' + l.b);
+        nodes.add((i + 1) + '|' + l.b);
+        next.add(l.b);
+      }
+    }
+    cur = next;
+  }
+  cur = new Set([skSel.key]);
+  for (let i = skSel.col - 1; i >= 0 && cur.size; i--) {
+    const next = new Set();
+    for (const l of allLinks) {
+      if (l.i === i && cur.has(l.b)) {
+        links.add(i + '|' + l.a + '|' + l.b);
+        nodes.add(i + '|' + l.a);
+        next.add(l.a);
+      }
+    }
+    cur = next;
+  }
+  return { links, nodes };
+}
+
+// Card click: highlight the path formed by a card's four column keys.
+function skPathFromCard(allLinks) {
+  const cols = skCardHi;
+  const nodes = new Set(), links = new Set();
+  cols.forEach((k, i) => nodes.add(i + '|' + k));
+  for (const l of allLinks) {
+    if (cols[l.i] === l.a && cols[l.i + 1] === l.b) links.add(l.i + '|' + l.a + '|' + l.b);
+  }
+  return { links, nodes };
+}
 
 // Col 0 — which harness sent the request, identified from its User-Agent.
 // No/empty/brainrouter UA → 'review': the review loop sends no UA on purpose.
-// A third-party client with no UA is indistinguishable from it and also lands
-// in 'review' — acceptable since every supported harness sends one. Any other
-// UA maps to known harnesses, else its first '/'-token (e.g. 'curl/8' → 'curl').
 function skHarness(e) {
   const ua = (e.user_agent || '').toLowerCase();
   if (!ua || ua === 'brainrouter' || ua.startsWith('brainrouter/')) return 'review';
-  if (ua.includes('oh-my-pi') || ua.includes('omp/') || ua.includes('pi-ai')) return 'omp';
+  if (ua.includes('oh-my-pi') || ua.includes('omp/')) return 'omp';
+  if (ua.includes('pi-ai') || /(^|[\s(])pi\//.test(ua)) return 'pi';
   if (ua.includes('claude')) return 'claude';
   if (ua.includes('codex')) return 'codex';
   if (ua.includes('opencode')) return 'opencode';
@@ -1015,91 +1087,54 @@ function skHarness(e) {
   return name || 'other';
 }
 
-// Col 1 — the conversation/session. conv_id (server fingerprint) groups every
-// turn of one harness conversation under one node; events with neither id
-// collapse to 'one-shot'.
+// Col 1 — the conversation. OMP titles its sessions (~/.omp session files,
+// served by /api/omp-sessions); fall back to the conversation fingerprint.
 function skSession(e) {
+  const title = ompTitleForCwd(e.cwd);
+  if (title) return title;
   const id = e.session_id || (e.conv_id ? '#' + e.conv_id.slice(0, 8) : '');
   if (!id) return 'one-shot';
-  return id.length > 9 ? id.slice(0, 9) : id;
+  return id.length > 12 ? id.slice(0, 11) + '…' : id;
 }
 
-// Col 2 — the prompt shape (what actually hit the router).
-function skPrompt(e) {
-  if (e.session_id) return 'review-iter';
-  const p = (e.prompt_excerpt || '').trim();
-  if (p.length <= 80) return 'short';
-  return 'long';
-}
-
-// Col 3 — hop chain.  A multi-hop request (manifest ✗ → local ✓) renders as a
-// single node named for the chain, so similar hops group into one card.
-function skHops(e) {
-  const chain = e._hops || [e];
-  if (chain.length === 1) {
-    const m = (e.requested_model || '').replace(/^brainrouter\//, '');
-    if (m === 'local') return 'local-direct';
-    if (m === 'cloud') return 'cloud-direct';
-    if (m === 'subs') return 'subs-pool';
-    if (m && m !== 'auto') return 'named';
-    return 'auto';
-  }
-  return chain.map(h => (h.success ? '✓' : '✗') + (h.stage || '?')).join('→');
-}
-
-// Col 4 — how the route was decided.
-function skClassification(e) {
-  if (e.session_id) return 'review-iter';
+// Col 2 — how the request got routed. routing_class comes from the server;
+// the fallback derives the same classes from the event when it is missing.
+function skRouting(e) {
+  if (e.routing_class) return e.routing_class;
+  if (e._route === 'cloud-fallback' || (e.stage || '').includes('fallback')) return 'failover';
   const m = (e.requested_model || '').replace(/^brainrouter\//, '');
-  if (m === 'local') return 'direct:local';
-  if (m === 'cloud') return 'direct:cloud';
-  if (m === 'subs') return 'subs-pool';
-  if (m && m !== 'auto') return 'named-model';
-  return 'auto→' + (e.bonsai_decision === 'cloud' ? 'cloud' : 'local');
+  if (!m || m === 'auto') return 'auto';
+  if (m === 'cloud') return 'cloud';
+  if (m === 'local') return 'local single';
+  if (m === 'subs') return 'local group';
+  return 'named';
 }
 
-// Col 5 — the model that served the request.
+// Col 3 — the model that served the request.
 function skModel(e) {
   if (e.model_key) return e.model_key;
   if (e.effective_provider) return e.effective_provider.split('/').pop();
   return 'failed';
 }
 
-// Col 6 — the reviewer model (review sessions only; '—' = no reviewer).
-function skReviewer(e, sess) {
-  if (!e.session_id || !sess) return '—';
-  const raw = sess.review_model || '';
-  const pm = raw.match(/\(([^)]+)\)$/);
-  return (pm ? pm[1] : raw) || 'reviewing';
-}
-
-function skKeysOf(e, sess) {
+function skKeysOf(e) {
   return {
-    c0: skHarness(e), c1: skSession(e), c2: skPrompt(e), c3: skHops(e),
-    c4: skClassification(e), c5: skModel(e), c6: skReviewer(e, sess),
+    c0: skHarness(e), c1: skSession(e), c2: skRouting(e), c3: skModel(e),
   };
 }
-
 // Does this event match the active Sankey node filter?
 function matchesSankey(t) {
   if (sankeyFilter.col === null) return true;
-  const k = skKeysOf(t, t._session);
+  const k = skKeysOf(t);
   return k['c' + sankeyFilter.col] === sankeyFilter.key;
 }
 
 function skColorFor(col, key) {
   const map = {
-    0: { 'omp': '#3ec5ff', 'claude': '#ff7ac6', 'codex': '#22d39a', 'opencode': '#f5b14a', 'droid': '#9d7bff', 'kimi': '#ff6b6b', 'review': '#a3e635', 'other': '#5a6679' },
+    0: { 'omp': '#3ec5ff', 'pi': '#ff7ac6', 'claude': '#f5b14a', 'codex': '#22d39a', 'opencode': '#7dd3fc', 'droid': '#9d7bff', 'kimi': '#ff6b6b', 'review': '#a3e635', 'other': '#5a6679' },
     1: {},
-    2: { 'prompt': '#22d39a', 'review-iter': '#f5b14a', 'short': '#22d39a', 'long': '#3ec5ff' },
-    3: { 'auto': '#3ec5ff', 'local-direct': '#22d39a', 'cloud-direct': '#9d7bff', 'subs-pool': '#ff7ac6', 'named': '#7dd3fc' },
-    4: {
-      'review-iter': '#f5b14a',
-      'auto→local': '#3ec5ff', 'auto→cloud': '#9d7bff',
-      'direct:local': '#22d39a', 'direct:cloud': '#9d7bff',
-      'subs-pool': '#ff7ac6', 'named-model': '#3ec5ff',
-    },
-    6: { 'reviewing': '#f5b14a', '—': '#5a6679' },
+    2: { 'auto': '#3ec5ff', 'cloud': '#9d7bff', 'failover': '#ff6b6b', 'local group': '#22d39a', 'local single': '#7dd3fc', 'named': '#f5b14a' },
+    3: {},
   };
   if (map[col] && map[col][key]) return map[col][key];
   const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
@@ -1162,8 +1197,8 @@ function updateSankey() {
   // keys must be joined with a separator that cannot occur in any key.
   const SK_SEP = '\u0001';
   for (const e of enriched) {
-    const k = skKeysOf(e, e._session);
-    const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5, k.c6];
+    const k = skKeysOf(e);
+    const keys = [k.c0, k.c1, k.c2, k.c3];
     for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
     for (let i = 0; i + 1 < NC; i++) {
       const lk = keys[i] + SK_SEP + keys[i + 1];
@@ -1204,8 +1239,11 @@ function updateSankey() {
     g.forEach(l => { l.inY = off + l.w / 2; off += l.w; });
   });
 
-  const sel = (ci, key) => sankeyFilter.col !== null && sankeyFilter.col === ci && sankeyFilter.key === key;
-  const anyFilter = sankeyFilter.col !== null;
+  const anyFilter = sankeyFilter.col !== null || skCardHi !== null;
+  // Highlight: whole start-to-end path through the selected node (or card).
+  const path = !anyFilter ? null : (skCardHi ? skPathFromCard(allLinks) : skComputePath(allLinks, NC));
+  const nodeHl = (ci, key) => !anyFilter || (path && path.nodes.has(ci + '|' + key));
+  const linkHl = (l) => !anyFilter || (path && path.links.has(l.i + '|' + l.a + '|' + l.b));
 
   let svgOut = '';
   SK_COLS.forEach(c => {
@@ -1216,16 +1254,18 @@ function updateSankey() {
     const x1 = SK_COLS[l.i].x + SK_W, x2 = SK_COLS[l.i + 1].x;
     const y1 = s.y + l.outY, y2 = t.y + l.inY;
     const mx = x1 + (x2 - x1) * 0.5;
-    svgOut += `<path d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" stroke="${t.color}" stroke-width="${Math.max(1, l.w)}" fill="none" opacity="${anyFilter ? 0.1 : 0.28}"/>`;
+    const cls = anyFilter ? (linkHl(l) ? 'lk lk-hl' : 'lk lk-dim') : 'lk';
+    svgOut += `<path class="${cls}" d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" stroke="${t.color}" stroke-width="${Math.max(1, l.w)}" fill="none"/>`;
   });
   colNodes.forEach((arr, ci) => {
     const c = SK_COLS[ci];
     const lastCol = ci === NC - 1;
     arr.forEach(n => {
-      const isSel = sel(ci, n.key);
-      const op = anyFilter && !isSel ? 0.35 : 1;
+      const isSel = (sankeyFilter.col === ci && sankeyFilter.key === n.key)
+        || (skCardHi && skCardHi[ci] === n.key);
+      const op = anyFilter && !nodeHl(ci, n.key) ? 0.12 : 1;
       const stroke = isSel ? `stroke="#ffffff" stroke-width="1.5"` : '';
-      svgOut += `<rect x="${c.x}" y="${n.y}" width="${SK_W}" height="${n.h}" rx="2" fill="${n.color}" opacity="${op}" ${stroke} data-col="${ci}" data-key="${escHtml(n.key)}" style="cursor:pointer"><title>${escHtml(c.name + ': ' + n.key + ' (' + n.value + ') — click to filter')}</title></rect>`;
+      svgOut += `<rect x="${c.x}" y="${n.y}" width="${SK_W}" height="${n.h}" rx="2" fill="${n.color}" opacity="${op}" ${stroke} data-col="${ci}" data-key="${escHtml(n.key)}" style="cursor:pointer"><title>${escHtml(c.name + ': ' + n.key + ' (' + n.value + ') — click to highlight its path')}</title></rect>`;
       const tx = lastCol ? c.x - 6 : c.x + SK_W + 6;
       const anchor = lastCol ? 'end' : 'start';
       const ty = n.y + Math.min(n.h / 2, 10) + 3.5;
@@ -1268,12 +1308,14 @@ document.getElementById('sankey-svg').addEventListener('click', (ev) => {
   } else {
     sankeyFilter = { col, key };
   }
+  skCardHi = null;
   updateSankey();
   renderStream();
 });
 
 function clearSankeyFilter() {
   sankeyFilter = { col: null, key: null };
+  skCardHi = null;
   updateSankey();
   renderStream();
 }
@@ -2073,22 +2115,27 @@ async function openEditor(path) {
 
 // ─── Polling ──────────────────────────────────────────────────────────────────
 async function refreshFast() {
-  const [evRes, sesRes, stRes, infRes] = await Promise.all([
+  const [evRes, sesRes, stRes, infRes, ifRes] = await Promise.all([
     safeFetch('/api/routing-events'),
     safeFetch('/review/api/sessions'),
     safeFetch('/api/routing-stats'),
     safeFetch('/api/inference-status'),
+    safeFetch('/api/inflight'),
   ]);
 
   if (evRes) allEvents = Array.isArray(evRes.events) ? evRes.events : (Array.isArray(evRes) ? evRes : []);
   if (sesRes) allSessions = Array.isArray(sesRes.sessions) ? sesRes.sessions : (Array.isArray(sesRes) ? sesRes : []);
   if (stRes) statsData = stRes;
   if (infRes) inferenceStatus = infRes;
+  if (ifRes && Array.isArray(ifRes.requests)) { inflightList = ifRes.requests; inflFetchTs = Date.now(); }
+  pollTick++;
+  if (ompSessions === null || pollTick % 5 === 0) refreshOmpSessions();
 
   if (activeView === 'stream') renderStream();
 
   updateSankey();
   updateKPI();
+  renderInflight();
 }
 
 async function refreshHealth() {
@@ -2114,6 +2161,153 @@ async function refreshSlow() {
   if (tbRes) { toolboxesData = tbRes; renderToolboxes(); }
 }
 
+// ─── In-flight requests (llama-swap parity) ─────────────────────────────────
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+// The live request matching this card, if any (conv_id first: OMP sends none,
+// so conv fingerprint is the only join key for those).
+function inflightFor(group) {
+  if (!inflightList.length) return null;
+  for (const e of group.events) {
+    for (const r of inflightList) {
+      if ((e.conv_id && r.conv_id && r.conv_id === e.conv_id) ||
+          (e.session_id && r.session_id && r.session_id === e.session_id)) return r;
+    }
+  }
+  return null;
+}
+
+function activityPill(r) {
+  const c = '#3ec5ff';
+  const label = r.activity || ((typeof r.pp_progress === 'number' && r.pp_progress < 1) ? 'prefilling' : 'generating');
+  const dot = `<span class="pulse-dot" style="width:6px;height:6px;border-radius:99px;background:${c};box-shadow:0 0 6px ${c};display:inline-block"></span>`;
+  return `<span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:99px;font-size:11px;background:${c}20;color:${c};border:1px solid ${c}40;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${dot}${escHtml(label)}</span>`;
+}
+
+// Average llama-server prefill / decode throughput over the group's events.
+function tsChips(evs) {
+  let out = '';
+  const avg = a => (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1);
+  const pp = evs.map(e => e.pp_tps).filter(v => typeof v === 'number' && v > 0);
+  const tg = evs.map(e => e.tg_tps).filter(v => typeof v === 'number' && v > 0);
+  if (pp.length) out += `<span style="opacity:0.6">· ${avg(pp)} t/s pp</span>`;
+  if (tg.length) out += `<span style="opacity:0.6">· ${avg(tg)} t/s tg</span>`;
+  return out;
+}
+
+function renderInflight() {
+  const panel = document.getElementById('inflight-panel');
+  const tbody = document.getElementById('inflight-tbody');
+  const cnt = document.getElementById('inflight-count');
+  if (!panel || !tbody) return;
+  if (!inflightList.length) { panel.style.display = 'none'; tbody.innerHTML = ''; return; }
+  panel.style.display = 'block';
+  if (cnt) cnt.textContent = inflightList.length + (inflightList.length === 1 ? ' request' : ' requests');
+  tbody.innerHTML = inflightList.map(r => {
+    const pp = typeof r.pp_progress === 'number' ? Math.round(r.pp_progress * 100) : null;
+    const act = r.activity || (pp !== null && pp < 100 ? 'prefilling' : 'generating');
+    const sess = r.session_id || (r.conv_id ? '#' + String(r.conv_id).slice(0, 8) : '—');
+    const ua = r.user_agent || '—';
+    return `<tr>
+      <td><button class="cancel-btn" onclick="cancelInflight(${r.id})">Cancel</button></td>
+      <td class="inf-elapsed" data-base="${r.elapsed_ms || 0}">${fmtElapsed(r.elapsed_ms || 0)}</td>
+      <td style="color:var(--text)">${escHtml(r.model || '—')}</td>
+      <td>${escHtml((r.method_path || '').slice(0, 44))}</td>
+      <td style="color:var(--cyan)">${escHtml(act)}</td>
+      <td>${pp === null ? '—' : pp + '%'}</td>
+      <td>${escHtml(r.peer_addr || '—')}</td>
+      <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(ua)}">${escHtml(ua)}</td>
+      <td>${escHtml(sess)}</td>
+      <td>${fmtBytes(r.bytes_received || 0)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function cancelInflight(id) {
+  try {
+    await fetch('/api/inflight/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+  } catch (e) {}
+  setTimeout(refreshFast, 300);
+}
+
+// OMP titles its sessions in ~/.omp/agent/sessions/<slug>/*.jsonl; the server
+// reads the title line of each file. slug = cwd minus $HOME with '/' → '-'.
+async function refreshOmpSessions() {
+  const r = await safeFetch('/api/omp-sessions');
+  if (!r || !Array.isArray(r.sessions)) return;
+  ompHome = r.home || '';
+  ompSessions = r.sessions;
+  const m = {};
+  r.sessions.slice().sort((a, b) => (a.updated_ms || 0) - (b.updated_ms || 0))
+    .forEach(s => { if (s.title) m[s.slug] = s.title; });
+  ompTitleBySlug = m;
+}
+
+function ompTitleForCwd(cwd) {
+  if (!ompHome || !cwd) return null;
+  if (cwd !== ompHome && !cwd.startsWith(ompHome + '/')) return null;
+  const slug = cwd === ompHome ? '' : cwd.slice(ompHome.length).replace(/\//g, '-');
+  return ompTitleBySlug[slug] || null;
+}
+
+// Card click → highlight the card's path in the sankey (delegation: group
+// keys embed prompt text, so no inline onclick).
+(function () {
+  const list = document.getElementById('card-list');
+  if (!list) return;
+  list.addEventListener('click', (ev) => {
+    if (!ev.target.closest) return;
+    if (ev.target.closest('button, a, input, select, textarea')) return;
+    const art = ev.target.closest('article[data-gidx]');
+    if (!art) return;
+    const g = renderedGroups[parseInt(art.dataset.gidx, 10)];
+    if (!g) return;
+    const e = g.events[g.events.length - 1];
+    const k = skKeysOf(e);
+    const cols = [k.c0, k.c1, k.c2, k.c3];
+    const same = skCardHi && skCardHi.join('\u0001') === cols.join('\u0001');
+    skCardHi = same ? null : cols;
+    sankeyFilter = { col: null, key: null };
+    updateSankey();
+    if (!same) {
+      const cont = document.getElementById('sankey-container');
+      if (cont) cont.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  });
+})();
+
+// 1s tick: elapsed timers advance between refreshFast polls; PP bars on
+// cards follow the latest inflight snapshot.
+setInterval(() => {
+  const drift = inflFetchTs ? (Date.now() - inflFetchTs) : 0;
+  document.querySelectorAll('.inf-elapsed').forEach(el => {
+    const base = parseInt(el.dataset.base, 10);
+    if (!isNaN(base)) el.textContent = fmtElapsed(base + drift);
+  });
+  document.querySelectorAll('[data-pp-id]').forEach(el => {
+    const id = parseInt(el.dataset.ppId, 10);
+    const r = inflightList.find(x => x.id === id);
+    if (r && typeof r.pp_progress === 'number' && el.firstElementChild)
+      el.firstElementChild.style.width = Math.max(2, Math.round(r.pp_progress * 100)) + '%';
+  });
+}, 1000);
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 // Keyboard shortcut ⌘K / Ctrl+K → focus search
 document.addEventListener('keydown', (e) => {
@@ -2126,6 +2320,7 @@ document.addEventListener('keydown', (e) => {
 
 // Initial load
 refreshFast();
+refreshOmpSessions();
 refreshHealth();
 refreshSlow();
 refreshBonsai();

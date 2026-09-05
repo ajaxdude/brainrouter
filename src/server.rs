@@ -84,6 +84,7 @@ use crate::session::SessionManager;
 use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
 use crate::stream::{DeferredStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
+use crate::inflight::SniffStream;
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
@@ -135,6 +136,8 @@ pub struct AppState {
     /// Runtime prompt-rewrite toggle (default on). When off, local routes
     /// forward the incoming prompt untouched.
     pub prompt_rewrite: Arc<AtomicBool>,
+    /// In-flight request registry (dashboard tracking + cancel).
+    pub inflight: Arc<crate::inflight::InflightRegistry>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -208,6 +211,7 @@ async fn handle_request(
             // project paths read into cloud prompts) and can approve/resolve
             // sessions. Gate it like the rest.
             || path.starts_with("/review/api/")
+            || path == "/api/inflight/cancel"
         ));
 
     if is_destructive {
@@ -292,7 +296,7 @@ async fn handle_request(
         ("POST", "/v1/chat/completions") => {
             let session_id = extract_session_id(req.headers());
             let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
-            match handle_chat_completion(req, state, cwd, session_id, user_agent).await {
+            match handle_chat_completion(req, state, cwd, session_id, user_agent, peer_addr).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
@@ -308,7 +312,7 @@ async fn handle_request(
         ("POST", "/v1/messages") => {
             let session_id = extract_session_id(req.headers());
             let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
-            match handle_anthropic_messages(req, state, cwd, session_id, user_agent).await {
+            match handle_anthropic_messages(req, state, cwd, session_id, user_agent, peer_addr).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling Anthropic messages: {}", e);
@@ -357,6 +361,36 @@ async fn handle_request(
                 .header("content-type", "image/svg+xml")
                 .body(Full::new(Bytes::from_static(LOGO_SVG)))
                 .expect("Failed to build logo response");
+            into_unsync(resp)
+        }
+
+        // ── In-flight request tracking API ────────────────────────────────────────
+        ("GET", "/api/inflight") => {
+            let resp = json_response(StatusCode::OK, &state.inflight.json());
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/inflight/cancel") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let ok = match val.get("id").and_then(|v| v.as_u64()) {
+                Some(id) => state.inflight.cancel(id),
+                None => false,
+            };
+            if !ok {
+                let resp = json_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorResponse { error: "Unknown in-flight request id".to_string() },
+                );
+                into_unsync(resp)
+            } else {
+                let resp = json_response(StatusCode::OK, &serde_json::json!({"cancelled": true}));
+                into_unsync(resp)
+            }
+        }
+
+        ("GET", "/api/omp-sessions") => {
+            let resp = json_response(StatusCode::OK, &omp_sessions());
             into_unsync(resp)
         }
 
@@ -967,6 +1001,61 @@ fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
     }
     None
 }
+/// Scan OMP session directories for their titles, used by the sankey
+/// "SESSION" column. Each session is a directory under ~/.omp/agent/sessions
+/// named by the cwd slug; the first JSONL line of any file carries
+/// {"type":"title",...}. Returns {home, sessions:[{slug,title,updated_ms}]}.
+fn omp_sessions() -> serde_json::Value {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let base = std::path::Path::new(&home).join(".omp/agent/sessions");
+    let mut sessions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for dir in entries.flatten() {
+            let slug = dir.file_name().to_string_lossy().into_owned();
+            let mut title = String::new();
+            let mut updated_ms = 0u64;
+            let mut newest_mt: Option<std::time::SystemTime> = None;
+            if let Ok(files) = std::fs::read_dir(dir.path()) {
+                for f in files.flatten() {
+                    let p = f.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    if title.is_empty() {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            if let Some(first) = content.lines().next() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(first) {
+                                    if v.get("type").and_then(|t| t.as_str()) == Some("title") {
+                                        title = v.get("title").and_then(|t| t.as_str())
+                                            .unwrap_or("").to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(md) = std::fs::metadata(&p) {
+                        if let Ok(mt) = md.modified() {
+                            if newest_mt.map_or(true, |n| mt > n) {
+                                newest_mt = Some(mt);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(mt) = newest_mt {
+                updated_ms = mt.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+            }
+            sessions.push(serde_json::json!({
+                "slug": slug,
+                "title": title,
+                "updated_ms": updated_ms,
+            }));
+        }
+    }
+    serde_json::json!({"home": base.to_string_lossy().into_owned(), "sessions": sessions})
+}
+
 /// Handle POST /v1/chat/completions
 async fn handle_chat_completion(
     req: Request<Incoming>,
@@ -974,6 +1063,7 @@ async fn handle_chat_completion(
     cwd: String,
     session_id: Option<String>,
     user_agent: String,
+    peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
@@ -991,11 +1081,29 @@ async fn handle_chat_completion(
     // Spawn routing in a background task so we can return SSE headers immediately.
     // This prevents OMP's "first event" timeout from firing while llama-swap loads
     // a model (which can take minutes for large models like qwen3-27b-mtp).
+    // Register the request in the in-flight registry before routing so the
+    // dashboard sees it during model loading. The handle lives in the spawned
+    // task and (via SniffStream) the response body; the row drops when both end.
+    let handle = state.inflight.register(
+        "POST /v1/chat/completions".to_string(),
+        request.model.clone(),
+        user_agent.clone(),
+        peer_addr.to_string(),
+        session_id.clone().unwrap_or_default(),
+        crate::router::conversation_fingerprint(&request),
+        0,
+    );
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = state.router.route_tagged(request, session_id, cwd, user_agent).await;
-        let stream_result = result.map(|(resp, _info)| match resp {
-            ProviderResponse::Stream(s) => s,
+        let stream_result = result.map(|(resp, info)| {
+            if !info.model_key.is_empty() {
+                handle.set_model(info.model_key.clone());
+            }
+            match resp {
+                ProviderResponse::Stream(s) => Box::pin(SniffStream::new(s, Arc::clone(&handle)))
+                    as crate::provider::SseStream,
+            }
         });
         let _ = tx.send(stream_result);
     });
@@ -1022,6 +1130,7 @@ async fn handle_anthropic_messages(
     cwd: String,
     session_id: Option<String>,
     user_agent: String,
+    peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
@@ -1037,11 +1146,26 @@ async fn handle_anthropic_messages(
         }
     }
     // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
+    let handle = state.inflight.register(
+        "POST /v1/messages".to_string(),
+        oai_request.model.clone(),
+        user_agent.clone(),
+        peer_addr.to_string(),
+        session_id.clone().unwrap_or_default(),
+        crate::router::conversation_fingerprint(&oai_request),
+        0,
+    );
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = state.router.route_tagged(oai_request, session_id, cwd, user_agent).await;
-        let stream_result = result.map(|(resp, _info)| match resp {
-            ProviderResponse::Stream(s) => s,
+        let stream_result = result.map(|(resp, info)| {
+            if !info.model_key.is_empty() {
+                handle.set_model(info.model_key.clone());
+            }
+            match resp {
+                ProviderResponse::Stream(s) => Box::pin(SniffStream::new(s, Arc::clone(&handle)))
+                    as crate::provider::SseStream,
+            }
         });
         let _ = tx.send(stream_result);
     });

@@ -316,6 +316,8 @@ impl Router {
                         session_id: session_id.clone(),
                         user_agent: user_agent.clone(),
                         conv_id: conv_id.clone(),
+                        pp_tps: 0.0,
+                        tg_tps: 0.0,
                     });
                 }
                 self.routing_events.emit(RouteEvent {
@@ -334,10 +336,15 @@ impl Router {
                     session_id: session_id.clone(),
                     user_agent: user_agent.clone(),
                     conv_id: conv_id.clone(),
+                    pp_tps: 0.0,
+                    tg_tps: 0.0,
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
+                let events = Arc::clone(&self.routing_events);
+                let conv_for_tps = conv_id.clone();
                 let resp = wrap_with_tracker_clear(resp, tracker_for_stream);
+                let resp = wrap_with_tps_capture(resp, events, conv_for_tps);
                 (resp, info)
             }
             Err(e) => {
@@ -358,6 +365,8 @@ impl Router {
                     session_id: session_id.clone(),
                     user_agent,
                     conv_id,
+                    pp_tps: 0.0,
+                    tg_tps: 0.0,
                 });
                 return Err(e);
             }
@@ -724,6 +733,102 @@ impl Drop for TrackerClearStream {
     }
 }
 
+/// Wrap a ProviderResponse stream so per-request token throughput is
+/// backfilled onto the conversation's most recent RouteEvent when the stream
+/// completes. Timings come from this wrapper's own polls; token counts come
+/// from the OpenAI SSE usage chunk at stream end.
+fn wrap_with_tps_capture(
+    resp: ProviderResponse,
+    routing_events: Arc<RoutingEvents>,
+    conv_id: String,
+) -> ProviderResponse {
+    match resp {
+        ProviderResponse::Stream(stream) => {
+            ProviderResponse::Stream(Box::pin(TpsCaptureStream {
+                stream,
+                routing_events,
+                conv_id,
+                started: None,
+                first_content: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            }))
+        }
+    }
+}
+
+/// Stream wrapper that measures prompt/generation timing and captures the
+/// OpenAI SSE usage chunk (prompt_tokens/completion_tokens) at stream end.
+struct TpsCaptureStream {
+    stream: crate::provider::SseStream,
+    routing_events: Arc<RoutingEvents>,
+    conv_id: String,
+    started: Option<std::time::Instant>,
+    first_content: Option<std::time::Instant>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+impl futures_util::Stream for TpsCaptureStream {
+    type Item = <crate::provider::SseStream as futures_util::Stream>::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let now = std::time::Instant::now();
+        if self.started.is_none() {
+            self.started = Some(now);
+        }
+        let item = self.stream.as_mut().poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(bytes))) = &item {
+            // Any data-bearing chunk (keepalive comments start with ':') marks
+            // the start of generation for pp/tg timing.
+            if self.first_content.is_none()
+                && bytes.iter().position(|b| *b == b'"').is_some()
+            {
+                self.first_content = Some(now);
+            }
+            // OpenAI usage chunk: {"...","usage":{"prompt_tokens":N,...}}
+            if bytes.windows(5).any(|w| w == b"usage") {
+                let start = bytes.iter().position(|b| *b == b'{').unwrap_or(0);
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes[start..]) {
+                    if let Some(usage) = v.get("usage") {
+                        if let Some(n) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
+                            self.prompt_tokens = n;
+                        }
+                        if let Some(n) = usage.get("completion_tokens").and_then(|x| x.as_u64()) {
+                            self.completion_tokens = n;
+                        }
+                    }
+                }
+            }
+        }
+        item
+    }
+}
+
+impl Drop for TpsCaptureStream {
+    fn drop(&mut self) {
+        if self.conv_id.is_empty() || self.prompt_tokens == 0 {
+            return;
+        }
+        let (Some(started), Some(first)) = (self.started, self.first_content) else {
+            return;
+        };
+        let end = std::time::Instant::now();
+        let pp_secs = first.duration_since(started).as_secs_f64();
+        let tg_secs = end.duration_since(first).as_secs_f64();
+        let pp_tps = if pp_secs > 0.0 { self.prompt_tokens as f64 / pp_secs } else { 0.0 };
+        let tg_tps = if tg_secs > 0.0 && self.completion_tokens > 0 {
+            self.completion_tokens as f64 / tg_secs
+        } else {
+            0.0
+        };
+        self.routing_events.update_tps(&self.conv_id, pp_tps, tg_tps);
+    }
+}
+
 /// Derive the Stage from the effective provider and Bonsai decision.
 /// This is a best-effort reconstruction — the internal routing methods track
 /// stage precisely, but here we reconstruct for the error path.
@@ -745,7 +850,7 @@ fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str)
 /// yields one id for the whole conversation — stable across turns, retries,
 /// and fallbacks. FNV-1a 64-bit: identity only, no security relevance.
 /// "" when the request carries no user message.
-fn conversation_fingerprint(request: &ChatCompletionRequest) -> String {
+pub(crate) fn conversation_fingerprint(request: &ChatCompletionRequest) -> String {
     let sys = request.messages.iter().find(|m| m.role == "system").map(|m| message_text(&m.content));
     let first_user = request.messages.iter().find(|m| m.role == "user").map(|m| message_text(&m.content));
     let (Some(sys), Some(first_user)) = (sys, first_user) else {
@@ -817,6 +922,7 @@ fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn user(content: &str) -> ChatMessage {
         ChatMessage {
@@ -996,5 +1102,95 @@ mod tests {
         assert_eq!(msgs[2].content.as_ref().unwrap().as_str().unwrap(), "Hello");
         // System message untouched
         assert_eq!(msgs[0].role, "system");
+    }
+
+    #[tokio::test]
+    async fn update_tps_backfills_matching_success_event() {
+        let events = RoutingEvents::new();
+        events.emit(RouteEvent {
+            id: 0,
+            timestamp: String::new(),
+            prompt_excerpt: "hi".to_string(),
+            requested_model: "auto".to_string(),
+            effective_provider: Some("llama-swap".to_string()),
+            model_key: "m".to_string(),
+            latency_ms: 1,
+            stage: Stage::LocalPrimary,
+            success: true,
+            error: String::new(),
+            bonsai_decision: "local",
+            cwd: String::new(),
+            session_id: None,
+            user_agent: String::new(),
+            conv_id: "abc123".to_string(),
+            pp_tps: 0.0,
+            tg_tps: 0.0,
+        });
+        // Matching conversation backfills.
+        assert!(events.update_tps("abc123", 41.5, 77.0));
+        let evs = events.get_all();
+        assert_eq!(evs[0].pp_tps, 41.5);
+        assert_eq!(evs[0].tg_tps, 77.0);
+        // Unknown conversation is a no-op.
+        assert!(!events.update_tps("nope", 1.0, 1.0));
+    }
+
+    #[tokio::test]
+    async fn tps_capture_stream_extracts_usage_and_backfills() {
+        use tokio_stream::wrappers::ReceiverStream;
+        use tokio_stream::StreamExt as _;
+
+        let events = Arc::new(RoutingEvents::new());
+        events.emit(RouteEvent {
+            id: 0,
+            timestamp: String::new(),
+            prompt_excerpt: "hi".to_string(),
+            requested_model: "auto".to_string(),
+            effective_provider: Some("llama-swap".to_string()),
+            model_key: "m".to_string(),
+            latency_ms: 1,
+            stage: Stage::LocalPrimary,
+            success: true,
+            error: String::new(),
+            bonsai_decision: "local",
+            cwd: String::new(),
+            session_id: None,
+            user_agent: String::new(),
+            conv_id: "convX".to_string(),
+            pp_tps: 0.0,
+            tg_tps: 0.0,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(16);
+        let mut cap = TpsCaptureStream {
+            stream: Box::pin(ReceiverStream::new(rx)),
+            routing_events: Arc::clone(&events),
+            conv_id: "convX".to_string(),
+            started: None,
+            first_content: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+
+        // Keepalive first (no content): sets started but not first_content.
+        tx.send(Ok(Bytes::from(":\n\n"))).await.unwrap();
+        let _ = futures_util::StreamExt::next(&mut cap).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        // Content chunks then the OpenAI usage chunk.
+        tx.send(Ok(Bytes::from("data: {\"delta\":{\"content\":\"hello\"}}\n\n"))).await.unwrap();
+        tx.send(Ok(Bytes::from("data: {\"delta\":{\"content\":\" world\"}}\n\n"))).await.unwrap();
+        tx.send(Ok(Bytes::from("data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n"))).await.unwrap();
+        tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await.unwrap();
+        drop(tx);
+        // Drain to completion so Drop runs and backfills.
+        while futures_util::StreamExt::next(&mut cap).await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Drop the wrapper explicitly so its Drop impl backfills before we read.
+        drop(cap);
+        let evs = events.get_all();
+        let e = &evs[0];
+        assert!(e.pp_tps > 0.0, "pp_tps backfilled: {}", e.pp_tps);
+        assert!(e.tg_tps > 0.0, "tg_tps backfilled: {}", e.tg_tps);
     }
 }

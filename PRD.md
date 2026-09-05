@@ -5,7 +5,7 @@
 **Binary:** `target/release/brainrouter`
 **Config:** `brainrouter.yaml` + `/etc/brainrouter/env` (multi-user) or `~/.config/brainrouter/.env` (single-user)
 **Repository:** https://github.com/ajaxdude/brainrouter
-**Tests:** 89 tests across the codebase
+**Tests:** 91 tests across the codebase
 
 ---
 
@@ -56,6 +56,8 @@ A single Rust daemon that:
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
+9. **Tracks in-flight requests live.** A registry records every request at handler entry (before routing, so the dashboard sees it during model load) and holds it until the stream ends or the user cancels it. The dashboard shows one row per active request — elapsed time, model, user agent, address, session, bytes received, PP progress, and an activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button.
+10. **Reports per-request throughput.** Each completed request backfills its prompt-tokens/s (llama-swap "pp") and generation-tokens/s ("tg") onto its routing event; the dashboard's conversation cards surface averaged t/s chips so you can see how a conversation performs across its turns.
 
 ---
 
@@ -122,6 +124,17 @@ Discord and Signal transports do not call LLMs directly. They shell out to the `
 
 The MCP server needs to know the caller's working directory. On Linux, brainrouter resolves this by mapping the peer's socket connection (TCP or UDS) back to a PID via `/proc`, then reading `/proc/<pid>/cwd`. This is a Linux-native approach that avoids requiring the caller to pass CWD explicitly, though callers may override it.
 
+### In-flight request registry (src/inflight.rs)
+
+The registry gives the dashboard a live view of every in-flight request — the "monitor LLM activity without opening llama-swap" goal. Each request registers an entry at handler entry, before `route_tagged`, so the row is visible during model load (when the registry is otherwise idle). The entry's identity (`InflightHandle`) is an `Arc` carried by the spawned routing task and, once routing resolves, by a `SniffStream` that wraps the provider's SSE stream. The row is removed when the last handle drops — i.e. at stream end, on a routing error (no stream is created, so the task-side handle is the last one), or on an explicit dashboard Cancel (a `watch` channel flips a flag; the `SniffStream` ends the stream immediately and the handles drop). Stale entries (older than a grace window) are swept on read.
+
+The activity label is derived by sniffing the head window of each SSE chunk for provider-specific markers (`tool_calls` / `toolUse` → tool calling, `reasoning_content` / `thinking` → reasoning, `multiple choice` → asking, otherwise generating). The sniff is **sticky with a priority order** — tool calling > reasoning > asking > generating — so a strong signal is never downgraded by a later weaker one.
+
+`model` is an interior-mutable `Mutex<String>`: it starts as the requested model and is updated to the resolved llama-swap model key after routing.
+
+### Per-request token throughput (src/router.rs, src/routing_events.rs)
+
+A stream wrapper (`TpsCaptureStream`) measures timing between the first chunk and the end of the stream, and reads token counts from the OpenAI SSE `usage` chunk at stream end. On drop it backfills `pp_tps` / `tg_tps` onto the conversation's most recent successful `RouteEvent` via `RoutingEvents::update_tps`. The dashboard re-fetches events on its poll tick, so the t/s appears on the card once the request finishes. This path is correct for any build that emits a `usage` chunk; builds that do not (e.g. some llama-server forks) leave the fields unset and the cards simply omit the chips. The PP progress bar on cards is fed the same way — from the active llama-server's slot progress (see the daemon poller). Both gracefully no-op on llama-server builds that expose no slot/usage endpoints.
 ---
 
 ## Component Map
@@ -153,6 +166,7 @@ The MCP server needs to know the caller's working directory. On Linux, brainrout
 | Prompt builder | `src/review/prompt.rs` | Review prompt template |
 | Escalation UI | `src/escalation/mod.rs` | `/review/*` HTTP handlers + embedded HTML templates; CWD sanitization |
 | Escalation templates | `src/escalation/templates/` | Embedded HTML for review session UI |
+| In-flight registry | `src/inflight.rs` | `InflightRegistry` + `InflightHandle` + `SniffStream`: per-request live rows (elapsed, model, UA, address, session, bytes, PP, activity) with dashboard cancel; sticky head-window activity sniff |
 | Provider adapter | `src/provider/mod.rs` | Provider trait and common types |
 | OpenAI provider | `src/provider/openai.rs` | OpenAI-compatible HTTP client with fault-aware circuit breaking (429/5xx) |
 | Bridge core | `src/bridge/core.rs` | Shared transport logic: OMP subprocess management, message chunking, aliases |
@@ -418,7 +432,7 @@ Incoming request (OpenAI or Anthropic format)
 - **Managed routing** (`auto`/`local` tokens) passes `allow_fallback: true` — if the chosen local model fails, the router retries once with `fallback_model`.
 - **Direct model picks** (any named/bare key, `subs`, specific-key routes) pass `allow_fallback: false` — a failed explicit selection surfaces the error to the client instead of silently switching models. This is the "memory compaction" fix: a failing `ds4-*` pick used to jump to the subs pool behind the agent's back; direct picks are authoritative.
 
-Every failed hop is recorded in `RouteInfo.failed_attempts` (stage, provider, model_key, error) and the router emits one `RouteEvent` **per failed hop** plus one for the winner. The dashboard therefore renders multi-hop routes as a hop chain (e.g. `manifest ✗ → local ✓`) instead of a single collapsed card; the Sankey's HOPS column shows the chain too.
+Every failed hop is recorded in `RouteInfo.failed_attempts` (stage, provider, model_key, error) and the router emits one `RouteEvent` **per failed hop** plus one for the winner. The dashboard therefore renders multi-hop routes as a hop chain (e.g. `manifest ✗ → local ✓`) inside the card body; the Sankey ROUTING column embeds the chain in the routing node key itself.
 
 Both Bonsai and Manifest disabled (the default): `auto` → local, `cloud` → local — every request is a single hop to llama-swap.
 
@@ -561,7 +575,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Redirect to `/dashboard` |
-| `GET` | `/dashboard` | Embedded HTML dashboard: live routing feed grouped **per conversation** (client session header, or a stable hash of the conversation prefix when no header is present — each conversation renders as one card), hop-chain rendering for multi-hop fallbacks, Sankey flow diagram (harness → session → prompts → hops → classification → model → reviewer), version display, one-click upgrades, review sessions |
+| `GET` | `/dashboard` | Embedded HTML dashboard: live routing feed grouped **per conversation** (client session header, or a stable hash of the conversation prefix when no header is present — each conversation renders as one card), hop-chain rendering for multi-hop fallbacks, in-flight request tracker (with cancel), a four-column Sankey flow diagram — **HARNESS** (Pi / OMP / Opencode / Claude / Droid, from User-Agent) → **SESSION** (OMP session title) → **ROUTING** (auto / cloud / local / fallback chain) → **MODEL** (resolved llama-swap key) — where clicking any node highlights its start-to-end path and clicking a card highlights the matching Sankey path, version display, one-click upgrades, review sessions |
 | `GET` | *(favicon/logo assets)* | Static assets for dashboard UI |
 
 ### Dashboard API
@@ -592,6 +606,14 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `POST` | `/api/upgrade/toolbox` | One-click upgrade llama.cpp toolbox |
 | `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier llama-server to free or reclaim VRAM; while stopped, `auto` routing defaults to Local. Toggling Bonsai **off also turns prompt rewrite off** (server-side coupling — the invariant "rewrite on ⇒ Bonsai on" is enforced in the daemon, not just the UI) |
 | `POST` | `/api/models/flush` | Unload all models from llama-swap memory (frees VRAM) without restarting the service |
+
+### In-flight Tracking API
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/inflight` | Active in-flight requests: `{requests:[{id, elapsed_ms, method_path, model, user_agent, peer_addr, conv_id, session_id, bytes_received, activity, pp_progress}]}`. The panel is hidden in the dashboard when this is empty |
+| `POST` | `/api/inflight/cancel` | Cancel one in-flight request. Body: `{id}`. Returns `{"cancelled":true}` on success, HTTP 404 for an unknown id. Loopback-only + CSRF-protected (in the `is_destructive` gate list) |
+| `GET` | `/api/omp-sessions` | OMP session titles for the Sankey "SESSION" column: `{home, sessions:[{slug, title, updated_ms}]}` — each session is a directory under `~/.omp/agent/sessions/<slug>` whose first JSONL line carries `{"type":"title",...}` |
 
 ### Review Endpoints
 
@@ -723,7 +745,6 @@ the `aistack` group can read it. `install.sh` adds every human system user to `a
 Individual users never have write access to this file -- only root can update the API key.
 The file is not world-readable; a user not in `aistack` cannot extract the Manifest API key.
 
-
 The daemon refuses to start if validation fails, with descriptive error messages.
 
 ---
@@ -744,4 +765,4 @@ The daemon refuses to start if validation fails, with descriptive error messages
 - Interrupt-and-redirect: user types a correction mid-stream; brainrouter cancels and re-prompts
 - Persistent review sessions (SQLite) so they survive daemon restarts
 - Pi extension shipping alongside the main binary
-- Token usage tracking and routing cost dashboard
+- Per-request token cost dashboard (pp/tg throughput per conversation is already surfaced; cost-per-token needs Manifest pricing data)

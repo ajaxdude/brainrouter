@@ -67,6 +67,17 @@ pub struct RouteEvent {
     /// Empty for review-loop events (they carry `session_id` instead).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub conv_id: String,
+    /// Prompt tokens per second (llama-swap "pp"), backfilled at stream
+    /// completion from the OpenAI SSE usage chunk + measured timings.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub pp_tps: f64,
+    /// Generation tokens per second (llama-swap "tg"), backfilled likewise.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub tg_tps: f64,
+}
+
+fn is_zero_f64(f: &f64) -> bool {
+    *f == 0.0
 }
 
 /// Thread-safe in-memory circular buffer.
@@ -111,6 +122,22 @@ impl RoutingEvents {
         while inner.events.len() > MAX_EVENTS {
             inner.events.pop_front();
         }
+    }
+
+    /// Backfill token throughput onto the most recent successful event of a
+    /// conversation, called at stream completion. Returns true if an event was
+    /// updated. The dashboard re-fetches events on its poll tick, so the tps
+    /// appears on the card once the request finishes.
+    pub fn update_tps(&self, conv_id: &str, pp_tps: f64, tg_tps: f64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        for e in inner.events.iter_mut().rev() {
+            if e.conv_id == conv_id && e.success {
+                e.pp_tps = pp_tps;
+                e.tg_tps = tg_tps;
+                return true;
+            }
+        }
+        false
     }
 
     /// Return all events newest-first for dashboard rendering.
