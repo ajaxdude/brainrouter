@@ -24,14 +24,16 @@
 //!   - Vision/image/PDF content
 //!   - Batch API
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_util::Stream;
 use pin_project::pin_project;
 use serde::Deserialize;
 use serde_json::Value;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use uuid::Uuid;
 use tracing::warn;
 
@@ -218,13 +220,20 @@ enum AdapterState {
     Done,
 }
 
+/// Bound waiting from the first finish_reason or [DONE]. Ready upstream items
+/// take priority over elapsed time; continuously ready tails have separate caps.
+pub(crate) const ANTHROPIC_EOF_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const ANTHROPIC_TAIL_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const ANTHROPIC_TAIL_MAX_LINE_BYTES: usize = 64 * 1024;
+pub(crate) const ANTHROPIC_TAIL_MAX_CHUNKS: usize = 1024;
+
 /// Adapts an OpenAI SSE stream to Anthropic SSE events.
 ///
 /// Emits in order:
 ///   event: message_start         (once, first chunk)
 ///   event: content_block_start   (once, block index 0)
 ///   event: content_block_delta*  (per text chunk)
-///   event: content_block_stop    (once, on finish_reason)
+///   event: content_block_stop    (once, after upstream EOF)
 ///   event: message_delta         (once, carries stop_reason + usage)
 ///   event: message_stop          (once, final)
 #[pin_project]
@@ -236,8 +245,14 @@ pub struct AnthropicSseAdapter {
     model: String,
     input_tokens: u32,
     output_tokens: u32,
-    /// Buffered bytes from partial SSE lines
-    line_buf: String,
+    /// Finish metadata is held until usage and upstream EOF have been consumed.
+    stop_reason: Option<&'static str>,
+    done_seen: bool,
+    eof_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    tail_bytes: usize,
+    tail_chunks: usize,
+    /// Preserve partial UTF-8 and SSE lines across transport chunks.
+    line_buf: Vec<u8>,
     /// Outgoing events queued to be flushed before pulling from inner
     pending: std::collections::VecDeque<Bytes>,
 }
@@ -254,7 +269,12 @@ impl AnthropicSseAdapter {
             model,
             input_tokens: 0,
             output_tokens: 0,
-            line_buf: String::new(),
+            stop_reason: None,
+            done_seen: false,
+            eof_deadline: None,
+            tail_bytes: 0,
+            tail_chunks: 0,
+            line_buf: Vec::new(),
             pending: std::collections::VecDeque::new(),
         }
     }
@@ -266,8 +286,21 @@ impl AnthropicSseAdapter {
     }
 
     /// Process one parsed OpenAI SSE JSON value, returning any Anthropic frames.
-    fn process_openai_chunk(&mut self, chunk: &Value) -> Vec<Bytes> {
+    fn process_openai_chunk(&mut self, chunk: &Value) -> Result<Vec<Bytes>> {
         let mut frames: Vec<Bytes> = Vec::new();
+        if chunk.get("error").is_some_and(|error| !error.is_null())
+            || matches!(chunk.get("type").and_then(Value::as_str),
+                Some("error" | "response.failed" | "response.incomplete" | "response.cancelled"))
+        {
+            return Err(anyhow!("Upstream reported an SSE error"));
+        }
+        // DeferredStream supplies Anthropic keepalives while waiting/draining.
+        if chunk.get("type").and_then(Value::as_str) == Some("ping") {
+            return Ok(frames);
+        }
+        if self.done_seen {
+            return Err(anyhow!("Unexpected upstream data after [DONE]"));
+        }
 
         // Extract content delta
         let choice = chunk.get("choices").and_then(|c| c.get(0));
@@ -278,6 +311,9 @@ impl AnthropicSseAdapter {
         let finish_reason = choice
             .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str);
+        if matches!(finish_reason, Some("error" | "cancelled" | "canceled")) {
+            return Err(anyhow!("Upstream ended generation with an error"));
+        }
 
         // On first chunk, emit message_start + content_block_start
         if self.state == AdapterState::Initial {
@@ -337,35 +373,76 @@ impl AnthropicSseAdapter {
             }
         }
 
-        // On finish_reason, close the stream
+        // Do not stop polling here: final usage, [DONE], errors, and confirming
+        // EOF can all arrive later. Text remains streaming through pending.
         if let Some(fr) = finish_reason {
-            let stop_reason = match fr {
+            self.stop_reason = Some(match fr {
                 "stop" => "end_turn",
                 "length" => "max_tokens",
                 "tool_calls" => "tool_use",
                 _ => "end_turn",
-            };
-
-            frames.push(Self::frame(
-                "content_block_stop",
-                serde_json::json!({ "type": "content_block_stop", "index": 0 }),
-            ));
-            frames.push(Self::frame(
-                "message_delta",
-                serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                    "usage": { "output_tokens": self.output_tokens }
-                }),
-            ));
-            frames.push(Self::frame(
-                "message_stop",
-                serde_json::json!({ "type": "message_stop" }),
-            ));
-            self.state = AdapterState::Done;
+            });
+            self.start_tail_drain();
         }
 
-        frames
+        Ok(frames)
+    }
+
+    fn start_tail_drain(&mut self) {
+        if self.eof_deadline.is_none() {
+            self.eof_deadline = Some(Box::pin(tokio::time::sleep(ANTHROPIC_EOF_GRACE)));
+        }
+    }
+
+    fn process_openai_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>> {
+        if self.eof_deadline.is_some() {
+            self.tail_chunks += 1;
+            if self.tail_chunks > ANTHROPIC_TAIL_MAX_CHUNKS {
+                return Err(anyhow!("Upstream exceeded the response tail-drain chunk budget"));
+            }
+        }
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if self.eof_deadline.is_some() {
+                self.tail_bytes += 1;
+                if self.tail_bytes > ANTHROPIC_TAIL_MAX_BYTES {
+                    return Err(anyhow!("Upstream exceeded the response tail-drain byte budget"));
+                }
+                if self.line_buf.len() >= ANTHROPIC_TAIL_MAX_LINE_BYTES {
+                    return Err(anyhow!("Upstream exceeded the response tail-drain line budget"));
+                }
+            }
+            // Buffer incrementally: a finish marker in the middle of this chunk
+            // must activate the tail cap before the remainder is copied.
+            self.line_buf.push(byte);
+            if byte == b'\n' {
+                let line = std::mem::take(&mut self.line_buf);
+                frames.extend(self.process_openai_line(&line)?);
+            }
+        }
+        Ok(frames)
+    }
+
+    fn process_openai_line(&mut self, line: &[u8]) -> Result<Vec<Bytes>> {
+        let line = std::str::from_utf8(line)?.trim();
+        if line.strip_prefix("event:").map(str::trim) == Some("error") {
+            return Err(anyhow!("Upstream reported an SSE error event"));
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(Vec::new());
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if data == "[DONE]" {
+            if !self.done_seen {
+                self.done_seen = true;
+                self.start_tail_drain();
+            }
+            return Ok(Vec::new());
+        }
+        self.process_openai_chunk(&serde_json::from_str::<Value>(data)?)
     }
 }
 
@@ -384,75 +461,44 @@ impl Stream for AnthropicSseAdapter {
                 return Poll::Ready(None);
             }
 
-            // 3. Pull from inner stream
+            // 3. Ready data/EOF/errors win over the timer, like tokio::timeout.
+            // A slow consumer must not lose an already completed response.
             match self.as_mut().project().inner.poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    // Inner stream ended — handle transition and closing logic once.
-                    if self.state != AdapterState::Done {
-                        let mut extra_frames: Vec<Bytes> = Vec::new();
-                        
-                        // Flush any remaining data in line buffer before closing
-                        if !self.line_buf.is_empty() {
-                            let line = self.line_buf.trim().to_string();
-                            self.line_buf.clear();
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if let Ok(chunk_val) = serde_json::from_str::<Value>(json_str) {
-                                    extra_frames.extend(self.process_openai_chunk(&chunk_val));
-                                }
-                            }
-                        }
-
-                        // Re-check state after potential process_openai_chunk transition.
-                        // Always close gracefully if we haven't reached Done yet.
-                        // This handles both empty responses (Initial) and interrupted streams.
-                        if self.state != AdapterState::Done {
-                            extra_frames.extend(close_stream_gracefully(&mut self));
-                        }
-                        
+                Poll::Pending => {
+                    if self.eof_deadline.as_mut().is_some_and(|timer| timer.as_mut().poll(cx).is_ready()) {
                         self.state = AdapterState::Done;
-                        self.pending.extend(extra_frames);
-                        
-                        // Loop back once more to flush the newly added pending frames
-                        continue;
+                        return Poll::Ready(Some(Err(anyhow!("Upstream exceeded the response tail-drain deadline"))));
                     }
-                    
-                    return Poll::Ready(None);
+                    return Poll::Pending;
+                }
+                Poll::Ready(None) => {
+                    let line = std::mem::take(&mut self.line_buf);
+                    match self.process_openai_line(&line) {
+                        Ok(frames) => self.pending.extend(frames),
+                        Err(error) => {
+                            self.state = AdapterState::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                    // Preserve graceful EOF compatibility for providers without
+                    // [DONE]; the inner measurement wrapper excludes those samples.
+                    let closing = close_stream_gracefully(&mut self);
+                    self.pending.extend(closing);
+                    self.state = AdapterState::Done;
+                    continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    self.state = AdapterState::Done;
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
-                    // Process the SSE chunk bytes
-                    let text = match std::str::from_utf8(&bytes) {
-                        Ok(t) => t.to_string(),
-                        Err(_) => continue,
-                    };
-
-                    // Accumulate in line buffer and process complete lines
-                    self.line_buf.push_str(&text);
-                    let mut new_frames: Vec<Bytes> = Vec::new();
-
-                    // Process complete SSE events (terminated by \n)
-                    // The .trim() on the extracted line handles \r\n line endings correctly.
-                    while let Some(newline_pos) = self.line_buf.find('\n') {
-                        let line = self.line_buf[..newline_pos].trim().to_string();
-                        self.line_buf.drain(..newline_pos + 1);
-
-                        if let Some(json_str) = line.strip_prefix("data: ") {
-                            if json_str == "[DONE]" {
-                                // Normal end — handled by finish_reason already
-                                continue;
-                            }
-                            if let Ok(chunk_val) = serde_json::from_str::<Value>(json_str) {
-                                let frames = self.process_openai_chunk(&chunk_val);
-                                new_frames.extend(frames);
-                            }
+                    match self.process_openai_bytes(&bytes) {
+                        Ok(frames) => self.pending.extend(frames),
+                        Err(error) => {
+                            self.line_buf = Vec::new();
+                            self.state = AdapterState::Done;
+                            return Poll::Ready(Some(Err(error)));
                         }
-                    }
-
-                    for f in new_frames {
-                        self.pending.push_back(f);
                     }
                     // Loop back to flush pending
                 }
@@ -461,7 +507,8 @@ impl Stream for AnthropicSseAdapter {
     }
 }
 
-/// Called when the upstream stream ends without emitting finish_reason.
+/// Close only after actual upstream EOF, using any previously observed finish
+/// reason and final usage. EOF without [DONE] retains legacy wire compatibility.
 fn close_stream_gracefully(adapter: &mut AnthropicSseAdapter) -> Vec<Bytes> {
     if matches!(
         adapter.state,
@@ -515,7 +562,7 @@ fn close_stream_gracefully(adapter: &mut AnthropicSseAdapter) -> Vec<Bytes> {
                 "message_delta",
                 serde_json::json!({
                     "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "delta": { "stop_reason": adapter.stop_reason.unwrap_or("end_turn"), "stop_sequence": null },
                     "usage": { "output_tokens": adapter.output_tokens }
                 }),
         ));
@@ -673,8 +720,8 @@ mod tests {
         assert_eq!(oai.extra["tool_choice"], "required");
     }
 
-    #[test]
-    fn map_stop_reason() {
+    #[tokio::test]
+    async fn map_stop_reason() {
         let mut adapter = AnthropicSseAdapter::new(Box::pin(futures_util::stream::empty()), "model".to_string());
         
         let chunk = serde_json::json!({
@@ -684,7 +731,10 @@ mod tests {
             }]
         });
         
-        let frames = adapter.process_openai_chunk(&chunk);
+        let frames = adapter.process_openai_chunk(&chunk).unwrap();
+        assert!(!frames.iter().any(|frame| String::from_utf8_lossy(frame).contains("message_stop")));
+        assert_ne!(adapter.state, AdapterState::Done);
+        let frames = close_stream_gracefully(&mut adapter);
         
         // Find message_delta frame and check stop_reason
         let msg_delta_frame = frames.iter().find(|f| {

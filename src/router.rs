@@ -17,7 +17,7 @@ use crate::{
     inference_state::{InferenceTracker, Phase},
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
-    routing_events::{RouteEvent, RoutingEvents, Stage},
+    routing_events::{CompletedStreamMeasurement, RouteEvent, RoutingEvents, Stage},
     routing_profile::{ModelChoice, ProfileStore},
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
@@ -393,7 +393,7 @@ impl Router {
                         tg_tps: 0.0,
                     });
                 }
-                self.routing_events.emit(RouteEvent {
+                let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
                     prompt_excerpt,
@@ -415,9 +415,11 @@ impl Router {
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
                 let events = Arc::clone(&self.routing_events);
-                let conv_for_tps = conv_id.clone();
                 let resp = wrap_with_tracker_clear(resp, tracker_for_stream);
-                let resp = wrap_with_tps_capture(resp, events, conv_for_tps);
+                let resp = wrap_with_tps_capture(
+                    resp, events, event_id, info.model_key.clone(),
+                    info.effective_provider.clone(), start,
+                );
                 (resp, info)
             }
             Err(e) => {
@@ -807,40 +809,41 @@ impl Drop for TrackerClearStream {
     }
 }
 
-/// Wrap a ProviderResponse stream so per-request token throughput is
-/// backfilled onto the conversation's most recent RouteEvent when the stream
-/// completes. Timings come from this wrapper's own polls; token counts come
-/// from the OpenAI SSE usage chunk at stream end.
+/// Observe the exact successful attempt emitted by the routing body. Its start
+/// precedes in-body classification, provider connection, and any Manifest peek,
+/// but excludes outer profile resolution. Output times are local SSE observations.
 fn wrap_with_tps_capture(
     resp: ProviderResponse,
     routing_events: Arc<RoutingEvents>,
-    conv_id: String,
+    event_id: u64,
+    model_key: String,
+    effective_provider: Option<String>,
+    started: Instant,
 ) -> ProviderResponse {
     match resp {
-        ProviderResponse::Stream(stream) => {
-            ProviderResponse::Stream(Box::pin(TpsCaptureStream {
-                stream,
-                routing_events,
-                conv_id,
-                started: None,
-                first_content: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-            }))
-        }
+        ProviderResponse::Stream(stream) => ProviderResponse::Stream(Box::pin(TpsCaptureStream {
+            stream,
+            routing_events,
+            event_id,
+            model_key,
+            effective_provider,
+            capture: SseMeasurementCapture::new(started),
+            finished: false,
+        })),
     }
 }
 
-/// Stream wrapper that measures prompt/generation timing and captures the
-/// OpenAI SSE usage chunk (prompt_tokens/completion_tokens) at stream end.
+/// Pass-through observer: only [DONE] followed by clean EOF records a sample.
+/// Drop intentionally does nothing; even a client that stops polling at [DONE]
+/// has not supplied clean EOF, so it cannot contribute a completed measurement.
 struct TpsCaptureStream {
     stream: crate::provider::SseStream,
     routing_events: Arc<RoutingEvents>,
-    conv_id: String,
-    started: Option<std::time::Instant>,
-    first_content: Option<std::time::Instant>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    event_id: u64,
+    model_key: String,
+    effective_provider: Option<String>,
+    capture: SseMeasurementCapture,
+    finished: bool,
 }
 
 impl futures_util::Stream for TpsCaptureStream {
@@ -850,57 +853,242 @@ impl futures_util::Stream for TpsCaptureStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let now = std::time::Instant::now();
-        if self.started.is_none() {
-            self.started = Some(now);
-        }
         let item = self.stream.as_mut().poll_next(cx);
-        if let std::task::Poll::Ready(Some(Ok(bytes))) = &item {
-            // Any data-bearing chunk (keepalive comments start with ':') marks
-            // the start of generation for pp/tg timing.
-            if self.first_content.is_none()
-                && bytes.iter().position(|b| *b == b'"').is_some()
-            {
-                self.first_content = Some(now);
-            }
-            // OpenAI usage chunk: {"...","usage":{"prompt_tokens":N,...}}
-            if bytes.windows(5).any(|w| w == b"usage") {
-                let start = bytes.iter().position(|b| *b == b'{').unwrap_or(0);
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes[start..]) {
-                    if let Some(usage) = v.get("usage") {
-                        if let Some(n) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
-                            self.prompt_tokens = n;
-                        }
-                        if let Some(n) = usage.get("completion_tokens").and_then(|x| x.as_u64()) {
-                            self.completion_tokens = n;
-                        }
+        if !self.finished {
+            match &item {
+                std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    self.capture.observe_bytes(bytes, Instant::now());
+                }
+                std::task::Poll::Ready(Some(Err(_))) => self.capture.invalid = true,
+                std::task::Poll::Ready(None) => {
+                    self.finished = true;
+                    if let Some(sample) = self.capture.measurement(
+                        self.event_id, self.model_key.clone(), self.effective_provider.clone(),
+                    ) {
+                        self.routing_events.record_measurement(sample);
                     }
                 }
+                std::task::Poll::Pending => {}
             }
         }
         item
     }
 }
 
-impl Drop for TpsCaptureStream {
-    fn drop(&mut self) {
-        if self.conv_id.is_empty() || self.prompt_tokens == 0 {
+/// Hard cap on a whole SSE frame (including ignored fields/comments). Exceeding
+/// it disables measurement, not forwarding, and releases the decoder buffers.
+const MAX_MEASUREMENT_FRAME_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct UsageTokenCount {
+    value: Option<u64>,
+    invalid: bool,
+}
+
+impl UsageTokenCount {
+    fn observe(&mut self, value: Option<&serde_json::Value>) {
+        let Some(value) = value else { return };
+        let count = value.as_u64();
+        if self.invalid || count.is_none() || self.value.is_some_and(|old| Some(old) != count) {
+            self.invalid = true;
+            self.value = None;
             return;
         }
-        let (Some(started), Some(first)) = (self.started, self.first_content) else {
+        self.value = count;
+    }
+}
+
+struct SseMeasurementCapture {
+    started: Instant,
+    first_output: Option<Instant>,
+    last_output: Option<Instant>,
+    done_at: Option<Instant>,
+    prompt_tokens: UsageTokenCount,
+    completion_tokens: UsageTokenCount,
+    line: Vec<u8>,
+    data: Vec<u8>,
+    frame_bytes: usize,
+    previous_cr: bool,
+    first_line: bool,
+    error_event: bool,
+    invalid: bool,
+}
+
+impl SseMeasurementCapture {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            first_output: None,
+            last_output: None,
+            done_at: None,
+            prompt_tokens: UsageTokenCount::default(),
+            completion_tokens: UsageTokenCount::default(),
+            line: Vec::new(),
+            data: Vec::new(),
+            frame_bytes: 0,
+            previous_cr: false,
+            first_line: true,
+            error_event: false,
+            invalid: false,
+        }
+    }
+
+    fn observe_bytes(&mut self, bytes: &[u8], now: Instant) {
+        for &byte in bytes {
+            if self.invalid {
+                return;
+            }
+            if self.previous_cr {
+                self.previous_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            self.frame_bytes += 1;
+            if self.frame_bytes > MAX_MEASUREMENT_FRAME_BYTES {
+                self.invalid = true;
+                self.line = Vec::new();
+                self.data = Vec::new();
+                return;
+            }
+            if byte == b'\r' || byte == b'\n' {
+                self.observe_line(now);
+                self.previous_cr = byte == b'\r';
+            } else {
+                self.line.push(byte);
+            }
+        }
+    }
+
+    fn observe_line(&mut self, now: Instant) {
+        let mut line = std::mem::take(&mut self.line);
+        if self.first_line {
+            self.first_line = false;
+            if line.starts_with(b"\xef\xbb\xbf") {
+                line.drain(..3);
+            }
+        }
+        if line.is_empty() {
+            self.frame_bytes = 0;
+            if self.error_event {
+                self.invalid = true;
+            } else if !self.data.is_empty() {
+                let mut data = std::mem::take(&mut self.data);
+                data.pop(); // SSE joins data fields with LF, omitting the final LF.
+                self.observe_frame(&data, now);
+            }
+            self.error_event = false;
+            return;
+        }
+        let colon = line.iter().position(|&b| b == b':').unwrap_or(line.len());
+        let field = &line[..colon];
+        let value = line.get(colon + 1..).unwrap_or_default();
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        match field {
+            b"data" => {
+                self.data.extend_from_slice(value);
+                self.data.push(b'\n');
+            }
+            b"event" => self.error_event |= value == b"error",
+            _ => {}
+        }
+    }
+
+    fn observe_frame(&mut self, data: &[u8], now: Instant) {
+        let Ok(data) = std::str::from_utf8(data) else {
+            self.invalid = true;
             return;
         };
-        let end = std::time::Instant::now();
-        let pp_secs = first.duration_since(started).as_secs_f64();
-        let tg_secs = end.duration_since(first).as_secs_f64();
-        let pp_tps = if pp_secs > 0.0 { self.prompt_tokens as f64 / pp_secs } else { 0.0 };
-        let tg_tps = if tg_secs > 0.0 && self.completion_tokens > 0 {
-            self.completion_tokens as f64 / tg_secs
-        } else {
-            0.0
+        let data = data.trim();
+        if data.is_empty() {
+            return;
+        }
+        if self.done_at.is_some() {
+            self.invalid = true; // No further data is valid after the terminal marker.
+            return;
+        }
+        if data == "[DONE]" {
+            self.done_at = Some(now);
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            self.invalid = true;
+            return;
         };
-        self.routing_events.update_tps(&self.conv_id, pp_tps, tg_tps);
+        if !value.is_object()
+            || value.get("error").is_some_and(|error| !error.is_null())
+            || matches!(value.get("type").and_then(|v| v.as_str()),
+                Some("error" | "response.failed" | "response.incomplete" | "response.cancelled"))
+        {
+            self.invalid = true;
+            return;
+        }
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            if usage.is_object() {
+                self.prompt_tokens.observe(usage.get("prompt_tokens"));
+                self.completion_tokens.observe(usage.get("completion_tokens"));
+            } else {
+                self.prompt_tokens.observe(Some(&serde_json::Value::Null));
+                self.completion_tokens.observe(Some(&serde_json::Value::Null));
+            }
+        }
+        if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                if matches!(choice.get("finish_reason").and_then(|v| v.as_str()),
+                    Some("error" | "cancelled" | "canceled"))
+                {
+                    self.invalid = true;
+                    return;
+                }
+                if choice.get("delta").is_some_and(delta_has_generated_output) {
+                    self.first_output.get_or_insert(now);
+                    self.last_output = Some(now);
+                }
+            }
+        }
     }
+
+    fn measurement(
+        &self,
+        event_id: u64,
+        model_key: String,
+        effective_provider: Option<String>,
+    ) -> Option<CompletedStreamMeasurement> {
+        if self.invalid || self.frame_bytes != 0 || !self.line.is_empty() || !self.data.is_empty() {
+            return None;
+        }
+        let done_at = self.done_at?;
+        let generation_tps = match (self.completion_tokens.value, self.first_output, self.last_output) {
+            (Some(tokens), Some(first), Some(last)) if tokens > 1 && last > first => {
+                Some((tokens - 1) as f64 / last.duration_since(first).as_secs_f64())
+            }
+            _ => None,
+        };
+        Some(CompletedStreamMeasurement {
+            event_id,
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            model_key,
+            effective_provider,
+            measured_ttft_ms: self.first_output.map(|first| {
+                first.duration_since(self.started).as_secs_f64() * 1000.0
+            }),
+            generation_tps,
+            prompt_tokens: self.prompt_tokens.value,
+            completion_tokens: self.completion_tokens.value,
+            stream_duration_ms: done_at.duration_since(self.started).as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+fn delta_has_generated_output(delta: &serde_json::Value) -> bool {
+    fn nonempty(value: Option<&serde_json::Value>) -> bool {
+        value.and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+    }
+    ["content", "reasoning", "reasoning_content"].iter().any(|key| nonempty(delta.get(key)))
+        || nonempty(delta.pointer("/function_call/arguments"))
+        || delta.get("tool_calls").and_then(|v| v.as_array()).is_some_and(|calls| {
+            calls.iter().any(|call| nonempty(call.pointer("/function/arguments")))
+        })
 }
 
 /// Derive the Stage from the effective provider and Bonsai decision.
@@ -1209,19 +1397,14 @@ mod tests {
         assert!(!events.update_tps("nope", 1.0, 1.0));
     }
 
-    #[tokio::test]
-    async fn tps_capture_stream_extracts_usage_and_backfills() {
-        use tokio_stream::wrappers::ReceiverStream;
-        use tokio_stream::StreamExt as _;
-
-        let events = Arc::new(RoutingEvents::new());
-        events.emit(RouteEvent {
+    fn tps_test_event(model: &str) -> RouteEvent {
+        RouteEvent {
             id: 0,
             timestamp: String::new(),
             prompt_excerpt: "hi".to_string(),
             requested_model: "auto".to_string(),
             effective_provider: Some("llama-swap".to_string()),
-            model_key: "m".to_string(),
+            model_key: model.to_string(),
             latency_ms: 1,
             stage: Stage::LocalPrimary,
             success: true,
@@ -1230,41 +1413,637 @@ mod tests {
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
-            conv_id: "convX".to_string(),
+            conv_id: "same-conversation".to_string(),
             pp_tps: 0.0,
             tg_tps: 0.0,
-        });
+        }
+    }
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(16);
-        let mut cap = TpsCaptureStream {
-            stream: Box::pin(ReceiverStream::new(rx)),
-            routing_events: Arc::clone(&events),
-            conv_id: "convX".to_string(),
-            started: None,
-            first_content: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+    fn tps_fixture(
+        events: &Arc<RoutingEvents>,
+        model: &str,
+        stream: crate::provider::SseStream,
+    ) -> (u64, crate::provider::SseStream) {
+        let event = tps_test_event(model);
+        let provider = event.effective_provider.clone();
+        let id = events.emit(event);
+        let ProviderResponse::Stream(stream) = wrap_with_tps_capture(
+            ProviderResponse::Stream(stream), Arc::clone(events), id,
+            model.to_string(), provider, Instant::now() - Duration::from_millis(25),
+        );
+        (id, stream)
+    }
+
+    fn tps_output(content: &str) -> Bytes {
+        Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": content}}]}),
+        ))
+    }
+
+    #[tokio::test]
+    async fn tps_capture_stream_correlates_overlapping_same_conversation_requests() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let events = Arc::new(RoutingEvents::new());
+        let (tx_a, rx_a) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(8);
+        let (tx_b, rx_b) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(8);
+        let (id_a, mut stream_a) = tps_fixture(&events, "model-a", Box::pin(ReceiverStream::new(rx_a)));
+        let (id_b, mut stream_b) = tps_fixture(&events, "model-b", Box::pin(ReceiverStream::new(rx_b)));
+        assert_ne!(id_a, id_b);
+        tx_a.send(Ok(tps_output("a"))).await.unwrap();
+        tx_b.send(Ok(tps_output("b"))).await.unwrap();
+        stream_a.next().await.unwrap().unwrap();
+        stream_b.next().await.unwrap().unwrap();
+        assert!(events.get_measurements().is_empty());
+
+        // Finish the newer request first, then the older one. Conversation-based
+        // backfill would overwrite model-b's rate with model-a's measurement.
+        for (tx, stream, tokens) in [
+            (tx_b, &mut stream_b, 11),
+            (tx_a, &mut stream_a, 3),
+        ] {
+            tx.send(Ok(tps_output("tail"))).await.unwrap();
+            tx.send(Ok(Bytes::from(format!(
+                "data: {{\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":{tokens}}}}}\n\n",
+            )))).await.unwrap();
+            tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await.unwrap();
+            drop(tx);
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+            }
+        }
+        let samples = events.get_measurements();
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].event_id, samples[0].model_key.as_str()), (id_a, "model-a"));
+        assert_eq!((samples[1].event_id, samples[1].model_key.as_str()), (id_b, "model-b"));
+        assert_eq!(samples[0].completion_tokens, Some(3));
+        assert_eq!(samples[1].completion_tokens, Some(11));
+        for sample in &samples {
+            assert!(sample.measured_ttft_ms.unwrap() >= 25.0);
+            assert!(sample.generation_tps.unwrap() > 0.0);
+            assert!(sample.stream_duration_ms >= sample.measured_ttft_ms.unwrap());
+            assert_eq!(sample.effective_provider.as_deref(), Some("llama-swap"));
+            chrono::DateTime::parse_from_rfc3339(&sample.completed_at).unwrap();
+            let event = events.get_all().into_iter().find(|e| e.id == sample.event_id).unwrap();
+            assert_eq!(event.tg_tps, sample.generation_tps.unwrap());
+            assert_eq!(event.pp_tps, 0.0);
+        }
+        // Samples already exist before Drop, and subsequent EOF polls do not duplicate them.
+        assert!(stream_a.next().await.is_none());
+        drop((stream_a, stream_b));
+        assert_eq!(events.get_measurements().len(), 2);
+    }
+
+    #[test]
+    fn tps_capture_ignores_role_heartbeat_and_measures_exact_output_interval() {
+        let start = Instant::now();
+        let mut capture = SseMeasurementCapture::new(start);
+        for bytes in [
+            b": heartbeat with \"quotes\"\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"x\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}}]}\n\n",
+        ] {
+            capture.observe_bytes(bytes, start + Duration::from_millis(10));
+            assert!(capture.first_output.is_none());
+        }
+        capture.observe_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            start + Duration::from_millis(100),
+        );
+        capture.observe_bytes(&tps_output("answer"), start + Duration::from_millis(300));
+        capture.observe_bytes(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\n",
+            start + Duration::from_millis(600),
+        );
+        capture.observe_bytes(b"data: [DONE]\n\n", start + Duration::from_millis(800));
+        let sample = capture.measurement(1, "model".into(), None).unwrap();
+        assert_eq!(sample.measured_ttft_ms, Some(100.0));
+        assert_eq!(sample.generation_tps, Some(20.0)); // (5 - 1) / 0.2; excludes usage/DONE tail.
+        assert_eq!(sample.stream_duration_ms, 800.0);
+        assert_eq!(sample.prompt_tokens, Some(100));
+        assert_eq!(sample.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn tps_capture_recognizes_reasoning_and_tool_argument_output() {
+        for delta in [
+            serde_json::json!({"content": " "}),
+            serde_json::json!({"reasoning": "think"}),
+            serde_json::json!({"reasoning_content": "think"}),
+            serde_json::json!({"tool_calls": [{"function": {"arguments": "{\"a\":"}}]}),
+            serde_json::json!({"function_call": {"arguments": "{}"}}),
+        ] {
+            let start = Instant::now();
+            let mut capture = SseMeasurementCapture::new(start);
+            let frame = format!("data: {}\n\n", serde_json::json!({"choices": [{"delta": delta}]}));
+            capture.observe_bytes(frame.as_bytes(), start + Duration::from_millis(50));
+            capture.observe_bytes(b"data: [DONE]\n\n", start + Duration::from_millis(100));
+            let sample = capture.measurement(1, String::new(), None).unwrap();
+            assert_eq!(sample.measured_ttft_ms, Some(50.0));
+            assert_eq!(sample.generation_tps, None);
+        }
+    }
+
+    #[test]
+    fn tps_capture_decodes_split_utf8_crlf_multiline_and_multiple_frames() {
+        let start = Instant::now();
+        let wire = concat!(
+            "\u{feff}: greeting\r\n\r\n",
+            "data: {\"choices\":\r\n",
+            "data: [{\"delta\":{\"content\":\"héllo\"}}]}\r\n\r\n",
+            "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        // Every split position includes UTF-8, CRLF, JSON, and DONE boundaries.
+        for split in 0..=wire.len() {
+            let mut capture = SseMeasurementCapture::new(start);
+            capture.observe_bytes(&wire.as_bytes()[..split], start + Duration::from_millis(10));
+            capture.observe_bytes(&wire.as_bytes()[split..], start + Duration::from_millis(20));
+            let sample = capture.measurement(1, String::new(), None).unwrap();
+            assert!(sample.measured_ttft_ms.is_some());
+            assert_eq!(sample.prompt_tokens, Some(7));
+            assert_eq!(sample.completion_tokens, Some(3));
+            assert_eq!(sample.generation_tps, None);
+        }
+        for separator in ["\r", "\n", "\r\n"] {
+            let wire = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"é\"}}}}]}}{separator}{separator}data: [DONE]{separator}{separator}");
+            let mut capture = SseMeasurementCapture::new(start);
+            for (index, byte) in wire.bytes().enumerate() {
+                capture.observe_bytes(&[byte], start + Duration::from_millis(index as u64 + 1));
+            }
+            assert!(capture.measurement(1, String::new(), None).unwrap().measured_ttft_ms.is_some());
+        }
+    }
+
+    #[test]
+    fn tps_capture_missing_malformed_conflicting_usage_stays_unknown() {
+        for usage in [
+            "",
+            "data: {\"usage\":null}\n\n",
+            "data: {\"usage\":{}}\n\n",
+            "data: {\"usage\":false}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":\"10\",\"completion_tokens\":-3}}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":1.5,\"completion_tokens\":2.0}}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\ndata: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+        ] {
+            let start = Instant::now();
+            let mut capture = SseMeasurementCapture::new(start);
+            capture.observe_bytes(&tps_output("a"), start + Duration::from_millis(10));
+            capture.observe_bytes(&tps_output("b"), start + Duration::from_millis(20));
+            capture.observe_bytes(usage.as_bytes(), start + Duration::from_millis(30));
+            capture.observe_bytes(b"data: [DONE]\n\n", start + Duration::from_millis(40));
+            let sample = capture.measurement(1, String::new(), None).unwrap();
+            assert_eq!(sample.measured_ttft_ms, Some(10.0), "{usage}");
+            assert_eq!(sample.prompt_tokens, None, "{usage}");
+            assert_eq!(sample.completion_tokens, None, "{usage}");
+            assert_eq!(sample.generation_tps, None, "{usage}");
+        }
+        let start = Instant::now();
+        let mut capture = SseMeasurementCapture::new(start);
+        capture.observe_bytes(&tps_output("a"), start);
+        capture.observe_bytes(&tps_output("b"), start + Duration::from_millis(100));
+        capture.observe_bytes(
+            b"data: {\"usage\":{\"prompt_tokens\":null,\"completion_tokens\":11}}\n\ndata: [DONE]\n\n",
+            start + Duration::from_millis(200),
+        );
+        let sample = capture.measurement(1, String::new(), None).unwrap();
+        assert_eq!(sample.prompt_tokens, None);
+        assert_eq!(sample.completion_tokens, Some(11));
+        assert_eq!(sample.generation_tps, Some(100.0));
+    }
+
+    #[test]
+    fn tps_capture_requires_enough_tokens_and_distinct_output_times() {
+        for tokens in [0, 1, 2] {
+            for separate_times in [false, true] {
+                let start = Instant::now();
+                let mut capture = SseMeasurementCapture::new(start);
+                capture.observe_bytes(&tps_output("a"), start);
+                let last = start + Duration::from_millis(if separate_times { 100 } else { 0 });
+                capture.observe_bytes(&tps_output("b"), last);
+                let ending = format!("data: {{\"usage\":{{\"completion_tokens\":{tokens}}}}}\n\ndata: [DONE]\n\n");
+                capture.observe_bytes(ending.as_bytes(), last);
+                let sample = capture.measurement(1, String::new(), None).unwrap();
+                assert_eq!(sample.completion_tokens, Some(tokens));
+                assert_eq!(sample.generation_tps.is_some(), tokens > 1 && separate_times);
+            }
+        }
+        let start = Instant::now();
+        let mut capture = SseMeasurementCapture::new(start);
+        capture.observe_bytes(b"data: [DONE]\n\n", start);
+        let sample = capture.measurement(1, String::new(), None).unwrap();
+        assert_eq!(sample.measured_ttft_ms, None);
+        assert_eq!(sample.generation_tps, None);
+    }
+
+    #[tokio::test]
+    async fn tps_capture_excludes_errors_incomplete_streams_and_cancellation() {
+        let cases: Vec<Vec<anyhow::Result<Bytes>>> = vec![
+            vec![],
+            vec![Ok(tps_output("unfinished"))],
+            vec![Ok(Bytes::from_static(b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: [DONE]"))],
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n"))],
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\ndata: {"))],
+            vec![Ok(Bytes::from_static(b"data: {bad json}\n\ndata: [DONE]\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: {\"error\":{\"message\":\"bad\"}}\n\ndata: [DONE]\n\n"))],
+            vec![Ok(Bytes::from_static(b"event: error\ndata: {}\n\ndata: [DONE]\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: {\"type\":\"response.incomplete\"}\n\ndata: [DONE]\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: {\"choices\":[{\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n"))],
+            vec![Err(anyhow!("transport failed")), Ok(Bytes::from_static(b"data: [DONE]\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\n")), Err(anyhow!("late transport failure"))],
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\ndata: {\"error\":\"late failure\"}\n\n"))],
+            vec![Ok(Bytes::from_static(b"data: \"\xff\"\n\ndata: [DONE]\n\n"))],
+        ];
+        for chunks in cases {
+            let events = Arc::new(RoutingEvents::new());
+            let (_, mut stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+            while stream.next().await.is_some() {}
+            drop(stream);
+            assert!(events.get_measurements().is_empty());
+            assert_eq!(events.get_all()[0].tg_tps, 0.0);
+        }
+        // Explicit cancellation before EOF, both before and after the DONE marker.
+        for ending in ["", "data: [DONE]\n\n"] {
+            let events = Arc::new(RoutingEvents::new());
+            let chunks = vec![
+                Ok(tps_output("a")), Ok(tps_output("b")),
+                Ok(Bytes::from(format!(
+                    "data: {{\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":20}}}}\n\n{ending}",
+                ))),
+            ];
+            let (_, mut stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+            for _ in 0..3 {
+                stream.next().await.unwrap().unwrap();
+            }
+            drop(stream);
+            assert!(events.get_measurements().is_empty());
+            assert_eq!(events.get_all()[0].tg_tps, 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tps_capture_bounds_decoder_without_changing_forwarded_bytes() {
+        for bytes in [
+            vec![b'x'; MAX_MEASUREMENT_FRAME_BYTES + 1],
+            b"data: \n".repeat(MAX_MEASUREMENT_FRAME_BYTES / 7 + 1),
+            b": comment\n".repeat(MAX_MEASUREMENT_FRAME_BYTES / 10 + 1),
+        ] {
+            let start = Instant::now();
+            let mut capture = SseMeasurementCapture::new(start);
+            capture.observe_bytes(&bytes, start);
+            assert!(capture.invalid);
+            assert!(capture.line.is_empty());
+            assert!(capture.data.is_empty());
+            capture.observe_bytes(b"\n\ndata: [DONE]\n\n", start);
+            assert!(capture.measurement(1, String::new(), None).is_none());
+
+            let events = Arc::new(RoutingEvents::new());
+            let input = Bytes::from(bytes);
+            let chunks = vec![Ok(input.clone()), Ok(Bytes::from_static(b"\n\ndata: [DONE]\n\n"))];
+            let (_, mut stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+            assert_eq!(stream.next().await.unwrap().unwrap(), input);
+            while stream.next().await.is_some() {}
+            assert!(events.get_measurements().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tps_capture_missing_usage_still_records_ttft_with_empty_conversation() {
+        let events = Arc::new(RoutingEvents::new());
+        let mut event = tps_test_event("model");
+        event.conv_id.clear();
+        event.session_id = Some("review-session".into());
+        let id = events.emit(event);
+        let chunks = vec![Ok(tps_output("a")), Ok(Bytes::from_static(b"data: [DONE]\n\n"))];
+        let ProviderResponse::Stream(mut stream) = wrap_with_tps_capture(
+            ProviderResponse::Stream(Box::pin(fstream::iter(chunks))),
+            Arc::clone(&events), id, "model".into(), Some("llama-swap".into()), Instant::now(),
+        );
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        };
+        let samples = events.get_measurements();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].event_id, id);
+        assert!(samples[0].measured_ttft_ms.is_some());
+        assert_eq!(samples[0].generation_tps, None);
+        assert_eq!(samples[0].prompt_tokens, None);
+        assert_eq!(samples[0].completion_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_drains_usage_and_eof_before_terminal_events() {
+        use crate::anthropic::AnthropicSseAdapter;
+        use futures_util::FutureExt;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let events = Arc::new(RoutingEvents::new());
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(8);
+        let (id, stream) = tps_fixture(&events, "model", Box::pin(ReceiverStream::new(rx)));
+        let mut adapter = AnthropicSseAdapter::new(stream, "model".into());
+        tx.send(Ok(tps_output("hello"))).await.unwrap();
+        loop {
+            let frame = adapter.next().await.unwrap().unwrap();
+            assert!(!String::from_utf8_lossy(&frame).contains("message_stop"));
+            if String::from_utf8_lossy(&frame).contains("content_block_delta") {
+                break;
+            }
+        }
+        tx.send(Ok(tps_output(" world"))).await.unwrap();
+        assert!(String::from_utf8_lossy(&adapter.next().await.unwrap().unwrap()).contains(" world"));
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":9}}\n\n",
+            "data: [DO",
+            "NE]\r\n\r\n",
+        ] {
+            tx.send(Ok(Bytes::from(chunk))).await.unwrap();
+            assert!(adapter.next().now_or_never().is_none(), "terminal output before EOF");
+            assert!(events.get_measurements().is_empty());
+        }
+        drop(tx);
+        let closing = adapter.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&closing).contains("content_block_stop"));
+        // Even a client stopping at the terminal event cannot bypass the inner EOF.
+        let samples = events.get_measurements();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].event_id, id);
+        assert_eq!(samples[0].completion_tokens, Some(9));
+        assert!(samples[0].generation_tps.unwrap() > 0.0);
+        let delta = adapter.next().await.unwrap().unwrap();
+        let delta = String::from_utf8_lossy(&delta);
+        assert!(delta.contains("\"stop_reason\":\"max_tokens\""));
+        assert!(delta.contains("\"output_tokens\":9"));
+        assert!(String::from_utf8_lossy(&adapter.next().await.unwrap().unwrap()).contains("message_stop"));
+        assert!(adapter.next().await.is_none());
+        assert_eq!(events.get_measurements().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_preserves_split_utf8_and_ending_frames() {
+        let events = Arc::new(RoutingEvents::new());
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"héllo\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        let chunks: Vec<anyhow::Result<Bytes>> = wire.bytes().map(|byte| Ok(Bytes::from(vec![byte]))).collect();
+        let (_, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+        let mut adapter = crate::anthropic::AnthropicSseAdapter::new(stream, "model".into());
+        let mut output = String::new();
+        while let Some(frame) = adapter.next().await {
+            output.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        assert!(output.contains("héllo"));
+        assert_eq!(output.matches("event: message_stop").count(), 1);
+        assert!(output.contains("\"output_tokens\":5"));
+        assert_eq!(events.get_measurements().len(), 1);
+        assert_eq!(events.get_measurements()[0].completion_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_excludes_late_errors_and_missing_done() {
+        let cases: Vec<(Vec<anyhow::Result<Bytes>>, bool)> = vec![
+            (vec![Err(anyhow!("late provider failure"))], true),
+            (vec![Ok(Bytes::from_static(b"data: {\"error\":\"late SSE error\"}\n\n"))], true),
+            (vec![Ok(Bytes::from_static(b"event: error\ndata: {}\n\n"))], true),
+            (vec![Ok(Bytes::from_static(b"data: {\"type\":\"response.cancelled\"}\n\n"))], true),
+            (vec![Ok(Bytes::from_static(b"data: [DONE]\n\n")), Err(anyhow!("error after DONE"))], true),
+            (vec![Ok(Bytes::from_static(b"data: {\"usage\":"))], true),
+            (vec![], false),
+        ];
+        for (tail, expect_error) in cases {
+            let events = Arc::new(RoutingEvents::new());
+            let mut chunks = vec![
+                Ok(tps_output("hello")),
+                Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")),
+                Ok(Bytes::from_static(b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\n")),
+            ];
+            chunks.extend(tail);
+            let (_, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+            let adapter = crate::anthropic::AnthropicSseAdapter::new(stream, "model".into());
+            let frames: Vec<_> = adapter.collect().await;
+            assert_eq!(frames.iter().any(|frame| frame.is_err()), expect_error);
+            let terminal = frames.iter().filter_map(|frame| frame.as_ref().ok())
+                .any(|frame| String::from_utf8_lossy(frame).contains("message_stop"));
+            assert_eq!(terminal, !expect_error);
+            assert!(events.get_measurements().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_cancellation_during_tail_drain_records_nothing() {
+        use futures_util::FutureExt;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        for done in ["", "data: [DONE]\n\n"] {
+            let events = Arc::new(RoutingEvents::new());
+            let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(8);
+            let (_, stream) = tps_fixture(&events, "model", Box::pin(ReceiverStream::new(rx)));
+            let mut adapter = crate::anthropic::AnthropicSseAdapter::new(stream, "model".into());
+            tx.send(Ok(tps_output("hello"))).await.unwrap();
+            loop {
+                let frame = adapter.next().await.unwrap().unwrap();
+                if String::from_utf8_lossy(&frame).contains("content_block_delta") {
+                    break;
+                }
+            }
+            tx.send(Ok(Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"usage\":{{\"completion_tokens\":5}}}}\n\n{done}",
+            )))).await.unwrap();
+            assert!(adapter.next().now_or_never().is_none());
+            drop(adapter);
+            drop(tx);
+            assert!(events.get_measurements().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tps_capture_anthropic_bounds_tail_after_finish_or_done() {
+        use crate::anthropic::{AnthropicSseAdapter, ANTHROPIC_EOF_GRACE};
+        use futures_util::FutureExt;
+
+        for ending in [
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let events = Arc::new(RoutingEvents::new());
+            let chunks = vec![Ok(tps_output("hello")), Ok(Bytes::from(ending))];
+            let source = fstream::iter(chunks).chain(fstream::pending());
+            let (_, stream) = tps_fixture(&events, "model", Box::pin(source));
+            let mut adapter = AnthropicSseAdapter::new(stream, "model".into());
+            loop {
+                let frame = adapter.next().await.unwrap().unwrap();
+                if String::from_utf8_lossy(&frame).contains("content_block_delta") {
+                    break;
+                }
+            }
+            assert!(adapter.next().now_or_never().is_none());
+            tokio::time::advance(ANTHROPIC_EOF_GRACE + Duration::from_millis(1)).await;
+            let error = adapter.next().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("tail-drain deadline"));
+            assert!(adapter.next().await.is_none());
+            assert!(events.get_measurements().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tps_capture_anthropic_done_does_not_extend_finish_deadline() {
+        use crate::anthropic::{AnthropicSseAdapter, ANTHROPIC_EOF_GRACE};
+        use futures_util::FutureExt;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let events = Arc::new(RoutingEvents::new());
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(8);
+        let (_, stream) = tps_fixture(&events, "model", Box::pin(ReceiverStream::new(rx)));
+        let mut adapter = AnthropicSseAdapter::new(stream, "model".into());
+        tx.send(Ok(tps_output("hello"))).await.unwrap();
+        loop {
+            let frame = adapter.next().await.unwrap().unwrap();
+            if String::from_utf8_lossy(&frame).contains("content_block_delta") {
+                break;
+            }
+        }
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ))).await.unwrap();
+        assert!(adapter.next().now_or_never().is_none());
+        tokio::time::advance(ANTHROPIC_EOF_GRACE / 2).await;
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"usage\":{\"completion_tokens\":5}}\n\ndata: [DONE]\n\n",
+        ))).await.unwrap();
+        assert!(adapter.next().now_or_never().is_none());
+        tokio::time::advance(ANTHROPIC_EOF_GRACE / 2 + Duration::from_millis(1)).await;
+        let error = adapter.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("tail-drain deadline"));
+        assert!(adapter.next().await.is_none());
+        assert!(events.get_measurements().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tps_capture_anthropic_ready_tail_wins_after_consumer_backpressure() {
+        use crate::anthropic::{AnthropicSseAdapter, ANTHROPIC_EOF_GRACE};
+
+        for ending in ["ready-eof", "ready-data", "ready-error"] {
+            let events = Arc::new(RoutingEvents::new());
+            let first = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
+            let usage = "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\n";
+            let done = "data: [DONE]\n\n";
+            let chunks = match ending {
+                "ready-eof" => vec![Ok(Bytes::from(format!("{first}{usage}{done}")))],
+                "ready-data" => vec![Ok(Bytes::from(first)), Ok(Bytes::from(usage)), Ok(Bytes::from(done))],
+                _ => vec![Ok(Bytes::from(first)), Err(anyhow!("original upstream failure"))],
+            };
+            let (id, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+            let mut adapter = AnthropicSseAdapter::new(stream, "model".into());
+            let first_frame = adapter.next().await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&first_frame).contains("message_start"));
+            assert!(events.get_measurements().is_empty());
+            // finish_reason was already decoded, but downstream has not yet
+            // consumed the queued content/start frames or polled the ready tail.
+            tokio::time::advance(ANTHROPIC_EOF_GRACE + Duration::from_secs(1)).await;
+            let frames: Vec<_> = adapter.collect().await;
+            if ending == "ready-error" {
+                let error = frames.iter().find_map(|frame| frame.as_ref().err()).unwrap();
+                assert_eq!(error.to_string(), "original upstream failure");
+                assert!(events.get_measurements().is_empty());
+            } else {
+                assert!(frames.iter().all(|frame| frame.is_ok()));
+                let text: String = frames.iter().map(|frame| {
+                    String::from_utf8_lossy(frame.as_ref().unwrap()).into_owned()
+                }).collect();
+                assert!(text.contains("\"output_tokens\":5"));
+                assert_eq!(text.matches("event: message_stop").count(), 1);
+                let samples = events.get_measurements();
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].event_id, id);
+                assert_eq!(samples[0].completion_tokens, Some(5));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_caps_ready_tail_bytes_and_partial_lines() {
+        use crate::anthropic::{
+            AnthropicSseAdapter, ANTHROPIC_TAIL_MAX_BYTES, ANTHROPIC_TAIL_MAX_LINE_BYTES,
         };
 
-        // Keepalive first (no content): sets started but not first_content.
-        tx.send(Ok(Bytes::from(":\n\n"))).await.unwrap();
-        let _ = futures_util::StreamExt::next(&mut cap).await;
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        // Content chunks then the OpenAI usage chunk.
-        tx.send(Ok(Bytes::from("data: {\"delta\":{\"content\":\"hello\"}}\n\n"))).await.unwrap();
-        tx.send(Ok(Bytes::from("data: {\"delta\":{\"content\":\" world\"}}\n\n"))).await.unwrap();
-        tx.send(Ok(Bytes::from("data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n"))).await.unwrap();
-        tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await.unwrap();
-        drop(tx);
-        // Drain to completion so Drop runs and backfills.
-        while futures_util::StreamExt::next(&mut cap).await.is_some() {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        for (tail, expected_error) in [
+            (vec![b'x'; ANTHROPIC_TAIL_MAX_LINE_BYTES + 1], "line budget"),
+            (b":\n".repeat(ANTHROPIC_TAIL_MAX_BYTES / 2 + 1), "byte budget"),
+        ] {
+            for same_chunk in [false, true] {
+                let events = Arc::new(RoutingEvents::new());
+                let finish = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+                let mut chunks = vec![Ok(tps_output("hello"))];
+                if same_chunk {
+                    let mut bytes = finish.to_vec();
+                    bytes.extend_from_slice(&tail);
+                    chunks.push(Ok(Bytes::from(bytes)));
+                } else {
+                    chunks.push(Ok(Bytes::from_static(finish)));
+                    // Split the tail across chunks to exercise cumulative limits.
+                    chunks.extend(tail.chunks(1024).map(|bytes| Ok(Bytes::copy_from_slice(bytes))));
+                }
+                let (_, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+                let adapter = AnthropicSseAdapter::new(stream, "model".into());
+                let frames: Vec<_> = adapter.collect().await;
+                let error = frames.iter().find_map(|frame| frame.as_ref().err()).unwrap();
+                assert!(error.to_string().contains(expected_error), "{error}");
+                assert!(events.get_measurements().is_empty());
+                assert!(!frames.iter().filter_map(|frame| frame.as_ref().ok())
+                    .any(|frame| String::from_utf8_lossy(frame).contains("message_stop")));
+            }
         }
-        // Drop the wrapper explicitly so its Drop impl backfills before we read.
-        drop(cap);
-        let evs = events.get_all();
-        let e = &evs[0];
-        assert!(e.pp_tps > 0.0, "pp_tps backfilled: {}", e.pp_tps);
-        assert!(e.tg_tps > 0.0, "tg_tps backfilled: {}", e.tg_tps);
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_caps_always_ready_empty_tail_work() {
+        use crate::anthropic::{AnthropicSseAdapter, ANTHROPIC_TAIL_MAX_CHUNKS};
+        use std::sync::atomic::AtomicUsize;
+
+        let events = Arc::new(RoutingEvents::new());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let tail_polls = Arc::clone(&polls);
+        let tail = fstream::poll_fn(move |_| {
+            let count = tail_polls.fetch_add(1, Ordering::Relaxed) + 1;
+            // Fail rather than spin forever if the work guard regresses.
+            assert!(count <= ANTHROPIC_TAIL_MAX_CHUNKS + 1);
+            std::task::Poll::Ready(Some(Ok(Bytes::new())))
+        });
+        let chunks = vec![
+            Ok(tps_output("hello")),
+            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")),
+        ];
+        let (_, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks).chain(tail)));
+        let adapter = AnthropicSseAdapter::new(stream, "model".into());
+        let frames: Vec<_> = adapter.collect().await;
+        let error = frames.iter().find_map(|frame| frame.as_ref().err()).unwrap();
+        assert!(error.to_string().contains("chunk budget"));
+        assert_eq!(polls.load(Ordering::Relaxed), ANTHROPIC_TAIL_MAX_CHUNKS + 1);
+        assert!(events.get_measurements().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tps_capture_anthropic_tail_line_cap_does_not_restrict_prefinish_content() {
+        use crate::anthropic::{AnthropicSseAdapter, ANTHROPIC_TAIL_MAX_LINE_BYTES};
+
+        let events = Arc::new(RoutingEvents::new());
+        let content = "x".repeat(ANTHROPIC_TAIL_MAX_LINE_BYTES + 1);
+        let chunks = vec![
+            Ok(tps_output(&content)),
+            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")),
+        ];
+        let (_, stream) = tps_fixture(&events, "model", Box::pin(fstream::iter(chunks)));
+        let adapter = AnthropicSseAdapter::new(stream, "model".into());
+        let frames: Vec<_> = adapter.collect().await;
+        assert!(frames.iter().all(|frame| frame.is_ok()));
+        assert!(frames.iter().any(|frame| String::from_utf8_lossy(frame.as_ref().unwrap()).contains(&content)));
+        assert_eq!(events.get_measurements().len(), 1);
     }
 }
