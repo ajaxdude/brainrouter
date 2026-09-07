@@ -59,6 +59,8 @@ pub async fn run_loop(
     config: &crate::config::ReviewConfig,
     project_dir: &str,
 ) -> Result<ReviewResult> {
+    config.validate()?;
+    let choice = config.model_choice()?;
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();
@@ -79,16 +81,9 @@ pub async fn run_loop(
 
         let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
 
-        // Determine the model for this review call
-        let requested_model = match config.forced_mode.as_str() {
-            "cloud" => "cloud".to_string(),
-            "local" => config.forced_model.clone().unwrap_or_else(|| "local".to_string()),
-            _ => "auto".to_string(),
-        };
-
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
-        let result = call_llm_for_review(router, prompt.clone(), session_id, requested_model, project_dir).await;
+        let result = call_llm_for_review(router, prompt.clone(), session_id, &choice, project_dir).await;
 
         match result {
             Err(e) => {
@@ -111,9 +106,7 @@ pub async fn run_loop(
                 break;
             }
             Ok((raw_text, route_info)) => {
-                // Record which model handled this review (first iteration sets it; later
-                // iterations are no-ops because update_session only sets it once).
-                let review_model = route_info.display();
+                let review_model = format!("requested {}; actual {}", choice.selector(), route_info.display());
 
                 // Parse the JSON response from the LLM
                 match parse_llm_response(&raw_text) {
@@ -222,11 +215,11 @@ async fn call_llm_for_review(
     router: &Arc<Router>,
     prompt: String,
     session_id: &str,
-    model: String,
+    choice: &crate::routing_profile::ModelChoice,
     project_dir: &str,
 ) -> Result<(String, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
-        model,
+        model: choice.selector(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -255,7 +248,7 @@ async fn call_llm_for_review(
 
 
     let (provider_response, route_info) = router
-        .route_tagged(request, Some(session_id.to_string()), project_dir.to_string(), String::new())
+        .route_with_choice(request, choice, Some(session_id.to_string()), project_dir.to_string(), String::new())
         .await?;
 
     // Collect the SSE stream into a full text response

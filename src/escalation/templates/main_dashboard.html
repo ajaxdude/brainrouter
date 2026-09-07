@@ -251,13 +251,43 @@ textarea { resize: vertical; }
   <!-- All toolboxes -->
   <div id="toolbox-list" style="padding:0 12px;display:flex;flex-direction:column;gap:2px"></div>
 
-  <!-- Routing Mode -->
+  <!-- Independent routing roles -->
   <div style="padding:12px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);margin-top:12px;text-transform:uppercase">Routing</div>
   <div style="padding:0 12px 8px">
-    <div style="display:flex;gap:6px">
-      <button id="mode-auto"  class="mode-btn"        onclick="setRoutingMode('auto')"  style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">auto</button>
-      <button id="mode-cloud" class="mode-btn"        onclick="setRoutingMode('cloud')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);color:var(--textMute);font-family:'JetBrains Mono',monospace">cloud</button>
-      <button id="mode-local" class="mode-btn active" onclick="setRoutingMode('local')" style="all:unset;flex:1;cursor:pointer;padding:7px 0;font-size:11px;text-align:center;border-radius:6px;border:1px solid var(--border);background:var(--bg3);color:var(--cyan);font-family:'JetBrains Mono',monospace">local</button>
+    <div style="display:grid;gap:6px;font-size:11px">
+      <label for="routing-preset">Preset</label>
+      <select id="routing-preset" class="config-input" onchange="selectRoutingPreset()">
+        <option value="auto">Auto</option>
+        <option value="cloud">Cloud</option>
+        <option value="local_main_sub">Local main/sub</option>
+        <option value="local_custom">Local custom</option>
+        <option value="cloud_main_local_review">Cloud main + local review</option>
+        <option value="local_main_cloud_review">Local main + cloud review</option>
+        <option value="custom">Custom roles</option>
+      </select>
+      <label for="main-backend">Main model</label>
+      <select id="main-backend" class="config-input" onchange="routingBackendChanged('main')">
+        <option value="auto">Auto (classifier)</option><option value="local">Local</option><option value="cloud">Cloud</option>
+      </select>
+      <input id="main-model" class="config-input" aria-label="Main model ID" placeholder="Backend default (optional ID)">
+      <label for="reviewer-backend">Reviewer model</label>
+      <select id="reviewer-backend" class="config-input" onchange="routingBackendChanged('reviewer')">
+        <option value="auto">Auto (classifier)</option><option value="local">Local</option><option value="cloud">Cloud</option>
+      </select>
+      <input id="reviewer-model" class="config-input" aria-label="Reviewer model ID" placeholder="Backend default (optional ID)">
+      <label for="subagent-model">Subagent pool (local, subs alias only)</label>
+      <input id="subagent-model" class="config-input" list="routing-local-models" placeholder="Unconfigured: legacy auto">
+      <datalist id="routing-local-models"></datalist>
+      <datalist id="routing-cloud-models"></datalist>
+      <div style="display:flex;gap:6px">
+        <button id="save-routing-profile" class="br-btn" onclick="saveRoutingProfile()" disabled>Save roles</button>
+        <button class="br-btn" onclick="loadRoutingModels()">Refresh lists</button>
+      </div>
+      <div id="routing-profile-message" role="status" style="color:var(--amber);overflow-wrap:anywhere">Loading preferences...</div>
+      <div id="routing-model-errors" role="status" style="color:var(--amber);overflow-wrap:anywhere"></div>
+      <div id="routing-saved" style="color:var(--textDim);overflow-wrap:anywhere"></div>
+      <div style="color:var(--textMute);line-height:1.5">Main applies only to auto/default requests. Explicit client models win. Reviews keep their original reviewer on continuation. Saving never starts a model or enables cloud.</div>
+      <div id="routing-last-actual" style="color:var(--textDim);overflow-wrap:anywhere"></div>
     </div>
     <div id="routing-hint" style="display:none;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;padding:2px 2px 0;line-height:1.4"></div>
     <div style="display:flex;align-items:center;gap:8px;margin-top:6px" title="Prompt rewrite — when on, local requests get a lean system prompt. Off → forward incoming prompts untouched">
@@ -698,11 +728,8 @@ function reviewHtml(sess, eventId) {
   // Don't render review block until the review has actually run.
   if (st === 'pending') return '';
 
-  // Parse reviewer name from review_model: "cloud-direct → manifest (claude-opus-4-6)"
-  // We want the part in parens if present, otherwise the whole string.
+  // Show the requested policy alongside the actual provider, including fallbacks.
   const rawModel = sess.review_model || '';
-  const parenMatch = rawModel.match(/\(([^)]+)\)$/);
-  const reviewerName = parenMatch ? parenMatch[1] : rawModel;
 
   const iters = sess.iteration_count != null ? sess.iteration_count : 0;
   const iterLabel = iters === 0 ? '1 pass' : `${iters + 1} passes`;
@@ -730,7 +757,7 @@ function reviewHtml(sess, eventId) {
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
       <span style="font-size:10px;letter-spacing:1px;color:${accentColor};font-family:'JetBrains Mono',monospace;font-weight:600">↳ REVIEW</span>
       ${statusPill(isApproved ? 'approved' : st === 'needs_revision' ? 'reviewing' : st)}
-      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${escHtml(reviewerName)}</span>
+      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${escHtml(rawModel)}</span>
       <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">· ${iterLabel}</span>
       ${isEscalated ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace;font-weight:600">HUMAN NEEDED</span>` : ''}
     </div>
@@ -881,6 +908,10 @@ function progressBar(pct, isLive, ppId) {
 // One turn (prompt + its hops) rendered as a nested sub-card, used when a
 // conversation group has several turns. Mirrors the single-turn card body but
 // without the outer chrome (border-left, header).
+function routingOutcomeHtml(event) {
+  return `<div style="margin-top:6px;font-size:10px;color:var(--textDim);overflow-wrap:anywhere">Requested: ${escHtml(event.requested_model || 'auto')} → actual: ${escHtml(event.effective_provider || 'error')} / ${escHtml(event.model_key || 'unknown')}</div>`;
+}
+
 function renderTurnCard(evs) {
   const latest = evs[evs.length - 1];
   const successEv = evs.filter(e => e.success);
@@ -904,6 +935,7 @@ function renderTurnCard(evs) {
 
   return `<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg2);padding:10px 12px;margin-bottom:8px">
     <div style="font-size:12px;color:var(--text);line-height:1.5">${prompt}</div>
+    ${routingOutcomeHtml(displayEv)}
     ${errHtml}
     ${hopSummary}
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">
@@ -977,6 +1009,7 @@ function renderGroup(group, index) {
     }
     body = `<div style="padding:10px 16px 4px">
       <div style="font-size:13px;color:var(--text);line-height:1.5">${prompt}</div>
+      ${routingOutcomeHtml(displayEv)}
       ${errHtml}
       ${hopSummary}
     </div>
@@ -1461,6 +1494,13 @@ function updateRoutingHint() {
   }
   el.textContent = notes.join(' · ');
   el.style.display = notes.length ? 'block' : 'none';
+  const actual = document.getElementById('routing-last-actual');
+  const last = allEvents.reduce((newest, event) => !newest || event.id > newest.id ? event : newest, null);
+  if (actual && last) {
+    actual.textContent = 'Last request: ' + last.requested_model + ' → actual: '
+      + (last.effective_provider || 'error') + ' / ' + (last.model_key || 'unknown')
+      + (last.success ? '' : ' — ' + last.error);
+  }
 }
 
 // ─── Generic pill toggle (discord/signal-style switch) ───────────────────────
@@ -1746,39 +1786,126 @@ function updateBridges() {
   }
 }
 
-async function setRoutingMode(mode) {
-  // Bonsai is off by default: auto still works — it routes straight to local.
-  // Offer to start the classifier so auto can route cloud requests too.
-  if (mode === 'auto' && !bonsaiIsOn()) {
-    const startNow = confirm('Bonsai is off — auto routing goes straight to local (no cloud hop).\n\nStart the classifier so auto can route cloud requests as well?');
-    if (startNow) {
-      await setBonsai(true);
-      if (!bonsaiIsOn()) {
-        alert('Bonsai did not come up yet. Auto will keep routing local until it shows "on".');
-      }
-    }
-  }
-  try {
-    await fetch('/api/routing-mode', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
-    });
-    currentRoutingMode = mode;
-    applyRoutingModeUI(mode);
-  } catch(e) {}
+let routingProfile = null;
+let routingCloudEnabled = false;
+let routingProfileBusy = false;
+
+async function routingFetch(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+  return data;
 }
 
-function applyRoutingModeUI(mode) {
-  const colors = { auto: 'var(--green)', cloud: 'var(--violet)', local: 'var(--cyan)' };
-  ['auto','cloud','local'].forEach(m => {
-    const btn = document.getElementById('mode-' + m);
-    if (!btn) return;
-    const active = m === mode;
-    btn.style.background = active ? 'var(--bg3)' : 'transparent';
-    btn.style.color = active ? (colors[m] || 'var(--text)') : 'var(--textMute)';
-    btn.style.fontWeight = active ? '600' : '400';
-  });
+function renderRoutingChoice(role, choice) {
+  document.getElementById(role + '-backend').value = choice.backend;
+  const input = document.getElementById(role + '-model');
+  input.value = choice.model || '';
+  input.disabled = choice.backend === 'auto';
+  input.setAttribute('list', 'routing-' + choice.backend + '-models');
+  input.placeholder = choice.backend === 'cloud' ? 'Manifest auto, or enter exact cloud ID' : 'Local default, or enter exact model ID';
+}
+
+function routingBackendChanged(role) {
+  const backend = document.getElementById(role + '-backend').value;
+  renderRoutingChoice(role, { backend });
+  document.getElementById('routing-preset').value = 'custom';
+}
+
+function selectRoutingPreset() {
+  const preset = document.getElementById('routing-preset').value;
+  if (preset === 'custom') return;
+  const main = document.getElementById('main-model').value;
+  const local = { backend: 'local', model: null };
+  const cloud = { backend: 'cloud', model: null };
+  const choices = {
+    auto: [{ backend: 'auto' }, { backend: 'auto' }],
+    cloud: [cloud, cloud],
+    local_main_sub: [local, local],
+    local_custom: [{ backend: 'local', model: document.getElementById('main-backend').value === 'local' ? main : '' }, local],
+    cloud_main_local_review: [cloud, local],
+    local_main_cloud_review: [local, cloud],
+  };
+  renderRoutingChoice('main', choices[preset][0]);
+  renderRoutingChoice('reviewer', choices[preset][1]);
+  document.getElementById('routing-profile-message').textContent = preset === 'local_custom'
+    ? 'Enter an explicit local main model, then save.' : 'Unsaved preset. Subagent pool is unchanged.';
+}
+
+function renderRoutingProfile(profile) {
+  routingProfile = profile;
+  document.getElementById('routing-preset').value = profile.preset;
+  renderRoutingChoice('main', profile.main);
+  renderRoutingChoice('reviewer', profile.reviewer);
+  document.getElementById('subagent-model').value = profile.subagent_model || '';
+  currentRoutingMode = profile.main.backend;
+  const describe = choice => choice.backend + (choice.model ? ' / ' + choice.model : ' / default');
+  document.getElementById('routing-saved').textContent = 'Saved: main ' + describe(profile.main)
+    + '; reviewer ' + describe(profile.reviewer) + '; subs ' + (profile.subagent_model || 'unconfigured (auto)')
+    + '. Cloud ' + (routingCloudEnabled ? 'enabled by config.' : 'DISABLED: cloud choices fall back to local.');
+}
+
+async function loadRoutingProfile() {
+  try {
+    const data = await routingFetch('/api/routing-profile');
+    routingCloudEnabled = data.cloud_enabled;
+    renderRoutingProfile(data.profile);
+    document.getElementById('save-routing-profile').disabled = false;
+    document.getElementById('routing-profile-message').textContent = '';
+  } catch (error) {
+    document.getElementById('routing-profile-message').textContent = 'Cannot load preferences: ' + error.message;
+  }
+}
+
+async function loadRoutingModels() {
+  const errors = document.getElementById('routing-model-errors');
+  errors.textContent = 'Loading model metadata (no inference)...';
+  try {
+    const data = await routingFetch('/api/routing-models');
+    const messages = [];
+    ['local', 'cloud'].forEach(backend => {
+      const list = document.getElementById('routing-' + backend + '-models');
+      list.replaceChildren();
+      data[backend].models.forEach(id => {
+        const option = document.createElement('option');
+        option.value = id;
+        list.appendChild(option);
+      });
+      if (data[backend].error) messages.push(backend + ': ' + data[backend].error);
+    });
+    errors.textContent = messages.length ? messages.join(' · ') + ' You can still enter explicit provider IDs manually.'
+      : 'Lists loaded. Manual provider IDs are also accepted; availability is checked by the provider when used.';
+  } catch (error) {
+    errors.textContent = 'Model discovery failed: ' + error.message + '. Manual IDs remain available.';
+  }
+}
+
+async function saveRoutingProfile() {
+  if (!routingProfile || routingProfileBusy) return;
+  const message = document.getElementById('routing-profile-message');
+  const choice = role => {
+    const backend = document.getElementById(role + '-backend').value;
+    return backend === 'auto' ? { backend } : { backend, model: document.getElementById(role + '-model').value || null };
+  };
+  const profile = {
+    preset: document.getElementById('routing-preset').value,
+    main: choice('main'), reviewer: choice('reviewer'),
+    subagent_model: document.getElementById('subagent-model').value || null,
+  };
+  routingProfileBusy = true;
+  document.getElementById('save-routing-profile').disabled = true;
+  try {
+    const data = await routingFetch('/api/routing-profile', profile);
+    renderRoutingProfile(data.profile);
+    message.textContent = 'Saved for new requests and review sessions.';
+  } catch (error) {
+    message.textContent = 'Not saved: ' + error.message;
+  } finally {
+    routingProfileBusy = false;
+    document.getElementById('save-routing-profile').disabled = false;
+  }
 }
 
 // ─── Nudge (thinking budget) controls ────────────────────────────────────────
@@ -2328,8 +2455,8 @@ refreshOmpSessions();
 refreshHealth();
 refreshSlow();
 refreshBonsai();
-// Fetch current routing mode from server (persists across page refreshes until daemon restart)
-safeFetch('/api/routing-mode').then(r => { if (r && r.mode) { currentRoutingMode = r.mode; applyRoutingModeUI(r.mode); } });
+loadRoutingProfile();
+loadRoutingModels();
 
 // Poll intervals
 setInterval(refreshFast, 3000);

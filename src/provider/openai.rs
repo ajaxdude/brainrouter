@@ -15,6 +15,24 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct Model { id: String }
+        #[derive(serde::Deserialize)]
+        struct Catalog { data: Vec<Model> }
+        let mut request = self.client.get(format!("{}/models", self.base_url))
+            .timeout(Duration::from_secs(5));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await?.error_for_status()?;
+        let mut models: Vec<String> = response.json::<Catalog>().await?.data
+            .into_iter().map(|model| model.id).collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
     /// Create a new OpenAI-compatible provider.
     ///
     /// # Arguments

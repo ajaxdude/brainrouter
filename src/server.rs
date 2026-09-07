@@ -122,8 +122,7 @@ pub struct AppState {
     /// Runtime control of the Bonsai classifier llama-server (dashboard
     /// start/stop). Also read by the classifier for its enabled flag.
     pub bonsai: Arc<crate::bonsai_server::BonsaiControl>,
-    /// Runtime routing mode: 0 = auto (Bonsai), 1 = cloud, 2 = local.
-    /// Read by the proxy handlers to force-rewrite `request.model`.
+    /// Legacy compatibility mirror. Routing decisions use Router's profile store.
     pub routing_mode: std::sync::Arc<AtomicU8>,
     /// Cached version/upgrade-check data (refreshed every 30 min).
     pub versions_cache: std::sync::Arc<tokio::sync::watch::Receiver<serde_json::Value>>,
@@ -222,6 +221,7 @@ async fn handle_request(
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
             || path == "/api/routing-mode" || path == "/api/review-config"
+            || path == "/api/routing-profile"
             || path == "/api/bridges/toggle"
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
@@ -229,9 +229,7 @@ async fn handle_request(
             // project paths read into cloud prompts) and can approve/resolve
             // sessions. Gate it like the rest.
             || path.starts_with("/review/api/")
-            || path == "/api/benchmarks/ingest"
-            || path == "/api/benchmarks/ingest/llama-bench"
-            || path == "/api/benchmarks/plan"
+            || path.starts_with("/api/benchmarks/")
             || path == "/api/inflight/cancel"
         ));
 
@@ -620,23 +618,69 @@ async fn handle_request(
 
         // ── Routing mode override API ─────────────────────────────────────────
         ("GET", "/api/routing-mode") => {
-            let mode = match state.routing_mode.load(AtomicOrdering::Relaxed) {
-                1 => "cloud",
-                2 => "local",
-                _ => "auto",
-            };
-            let resp = json_response(StatusCode::OK, &serde_json::json!({ "mode": mode }));
+            let choice = state.review_service.preferences().profile().main;
+            let resp = json_response(StatusCode::OK, &serde_json::json!({
+                "mode": choice.backend(), "model": choice.model(),
+            }));
             into_unsync(resp)
         }
 
         ("POST", "/api/routing-mode") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-            let mode_str = val.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
-            let code: u8 = match mode_str { "cloud" => 1, "local" => 2, _ => 0 };
-            state.routing_mode.store(code, AtomicOrdering::Relaxed);
-            let resp = json_response(StatusCode::OK, &serde_json::json!({ "mode": mode_str }));
-            into_unsync(resp)
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ModeUpdate { mode: String }
+            let update: ModeUpdate = match read_routing_json(req).await {
+                Ok(update) => update,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let choice = match crate::routing_profile::ModelChoice::from_legacy(&update.mode, None) {
+                Ok(choice) => choice,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let store = Arc::clone(state.review_service.preferences());
+            match tokio::task::spawn_blocking(move || store.update_main(choice)).await
+                .map_err(anyhow::Error::from).and_then(|result| result) {
+                Ok(()) => {
+                    let code = match update.mode.as_str() { "cloud" => 1, "local" => 2, _ => 0 };
+                    state.routing_mode.store(code, AtomicOrdering::Relaxed);
+                    into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "mode": update.mode })))
+                }
+                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+
+        ("GET", "/api/routing-profile") => {
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "profile": state.review_service.preferences().profile(),
+                "cloud_enabled": state.manifest_enabled,
+                "cloud_policy": "Disabled or unavailable cloud falls back to the configured local default; selecting a profile never enables cloud.",
+                "review_policy": "New sessions snapshot the reviewer; continuations keep that choice.",
+            })))
+        }
+
+        ("POST", "/api/routing-profile") => {
+            let profile: crate::routing_profile::RoutingProfile = match read_routing_json(req).await {
+                Ok(profile) => profile,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            if let Err(error) = profile.validate() {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, error));
+            }
+            let store = Arc::clone(state.review_service.preferences());
+            let saved = profile.clone();
+            match tokio::task::spawn_blocking(move || store.update_profile(saved)).await
+                .map_err(anyhow::Error::from).and_then(|result| result) {
+                Ok(()) => {
+                    let code = match profile.main.backend() { "cloud" => 1, "local" => 2, _ => 0 };
+                    state.routing_mode.store(code, AtomicOrdering::Relaxed);
+                    into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "profile": profile })))
+                }
+                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+
+        ("GET", "/api/routing-models") => {
+            into_unsync(json_response(StatusCode::OK, &state.router.model_catalog().await))
         }
 
         // ── Bonsai classifier server API ────────────────────────────────────
@@ -831,7 +875,10 @@ async fn handle_request(
                         );
                         into_unsync(resp)
                     }
-                    Ok(_) => {
+                    Ok(config) => {
+                        if let Err(error) = config.review.validate().and_then(|_| config.routing_profile().map(|_| ())) {
+                            return Ok(routing_error(StatusCode::BAD_REQUEST, error));
+                        }
                         // Atomic write: write to .tmp then rename.
                         let tmp_path = state.config_path.with_extension("yaml.tmp");
                         let write_result = std::fs::write(&tmp_path, body.as_bytes())
@@ -1094,18 +1141,8 @@ async fn handle_chat_completion(
     peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
-    let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
-    // Apply global routing override from dashboard — only when the harness
-    // sends model="auto" (i.e. no explicit model preference). Specific model
-    // selections like "brainrouter/qwen-coder" or "cloud" are always honoured.
-    let is_auto = matches!(request.model.as_str(), "auto" | "" | "brainrouter/auto");
-    if is_auto {
-        match state.routing_mode.load(AtomicOrdering::Relaxed) {
-            1 => request.model = "cloud".to_string(),
-            2 => request.model = "local".to_string(),
-            _ => {}
-        }
-    }
+    let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    // Router resolves managed defaults for both protocols and direct callers.
     // Spawn routing in a background task so we can return SSE headers immediately.
     // This prevents OMP's "first event" timeout from firing while llama-swap loads
     // a model (which can take minutes for large models like qwen3-27b-mtp).
@@ -1163,16 +1200,7 @@ async fn handle_anthropic_messages(
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
     let model = anthropic_req.model.clone();
-    let mut oai_request = anthropic_to_openai(anthropic_req);
-    // Apply global routing override — only for auto-routing requests.
-    let is_auto = matches!(oai_request.model.as_str(), "auto" | "" | "brainrouter/auto");
-    if is_auto {
-        match state.routing_mode.load(AtomicOrdering::Relaxed) {
-            1 => oai_request.model = "cloud".to_string(),
-            2 => oai_request.model = "local".to_string(),
-            _ => {}
-        }
-    }
+    let oai_request = anthropic_to_openai(anthropic_req);
     // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
     let handle = state.inflight.register(
         "POST /v1/messages".to_string(),
@@ -2247,13 +2275,29 @@ async fn handle_update_review_config(
     req: Request<Incoming>,
     service: &ReviewService,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
-    let body_bytes = req.collect().await?.to_bytes();
-    let update: crate::config::ReviewConfig = serde_json::from_slice(&body_bytes)?;
-    
-    service.update_config(update).await;
-    
-    let resp = json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" }));
-    Ok(into_unsync(resp))
+    let update: crate::config::ReviewConfig = match read_routing_json(req).await {
+        Ok(update) => update,
+        Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+    };
+    if let Err(error) = update.validate() {
+        return Ok(routing_error(StatusCode::BAD_REQUEST, error));
+    }
+    match service.update_config(update).await {
+        Ok(()) => Ok(into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" })))),
+        Err(error) => Ok(routing_error(StatusCode::INTERNAL_SERVER_ERROR, error)),
+    }
+}
+
+fn routing_error(status: StatusCode, error: impl std::fmt::Display) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    into_unsync(json_response(status, &ErrorResponse { error: error.to_string() }))
+}
+
+async fn read_routing_json<T: serde::de::DeserializeOwned>(
+    req: Request<Incoming>,
+) -> anyhow::Result<T> {
+    let bytes = http_body_util::Limited::new(req.into_body(), 16 * 1024).collect().await
+        .map_err(anyhow::Error::from_boxed)?.to_bytes();
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn handle_llama_swap_models(

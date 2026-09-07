@@ -15,6 +15,9 @@ pub struct BrainrouterConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Independent main, reviewer and subagent choices. Omitted preserves local defaults.
+    #[serde(default)]
+    pub routing: Option<crate::routing_profile::RoutingProfile>,
     /// Persistent imported benchmark results and explorer.
     #[serde(default)]
     pub benchmarks: BenchmarkConfig,
@@ -51,7 +54,7 @@ fn default_benchmark_database_path() -> PathBuf {
 
 /// Configuration for the Manifest cloud LLM router.
 /// Manifest exposes an OpenAI-compatible endpoint; brainrouter delegates all
-/// cloud routing decisions to Manifest by sending requests with model="auto".
+/// managed cloud routing decisions to Manifest with model="auto"; explicit IDs pass through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestConfig {
     /// Master switch for the cloud backend. Off by default: `model=cloud` and
@@ -280,6 +283,7 @@ fn apply_dir_mode(dir: &Path, mode: u32) -> Result<()> {
 
 /// Configuration for the review service and escalation dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     /// Maximum number of LLM review iterations before escalating to human.
     #[serde(default = "default_max_iterations")]
@@ -289,7 +293,7 @@ pub struct ReviewConfig {
     #[serde(default = "default_review_mode")]
     pub forced_mode: String,
 
-    /// Forced model key (only used when forced_mode is "local").
+    /// Explicit local or cloud model ID. None uses the backend's default.
     #[serde(default)]
     pub forced_model: Option<String>,
 }
@@ -312,7 +316,31 @@ impl Default for ReviewConfig {
     }
 }
 
+impl ReviewConfig {
+    pub fn model_choice(&self) -> Result<crate::routing_profile::ModelChoice> {
+        crate::routing_profile::ModelChoice::from_legacy(&self.forced_mode, self.forced_model.clone())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        crate::routing_profile::validate_iterations(self.max_iterations)?;
+        self.model_choice()?;
+        Ok(())
+    }
+}
+
 impl BrainrouterConfig {
+    pub fn routing_profile(&self) -> Result<crate::routing_profile::RoutingProfile> {
+        use crate::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
+        let profile = self.routing.clone().unwrap_or(RoutingProfile {
+            preset: RoutingPreset::Custom,
+            main: ModelChoice::local(),
+            reviewer: self.review.model_choice()?,
+            subagent_model: self.llama_swap.subs_model.clone(),
+        });
+        profile.validate()?;
+        Ok(profile)
+    }
+
     /// Resolve the Manifest API key from the configured environment variable.
     /// Returns None if no env var is configured or it is unset.
     pub fn resolve_manifest_api_key(&self) -> Option<String> {
@@ -388,6 +416,8 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     if config.benchmarks.database_path.as_os_str().is_empty() {
         bail!("benchmarks.database_path must not be empty");
     }
+    config.review.validate()?;
+    config.routing_profile()?;
 
     // Validate bonsai.model_path exists (after token expansion) — but only
     // when the classifier is enabled. Disabled Bonsai needs no model file, so

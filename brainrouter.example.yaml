@@ -90,11 +90,19 @@ models:
 # Review loop configuration (all fields optional — defaults shown)
 # review:
 #   max_iterations: 5
-#   retry_on_llm_error: true
-#   context:
-#     prd_paths: [docs/PRD.md, PRD.md, README.md]
-#     include_git_diff: true
-#     git_diff_max_bytes: 102400
+#   forced_mode: local       # auto | local | cloud
+#   forced_model: null       # explicit local OR cloud provider ID, or default
+
+# Independent role defaults. Saved dashboard/CLI preferences in routing_state.json
+# override these on restart. Omit routing to retain local main, review settings
+# above, and llama_swap.subs_model. Selecting a profile never enables cloud.
+# routing:
+#   preset: local_main_cloud_review
+#   main: { backend: local, model: "your-local-model-key" }
+#   reviewer: { backend: cloud, model: "vendor/reviewer-model" }
+#   subagent_model: "your-subs-pool-key"
+# Presets: auto, cloud, local_main_sub, local_custom (explicit local main required),
+# cloud_main_local_review, local_main_cloud_review, custom.
 
 
 # Bridge transports — forward Discord/Signal messages to OMP (all optional)

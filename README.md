@@ -28,7 +28,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 ```
 
 - **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
-- **Three routing modes.** `auto` uses Bonsai classification (<500 ms) when the classifier is on; with it off (the default), `auto` goes straight to local. `local` rewrites the system prompt and goes straight to llama-swap. `cloud` goes straight to Manifest (also off by default).
+- **Independent routing roles.** Choose Main, Reviewer (explicit local or cloud ID), and a separate local Subagent pool, or apply a named preset. Legacy `auto`, `local`, `cloud`, and `subs` aliases remain supported. Cloud and Bonsai stay off by default.
 - **Off by default, opt in.** Fresh installs run fully local with a single hop — no Bonsai model download, no Manifest stack, no cloud API key required.
 
 - **Local prompt rewriting.** OMP's 15–20 K token system prompt overwhelms small local models. Local mode replaces it with a lean ~500 token prompt with anti-loop directives.
@@ -491,12 +491,58 @@ brainrouter cli context set auto         # 131072 tokens
 brainrouter cli context set 65536        # range 2048–262144
 brainrouter cli routing-mode status
 brainrouter cli routing-mode set local   # auto | cloud | local
+brainrouter cli routing-profile status
+brainrouter cli routing-profile models   # metadata only; never starts a model
+brainrouter cli routing-profile preset local_custom --main-model my-local-model
+brainrouter cli routing-profile choose reviewer cloud --model vendor/reviewer-model
+brainrouter cli routing-profile pool my-local-subagent-pool
+brainrouter cli routing-profile set ./profile.json  # same body as POST /api/routing-profile
 
 brainrouter cli bridges status
 brainrouter cli bridges enable discord
 brainrouter cli bridges disable signal
 brainrouter cli bridges toggle signal
 ```
+
+The dashboard has independent Main and Reviewer backend/model selectors and a separate
+local Subagent pool selector. Model lists come from the configured providers' `/models`
+endpoints using their existing authentication. Discovery errors remain visible; manual
+explicit IDs are accepted even when discovery is unavailable. The provider validates
+model availability when called. Choosing or saving a profile does not perform inference.
+
+| Preset | Main | Reviewer |
+|---|---|---|
+| `auto` | Classifier (local if off) | Classifier (local if off) |
+| `cloud` | Manifest auto | Manifest auto |
+| `local_main_sub` | Local default | Local default |
+| `local_custom` | Required explicit local model | Local default |
+| `cloud_main_local_review` | Manifest auto | Local default |
+| `local_main_cloud_review` | Local default | Manifest auto |
+| `custom` | Independent choice | Independent choice |
+
+Presets preserve the independently selected subagent pool. Only `subs` /
+`brainrouter/subs` requests use that pool; an unconfigured pool retains the legacy
+classifier/auto behavior, not the main override. Presets can use explicit model IDs
+within the indicated backends.
+
+Main applies only to `auto`, `brainrouter/auto`, or empty/default model requests.
+Explicit client IDs remain authoritative: bare names and `brainrouter/<id>` select
+local models, while `cloud/<id>` selects an exact Manifest model. Explicit `local`
+and `cloud` aliases still select their backend defaults. An explicit local failure
+returns an error rather than switching models. Cloud failures and disabled cloud
+retain the existing local fallback policy; requested and actual routes are shown
+in the dashboard and review metadata. Cloud traffic requires `manifest.enabled: true`
+in YAML; a profile never changes that opt-in.
+
+Preferences are saved atomically, owner-readable/writable only, to
+`$XDG_CONFIG_HOME/brainrouter/routing_state.json` (otherwise
+`~/.config/brainrouter/routing_state.json`). Saved profiles override YAML role
+defaults after restart; remove the state file to restore YAML defaults. Valid
+legacy `review_state.json` overrides migrate when no new state exists. Invalid
+saved preferences cause an explicit startup error rather than an unexpected
+route. Review sessions snapshot their reviewer at creation; continuations retain
+that choice. As before, `review.max_iterations` reloads from YAML after restart.
+The legacy routing-mode and review-config APIs/CLI update the same preferences.
 
 ### Operations
 
@@ -685,8 +731,15 @@ benchmarks:
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
-  forced_mode: "auto"         # "auto" | "cloud" | "local" — default "auto"
-  forced_model: "my-model"    # only used when forced_mode = "local"
+  forced_mode: "local"        # "auto" | "cloud" | "local" — default "local"
+  forced_model: "my-model"    # explicit local OR cloud ID; null for backend default
+
+# Optional YAML role defaults; saved dashboard/CLI preferences take precedence.
+routing:
+  preset: local_main_cloud_review
+  main: { backend: local, model: null }
+  reviewer: { backend: cloud, model: "vendor/reviewer-model" }
+  subagent_model: "my-local-subagent-pool"
 
 bridge:
   omp_path: "omp"                              # path to omp CLI binary
@@ -769,6 +822,8 @@ Mutating requests must come from a loopback peer or the Unix socket. Browser `Or
 | `GET/POST` | `/api/prompt-rewrite` | Prompt-rewrite state / update `{enabled}` |
 | `GET/POST` | `/api/context` | llama-swap context size / set `{value}` |
 | `GET/POST` | `/api/routing-mode` | Routing override / set `{mode}` |
+| `GET/POST` | `/api/routing-profile` | Independent role profile; POST `{preset,main,reviewer,subagent_model}` |
+| `GET` | `/api/routing-models` | Local/cloud catalog with explicit per-provider discovery errors; no inference |
 | `GET/POST` | `/api/bridges/toggle` | Bridge status / toggle `{bridge, enabled}` |
 
 #### Benchmarks

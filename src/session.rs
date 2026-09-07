@@ -77,6 +77,9 @@ pub struct Session {
     pub reviewer_type: Option<ReviewerType>,
     /// Which model/provider handled the review LLM calls (e.g. "cloud via manifest").
     pub review_model: Option<String>,
+    /// Immutable reviewer policy for this session, including continuations.
+    #[serde(default)]
+    pub review_config: Option<crate::config::ReviewConfig>,
     pub created_at: String,
     pub updated_at: String,
     /// Working directory of the process that started the review.
@@ -100,6 +103,7 @@ impl Session {
             iteration_count: 0,
             reviewer_type: None,
             review_model: None,
+            review_config: None,
             created_at: now.clone(),
             updated_at: now,
             cwd,
@@ -113,7 +117,7 @@ pub struct SessionUpdate {
     pub feedback: Option<String>,
     pub reviewer_type: Option<ReviewerType>,
     pub escalation_reason: Option<EscalationReason>,
-    /// Model/provider string to record on the session (set once on first review iteration).
+    /// Latest model/provider string, including requested policy and actual fallback.
     pub review_model: Option<String>,
     /// Full accumulated review-loop history (replaces the session's copy).
     pub llm_turns: Option<Vec<String>>,
@@ -149,7 +153,20 @@ impl SessionManager {
         conversation_history: Vec<String>,
         cwd: String,
     ) -> Session {
-        let session = Session::new(task_id, summary, details, conversation_history, cwd);
+        self.create_session_with_config(task_id, summary, details, conversation_history, cwd, None)
+    }
+
+    pub fn create_session_with_config(
+        &self,
+        task_id: String,
+        summary: String,
+        details: Option<String>,
+        conversation_history: Vec<String>,
+        cwd: String,
+        review_config: Option<crate::config::ReviewConfig>,
+    ) -> Session {
+        let mut session = Session::new(task_id, summary, details, conversation_history, cwd);
+        session.review_config = review_config;
         let mut map = self.sessions.lock().unwrap();
         map.insert(session.id.clone(), session.clone());
         session
@@ -186,11 +203,9 @@ impl SessionManager {
         if let Some(reason) = update.escalation_reason {
             session.escalation_reason = Some(reason);
         }
-        // Only set review_model if provided and not already set (first iteration wins).
+        // Keep the latest actual route visible, including a later fallback.
         if let Some(rm) = update.review_model {
-            if session.review_model.is_none() {
-                session.review_model = Some(rm);
-            }
+            session.review_model = Some(rm);
         }
         if let Some(turns) = update.llm_turns {
             session.llm_turns = turns;

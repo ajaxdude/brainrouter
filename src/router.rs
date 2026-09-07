@@ -18,6 +18,7 @@ use crate::{
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{RouteEvent, RoutingEvents, Stage},
+    routing_profile::{ModelChoice, ProfileStore},
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
@@ -107,6 +108,7 @@ pub struct Router {
     /// Runtime prompt-rewrite toggle. When off, local routes forward the
     /// incoming messages untouched (no system-prompt rewrite).
     prompt_rewrite: Arc<AtomicBool>,
+    profiles: Option<Arc<ProfileStore>>,
 }
 
 pub struct RouterArgs {
@@ -150,7 +152,37 @@ impl Router {
             nudge_enabled: args.nudge_enabled,
             nudge_tier: args.nudge_tier,
             prompt_rewrite: args.prompt_rewrite,
+            profiles: None,
         }
+    }
+
+    pub fn with_profiles(mut self, profiles: Arc<ProfileStore>) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    pub fn profiles(&self) -> Option<&Arc<ProfileStore>> { self.profiles.as_ref() }
+
+    /// Catalog discovery is metadata-only; never invokes inference or starts a model.
+    pub async fn model_catalog(&self) -> serde_json::Value {
+        let local = self.llama_swap.list_models().await;
+        let cloud = if self.manifest_enabled {
+            self.manifest.list_models().await
+        } else {
+            Err(anyhow!("Cloud is disabled; discovery was not attempted"))
+        };
+        fn entry(result: Result<Vec<String>>) -> serde_json::Value {
+            match result {
+                Ok(models) => serde_json::json!({ "models": models, "error": null }),
+                Err(error) => serde_json::json!({ "models": [], "error": error.to_string() }),
+            }
+        }
+        serde_json::json!({
+            "local": entry(local), "cloud": entry(cloud),
+            "cloud_enabled": self.manifest_enabled,
+            "local_default": self.fallback_model,
+            "unknown_model_policy": "Explicit IDs are accepted without discovery; the provider validates availability. Explicit local failures are errors. Cloud failure or disabled cloud uses the existing local fallback.",
+        })
     }
 
     /// Model keys known to belong to llama-swap (from config). Exposed so the
@@ -211,6 +243,37 @@ impl Router {
         cwd: String,
         user_agent: String,
     ) -> Result<(ProviderResponse, RouteInfo)> {
+        // Only default/auto requests use the main choice. Explicit client
+        // aliases and model IDs remain authoritative in both proxy protocols.
+        if matches!(request.model.as_str(), "" | "auto" | "brainrouter/auto") {
+            request.model = self.profiles.as_ref()
+                .map(|store| store.profile().main.selector())
+                .unwrap_or_else(|| "auto".into());
+        }
+        self.route_resolved(request, session_id, cwd, user_agent).await
+    }
+
+    /// Review calls use their session snapshot, never the live main or subs choice.
+    pub async fn route_with_choice(
+        &self,
+        mut request: ChatCompletionRequest,
+        choice: &ModelChoice,
+        session_id: Option<String>,
+        cwd: String,
+        user_agent: String,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        choice.validate()?;
+        request.model = choice.selector();
+        self.route_resolved(request, session_id, cwd, user_agent).await
+    }
+
+    async fn route_resolved(
+        &self,
+        mut request: ChatCompletionRequest,
+        session_id: Option<String>,
+        cwd: String,
+        user_agent: String,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
         let prompt_excerpt = extract_prompt_excerpt(&request);
@@ -234,6 +297,14 @@ impl Router {
             "cloud" | "brainrouter/cloud" => {
                 info!("Direct cloud mode — routing to Manifest");
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
+                request.model = "auto".into();
+                ("cloud-direct", self.route_cloud(request).await)
+            }
+            model if model.starts_with("cloud/") => {
+                let model = model.strip_prefix("cloud/").unwrap();
+                crate::routing_profile::validate_model_id(model)?;
+                request.model = model.to_string();
+                tracker.set(Phase::CloudWaiting, Some(model.into()), Some("Manifest".into()), max_tokens);
                 ("cloud-direct", self.route_cloud(request).await)
             }
             // Managed routing: Bonsai classify + subs pool. Only these tokens get
@@ -242,7 +313,9 @@ impl Router {
                 // Subs pool: `subs` or `brainrouter/subs` → subs_model, bypassing
                 // Bonsai. Unconfigured → warn and fall back to auto below.
                 if requested_model == "subs" || requested_model == "brainrouter/subs" {
-                    if let Some(subs) = self.subs_model.clone() {
+                    let subs = self.profiles.as_ref().map(|store| store.profile().subagent_model)
+                        .unwrap_or_else(|| self.subs_model.clone());
+                    if let Some(subs) = subs {
                         info!(model = %subs, "Subs pool routing — direct to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
                         request.model = subs;
@@ -357,7 +430,7 @@ impl Router {
                     effective_provider: None,
                     model_key: String::new(),
                     latency_ms,
-                    stage: if bonsai_decision == "cloud" { Stage::CloudPrimary } else { Stage::LocalPrimary },
+                    stage: if bonsai_decision.starts_with("cloud") { Stage::CloudPrimary } else { Stage::LocalPrimary },
                     success: false,
                     error: e.to_string(),
                     bonsai_decision,
@@ -389,6 +462,7 @@ impl Router {
         match decision {
             RoutingDecision::Cloud => {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
+                request.model = "auto".into();
                 ("cloud", self.route_cloud(request).await)
             }
             RoutingDecision::Local { model, tier } => {
@@ -407,8 +481,8 @@ impl Router {
         &self,
         mut request: ChatCompletionRequest,
     ) -> Result<(ProviderResponse, RouteInfo)> {
-        // Manifest expects "auto" — it does its own model selection.
-        request.model = "auto".to_string();
+        // Callers normalize managed aliases to auto; exact cloud IDs pass through.
+        let requested_cloud_model = request.model.clone();
 
         if !self.manifest_enabled {
             warn!(
@@ -466,7 +540,7 @@ impl Router {
                 failed_attempts: vec![FailedAttempt {
                     stage: Stage::CloudPrimary,
                     provider: "manifest".to_string(),
-                    model_key: "auto".to_string(),
+                    model_key: requested_cloud_model,
                     error: "manifest unavailable (disabled, circuit open, or error)".to_string(),
                 }],
             },

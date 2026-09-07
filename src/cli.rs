@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use tracing::debug;
 
 use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
+use brainrouter::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
 
 /// Arguments for the `cli` subcommand.
 #[derive(Args)]
@@ -76,6 +77,11 @@ pub enum CliCommand {
     RoutingMode {
         #[command(subcommand)]
         action: RoutingModeAction,
+    },
+    /// Independent main/reviewer/subagent choices and named presets
+    RoutingProfile {
+        #[command(subcommand)]
+        action: RoutingProfileAction,
     },
     /// Discord/Signal bridge status / toggle
     Bridges {
@@ -194,6 +200,35 @@ pub enum RoutingModeAction {
 }
 
 #[derive(Subcommand)]
+pub enum RoutingProfileAction {
+    /// Current profile and cloud opt-in policy
+    Status,
+    /// Discover local and cloud model IDs (metadata only; no inference)
+    Models,
+    /// Replace the profile with a JSON file ("-" = stdin)
+    Set { path: String },
+    /// Apply a named preset, preserving the subagent pool
+    Preset {
+        #[arg(value_enum)]
+        preset: RoutingPreset,
+        /// Explicit local main model required by local_custom
+        #[arg(long)]
+        main_model: Option<String>,
+    },
+    /// Select one independent role; omit --model for backend default/auto
+    Choose {
+        #[arg(value_parser = ["main", "reviewer"])]
+        role: String,
+        #[arg(value_parser = ["auto", "local", "cloud"])]
+        backend: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Set the local subagent pool; omit MODEL to clear it (legacy auto behavior)
+    Pool { model: Option<String> },
+}
+
+#[derive(Subcommand)]
 pub enum BridgesAction {
     /// Current bridge status
     Status,
@@ -238,11 +273,14 @@ pub enum ReviewConfigAction {
         #[arg(long)]
         max_iterations: Option<u32>,
         /// Forced review mode: auto | cloud | local
-        #[arg(long)]
+        #[arg(long, value_parser = ["auto", "cloud", "local"])]
         forced_mode: Option<String>,
-        /// Forced model key (used when forced_mode is local)
+        /// Explicit local or cloud model ID
         #[arg(long)]
         forced_model: Option<String>,
+        /// Clear a prior explicit model and use the backend default
+        #[arg(long, conflicts_with = "forced_model")]
+        clear_model: bool,
     },
 }
 
@@ -421,6 +459,43 @@ pub async fn run(args: CliArgs) -> Result<()> {
                 print_json(&client.post_json("/api/routing-mode", json!({ "mode": mode })).await?);
             }
         },
+        CliCommand::RoutingProfile { action } => {
+            match action {
+                RoutingProfileAction::Status => print_json(&client.get_json("/api/routing-profile").await?),
+                RoutingProfileAction::Models => print_json(&client.get_json("/api/routing-models").await?),
+                action => {
+                    let mut profile: RoutingProfile = if let RoutingProfileAction::Set { ref path } = action {
+                        let text = if path == "-" {
+                            use std::io::Read;
+                            let mut text = String::new();
+                            std::io::stdin().read_to_string(&mut text)?;
+                            text
+                        } else { std::fs::read_to_string(path)? };
+                        serde_json::from_str(&text)?
+                    } else {
+                        serde_json::from_value(client.get_json("/api/routing-profile").await?["profile"].clone())?
+                    };
+                    match action {
+                        RoutingProfileAction::Preset { preset, main_model } => {
+                            if let Some(model) = main_model {
+                                if preset != RoutingPreset::LocalCustom { bail!("--main-model requires local_custom"); }
+                                profile.main = ModelChoice::Local { model: Some(model) };
+                            }
+                            profile.apply_preset(preset)?;
+                        }
+                        RoutingProfileAction::Choose { role, backend, model } => {
+                            let choice = ModelChoice::from_legacy(&backend, model)?;
+                            if role == "main" { profile.main = choice; } else { profile.reviewer = choice; }
+                            profile.preset = RoutingPreset::Custom;
+                        }
+                        RoutingProfileAction::Pool { model } => profile.subagent_model = model,
+                        _ => {}
+                    }
+                    profile.validate()?;
+                    print_json(&client.post_json("/api/routing-profile", serde_json::to_value(profile)?).await?);
+                }
+            }
+        }
         CliCommand::Bridges { action } => match action {
             BridgesAction::Status => {
                 print_json(&client.get_json("/api/bridge-status").await?);
@@ -478,7 +553,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
             ReviewConfigAction::Status => {
                 print_json(&client.get_json("/api/review-config").await?);
             }
-            ReviewConfigAction::Update { max_iterations, forced_mode, forced_model } => {
+            ReviewConfigAction::Update { max_iterations, forced_mode, forced_model, clear_model } => {
                 // Merge into the current config — the daemon endpoint replaces it.
                 let current = client.get_json("/api/review-config").await?;
                 let mut update = current.clone();
@@ -491,6 +566,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
                 if let Some(v) = forced_model {
                     update["forced_model"] = json!(v);
                 }
+                if clear_model { update["forced_model"] = Value::Null; }
                 print_json(&client.post_json("/api/review-config", update).await?);
             }
         },

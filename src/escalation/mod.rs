@@ -439,6 +439,7 @@ struct SessionSummary {
     iteration_count: u32,
     updated_at: String,
     review_model: Option<String>,
+    review_config: Option<crate::config::ReviewConfig>,
     cwd: String,
 }
 
@@ -452,6 +453,7 @@ impl From<&Session> for SessionSummary {
             iteration_count: s.iteration_count,
             updated_at: s.updated_at.clone(),
             review_model: s.review_model.clone(),
+            review_config: s.review_config.clone(),
             cwd: s.cwd.clone(),
         }
     }
@@ -469,6 +471,8 @@ struct SessionDetail {
     escalation_reason: Option<String>,
     iteration_count: u32,
     reviewer_type: Option<String>,
+    review_model: Option<String>,
+    review_config: Option<crate::config::ReviewConfig>,
     created_at: String,
     updated_at: String,
     cwd: String,
@@ -490,6 +494,8 @@ impl From<&Session> for SessionDetail {
                 .map(|r| format!("{:?}", r).to_lowercase()),
             iteration_count: s.iteration_count,
             reviewer_type: s.reviewer_type.as_ref().map(|r| format!("{:?}", r).to_lowercase()),
+            review_model: s.review_model.clone(),
+            review_config: s.review_config.clone(),
             created_at: s.created_at.clone(),
             updated_at: s.updated_at.clone(),
             cwd: s.cwd.clone(),

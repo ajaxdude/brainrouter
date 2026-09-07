@@ -13,6 +13,7 @@ pub mod prompt_rewriter;
 pub mod provider;
 pub mod review;
 pub mod router;
+pub mod routing_profile;
 pub mod server;
 pub mod session;
 pub mod stream;
