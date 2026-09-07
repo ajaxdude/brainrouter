@@ -578,9 +578,16 @@ Preferences are saved atomically, owner-readable/writable only, to
 `$XDG_CONFIG_HOME/brainrouter/routing_state.json` (otherwise
 `~/.config/brainrouter/routing_state.json`). Saved profiles override YAML role
 defaults after restart; remove the state file to restore YAML defaults. Valid
-legacy `review_state.json` overrides migrate when no new state exists. Invalid
-saved preferences cause an explicit startup error rather than an unexpected
-route. Review sessions snapshot their reviewer at creation; continuations retain
+legacy `review_state.json` overrides migrate once when no new state exists and
+are persisted immediately to `routing_state.json`; the legacy file is left unchanged.
+For upgrade compatibility only, reading YAML or legacy review state with
+`forced_mode: auto` discards a leftover `forced_model`, which older versions
+ignored. A warning names the source file and asks you to remove that field or
+choose local/cloud explicitly. This normalization does not apply to new writes:
+the config, review-config, and routing-profile APIs still reject auto with an
+explicit model. Local/cloud model choices and other validation remain strict;
+read/migration failures report the source path and cause.
+Review sessions snapshot their reviewer at creation; continuations retain
 that choice. As before, `review.max_iterations` reloads from YAML after restart.
 The legacy routing-mode and review-config APIs/CLI update the same preferences.
 

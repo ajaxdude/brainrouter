@@ -317,6 +317,17 @@ impl Default for ReviewConfig {
 }
 
 impl ReviewConfig {
+    /// Legacy files could retain a model while auto mode ignored it. Do not
+    /// apply this compatibility rule during deserialization or API validation.
+    pub(crate) fn normalize_legacy_read(&mut self, source: &Path) {
+        if self.forced_mode == "auto" && self.forced_model.take().is_some() {
+            tracing::warn!(
+                path = %source.display(),
+                "Ignoring legacy forced_model with forced_mode=auto; remove forced_model from this file or choose local/cloud explicitly"
+            );
+        }
+    }
+
     pub fn model_choice(&self) -> Result<crate::routing_profile::ModelChoice> {
         crate::routing_profile::ModelChoice::from_legacy(&self.forced_mode, self.forced_model.clone())
     }
@@ -416,8 +427,11 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     if config.benchmarks.database_path.as_os_str().is_empty() {
         bail!("benchmarks.database_path must not be empty");
     }
-    config.review.validate()?;
-    config.routing_profile()?;
+    config.review.normalize_legacy_read(path);
+    config.review.validate()
+        .with_context(|| format!("Invalid review configuration in {}", path.display()))?;
+    config.routing_profile()
+        .with_context(|| format!("Invalid routing configuration in {}", path.display()))?;
 
     // Validate bonsai.model_path exists (after token expansion) — but only
     // when the classifier is enabled. Disabled Bonsai needs no model file, so

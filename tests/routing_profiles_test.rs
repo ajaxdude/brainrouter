@@ -764,3 +764,114 @@ fn malformed_saved_state_and_legacy_configuration_are_validated() {
     fs::write(&config_path, serde_yaml::to_string(&invalid).unwrap()).unwrap();
     assert!(config::load(&config_path).is_err());
 }
+
+#[test]
+fn legacy_auto_yaml_ignores_the_leftover_model_only_on_read() {
+    let directory = Directory::new();
+    let path = directory.0.join("brainrouter.yaml");
+    let yaml = serde_yaml::to_string(&json!({
+        "manifest": {"base_url": "http://127.0.0.1:1/v1"},
+        "llama_swap": {"base_url": "http://127.0.0.1:1/v1", "fallback_model": "main-local"},
+        "bonsai": {"enabled": false},
+        "review": {"forced_mode": "auto", "forced_model": "my-model", "max_iterations": 5},
+    }))
+    .unwrap();
+    fs::write(&path, &yaml).unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.review.forced_mode, "auto");
+    assert_eq!(loaded.review.forced_model, None);
+    assert_eq!(
+        loaded.routing_profile().unwrap().reviewer,
+        ModelChoice::Auto
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), yaml);
+
+    let new_write: config::BrainrouterConfig = serde_yaml::from_str(&yaml).unwrap();
+    assert!(new_write.review.validate().is_err());
+    assert!(new_write.routing_profile().is_err());
+}
+
+#[test]
+fn legacy_auto_state_migrates_once_and_persists_normalized_preferences() {
+    let directory = Directory::new();
+    let legacy = directory.0.join("review_state.json");
+    let path = directory.0.join("routing_state.json");
+    let original =
+        r#"{"forced_mode":"auto","forced_model":"ignored old model","max_iterations":9}"#;
+    fs::write(&legacy, original).unwrap();
+    let review = ReviewConfig {
+        max_iterations: 3,
+        ..ReviewConfig::default()
+    };
+    let store = ProfileStore::load(path.clone(), profile(), &review).unwrap();
+    assert_eq!(store.profile().reviewer, ModelChoice::Auto);
+    assert_eq!(store.profile().main, profile().main);
+    assert_eq!(store.profile().subagent_model, profile().subagent_model);
+    assert_eq!(store.review_config().max_iterations, 3);
+    assert_eq!(store.review_config().forced_model, None);
+    let normalized: RoutingProfile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(normalized, store.profile());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+    fs::write(
+        &legacy,
+        "malformed legacy state that must no longer be read",
+    )
+    .unwrap();
+    let reloaded = ProfileStore::load(path, profile(), &review).unwrap();
+    assert_eq!(reloaded.profile(), normalized);
+    assert!(store
+        .update_review(ReviewConfig {
+            forced_mode: "auto".into(),
+            forced_model: Some("new-invalid-model".into()),
+            ..ReviewConfig::default()
+        })
+        .is_err());
+    assert_eq!(store.profile(), normalized);
+}
+
+#[test]
+fn migration_validation_failures_report_the_source_path_and_cause() {
+    let directory = Directory::new();
+    let legacy = directory.0.join("review_state.json");
+    let path = directory.0.join("routing_state.json");
+    for (saved, cause) in [
+        (json!({"forced_mode":"unknown"}), "unknown routing mode"),
+        (
+            json!({"forced_mode":"local","forced_model":"bad model"}),
+            "model ID",
+        ),
+        (
+            json!({"forced_mode":"cloud","forced_model":"cloud/alias"}),
+            "model ID",
+        ),
+        (
+            json!({"forced_mode":"auto","forced_model":"ignored","max_iterations":0}),
+            "max_iterations",
+        ),
+    ] {
+        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let error = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default())
+            .err()
+            .expect("invalid migration must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains(legacy.to_str().unwrap()), "{message}");
+        assert!(message.contains(cause), "{message}");
+        assert!(!path.exists(), "failed migration must not write new state");
+    }
+
+    let invalid_profile = json!({
+        "preset":"local_main_sub","main":{"backend":"cloud","model":"cloud-model"},
+        "reviewer":{"backend":"local","model":null},"subagent_model":null,
+    });
+    fs::write(&path, serde_json::to_vec(&invalid_profile).unwrap()).unwrap();
+    let error = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default())
+        .err()
+        .expect("invalid saved profile must fail");
+    let message = format!("{error:#}");
+    assert!(message.contains(path.to_str().unwrap()), "{message}");
+    assert!(message.contains("preset"), "{message}");
+}

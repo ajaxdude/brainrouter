@@ -153,6 +153,16 @@ impl TestDaemon {
         upstream: &str,
         cloud_enabled: bool,
     ) -> Self {
+        Self::start_with_review(directory, database, upstream, cloud_enabled, json!({}))
+    }
+
+    fn start_with_review(
+        directory: &Path,
+        database: &Path,
+        upstream: &str,
+        cloud_enabled: bool,
+        review: Value,
+    ) -> Self {
         let config = directory.join("config.yaml");
         fs::write(
             &config,
@@ -170,6 +180,7 @@ impl TestDaemon {
                     "fork_path": directory.join("no-model-server"),
                 },
                 "benchmarks": {"database_path": database},
+                "review": review,
             }))
             .unwrap(),
         )
@@ -842,4 +853,118 @@ async fn synthetic_example_can_be_prepared_validated_and_imported_without_infere
     assert_eq!(profile_after["profile"], profile_before["profile"]);
     assert!(upstream.requests.lock().unwrap().is_empty());
     daemon.assert_core_routing(&upstream).await;
+}
+
+#[tokio::test]
+async fn legacy_auto_yaml_survives_startup_but_new_auto_model_writes_are_rejected() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let upstream = MockUpstream::start().await;
+    let legacy_review = json!({
+        "forced_mode":"auto","forced_model":"my-model","max_iterations":5,
+    });
+    let mut daemon = TestDaemon::start_with_review(
+        &directory.0,
+        &database,
+        &upstream.url,
+        false,
+        legacy_review.clone(),
+    );
+    daemon.wait_until_ready().await;
+    daemon.assert_core_routing(&upstream).await;
+    let before = daemon.get_json("/api/routing-profile").await;
+    assert_eq!(before["profile"]["reviewer"], json!({"backend":"auto"}));
+    let review = daemon.get_json("/api/review-config").await;
+    assert_eq!(review["forced_mode"], "auto");
+    assert!(review["forced_model"].is_null());
+    let config_path = directory.0.join("config.yaml");
+    let original_yaml = fs::read(&config_path).unwrap();
+    let mut invalid_profile = before["profile"].clone();
+    invalid_profile["reviewer"] = json!({"backend":"auto","model":"new-model"});
+    for (path, body) in [
+        (
+            "/api/review-config",
+            serde_json::to_vec(&legacy_review).unwrap(),
+        ),
+        (
+            "/api/routing-profile",
+            serde_json::to_vec(&invalid_profile).unwrap(),
+        ),
+        ("/api/config", original_yaml.clone()),
+    ] {
+        let response = daemon
+            .client
+            .post(format!("{}{path}", daemon.url))
+            .header("Origin", "http://localhost:8080")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{path}");
+        let error = response.json::<Value>().await.unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("auto cannot specify a model"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        daemon.get_json("/api/routing-profile").await["profile"],
+        before["profile"]
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), original_yaml);
+    let log = fs::read_to_string(&daemon.log).unwrap();
+    assert_eq!(
+        log.matches("Ignoring legacy forced_model").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains(config_path.to_str().unwrap()), "{log}");
+    assert!(log.contains("remove forced_model"), "{log}");
+}
+
+#[tokio::test]
+async fn legacy_auto_saved_state_survives_startup_and_is_migrated_once() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let config_directory = directory.0.join("config/brainrouter");
+    fs::create_dir_all(&config_directory).unwrap();
+    let legacy_path = config_directory.join("review_state.json");
+    let legacy = r#"{"forced_mode":"auto","forced_model":"leftover-reviewer","max_iterations":9}"#;
+    fs::write(&legacy_path, legacy).unwrap();
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
+    daemon.wait_until_ready().await;
+    daemon.assert_core_routing(&upstream).await;
+    let profile = daemon.get_json("/api/routing-profile").await["profile"].clone();
+    assert_eq!(profile["reviewer"], json!({"backend":"auto"}));
+    assert_eq!(
+        daemon.get_json("/api/review-config").await["max_iterations"],
+        5
+    );
+    let state_path = config_directory.join("routing_state.json");
+    let persisted: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(persisted, profile);
+    assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy);
+    let log = fs::read_to_string(&daemon.log).unwrap();
+    assert_eq!(
+        log.matches("Ignoring legacy forced_model").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains(legacy_path.to_str().unwrap()), "{log}");
+    drop(daemon);
+    fs::write(&legacy_path, "invalid legacy state; already migrated").unwrap();
+    let mut restarted = TestDaemon::start(&directory.0, &database, &upstream.url);
+    restarted.wait_until_ready().await;
+    assert_eq!(
+        restarted.get_json("/api/routing-profile").await["profile"],
+        profile
+    );
+    upstream.requests.lock().unwrap().clear();
+    restarted.assert_core_routing(&upstream).await;
+    let log = fs::read_to_string(&restarted.log).unwrap();
+    assert!(!log.contains("Ignoring legacy forced_model"), "{log}");
 }

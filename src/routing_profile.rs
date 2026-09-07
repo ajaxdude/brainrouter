@@ -213,12 +213,17 @@ impl ProfileStore {
     }
 
     pub fn load(path: PathBuf, profile: RoutingProfile, review: &ReviewConfig) -> Result<Self> {
-        let mut store = Self::memory(profile, review.max_iterations)?;
+        let mut store = Self::memory(profile, review.max_iterations).with_context(|| {
+            format!("invalid initial routing preferences for {}", path.display())
+        })?;
+        let mut migrated_from = None;
         match fs::read(&path) {
             Ok(bytes) => {
                 let saved: RoutingProfile = serde_json::from_slice(&bytes)
                     .with_context(|| format!("invalid routing preferences: {}", path.display()))?;
-                saved.validate()?;
+                saved
+                    .validate()
+                    .with_context(|| format!("invalid routing preferences: {}", path.display()))?;
                 store.state.get_mut().unwrap().profile = saved;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -226,20 +231,51 @@ impl ProfileStore {
                 let legacy = path.with_file_name("review_state.json");
                 match fs::read(&legacy) {
                     Ok(bytes) => {
-                        let saved: ReviewConfig =
+                        let mut saved: ReviewConfig =
                             serde_json::from_slice(&bytes).with_context(|| {
                                 format!("invalid legacy review preferences: {}", legacy.display())
                             })?;
-                        saved.validate()?;
+                        saved.normalize_legacy_read(&legacy);
+                        saved.validate().with_context(|| {
+                            format!("invalid legacy review preferences: {}", legacy.display())
+                        })?;
                         let state = store.state.get_mut().unwrap();
-                        state.profile.reviewer = saved.model_choice()?;
+                        state.profile.reviewer = saved.model_choice().with_context(|| {
+                            format!(
+                                "converting legacy reviewer choice from {}",
+                                legacy.display()
+                            )
+                        })?;
                         state.profile.preset = RoutingPreset::Custom;
+                        migrated_from = Some(legacy);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).context("reading legacy review preferences"),
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("reading legacy review preferences: {}", legacy.display())
+                        })
+                    }
                 }
             }
-            Err(e) => return Err(e).context("reading routing preferences"),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading routing preferences: {}", path.display()))
+            }
+        }
+        if let Some(legacy) = migrated_from {
+            let bytes = serde_json::to_vec_pretty(&store.profile()).with_context(|| {
+                format!(
+                    "serializing migrated routing preferences from {}",
+                    legacy.display()
+                )
+            })?;
+            atomic_write(&path, &bytes).with_context(|| {
+                format!(
+                    "migrating legacy review preferences from {} to {}; check the destination directory permissions",
+                    legacy.display(),
+                    path.display()
+                )
+            })?;
         }
         store.path = Some(path);
         Ok(store)
