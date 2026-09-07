@@ -81,14 +81,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         format!("Failed to load config from {}", config_path.display())
     })?;
 
-    let benchmark_store = Arc::new(
-        BenchmarkStore::open(config.benchmarks.database_path.clone()).with_context(|| {
-            format!(
-                "Failed to initialize benchmark database at {}",
-                config.benchmarks.database_path.display()
-            )
-        })?,
-    );
+    let benchmark_store = BenchmarkStore::open(config.benchmarks.database_path.clone())
+        .map(Arc::new)
+        .map_err(|error| {
+            warn!(
+                path = %config.benchmarks.database_path.display(),
+                error = %error,
+                "Benchmark explorer unavailable; continuing core daemon startup"
+            );
+            error.to_string()
+        });
 
     let tcp_addr: std::net::SocketAddr = args
         .tcp_addr

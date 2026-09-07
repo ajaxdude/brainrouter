@@ -139,8 +139,8 @@ pub struct AppState {
     pub prompt_rewrite: Arc<AtomicBool>,
     /// In-flight request registry (dashboard tracking + cancel).
     pub inflight: Arc<crate::inflight::InflightRegistry>,
-    /// Persistent imported benchmark data and query service.
-    pub benchmark_store: Arc<BenchmarkStore>,
+    /// Optional benchmark storage; an initialization error disables only the explorer.
+    pub benchmark_store: Result<Arc<BenchmarkStore>, String>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -186,15 +186,11 @@ fn into_unsync(resp: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, any
     resp.map(|body| body.map_err(|e: Infallible| match e {}).boxed_unsync())
 }
 
-fn is_loopback_http_url(value: &str, expected_port: u16) -> bool {
+fn is_loopback_http_url(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
     };
-    if url.scheme() != "http"
-        || url.port_or_known_default() != Some(expected_port)
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
     match url.host() {
@@ -249,16 +245,12 @@ async fn handle_request(
             return Ok(into_unsync(resp));
         }
         
-        // Anti-CSRF: Check Origin/Referer for browser-originated POSTs.
-        let dashboard_port = state
-            .tcp_addr
-            .parse::<SocketAddr>()
-            .map(|address| address.port())
-            .unwrap_or(9099);
+        // Local port forwarding can change the browser port without changing the
+        // trusted loopback host. Null and non-loopback origins remain forbidden.
         let has_allowed_origin = if let Some(origin) = req.headers().get("Origin") {
-            is_loopback_http_url(origin.to_str().unwrap_or(""), dashboard_port)
+            is_loopback_http_url(origin.to_str().unwrap_or(""))
         } else if let Some(referer) = req.headers().get("Referer") {
-            is_loopback_http_url(referer.to_str().unwrap_or(""), dashboard_port)
+            is_loopback_http_url(referer.to_str().unwrap_or(""))
         } else {
             // Non-browser client (curl, MCP) doesn't send Origin usually.
             true
@@ -282,7 +274,10 @@ async fn handle_request(
     }
 
     if path == "/benchmarks" || path == "/benchmarks/" || path.starts_with("/api/benchmarks/") {
-        return benchmark::handle_request(req, &state.benchmark_store).await;
+        return match &state.benchmark_store {
+            Ok(store) => benchmark::handle_request(req, store).await,
+            Err(reason) => Ok(benchmark::unavailable_response(reason)),
+        };
     }
 
     let response = match (method, path) {
@@ -2534,13 +2529,20 @@ mod tests {
 
     #[test]
     fn destructive_api_origins_require_real_loopback_urls() {
-        assert!(is_loopback_http_url("http://localhost:9099", 9099));
-        assert!(is_loopback_http_url("http://127.0.0.1:9099/dashboard", 9099));
-        assert!(is_loopback_http_url("http://[::1]:9099", 9099));
-        assert!(!is_loopback_http_url("null", 9099));
-        assert!(!is_loopback_http_url("http://localhost.example.com:9099", 9099));
-        assert!(!is_loopback_http_url("https://localhost:9099", 9099));
-        assert!(!is_loopback_http_url("http://localhost:8080", 9099));
+        for value in [
+            "http://localhost:9099", "http://127.0.0.1:9099/dashboard", "http://[::1]:9099",
+            "http://localhost:8080", "http://127.0.0.1:12345", "http://[::1]:12345/dashboard",
+            "http://localhost",
+        ] {
+            assert!(is_loopback_http_url(value), "{value}");
+        }
+        for value in [
+            "null", "http://localhost.example.com:9099", "https://localhost:9099",
+            "http://192.0.2.1:8080", "http://[2001:db8::1]:8080", "not a URL",
+            "http://localhost@evil.example:9099", "http://evil.example@localhost:9099",
+        ] {
+            assert!(!is_loopback_http_url(value), "{value}");
+        }
     }
 
     #[test]

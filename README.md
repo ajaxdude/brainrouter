@@ -435,6 +435,8 @@ Changes take effect immediately for new review requests. The setting persists ac
 
 Open **`http://127.0.0.1:9099/benchmarks`** or select **Benchmarks** in the dashboard navigation. Brainrouter initializes a normalized SQLite database at `~/.local/share/brainrouter/benchmarks.sqlite3` by default. The explorer only imports and analyzes completed or externally managed benchmark runs; it never starts a model or benchmark process.
 
+Benchmark storage is optional for daemon availability. If initialization fails (for example, a corrupt database, an unwritable path, or a schema newer than this binary supports), core routing, listeners, and Bonsai startup continue normally. The daemon logs the cause, and benchmark pages/data APIs return HTTP **503** with recovery guidance instead of empty results. Repair the database or update `benchmarks.database_path`, then restart Brainrouter to retry; unsupported schemas are not downgraded.
+
 The explorer provides deterministic filtering and pagination, throughput-vs-memory Pareto visualization, 8K/32K/128K context scaling, runtime and quantization comparisons, pass@1-per-GB analysis, full configuration/result inspection, and filtered CSV or JSONL downloads.
 
 Import a complete result bundle with `POST /api/benchmarks/ingest`. The JSON object contains `model`, `artifact`, `runtime`, `hardware`, `workload`, `experiment`, and `run`, plus optional `performance_metrics`, `speculative_metrics`, `quality_results`, and `telemetry_samples`. IDs in the bundle must reference each other. SHA-256 fields use lowercase 64-character hex, counts and metrics enforce their documented bounds, and unknown fields are rejected.
@@ -740,6 +742,8 @@ All on `http://127.0.0.1:9099`.
 | `POST` | `/v1/messages` | Anthropic | For Claude Code and droid |
 
 #### Management (localhost-only, CSRF-protected)
+
+Mutating requests must come from a loopback peer or the Unix socket. Browser `Origin`/`Referer` URLs may use HTTP `localhost`, IPv4 loopback, or IPv6 loopback on any port, including a port remapped by a local tunnel or proxy. `Origin: null`, non-loopback origins, and credential-bearing URLs remain forbidden. Non-loopback proxy frontends need a separate trusted-origin policy; port forwarding does not remove the peer restriction.
 
 | Method | Path | Notes |
 |---|---|---|

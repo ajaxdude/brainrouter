@@ -2785,6 +2785,18 @@ pub async fn handle_request(
     Ok(response)
 }
 
+pub fn unavailable_response(reason: &str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({
+            "error": format!(
+                "Benchmark explorer unavailable: {reason}. Core routing is still available. \
+                 Repair the database or change benchmarks.database_path, then restart Brainrouter to retry."
+            ),
+        }),
+    )
+}
+
 fn parse_export_query(query: Option<&str>) -> BenchmarkResult<(RunQuery, String)> {
     let mut format = None;
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());

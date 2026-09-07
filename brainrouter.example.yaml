@@ -82,6 +82,8 @@ models:
 # Imported benchmark results and explorer storage.
 # The daemon creates and migrates this SQLite database at startup. It only
 # imports and explores results; it never launches benchmark/model workloads.
+# Initialization failures disable only the explorer (HTTP 503), not routing.
+# Fix the database/path and restart Brainrouter to retry initialization.
 # benchmarks:
 #   database_path: "/home/yourname/.local/share/brainrouter/benchmarks.sqlite3"
 
