@@ -5,166 +5,573 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>brainrouter benchmark explorer</title>
 <style>
-:root{--bg:#0b0e13;--panel:#141923;--panel2:#11151c;--border:#252d3a;--text:#e6edf6;--dim:#8a96a9;--mute:#596578;--green:#22d39a;--cyan:#3ec5ff;--amber:#f5b14a;--red:#ff6b6b;--violet:#9d7bff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px Inter,system-ui,sans-serif}button,input,select{font:inherit}
-header{height:64px;display:flex;align-items:center;gap:14px;padding:0 24px;border-bottom:1px solid var(--border);background:var(--panel2);position:sticky;top:0;z-index:2}
-a{color:var(--cyan);text-decoration:none}.brand{font-weight:650}.subtitle{color:var(--mute);font-size:11px}.spacer{flex:1}
-.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:7px 11px;border-radius:7px;cursor:pointer}.btn:hover{border-color:var(--cyan)}.btn.primary{color:var(--green);border-color:#22d39a66}
-main{padding:22px;max-width:1700px;margin:auto}.notice{padding:10px 13px;border:1px solid var(--border);border-radius:8px;color:var(--dim);margin-bottom:16px;background:var(--panel2)}
-.filters{display:grid;grid-template-columns:minmax(180px,2fr) repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:14px}.filters input,.filters select{width:100%;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:8px}
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.kpi,.chart,.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:10px}.kpi{padding:13px}.kpi-label{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:1px}.kpi-value{font:600 22px ui-monospace,monospace;margin-top:3px}
-.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}.chart{padding:13px;min-height:300px}.chart h2{font-size:12px;margin:0 0 8px}.chart .hint{color:var(--mute);font-size:10px;margin-bottom:8px}svg{width:100%;height:240px;overflow:visible}.axis{stroke:var(--border)}.tick{fill:var(--mute);font-size:9px}.point{cursor:pointer;stroke:#0b0e13;stroke-width:1.5}.point:hover{stroke:#fff;stroke-width:2}
-.table-wrap{overflow:hidden}.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%;min-width:1200px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);white-space:nowrap}th{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px;background:var(--panel2);position:sticky;top:0}tbody tr{cursor:pointer}tbody tr:hover{background:#ffffff08}.mono{font-family:ui-monospace,monospace}.status{padding:3px 7px;border-radius:99px;background:#ffffff0b}.succeeded{color:var(--green)}.failed,.oom,.timeout{color:var(--red)}.running{color:var(--cyan)}
-.pager{display:flex;align-items:center;gap:8px;padding:11px;color:var(--dim)}#message{min-height:18px;color:var(--dim);margin:8px 0}.empty{text-align:center;color:var(--mute);padding:35px}
-dialog{width:min(900px,92vw);max-height:85vh;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:0}dialog::backdrop{background:#000b}.dialog-head{display:flex;align-items:center;padding:14px;border-bottom:1px solid var(--border)}pre{white-space:pre-wrap;word-break:break-word;padding:14px;margin:0;color:var(--dim);font:11px ui-monospace,monospace;overflow:auto}
-@media(max-width:1000px){.filters{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}}
+:root{--bg:#0b0e13;--panel:#141923;--panel2:#11151c;--border:#354054;--text:#e6edf6;--dim:#a1aec2;--mute:#a1aec2;--green:#22d39a;--cyan:#3ec5ff;--amber:#f5b14a;--red:#ff6b6b;--violet:#9d7bff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,sans-serif;line-height:1.5}button,input,select,textarea{font:inherit}a{color:var(--cyan);text-underline-offset:3px}
+header{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--panel2)}h1{font-size:24px;margin:0}h2{font-size:20px;margin:0 0 12px}h3{font-size:16px;margin:22px 0 8px}h4{margin:12px 0 6px}.subtitle,.hint{color:var(--dim);font-size:13px}.spacer{flex:1}
+.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:8px 12px;border-radius:6px;cursor:pointer;text-decoration:none;display:inline-block}.btn:hover:not(:disabled){border-color:var(--cyan)}.btn.primary{color:var(--green);border-color:#258c70}button:disabled{opacity:.5;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}.skip{position:absolute;top:-100px}.skip:focus{top:8px;left:8px;background:var(--panel);padding:10px;z-index:5}
+main{padding:22px;max-width:1700px;margin:auto}.notice{padding:12px 14px;border:1px solid var(--border);border-radius:6px;color:var(--dim);margin-bottom:18px;background:var(--panel2)}.notice p{margin:0}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+.filters{display:grid;grid-template-columns:minmax(180px,2fr) repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:14px}label{display:block;color:var(--dim);font-size:13px}input,select,textarea{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:8px;max-width:100%}label>input,label>select,label>textarea{display:block;width:100%;margin-top:4px}textarea{width:100%;min-height:180px;resize:vertical;font:13px ui-monospace,monospace;line-height:1.5}input[type=file]{max-width:100%}input::placeholder,textarea::placeholder{color:var(--dim)}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.kpi,.chart,.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:7px}.kpi{padding:13px}.kpi-label{font-size:12px;color:var(--dim)}.kpi-value{font:600 22px ui-monospace,monospace;margin-top:3px}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}.chart{padding:14px;min-width:0}.chart h3{font-size:15px;margin:0 0 8px}.chart .hint{margin-bottom:8px}svg{width:100%;height:auto;display:block}.axis{stroke:var(--border)}.tick{fill:var(--dim);font-size:11px}.point{cursor:pointer;stroke:var(--bg);stroke-width:1.5}.point:hover,.point:focus{stroke:#fff;stroke-width:2}
+.table-wrap{overflow:hidden}.table-scroll{overflow:auto;max-height:520px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:12px;color:var(--dim);background:var(--panel2);position:sticky;top:0}#run-table{min-width:1450px}#run-table td{white-space:nowrap}caption{text-align:left;padding:10px;color:var(--dim)}tbody tr:hover{background:#ffffff08}.mono{font-family:ui-monospace,monospace}.succeeded{color:var(--green)}.failed,.oom,.timeout,.error{color:var(--red)}.running{color:var(--cyan)}
+.pager{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:11px;color:var(--dim)}.message{min-height:22px;color:var(--dim);margin:8px 0;overflow-wrap:anywhere}.message.error{color:var(--red)}.empty{color:var(--dim);padding:22px}
+details{border-top:1px solid var(--border);padding:12px 0}summary{cursor:pointer;font-weight:600;padding:4px 0}fieldset{border:0;padding:0;margin:0;min-width:0}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.workflow{margin:24px 0}.workflow>details{padding:16px 0}.workflow pre{max-height:360px}.inline-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.inline-label>input,.inline-label>select{width:auto}.wide{grid-column:1/-1}
+dialog{width:min(1180px,94vw);max-height:90vh;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:0}dialog::backdrop{background:#000b}.dialog-head{display:flex;align-items:center;gap:12px;padding:14px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);z-index:1}.dialog-head h2{margin:0;overflow-wrap:anywhere;min-width:0}.dialog-body{padding:18px}.detail-section{border-top:1px solid var(--border);padding:16px 0}.detail-section:first-child{border-top:0}.detail-section h3{margin:0 0 12px}.definition{display:grid;grid-template-columns:minmax(130px,1fr) minmax(0,3fr);margin:0;gap:8px 18px}.definition dt{color:var(--dim)}.definition dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.definition .definition{grid-template-columns:minmax(100px,1fr) minmax(0,2fr)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(--dim);font:12px ui-monospace,monospace;line-height:1.5;overflow:auto;background:var(--panel2)}.spark-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.spark{margin:0;padding:8px 0}.spark figcaption{font-size:13px}.spark svg{height:85px}.quality-table{min-width:1000px}.quality-table td{max-width:260px;overflow-wrap:anywhere}#preview-summary{font-weight:600}#success a{margin-left:8px}#selected-candidate{overflow-wrap:anywhere}
+@media(max-width:1050px){.filters{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}.fields{grid-template-columns:1fr 1fr}}
+@media(max-width:650px){body{font-size:16px}main{padding:14px}header{padding:14px}.fields,.spark-grid{grid-template-columns:1fr}.definition,.definition .definition{grid-template-columns:1fr;gap:4px}.definition dd{margin-bottom:10px}input,select,textarea{font-size:16px}.dialog-body{padding:12px}.dialog-head{flex-wrap:wrap}.kpi-value{font-size:20px}.filters{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+<a class="skip" href="#explorer">Skip to benchmark runs</a>
 <header>
   <a href="/dashboard">&larr; Dashboard</a>
-  <div><div class="brand">Benchmark Explorer</div><div class="subtitle">Reproducible imported results; no workloads are launched here</div></div>
+  <div><h1>Benchmark Explorer</h1><div class="subtitle">Imported evidence, not a workload launcher</div></div>
   <div class="spacer"></div>
-  <button class="btn" onclick="downloadExport('jsonl')">Export JSONL</button>
-  <button class="btn" onclick="downloadExport('csv')">Export CSV</button>
-  <button class="btn primary" onclick="document.getElementById('import-file').click()">Import result</button>
-  <input id="import-file" type="file" accept=".json,application/json" hidden>
+  <a class="btn primary" href="#workflows">Plan &amp; import</a>
+  <button class="btn" id="export-jsonl">Export filtered JSONL</button>
+  <button class="btn" id="export-csv">Export filtered CSV</button>
 </header>
 <main>
-  <div class="notice">Compare throughput, memory, context scaling, runtimes, quantizations, and quality from immutable benchmark records. Import accepts the documented result bundle JSON format.</div>
-  <div class="filters">
-    <input id="q" placeholder="Search model, runtime, workload, run ID">
-    <select id="family"><option value="">All families</option></select>
-    <select id="backend"><option value="">All backends</option></select>
-    <select id="workload"><option value="">All workloads</option></select>
-    <select id="quant_name"><option value="">All quantizations</option></select>
-    <select id="status"><option value="">All statuses</option></select>
-  </div>
-  <div class="kpis">
-    <div class="kpi"><div class="kpi-label">Matching runs</div><div class="kpi-value" id="kpi-runs">0</div></div>
-    <div class="kpi"><div class="kpi-label">Best generation TPS</div><div class="kpi-value" id="kpi-tps">-</div></div>
-    <div class="kpi"><div class="kpi-label">Lowest TTFT</div><div class="kpi-value" id="kpi-ttft">-</div></div>
-    <div class="kpi"><div class="kpi-label">Best pass@1 / disk GB</div><div class="kpi-value" id="kpi-quality">-</div></div>
-  </div>
-  <div class="charts">
-    <section class="chart"><h2>Throughput vs peak memory</h2><div class="hint">Pareto frontier favors higher generation TPS and lower RAM + VRAM.</div><svg id="pareto-chart" viewBox="0 0 600 240"></svg></section>
-    <section class="chart"><h2>Context scaling</h2><div class="hint">Generation TPS by context length; compare 8K, 32K, and 128K configurations.</div><svg id="context-chart" viewBox="0 0 600 240"></svg></section>
-    <section class="chart"><h2>Runtime comparison</h2><div class="hint">Mean generation TPS for each runtime fork/backend.</div><svg id="runtime-chart" viewBox="0 0 600 240"></svg></section>
-    <section class="chart"><h2>Quantization comparison</h2><div class="hint">Mean generation TPS by quantization.</div><svg id="quant-chart" viewBox="0 0 600 240"></svg></section>
-    <section class="chart"><h2>Pass@1 per disk GB</h2><div class="hint">Mean imported pass@1 score divided by artifact size.</div><svg id="quality-chart" viewBox="0 0 600 240"></svg></section>
-  </div>
-  <div id="message"></div>
-  <section class="table-wrap">
-    <div class="table-scroll">
-      <table>
-        <thead><tr><th>Status</th><th>Model</th><th>Quant</th><th>Runtime</th><th>Backend</th><th>Context</th><th>Workload</th><th>Prompt TPS</th><th>Gen TPS</th><th>TTFT</th><th>Peak RAM</th><th>Peak VRAM</th><th>Speculation</th><th>Started</th></tr></thead>
-        <tbody id="runs"></tbody>
-      </table>
+  <div class="notice">All metadata, hashes, capabilities, commands, and paths are declarations, not artifact verification or runtime capability checks. Commands and paths are inert text: this page never executes them or opens referenced files.</div>
+  <section id="explorer" aria-labelledby="explorer-title">
+    <h2 id="explorer-title">Explore benchmark runs</h2>
+    <div class="filters">
+      <label>Search<input id="q" placeholder="Model, runtime, workload, run ID" type="search"></label>
+      <label>Family<select id="family"><option value="">All families</option></select></label>
+      <label>Backend<select id="backend"><option value="">All backends</option></select></label>
+      <label>Workload<select id="workload"><option value="">All workloads</option></select></label>
+      <label>Quantization<select id="quant_name"><option value="">All quantizations</option></select></label>
+      <label>Status<select id="status"><option value="">All statuses</option></select></label>
     </div>
-    <div class="pager"><button class="btn" id="prev">Previous</button><span id="page-label"></span><button class="btn" id="next">Next</button><span class="spacer"></span><select id="sort"><option value="started_at:desc">Newest</option><option value="generation_tps:desc">Generation TPS</option><option value="prompt_tps:desc">Prompt TPS</option><option value="ttft_ms:asc">TTFT</option><option value="context_tokens:desc">Context</option></select></div>
+    <p id="analytics-scope" class="hint" role="status">Charts and extrema use only the current page (at most 25 runs), never the full registry.</p>
+    <div class="kpis">
+      <div class="kpi"><div class="kpi-label">All matching runs</div><div class="kpi-value" id="kpi-runs">—</div></div>
+      <div class="kpi"><div class="kpi-label">Page · best generation TPS</div><div class="kpi-value" id="kpi-tps">—</div></div>
+      <div class="kpi"><div class="kpi-label">Page · lowest TTFT</div><div class="kpi-value" id="kpi-ttft">—</div></div>
+      <div class="kpi"><div class="kpi-label">Page · best pass@1 / disk GiB</div><div class="kpi-value" id="kpi-quality">—</div></div>
+    </div>
+    <details>
+      <summary>Current-page charts</summary>
+      <p class="hint">Descriptive only: configurations and workloads may differ. Missing measurements are omitted, not zero. Every plotted run is available in the keyboard-accessible table below.</p>
+      <div class="charts">
+        <section class="chart"><h3>Throughput vs reported peak memory</h3><label class="inline-label">Memory measure<select id="memory-metric"><option value="peak_rss_bytes">Process RAM (RSS)</option><option value="peak_vram_bytes">VRAM</option></select></label><p class="hint">Separate measures, never RAM + VRAM: unified memory may overlap. Not a capacity or Pareto claim.</p><svg id="pareto-chart" viewBox="0 0 600 240" role="img" aria-label="Current page throughput versus one reported memory measure"></svg></section>
+        <section class="chart"><h3>Context scaling observations</h3><p class="hint">One point per measured run; no lines joining different configurations.</p><svg id="context-chart" viewBox="0 0 600 240" role="img" aria-label="Current page generation throughput by context length"></svg></section>
+        <section class="chart"><h3>Runtime observations</h3><p class="hint">Page-only mean generation TPS, top 8 runtime/backend groups. Mixed configurations; not a controlled comparison. Hover or focus for sample count.</p><svg id="runtime-chart" viewBox="0 0 600 240" role="img" aria-label="Page-only runtime group means"></svg></section>
+        <section class="chart"><h3>Quantization observations</h3><p class="hint">Page-only mean generation TPS, top 8 quantization groups. Mixed models and workloads; not a controlled comparison.</p><svg id="quant-chart" viewBox="0 0 600 240" role="img" aria-label="Page-only quantization group means"></svg></section>
+        <section class="chart"><h3>Pass@1 per declared disk GiB</h3><p class="hint">One point per run using its imported mean pass@1 only, not other quality scores. Tasks/workloads may differ; inspect per-task evidence before comparing.</p><svg id="quality-chart" viewBox="0 0 600 240" role="img" aria-label="Per-run pass at one per disk GiB on the current page"></svg></section>
+      </div>
+    </details>
+    <div id="message" class="message" role="status"></div>
+    <button class="btn" id="reload">Refresh runs</button>
+    <section class="table-wrap">
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable benchmark runs">
+        <table id="run-table">
+          <caption>Open a run for configuration, performance, per-task quality, telemetry, and raw JSON.</caption>
+          <thead><tr><th scope="col">Run</th><th scope="col">Status</th><th scope="col">Model</th><th scope="col">Quant</th><th scope="col">Runtime</th><th scope="col">Backend</th><th scope="col">Context</th><th scope="col">Workload</th><th scope="col">Prompt TPS</th><th scope="col">Gen TPS</th><th scope="col">TTFT</th><th scope="col">Peak RAM</th><th scope="col">Peak VRAM</th><th scope="col">Speculation</th><th scope="col">Started</th></tr></thead>
+          <tbody id="runs"></tbody>
+        </table>
+      </div>
+      <div class="pager"><button class="btn" id="prev">Previous</button><span id="page-label"></span><button class="btn" id="next">Next</button><span class="spacer"></span><label class="inline-label">Sort<select id="sort"><option value="started_at:desc">Newest</option><option value="generation_tps:desc">Generation TPS</option><option value="prompt_tps:desc">Prompt TPS</option><option value="ttft_ms:asc">TTFT</option><option value="context_tokens:desc">Context</option></select></label></div>
+    </section>
+  </section>
+  <section id="workflows" class="workflow" aria-labelledby="workflow-title">
+    <h2 id="workflow-title">Plan, prepare, then confirm</h2>
+    <p class="hint">Examples are synthetic downloads. Loading, planning, and previewing never insert a run. Only “Confirm import” persists the exact validated preview.</p>
+    <fieldset id="workflow-inputs">
+      <legend class="hint">Source inputs · changing any source discards the prepared preview</legend>
+      <details id="template-section" open>
+        <summary>Reusable metadata &amp; llama-bench preparation</summary>
+        <p class="hint">Enter model, artifact, runtime, hardware, workload, and experiment once. The server wires base references and generates deterministic experiment/run IDs. The same experiment and repetition keep the same run ID; conflicts require your decision, never an automatic next repetition.</p>
+        <div class="toolbar">
+          <button class="btn" id="template-example">Load synthetic template</button>
+          <a class="btn" href="/api/benchmarks/examples/template.json" download>Download template JSON</a>
+          <label>Upload template JSON<input id="template-file" type="file" accept=".json,application/json"></label>
+        </div>
+        <label for="template-json">ImportTemplate JSON · model, artifact, runtime, hardware, workload, experiment</label>
+        <textarea id="template-json" spellcheck="false" aria-describedby="template-help" placeholder="Load the synthetic template or paste your six metadata definitions here."></textarea>
+        <p class="hint" id="template-help">Edit experiment.context_tokens, prompt_tokens, generation_tokens, optimization, and sampling here. This is metadata, not proof that files or hardware exist. Browser upload limit: 16 MiB per file/request. Numeric values outside ±9,007,199,254,740,991 are unsupported here: use the direct API, or strings for free-form metadata only. Schema-defined numeric fields must remain numeric in the API.</p>
+        <div class="toolbar"><button class="btn" id="save-template">Save metadata in this browser</button><button class="btn" id="load-template">Load saved metadata</button><button class="btn" id="clear-template">Clear saved &amp; current metadata</button></div>
+        <p id="template-status" class="message" role="status">Nothing is saved or loaded automatically. Explicit save stores only the template on this browser/origin; it may include private provenance.</p>
+        <p id="selected-candidate" class="hint">Using the template’s base experiment.</p>
+        <div class="fields">
+          <label>Repetition (explicit, starts at 0)<input id="repetition" type="number" min="0" max="9007199254740991" step="1" value="0"></label>
+          <label>Run status<select id="prepare-status"><option value="">Choose a status</option><option value="planned">planned · no result file</option><option value="running">running · no result file</option><option value="succeeded">succeeded</option><option value="failed">failed</option><option value="oom">oom</option><option value="timeout">timeout</option><option value="cancelled">cancelled</option><option value="skipped">skipped · no result file</option></select></label>
+          <label>Preparation mode<select id="prepare-mode"><option value="metadata">Metadata only · no measurements</option><option value="llama">Import llama-bench result file</option></select></label>
+          <label>Started at (optional RFC3339)<input id="started-at" placeholder="2026-09-01T12:00:00Z"></label>
+          <label>Ended at (optional RFC3339)<input id="ended-at" placeholder="2026-09-01T12:01:00Z"></label>
+          <label>llama-bench JSON result file<input id="llama-file" type="file" accept=".json,application/json"></label>
+          <label class="wide">Exact command · inert provenance only<input id="exact-command" placeholder="Paste the recorded command; never executed here"></label>
+        </div>
+        <p id="llama-status" class="hint" role="status">No result file selected. Metadata-only preparation does not invent measurements.</p>
+        <div class="toolbar"><button class="btn primary" id="prepare">Prepare &amp; validate preview</button><a class="btn" href="/api/benchmarks/examples/llama-bench.json" download>Download synthetic llama-bench JSON</a></div>
+      </details>
+      <details id="bundle-section">
+        <summary>Upload a complete result bundle</summary>
+        <p class="hint">A complete IngestBundle includes the six definitions and run, plus optional results. Uploading only loads the editor; preview validates without persistence.</p>
+        <div class="toolbar"><label>Bundle JSON file<input id="bundle-file" type="file" accept=".json,application/json"></label><button class="btn" id="bundle-example">Load synthetic bundle</button><a class="btn" href="/api/benchmarks/examples/bundle.json" download>Download synthetic bundle JSON</a></div>
+        <label for="bundle-json">Complete IngestBundle JSON</label><textarea id="bundle-json" spellcheck="false" placeholder="Paste or upload a complete bundle"></textarea>
+        <div class="toolbar"><button class="btn primary" id="validate-bundle">Validate bundle preview</button><button class="btn" id="validate-llama">Validate bundle + selected llama-bench file</button></div>
+        <p class="hint">The second action uses the result file selected above and the bundle’s explicit run status. Neither action imports anything.</p>
+      </details>
+      <details id="plan-section">
+        <summary>Expand a JSON / YAML experiment matrix</summary>
+        <p class="hint">Planning checks declarations and combinations only, not installed models or runtime capabilities. Nothing is scheduled or executed. Synthetic 8K / 32K / 128K matrices reference the synthetic template.</p>
+        <div class="toolbar"><label class="inline-label">Matrix format<select id="plan-format"><option value="json">JSON</option><option value="yaml">YAML</option></select></label><label>Matrix file<input id="plan-file" type="file" accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml"></label><button class="btn" id="plan-example">Load synthetic matrix</button><a class="btn" href="/api/benchmarks/examples/matrix.json" download>Download JSON</a><a class="btn" href="/api/benchmarks/examples/matrix.yaml" download>Download YAML</a></div>
+        <label for="plan-source">Experiment matrix</label><textarea id="plan-source" spellcheck="false" placeholder="Paste a JSON or YAML ExperimentMatrix"></textarea>
+        <div class="toolbar"><button class="btn primary" id="plan">Preview plan</button><button class="btn" id="download-plan" disabled>Download expanded plan</button></div>
+        <p id="plan-status" class="message" role="status"></p>
+        <div id="plan-results"></div>
+      </details>
+    </fieldset>
+    <section class="notice" aria-labelledby="preview-title">
+      <h3 id="preview-title">Validated preview · confirmation required</h3>
+      <p id="workflow-status" class="message" role="status">Prepare metadata or validate a complete bundle to preview it here.</p>
+      <p id="preview-summary"></p><ul id="preview-warnings"></ul>
+      <details><summary>Exact preview bundle JSON</summary><pre id="preview-json">No current preview.</pre></details>
+      <details><summary>Original validation response JSON · read-only</summary><pre id="preview-response-json">No current validation response.</pre></details>
+      <div class="toolbar"><button class="btn" id="download-preview" disabled>Download validated bundle</button><button class="btn primary" id="confirm-import" disabled>Confirm import</button></div>
+      <p id="success" class="message" role="status"></p>
+    </section>
   </section>
 </main>
-<dialog id="detail">
-  <div class="dialog-head"><strong id="detail-title">Run detail</strong><div class="spacer"></div><button class="btn" onclick="document.getElementById('detail').close()">Close</button></div>
-  <pre id="detail-json"></pre>
+<dialog id="detail" aria-labelledby="detail-title">
+  <div class="dialog-head"><h2 id="detail-title">Run inspector</h2><div class="spacer"></div><button class="btn" id="detail-download" disabled>Download raw JSON</button><button class="btn" id="detail-close" autofocus>Close</button></div>
+  <div class="dialog-body">
+    <p id="detail-status" class="message" role="status"></p>
+    <button class="btn" id="detail-retry" hidden>Retry detail</button>
+    <div id="detail-content" aria-busy="false"></div>
+    <details><summary>Raw detail JSON</summary><pre id="detail-json">Loading…</pre></details>
+  </div>
 </dialog>
 <script>
-const state={page:1,perPage:25,totalPages:0};
-let loadGeneration=0;
-let detailGeneration=0;
+'use strict';
+const state={page:1,perPage:25,totalPages:0,items:[]};
 const colors=['#22d39a','#3ec5ff','#9d7bff','#f5b14a','#ff6b6b','#ff7ac6'];
 const byId=id=>document.getElementById(id);
-const esc=s=>String(s??'');
-const num=(n,d=1)=>n==null?'-':Number(n).toFixed(d);
-const bytes=n=>n==null?'-':(Number(n)/1073741824).toFixed(1)+' GB';
-const context=n=>n==null?'-':(Number(n)/1024).toFixed(Number(n)%1024?1:0)+'K';
+const finite=n=>typeof n==='number'&&Number.isFinite(n);
+const num=(n,d=1)=>finite(n)?n.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):'Not reported';
+const bytes=n=>finite(n)?num(n/1073741824,2)+' GiB':'Not reported';
+const context=n=>finite(n)?num(n/1024,n%1024?1:0)+'K':'Not reported';
+const unit=(n,suffix)=>finite(n)?num(n)+' '+suffix:'Not reported';
+const bool=n=>n===true?'Yes':n===false?'No':'Not reported';
+const pretty=x=>JSON.stringify(x,null,2);
+const MAX_INPUT_BYTES=16*1024*1024;
+let loadGeneration=0,detailGeneration=0,detailAbort=null,detailRawText=null,detailId=null,detailTrigger=null;
+let revision=0,previewGeneration=0,prepared=null,confirming=false,selectedCandidate=null,llamaResult=null;
+let planGeneration=0,planData=null,planPage=0;
+const fileGenerations=new Map(),editorGenerations=new Map();
+function el(tag,text,cls){const node=document.createElement(tag);if(text!==undefined)node.textContent=String(text);if(cls)node.className=cls;return node}
+function message(id,text,error=false){byId(id).textContent=text;byId(id).classList.toggle('error',error)}
+function button(text,action){const node=el('button',text,'btn');node.type='button';node.onclick=action;return node}
+function jsonSize(text){if(new TextEncoder().encode(text).length>MAX_INPUT_BYTES)throw new Error('Input exceeds the 16 MiB browser limit. Use a smaller bundle or matrix.');return text}
+function unsafeNumberLiteral(token){
+  const [mantissa,exponent='0']=token.replace(/^-/,'').split(/[eE]/),[whole,fraction='']=mantissa.split('.');
+  const allDigits=whole+fraction,digits=allDigits.replace(/^0+/,'');if(!digits)return false;
+  const decimalPosition=whole.length+Number(exponent)-(allDigits.length-digits.length),limit='9007199254740991';
+  if(decimalPosition!==limit.length)return decimalPosition>limit.length;
+  const prefix=digits.slice(0,limit.length).padEnd(limit.length,'0');
+  return prefix>limit||(prefix===limit&&/[1-9]/.test(digits.slice(limit.length)));
+}
+function firstUnsafeJSONNumber(text){
+  // Match complete quoted strings first so numeric-looking IDs, hashes, and text are never numbers.
+  const tokens=/"(?:[^"\\]|\\[\s\S])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+  for(const match of text.matchAll(tokens)){const token=match[0];if(token[0]!=='"'&&unsafeNumberLiteral(token))return token}return null;
+}
+function unsafeNumberError(name,token){return new Error(name+' contains a numeric value outside JavaScript’s safe integer range (±9007199254740991): '+String(token).slice(0,80)+'. This browser cannot safely preserve it. Use the direct API, or store free-form metadata values as strings. Schema-defined numeric fields must stay numeric in the API.')}
+function assertSafeJSONNumbers(text,name){const token=firstUnsafeJSONNumber(text);if(token!==null)throw unsafeNumberError(name,token)}
+function assertSafeNumbers(value,name){
+  const pending=[value];
+  while(pending.length){const item=pending.pop();if(typeof item==='number'&&(!Number.isFinite(item)||Math.abs(item)>Number.MAX_SAFE_INTEGER))throw unsafeNumberError(name,item);if(item&&typeof item==='object')for(const child of Object.values(item))pending.push(child)}
+}
+function parseInput(text,name){
+  if(!text.trim())throw new Error('Provide '+name+' first.');
+  try{const value=JSON.parse(jsonSize(text));assertSafeJSONNumbers(text,name);return value}catch(e){if(e instanceof SyntaxError)throw new Error(name+' is not valid JSON: '+e.message);throw e}
+}
+async function jsonResponse(url,opts){
+  const response=await fetch(url,opts),text=await response.text();let data;
+  try{data=JSON.parse(text)}catch{throw new Error('HTTP '+response.status+': server returned invalid JSON. Retry or inspect the server logs.')}
+  if(!response.ok)throw new Error('HTTP '+response.status+': '+(data?.error||response.statusText||'Request failed'));
+  return {data,text};
+}
+async function jsonFetch(url,opts){const response=await jsonResponse(url,opts);assertSafeJSONNumbers(response.text,'Server response');return response.data}
+function jsonRequest(data){assertSafeNumbers(data,'Request');return {method:'POST',headers:{'content-type':'application/json'},body:jsonSize(JSON.stringify(data))}}
+function post(url,data){return jsonFetch(url,jsonRequest(data))}
+function downloadText(text,name){
+  const url=URL.createObjectURL(new Blob([text],{type:'application/json'}));
+  const link=el('a');link.href=url;link.download=name;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function downloadJSON(value,name){assertSafeNumbers(value,'Download');downloadText(pretty(value)+'\n',name)}
 function params(includePage=true){
   const p=new URLSearchParams();
-  for(const id of ['q','family','backend','workload','quant_name','status']){const v=byId(id).value.trim();if(v)p.set(id,v)}
+  for(const id of ['q','family','backend','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
   const [sort,order]=byId('sort').value.split(':');p.set('sort',sort);p.set('order',order);
-  if(includePage){p.set('page',state.page);p.set('per_page',state.perPage)}
-  return p;
+  if(includePage){p.set('page',state.page);p.set('per_page',state.perPage)}return p;
 }
-async function jsonFetch(url,opts){const r=await fetch(url,opts);let body;try{body=await r.json()}catch{body={error:'Invalid server response'}}if(!r.ok)throw new Error(body.error||r.statusText);return body}
-function optionList(id,values){const s=byId(id);while(s.options.length>1)s.remove(1);for(const value of values){const o=document.createElement('option');o.value=value;o.textContent=value;s.append(o)}}
-async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');optionList('family',f.families);optionList('backend',f.backends);optionList('workload',f.workloads);optionList('quant_name',f.quant_names);optionList('status',f.statuses)}
+function optionList(id,values){
+  const select=byId(id),selected=select.value;while(select.options.length>1)select.remove(1);
+  for(const value of values){const option=el('option',value);option.value=value;select.append(option)}
+  if(values.includes(selected))select.value=selected;
+}
+async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');for(const [id,key] of [['family','families'],['backend','backends'],['workload','workloads'],['quant_name','quant_names'],['status','statuses']])optionList(id,f[key])}
 async function load(){
-  const generation=++loadGeneration;
-  byId('message').textContent='Loading...';
+  const generation=++loadGeneration;message('message','Loading runs…');byId('prev').disabled=true;byId('next').disabled=true;
+  state.items=[];renderTable([]);renderAnalytics([],0);byId('kpi-runs').textContent='—';byId('page-label').textContent='';
   try{
-    const page=await jsonFetch('/api/benchmarks/runs?'+params());
-    if(generation!==loadGeneration)return;
-    state.totalPages=page.total_pages;
-    byId('kpi-runs').textContent=page.total;
+    const page=await jsonFetch('/api/benchmarks/runs?'+params());if(generation!==loadGeneration)return;
+    state.totalPages=page.total_pages;state.items=page.items;byId('kpi-runs').textContent=String(page.total);
     byId('page-label').textContent=`Page ${page.page} of ${Math.max(1,page.total_pages)}`;
     byId('prev').disabled=page.page<=1;byId('next').disabled=page.page>=page.total_pages;
-    renderTable(page.items);byId('message').textContent='';
-    await loadAnalytics(generation);
-  }catch(e){if(generation===loadGeneration)byId('message').textContent=e.message}
+    renderTable(page.items);renderAnalytics(page.items,page.total);message('message',page.items.length?'':'No matching runs. Change filters or prepare an import below.');
+  }catch(e){if(generation===loadGeneration)message('message',e.message+' Use Refresh runs to retry.',true)}
 }
-async function loadAnalytics(generation){
-  const p=params(false);p.set('page','1');p.set('per_page','100');p.set('sort','generation_tps');p.set('order','desc');
-  if(!p.has('status'))p.set('status','succeeded');
-  const first=await jsonFetch('/api/benchmarks/runs?'+p),items=[...first.items];
-  for(let page=2;page<=first.total_pages;page++){if(generation!==loadGeneration)return;p.set('page',String(page));const next=await jsonFetch('/api/benchmarks/runs?'+p);items.push(...next.items)}
-  if(generation!==loadGeneration)return;
-  const tps=items.map(x=>x.generation_tps).filter(x=>x!=null);
-  const ttft=items.map(x=>x.ttft_ms).filter(x=>x!=null);
-  byId('kpi-tps').textContent=tps.length?num(tps.reduce((best,value)=>Math.max(best,value),-Infinity)):'-';
-  byId('kpi-ttft').textContent=ttft.length?num(ttft.reduce((best,value)=>Math.min(best,value),Infinity))+' ms':'-';
-  const quality=items.filter(x=>x.quality_score!=null&&x.disk_bytes>0).map(x=>x.quality_score/(x.disk_bytes/1073741824));
-  byId('kpi-quality').textContent=quality.length?num(quality.reduce((best,value)=>Math.max(best,value),-Infinity),2):'-';
+function renderAnalytics(items,total){
+  message('analytics-scope',`Charts and extrema: current page only, ${items.length} of ${total} matching runs (maximum 25). All selected statuses; missing measurements excluded. Changing page or sort changes this sample.`);
+  const tps=items.map(x=>x.generation_tps).filter(finite),ttft=items.map(x=>x.ttft_ms).filter(finite),quality=qualityPoints(items);
+  byId('kpi-tps').textContent=tps.length?num(Math.max(...tps)):'—';
+  byId('kpi-ttft').textContent=ttft.length?unit(Math.min(...ttft),'ms'):'—';
+  byId('kpi-quality').textContent=quality.length?num(Math.max(...quality.map(x=>x.quality_per_gb)),2):'—';
   drawScatter(items);drawContext(items);drawBars('runtime-chart',items,x=>x.fork_name+' / '+x.backend);drawBars('quant-chart',items,x=>x.quant_name);drawQuality(items);
 }
 function renderTable(items){
   const body=byId('runs');body.replaceChildren();
-  if(!items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=14;td.className='empty';td.textContent='No benchmark runs match these filters.';tr.append(td);body.append(tr);return}
   for(const run of items){
-    const tr=document.createElement('tr');tr.onclick=()=>showDetail(run.run_id);
-    const values=[[run.status,'status '+run.status],[run.family],[run.quant_name,'mono'],[run.fork_name],[run.backend],[context(run.context_tokens),'mono'],[run.workload],[num(run.prompt_tps),'mono'],[num(run.generation_tps),'mono'],[run.ttft_ms==null?'-':num(run.ttft_ms)+' ms','mono'],[bytes(run.peak_rss_bytes),'mono'],[bytes(run.peak_vram_bytes),'mono'],[run.speculator_type||'none'],[run.started_at?new Date(run.started_at).toLocaleString():'-']];
-    for(const [value,cls] of values){const td=document.createElement('td');td.textContent=esc(value);if(cls)td.className=cls;tr.append(td)}body.append(tr);
+    const tr=el('tr'),openCell=el('td'),open=button('Open run',()=>showDetail(run.run_id,open));open.setAttribute('aria-label','Open run '+run.run_id);openCell.append(open);tr.append(openCell);
+    const values=[run.status,run.family,run.quant_name,run.fork_name,run.backend,context(run.context_tokens),run.workload,num(run.prompt_tps),num(run.generation_tps),unit(run.ttft_ms,'ms'),bytes(run.peak_rss_bytes),bytes(run.peak_vram_bytes),run.speculator_type??'Not reported',run.started_at?new Date(run.started_at).toLocaleString():'Not reported'];
+    for(const value of values)tr.append(el('td',value));body.append(tr);
   }
 }
-async function showDetail(id){const generation=++detailGeneration;try{const data=await jsonFetch('/api/benchmarks/runs/'+encodeURIComponent(id));if(generation!==detailGeneration)return;byId('detail-title').textContent='Run '+id;byId('detail-json').textContent=JSON.stringify(data,null,2);byId('detail').showModal()}catch(e){if(generation===detailGeneration)byId('message').textContent=e.message}}
-function svgEl(tag,attrs={}){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))e.setAttribute(k,v);return e}
+function svgEl(tag,attrs={}){const node=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,value);return node}
 function axes(svg,xlabel,ylabel){
-  svg.replaceChildren();svg.append(svgEl('line',{x1:52,y1:205,x2:580,y2:205,class:'axis'}),svgEl('line',{x1:52,y1:15,x2:52,y2:205,class:'axis'}));
-  const x=svgEl('text',{x:300,y:232,class:'tick','text-anchor':'middle'});x.textContent=xlabel;const y=svgEl('text',{x:12,y:110,class:'tick',transform:'rotate(-90 12 110)','text-anchor':'middle'});y.textContent=ylabel;svg.append(x,y);
+  svg.replaceChildren();svg.append(svgEl('line',{x1:60,y1:200,x2:580,y2:200,class:'axis'}),svgEl('line',{x1:60,y1:20,x2:60,y2:200,class:'axis'}));
+  const x=svgEl('text',{x:310,y:236,class:'tick','text-anchor':'middle'}),y=svgEl('text',{x:14,y:110,class:'tick',transform:'rotate(-90 14 110)','text-anchor':'middle'});
+  x.textContent=xlabel;y.textContent=ylabel;svg.append(x,y);
 }
-function drawScatter(items){
-  const svg=byId('pareto-chart');axes(svg,'Peak RAM + VRAM (GB)','Generation TPS');
-  const points=items.filter(x=>x.generation_tps!=null&&(x.peak_rss_bytes!=null||x.peak_vram_bytes!=null)).map(x=>({...x,mem:((x.peak_rss_bytes||0)+(x.peak_vram_bytes||0))/1073741824}));
-  if(!points.length)return;const maxX=points.reduce((best,x)=>Math.max(best,x.mem),1),maxY=points.reduce((best,x)=>Math.max(best,x.generation_tps),1);
-  const sx=x=>52+x/maxX*520,sy=y=>205-y/maxY*180;
-  const sorted=[...points].sort((a,b)=>a.mem-b.mem||b.generation_tps-a.generation_tps),frontier=[];let bestTps=-Infinity;
-  for(const point of sorted){if(point.generation_tps>bestTps){frontier.push(point);bestTps=point.generation_tps}}
-  if(frontier.length>1)svg.append(svgEl('polyline',{points:frontier.map(x=>`${sx(x.mem)},${sy(x.generation_tps)}`).join(' '),fill:'none',stroke:'#22d39a','stroke-width':2,'stroke-dasharray':'4 4'}));
-  for(const [i,p] of points.entries()){const c=svgEl('circle',{cx:sx(p.mem),cy:sy(p.generation_tps),r:5,fill:colors[i%colors.length],class:'point'});c.onclick=()=>showDetail(p.run_id);const t=svgEl('title');t.textContent=`${p.family} ${p.quant_name}: ${num(p.generation_tps)} TPS, ${num(p.mem)} GB`;c.append(t);svg.append(c)}
+function emptyChart(svg){const text=svgEl('text',{x:310,y:110,class:'tick','text-anchor':'middle'});text.textContent='No reported measurements on this page';svg.append(text)}
+function scaleTicks(svg,maxX,maxY){
+  for(const [x,y,value] of [[60,218,'0'],[565,218,num(maxX)],[42,26,num(maxY)],[42,200,'0']]){const label=svgEl('text',{x,y,class:'tick','text-anchor':'end'});label.textContent=value;svg.append(label)}
 }
-function drawContext(items){
-  const svg=byId('context-chart');axes(svg,'Context tokens','Generation TPS');const pts=items.filter(x=>x.generation_tps!=null&&x.context_tokens);
-  if(!pts.length)return;const xs=[...new Set(pts.map(x=>x.context_tokens))].sort((a,b)=>a-b),maxY=pts.reduce((best,x)=>Math.max(best,x.generation_tps),1);const sx=x=>xs.length===1?315:52+xs.indexOf(x)/(xs.length-1)*520,sy=y=>205-y/maxY*180;
-  const groups=new Map();for(const p of pts){const key=p.family+' / '+p.quant_name+' / '+p.backend,group=groups.get(key)||[];group.push(p);groups.set(key,group)}let i=0;
-  for(const [label,group] of groups){const avg=xs.map(x=>{const a=group.filter(v=>v.context_tokens===x);return a.length?{x,y:a.reduce((s,v)=>s+v.generation_tps,0)/a.length}:null}).filter(Boolean);const color=colors[i++%colors.length];if(avg.length>1)svg.append(svgEl('polyline',{points:avg.map(p=>`${sx(p.x)},${sy(p.y)}`).join(' '),fill:'none',stroke:color,'stroke-width':2}));for(const p of avg){const c=svgEl('circle',{cx:sx(p.x),cy:sy(p.y),r:4,fill:color});const t=svgEl('title');t.textContent=`${label}: ${context(p.x)}, ${num(p.y)} TPS`;c.append(t);svg.append(c)}}
-  for(const x of xs){const t=svgEl('text',{x:sx(x),y:220,class:'tick','text-anchor':'middle'});t.textContent=context(x);svg.append(t)}
+function describeSVG(node,text){node.setAttribute('tabindex','0');node.setAttribute('aria-label',text);const title=svgEl('title');title.textContent=text;node.append(title)}
+function scatter(id,points,xkey,ykey,xlabel,ylabel,describe){
+  const svg=byId(id);axes(svg,xlabel,ylabel);if(!points.length){emptyChart(svg);return}
+  const maxX=Math.max(1,...points.map(x=>x[xkey])),maxY=Math.max(1,...points.map(x=>x[ykey]));scaleTicks(svg,maxX,maxY);
+  points.forEach((p,i)=>{
+    const dot=svgEl('circle',{cx:60+p[xkey]/maxX*500,cy:200-p[ykey]/maxY*170,r:5,fill:colors[i%colors.length],class:'point',role:'button'});
+    describeSVG(dot,describe(p)+'; open run '+p.run_id);dot.onclick=()=>showDetail(p.run_id,dot);dot.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showDetail(p.run_id,dot)}};svg.append(dot);
+  });
 }
-function drawBars(id,items,key,metric='generation_tps',ylabel='Mean generation TPS'){
-  const svg=byId(id);axes(svg,'',ylabel);const groups=new Map();
-  for(const x of items){if(x[metric]==null)continue;const k=key(x),a=groups.get(k)||[];a.push(x[metric]);groups.set(k,a)}
-  const rows=[...groups].map(([k,a])=>({k,v:a.reduce((s,x)=>s+x,0)/a.length})).sort((a,b)=>b.v-a.v).slice(0,8);if(!rows.length)return;
-  const max=rows.reduce((best,x)=>Math.max(best,x.v),1),w=Math.min(55,480/rows.length);
-  rows.forEach((r,i)=>{const x=65+i*(500/rows.length),h=r.v/max*175;const rect=svgEl('rect',{x,y:205-h,width:w,height:h,fill:colors[i%colors.length]});const title=svgEl('title');title.textContent=`${r.k}: ${num(r.v)}`;rect.append(title);svg.append(rect);const t=svgEl('text',{x:x+w/2,y:218,class:'tick','text-anchor':'middle'});t.textContent=r.k.length>12?r.k.slice(0,11)+'...':r.k;svg.append(t)})
+function memoryPoints(items,key){return items.filter(x=>finite(x.generation_tps)&&finite(x[key])).map(x=>({...x,memory_gib:x[key]/1073741824}))}
+function drawScatter(items){const key=byId('memory-metric').value;scatter('pareto-chart',memoryPoints(items,key),'memory_gib','generation_tps',key==='peak_rss_bytes'?'Peak process RSS (GiB)':'Reported peak VRAM (GiB)','Generation TPS',p=>`${p.family} ${p.quant_name}: ${num(p.generation_tps)} TPS, ${num(p.memory_gib,2)} GiB`)}
+function drawContext(items){scatter('context-chart',items.filter(x=>finite(x.context_tokens)&&finite(x.generation_tps)),'context_tokens','generation_tps','Context tokens','Generation TPS',p=>`${p.family} / ${p.fork_name} / ${p.workload}: ${context(p.context_tokens)}, ${num(p.generation_tps)} TPS`)}
+function drawBars(id,items,key){
+  const svg=byId(id);axes(svg,'Page-only groups (top 8)','Mean generation TPS');const groups=new Map();
+  for(const item of items){if(!finite(item.generation_tps))continue;const k=key(item),group=groups.get(k)||[];group.push(item.generation_tps);groups.set(k,group)}
+  const rows=[...groups].map(([k,values])=>({k,n:values.length,v:values.reduce((sum,x)=>sum+x,0)/values.length})).sort((a,b)=>b.v-a.v).slice(0,8);
+  if(!rows.length){emptyChart(svg);return}const max=Math.max(1,...rows.map(x=>x.v));scaleTicks(svg,rows.length,max);
+  rows.forEach((row,i)=>{const x=70+i*500/rows.length,w=Math.min(50,420/rows.length),height=row.v/max*170,bar=svgEl('rect',{x,y:200-height,width:w,height:Math.max(height,.5),fill:colors[i%colors.length]});describeSVG(bar,`${row.k}: ${num(row.v)} mean generation TPS; n=${row.n} reported runs on this page`);svg.append(bar);const label=svgEl('text',{x:x+w/2,y:218,class:'tick','text-anchor':'middle'});label.textContent=row.k.length>10?row.k.slice(0,9)+'…':row.k;svg.append(label)});
 }
-function drawQuality(items){
-  const scored=items.filter(x=>x.quality_score!=null&&x.disk_bytes>0).map(x=>({...x,quality_per_gb:x.quality_score/(x.disk_bytes/1073741824)}));
-  drawBars('quality-chart',scored,x=>x.family+' '+x.quant_name,'quality_per_gb','Pass@1 / GB');
+function qualityPoints(items){return items.filter(x=>finite(x.quality_score)&&finite(x.disk_bytes)&&x.disk_bytes>0).map(x=>({...x,disk_gib:x.disk_bytes/1073741824,quality_per_gb:x.quality_score/(x.disk_bytes/1073741824)}))}
+function drawQuality(items){scatter('quality-chart',qualityPoints(items),'disk_gib','quality_per_gb','Declared artifact size (GiB)','Run mean pass@1 / GiB',p=>`${p.family} / ${p.workload}: imported mean pass@1 ${num(p.quality_score,3)}, ${num(p.quality_per_gb,3)} per GiB`)}
+
+const labels={id:'ID',sha256:'Declared SHA-256 (not verified)',manifest_sha256:'Declared manifest SHA-256 (not verified)',executable_sha256:'Declared executable SHA-256 (not verified)',model_load_ms:'Model load',prompt_processing_ms:'Prompt processing latency',prompt_tps:'Prompt throughput',ttft_ms:'Time to first token (TTFT)',generation_ms:'Generation latency',generation_tps:'Generation throughput',inter_token_p50_ms:'Inter-token latency p50',inter_token_p95_ms:'Inter-token latency p95',inter_token_p99_ms:'Inter-token latency p99',peak_rss_bytes:'Peak process RAM (RSS)',peak_vram_bytes:'Reported peak VRAM',kv_cache_bytes:'KV cache memory',energy_joules:'Energy',avg_power_watts:'Average power',speculator_memory_bytes:'Speculator memory',acceptance_rate:'Acceptance rate',mmap:'Memory mapping (mmap)',mlock:'Memory locking (mlock)',mtp:'Multi-token prediction (MTP)',ngram:'N-gram speculation',cwd:'Working directory (inert text)',exact_command:'Exact command (inert text)',command_template:'Command template (inert text)',conversion_command:'Conversion command (inert text)',source_uri:'Source URI (inert text)',repository:'Repository (inert text)',stdout_path:'stdout path (inert text)',stderr_path:'stderr path (inert text)',output_path:'Output path (inert text)',log_path:'Log path (inert text)'};
+function labelFor(key){return labels[key]||key.replaceAll('_',' ').replace(/^\w/,x=>x.toUpperCase())}
+function displayValue(key,value){
+  if(value==null)return 'Not reported';if(typeof value==='boolean')return bool(value);
+  if(typeof value==='object')return pretty(value);if(key.endsWith('_bytes'))return bytes(value)+' ('+num(value,0)+' bytes)';
+  if(key.endsWith('_ms'))return unit(value,'ms');if(key.endsWith('_tps'))return unit(value,'tokens/s');
+  if(key.endsWith('_watts'))return unit(value,'W');if(key.endsWith('_joules'))return unit(value,'J');
+  if(key==='acceptance_rate')return finite(value)?num(value*100,2)+'%':'Not reported';
+  return String(value);
 }
-function downloadExport(format){const p=params(false);p.set('format',format);location.href='/api/benchmarks/export?'+p}
-byId('import-file').onchange=async e=>{const file=e.target.files[0];if(!file)return;byId('message').textContent='Importing...';try{const text=await file.text();JSON.parse(text);await jsonFetch('/api/benchmarks/ingest',{method:'POST',headers:{'content-type':'application/json'},body:text});byId('message').textContent='Imported successfully.';state.page=1;await load();await loadFilters()}catch(err){byId('message').textContent=err.message}finally{e.target.value=''}};
+function definition(data,depth=0){
+  const dl=el('dl',undefined,'definition');
+  for(const [key,value] of Object.entries(data||{})){
+    const dt=el('dt',labelFor(key)),dd=el('dd');
+    if(value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length&&depth<3)dd.append(definition(value,depth+1));
+    else dd.textContent=displayValue(key,value);
+    dl.append(dt,dd);
+  }
+  if(!dl.children.length)dl.append(el('dt','Measurements'),el('dd','Not reported'));return dl;
+}
+function detailSection(title){const section=el('section',undefined,'detail-section');section.append(el('h3',title));return section}
+function renderDetail(data){
+  const root=byId('detail-content');root.replaceChildren();
+  const record=detailSection('Run & provenance');record.append(el('p','Commands, URLs, environment values, and paths below are inert text only. Hashes are declarations, not verified files.','hint'),definition(data.run_record||data.run));root.append(record);
+  const performance=detailSection('Performance & memory');
+  if(data.performance_metrics)performance.append(definition(data.performance_metrics));else performance.append(el('p','No performance measurements reported.'));
+  performance.append(el('p','RAM and VRAM are separate reported measures and may overlap on unified-memory systems. No memory total is inferred.','hint'));root.append(performance);
+  const speculation=detailSection('Speculation measurements');speculation.append(data.speculative_metrics?definition(data.speculative_metrics):el('p','No speculation measurements reported.'));root.append(speculation);
+  const config=data.configuration||{};
+  for(const [key,title] of [['model','Model'],['artifact','Artifact & conversion provenance'],['runtime','Runtime, build & declared capabilities'],['hardware','Hardware & memory topology'],['workload','Workload'],['experiment','Experiment, optimization & sampling']]){
+    const section=detailSection(title),value=config[key];section.append(value?definition(key==='hardware'?Object.fromEntries(Object.entries(value).filter(([name])=>name!=='gpus')):value):el('p','Not reported.'));
+    if(key==='hardware'&&value?.gpus?.length){section.append(el('h4','GPU devices, ordered by index'));for(const gpu of [...value.gpus].sort((a,b)=>a.index-b.index)){section.append(el('h4','GPU '+gpu.index),definition(gpu))}}
+    root.append(section);
+  }
+  root.append(renderQuality(data.quality_results||[]),renderTelemetry(data.telemetry_samples||[],config.hardware?.gpus||[]));
+}
+function renderQuality(rows){
+  const section=detailSection('Per-task quality evidence');section.append(el('p',`${rows.length} result rows. Each metric keeps its own name and value; no scores are blended. Unknown compile/pass/test values remain “Not reported”, not failures or zeros.`,'hint'));
+  if(!rows.length){section.append(el('p','No per-task quality results reported.'));return section}
+  let page=0;const container=el('div'),pager=el('div',undefined,'pager'),label=el('span');
+  const prev=button('Previous quality rows',()=>{page--;render()}),next=button('Next quality rows',()=>{page++;render()});pager.append(prev,label,next);section.append(container,pager);
+  function render(){
+    const table=el('table',undefined,'quality-table'),head=el('thead'),tr=el('tr');
+    for(const title of ['Task / result','Metric','Value','Passed','Compiled','Tests passed / total','Generated tokens','Duration','Provenance & details']){const th=el('th',title);th.scope='col';tr.append(th)}head.append(tr);table.append(head);const body=el('tbody');
+    for(const row of rows.slice(page*50,page*50+50)){
+      const line=el('tr');for(const value of [row.task_id+' / '+row.id,row.metric_name,num(row.metric_value,4),bool(row.passed),bool(row.compile_succeeded),num(row.tests_passed,0)+' / '+num(row.tests_total,0),num(row.generated_tokens,0),unit(row.duration_ms,'ms')])line.append(el('td',value));
+      const cell=el('td'),details=el('details');details.append(el('summary','Show inert provenance'),definition({output_path:row.output_path,log_path:row.log_path,details:row.details}));cell.append(details);line.append(cell);body.append(line);
+    }
+    table.append(body);const scroll=el('div',undefined,'table-scroll');scroll.tabIndex=0;scroll.setAttribute('role','region');scroll.setAttribute('aria-label','Per-task quality evidence');scroll.append(table);container.replaceChildren(scroll);
+    label.textContent=`Rows ${page*50+1}–${Math.min(page*50+50,rows.length)} of ${rows.length}`;prev.disabled=page===0;next.disabled=(page+1)*50>=rows.length;
+  }
+  render();return section;
+}
+function collapseField(rows,key){
+  const values=new Set(rows.map(row=>row[key]).filter(finite));return values.size===1?[...values][0]:null;
+}
+function telemetryModel(samples){
+  const host=new Map(),devices=new Map(),times=new Set();let invalidTimes=0,hostConflicts=0;
+  for(const sample of samples){
+    const time=Date.parse(sample.sampled_at);if(!Number.isFinite(time)){invalidTimes++;continue}times.add(time);
+    if(!host.has(time))host.set(time,[]);host.get(time).push(sample);
+    const key=finite(sample.gpu_index)?sample.gpu_index:'unattributed';
+    if(!devices.has(key))devices.set(key,new Map());const map=devices.get(key);
+    if(!map.has(time))map.set(time,[]);map.get(time).push(sample);
+  }
+  const ordered=[...times].sort((a,b)=>a-b),hostPoints=new Map();
+  for(const [time,rows] of host){const point={};for(const key of ['cpu_percent','rss_bytes']){point[key]=collapseField(rows,key);if(new Set(rows.map(row=>row[key]).filter(finite)).size>1)hostConflicts++}hostPoints.set(time,point)}
+  const groups=[...devices].sort(([a],[b])=>a==='unattributed'?1:b==='unattributed'?-1:a-b).map(([index,map])=>({index,points:new Map([...map].map(([time,rows])=>[time,Object.fromEntries(['gpu_util_percent','vram_used_bytes','power_watts','temperature_c'].map(key=>[key,collapseField(rows,key)]))]))}));
+  return {times:ordered,host:hostPoints,groups,invalidTimes,hostConflicts};
+}
+function telemetrySeries(model,points,key){return model.times.map(time=>({time,value:points.get(time)?.[key]??null}))}
+function sparkPath(series,scaleX,scaleY){
+  let path='',connected=false;
+  for(const point of series){if(!finite(point.value)){connected=false;continue}const x=scaleX(point.time).toFixed(2),y=scaleY(point.value).toFixed(2);path+=(connected?' L':' M')+x+' '+y;if(!connected)path+=' l0.01 0';connected=true}
+  return path;
+}
+function spark(title,series,format){
+  const figure=el('figure',undefined,'spark'),reported=series.filter(p=>finite(p.value)),caption=el('figcaption');
+  if(!reported.length){caption.textContent=title+' · Not reported';figure.append(caption);return figure}
+  const min=Math.min(...reported.map(p=>p.value)),max=Math.max(...reported.map(p=>p.value));
+  caption.textContent=`${title} · ${format(min)} to ${format(max)} · ${reported.length}/${series.length} timestamps reported`;
+  const svg=svgEl('svg',{viewBox:'0 0 500 85',role:'img','aria-label':caption.textContent+'; missing timestamps break the line'});
+  const start=series[0].time,end=series[series.length-1].time,low=Math.min(0,min),span=Math.max(1,max-low);
+  svg.append(svgEl('path',{d:sparkPath(series,t=>6+(t-start)/Math.max(1,end-start)*488,v=>70-(v-low)/span*60),fill:'none',stroke:colors[1],'stroke-width':2,'stroke-linecap':'round'}));
+  figure.append(caption,svg);return figure;
+}
+function renderTelemetry(samples,gpus){
+  const section=detailSection('Ordered telemetry');section.append(el('p',`${samples.length} imported samples. Timestamp order is preserved; explicit nulls and missing device samples break lines. CPU/RSS host duplicates at a timestamp are collapsed, never summed. Conflicting host values become gaps. Unindexed device sensors remain unattributed.`,'hint'));
+  if(!samples.length){section.append(el('p','No telemetry reported.'));return section}
+  const model=telemetryModel(samples);
+  if(!model.times.length){section.append(el('p','No valid telemetry timestamps to plot. See raw JSON.'));return section}
+  section.append(el('p',`${new Date(model.times[0]).toISOString()} → ${new Date(model.times.at(-1)).toISOString()} · ${model.times.length} distinct timestamps · ${model.invalidTimes} invalid timestamps omitted · ${model.hostConflicts} conflicting host fields shown as gaps.`,'hint'));
+  section.append(el('h4','Host measurements (not a sum across GPUs)'));const host=el('div',undefined,'spark-grid');
+  host.append(spark('CPU utilization',telemetrySeries(model,model.host,'cpu_percent'),v=>unit(v,'%')),spark('Process RAM (RSS)',telemetrySeries(model,model.host,'rss_bytes'),bytes));section.append(host);
+  const measuredGroups=model.groups.filter(group=>group.index!=='unattributed'||[...group.points.values()].some(point=>Object.values(point).some(finite)));
+  let page=0;const deviceRoot=el('div'),pager=el('div',undefined,'pager'),label=el('span'),prev=button('Previous devices',()=>{page--;render()}),next=button('Next devices',()=>{page++;render()});
+  pager.append(prev,label,next);section.append(deviceRoot,pager);
+  function render(){
+    deviceRoot.replaceChildren();
+    for(const group of measuredGroups.slice(page*4,page*4+4)){
+      const gpu=gpus.find(g=>g.index===group.index),title=group.index==='unattributed'?'Unattributed device sensors (gpu_index missing)':'GPU '+group.index+(gpu?' · '+gpu.name:'');
+      deviceRoot.append(el('h4',title));const grid=el('div',undefined,'spark-grid');
+      for(const [key,name,format] of [['gpu_util_percent','GPU utilization',v=>unit(v,'%')],['vram_used_bytes','VRAM used',bytes],['power_watts','Power',v=>unit(v,'W')],['temperature_c','Temperature',v=>unit(v,'°C')]])grid.append(spark(name,telemetrySeries(model,group.points,key),format));deviceRoot.append(grid);
+    }
+    label.textContent=measuredGroups.length?`Device groups ${page*4+1}–${Math.min(page*4+4,measuredGroups.length)} of ${measuredGroups.length}`:'No attributed GPU measurements.';
+    prev.disabled=page===0;next.disabled=(page+1)*4>=measuredGroups.length;
+  }
+  render();return section;
+}
+async function showDetail(id,trigger){
+  const generation=++detailGeneration;detailAbort?.abort();detailAbort=new AbortController();detailId=id;detailRawText=null;
+  const dialog=byId('detail');if(!dialog.open)detailTrigger=trigger||document.activeElement;
+  byId('detail-title').textContent='Run '+id;byId('detail-content').replaceChildren();byId('detail-content').setAttribute('aria-busy','true');byId('detail-json').textContent='Loading…';
+  byId('detail-download').disabled=true;byId('detail-retry').hidden=true;message('detail-status','Loading run detail…');
+  if(!dialog.open)dialog.showModal();
+  try{
+    const response=await jsonResponse('/api/benchmarks/runs/'+encodeURIComponent(id),{signal:detailAbort.signal});
+    if(generation!==detailGeneration||!dialog.open)return;
+    renderDetail(response.data);detailRawText=response.text;byId('detail-json').textContent=response.text;byId('detail-download').disabled=false;
+    message('detail-status',firstUnsafeJSONNumber(response.text)!==null?'Warning: numbers outside the browser-safe range may be rounded in rich values or grouped identifiers. Only the original raw JSON view and download are exact.':'Imported evidence. Missing values are not inferred. Raw JSON preserves the original response text.');
+  }catch(e){if(generation!==detailGeneration||!dialog.open)return;message('detail-status',e.message,true);byId('detail-json').textContent='Detail unavailable; no partial or truncated result is displayed.';byId('detail-retry').hidden=false}
+  finally{if(generation===detailGeneration)byId('detail-content').setAttribute('aria-busy','false')}
+}
+function closeDetail(){detailGeneration++;detailAbort?.abort();byId('detail-content').setAttribute('aria-busy','false');byId('detail').close();if(detailTrigger?.isConnected)detailTrigger.focus()}
+function openHashRun(){
+  if(!location.hash.startsWith('#run='))return;
+  try{return showDetail(decodeURIComponent(location.hash.slice(5)))}catch{message('message','The run link contains an invalid run ID.',true)}
+}
+function openLinkedRun(){
+  const runId=new URLSearchParams(location.search).get('run_id');
+  return runId?showDetail(runId):openHashRun();
+}
+async function initializeExplorer(){
+  const detailRequest=openLinkedRun();load();
+  if(detailRequest)await detailRequest;
+  try{await loadFilters()}catch(e){message('message','Filters unavailable: '+e.message+'. Runs can still be refreshed.',true)}
+}
+
+const sourceIds=['template-json','bundle-json','repetition','prepare-status','prepare-mode','started-at','ended-at','exact-command','plan-source','plan-format'];
+function sourceFingerprint(){return JSON.stringify([sourceIds.map(id=>byId(id).value),selectedCandidate,llamaResult])}
+function invalidatePreview(text='Source inputs changed. Prepare or validate again before downloading or confirming.'){
+  revision++;prepared=null;byId('confirm-import').disabled=true;byId('download-preview').disabled=true;
+  byId('preview-summary').textContent='';byId('preview-warnings').replaceChildren();byId('preview-json').textContent='No current preview.';byId('preview-response-json').textContent='No current validation response.';message('workflow-status',text);
+}
+function invalidatePlan(){
+  planGeneration++;editorGenerations.set('plan-source',(editorGenerations.get('plan-source')||0)+1);planData=null;planPage=0;byId('download-plan').disabled=true;byId('plan-results').replaceChildren();message('plan-status','Matrix changed. Preview the plan again.');selectedCandidate=null;describeCandidate();
+}
+function describeCandidate(){byId('selected-candidate').textContent=selectedCandidate?'Selected plan experiment '+selectedCandidate.id+'. Its configuration is now in the template editor; editing it switches back to the base experiment.':'Using the template’s base experiment.'}
+function templateChanged(){selectedCandidate=null;describeCandidate();editorGenerations.set('template-json',(editorGenerations.get('template-json')||0)+1);invalidatePreview()}
+function currentPreview(){return prepared&&prepared.revision===revision&&prepared.fingerprint===sourceFingerprint()&&!confirming}
+async function previewRequest(url,body){
+  invalidatePreview('Validating without persistence…');const generation=++previewGeneration,version=revision,fingerprint=sourceFingerprint();
+  try{
+    const response=await jsonResponse(url,jsonRequest(body));if(generation!==previewGeneration||version!==revision||fingerprint!==sourceFingerprint())return;
+    byId('preview-response-json').textContent=response.text;assertSafeJSONNumbers(response.text,'Validation response');const result=response.data;
+    if(result.valid!==true||result.persisted!==false||!result.bundle?.run)throw new Error('Server did not return a non-persisted, validated bundle.');
+    prepared={revision:version,fingerprint,bundle:result.bundle};byId('preview-json').textContent=pretty(result.bundle);
+    byId('preview-summary').textContent=`Run ${result.bundle.run.id} · ${result.bundle.run.status} · repetition ${result.bundle.run.repetition}. Not persisted.`;
+    byId('preview-warnings').replaceChildren();for(const warning of result.warnings||[])byId('preview-warnings').append(el('li',warning));
+    byId('confirm-import').disabled=false;byId('download-preview').disabled=false;message('workflow-status','Validation passed without persistence. Review the exact bundle and warnings; Confirm import is the only write.');
+  }catch(e){if(generation===previewGeneration&&version===revision)message('workflow-status',e.message+' Nothing was imported. Correct the source and preview again.',true)}
+}
+function resultStatus(status){if(!['succeeded','failed','oom','timeout','cancelled'].includes(status))throw new Error('For a result file, explicitly choose a completed status: succeeded, failed, oom, timeout, or cancelled.')}
+function readTemplate(){const value=parseInput(byId('template-json').value,'ImportTemplate');for(const key of ['model','artifact','runtime','hardware','workload','experiment'])if(!value?.[key]||typeof value[key]!=='object'||Array.isArray(value[key]))throw new Error('Template requires a '+key+' definition.');return value}
+function optionalTimestamp(id){const value=byId(id).value.trim();if(value&&!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value))throw new Error('Use RFC3339 with timezone for '+id+'.');return value||null}
+async function prepare(){
+  try{
+    const template=readTemplate(),raw=byId('repetition').value,repetition=Number(raw),status=byId('prepare-status').value,exact_command=byId('exact-command').value;
+    if(!/^(0|[1-9]\d*)$/.test(raw)||!Number.isSafeInteger(repetition)||repetition<0)throw new Error('Enter a non-negative safe integer repetition using digits only; it is never incremented automatically. Use the direct API for integers beyond the browser-safe range.');
+    if(!status)throw new Error('Choose the run status explicitly.');if(!exact_command.trim())throw new Error('Provide the exact command as inert provenance.');
+    const body={template,repetition,status,exact_command,started_at:optionalTimestamp('started-at'),ended_at:optionalTimestamp('ended-at')};
+    if(selectedCandidate)body.experiment=selectedCandidate;
+    if(byId('prepare-mode').value==='llama'){if(!llamaResult)throw new Error('Select an actual llama-bench JSON result file first.');resultStatus(status);body.llama_bench=llamaResult.data}
+    await previewRequest('/api/benchmarks/prepare',body);
+  }catch(e){invalidatePreview();message('workflow-status',e.message,true)}
+}
+async function validateBundle(withLlama=false){
+  try{const bundle=parseInput(byId('bundle-json').value,'complete IngestBundle');if(withLlama){if(!llamaResult)throw new Error('Select an actual llama-bench JSON result file first.');resultStatus(bundle?.run?.status);await previewRequest('/api/benchmarks/validate/llama-bench',{bundle,llama_bench:llamaResult.data})}else await previewRequest('/api/benchmarks/validate',bundle)}
+  catch(e){invalidatePreview();message('workflow-status',e.message,true)}
+}
+async function confirmImport(){
+  if(!currentPreview()){if(!confirming)invalidatePreview();return}
+  const bundle=prepared.bundle;confirming=true;prepared=null;byId('workflow-inputs').disabled=true;byId('confirm-import').disabled=true;byId('download-preview').disabled=true;
+  message('success','Persisting the exact validated bundle…');
+  try{
+    const result=await post('/api/benchmarks/ingest',bundle);if(typeof result.run_id!=='string')throw new Error('Import response did not include a run ID. Refresh runs before retrying.');
+    message('success','Imported run '+result.run_id+'.');const link=el('a','Open run');link.href='/benchmarks?'+new URLSearchParams({run_id:result.run_id});link.onclick=e=>{e.preventDefault();showDetail(result.run_id,link)};byId('success').append(link);
+    message('workflow-status','Preview consumed by explicit import. Prepare again for another run; repetition was not changed.');state.page=1;load();loadFilters().catch(e=>message('message','Imported, but filters could not refresh: '+e.message,true));
+  }catch(e){message('success',e.message+' The preview is consumed. Refresh runs to check persistence before validating and retrying; repetition is unchanged.',true)}
+  finally{confirming=false;byId('workflow-inputs').disabled=false}
+}
+async function loadTextFile(inputId,editorId,onLoaded){
+  const token=(fileGenerations.get(inputId)||0)+1;fileGenerations.set(inputId,token);
+  const file=byId(inputId).files[0],editorToken=(editorGenerations.get(editorId)||0)+1;editorGenerations.set(editorId,editorToken);invalidatePreview('Reading selected file…');if(!file)return;
+  try{
+    if(file.size>MAX_INPUT_BYTES)throw new Error('Selected file exceeds the 16 MiB browser limit.');
+    const text=jsonSize(await file.text());if(fileGenerations.get(inputId)!==token||editorGenerations.get(editorId)!==editorToken)return;
+    byId(editorId).value=text;onLoaded?.(file);invalidatePreview('Loaded '+file.name+' into the editor. Not validated, saved, or imported.');
+  }catch(e){if(fileGenerations.get(inputId)===token)message('workflow-status',e.message,true)}
+}
+async function loadExample(editorId,name,onLoaded){
+  const token=(editorGenerations.get(editorId)||0)+1;editorGenerations.set(editorId,token);invalidatePreview('Loading synthetic example; no persistence…');
+  try{
+    const response=await fetch('/api/benchmarks/examples/'+name);if(!response.ok)throw new Error('HTTP '+response.status+': example unavailable');
+    const text=jsonSize(await response.text());if(editorGenerations.get(editorId)!==token)return;byId(editorId).value=text;onLoaded?.();
+    invalidatePreview('Synthetic example loaded. Declarations only; not validated, saved, or imported.');
+  }catch(e){if(editorGenerations.get(editorId)===token)message('workflow-status',e.message,true)}
+}
+async function loadLlama(){
+  const token=(fileGenerations.get('llama-file')||0)+1;fileGenerations.set('llama-file',token);llamaResult=null;invalidatePreview();
+  const file=byId('llama-file').files[0];message('llama-status',file?'Reading result file…':'No result file selected.');if(!file)return;
+  try{
+    if(file.size>MAX_INPUT_BYTES)throw new Error('Result file exceeds the 16 MiB browser limit.');
+    const data=parseInput(await file.text(),'llama-bench result');if(fileGenerations.get('llama-file')!==token)return;
+    llamaResult={name:file.name,data};byId('prepare-mode').value='llama';invalidatePreview();message('llama-status','Selected '+file.name+'. Not imported; choose its actual status and preview. File declarations and hashes are not verified.');
+  }catch(e){if(fileGenerations.get('llama-file')===token)message('llama-status',e.message,true)}
+}
+const TEMPLATE_KEY='brainrouter.benchmark.import-template.v1';
+function saveTemplate(){try{const template=readTemplate();localStorage.setItem(TEMPLATE_KEY,pretty(template));message('template-status','Template explicitly saved on this browser/origin. No run or result file is saved.')}catch(e){message('template-status','Could not save metadata: '+e.message,true)}}
+function loadSavedTemplate(){try{const text=localStorage.getItem(TEMPLATE_KEY);if(!text)throw new Error('No saved template on this browser/origin.');byId('template-json').value=jsonSize(text);templateChanged();message('template-status','Explicitly loaded browser-saved declarations. They have not been validated or verified.')}catch(e){message('template-status',e.message,true)}}
+function clearTemplate(){
+  try{localStorage.removeItem(TEMPLATE_KEY)}catch(e){message('template-status','Could not clear browser storage: '+e.message,true);return}
+  byId('template-json').value='';byId('template-file').value='';templateChanged();message('template-status','Saved and current template metadata cleared. Other source editors and selected result files are unchanged; no browser metadata loads automatically.');
+}
+function planFingerprint(){return JSON.stringify([byId('plan-format').value,byId('plan-source').value])}
+async function previewPlan(){
+  invalidatePlan();invalidatePreview('Expanding matrix without persistence…');const generation=planGeneration,fingerprint=planFingerprint();
+  message('plan-status','Expanding declared candidates…');
+  try{
+    const source=jsonSize(byId('plan-source').value);if(!source.trim())throw new Error('Provide a matrix first.');
+    if(byId('plan-format').value==='json')parseInput(source,'Experiment matrix');
+    const plan=await jsonFetch('/api/benchmarks/plan',{method:'POST',headers:{'content-type':byId('plan-format').value==='yaml'?'application/yaml':'application/json'},body:source});
+    if(generation!==planGeneration||fingerprint!==planFingerprint())return;if(!Array.isArray(plan.experiments)||!Array.isArray(plan.exclusions))throw new Error('Invalid plan response.');
+    planData={plan,fingerprint};byId('download-plan').disabled=false;renderPlan();
+  }catch(e){if(generation===planGeneration)message('plan-status',e.message,true)}
+}
+function renderPlan(){
+  const root=byId('plan-results');root.replaceChildren();if(!planData)return;const plan=planData.plan;
+  message('plan-status',`${plan.name}: ${plan.experiments.length} eligible experiments × ${plan.repetitions} repetitions = ${plan.run_count} planned runs; ${plan.exclusions.length} exclusions. Nothing persisted or executed.`);
+  const label=el('span'),pager=el('div',undefined,'pager'),prev=button('Previous candidates',()=>{planPage--;renderPlan()}),next=button('Next candidates',()=>{planPage++;renderPlan()});
+  label.textContent=plan.experiments.length?`Showing ${planPage*25+1}–${Math.min(planPage*25+25,plan.experiments.length)} of ${plan.experiments.length}`:'No eligible candidates';
+  prev.disabled=planPage===0;next.disabled=(planPage+1)*25>=plan.experiments.length;pager.append(prev,label,next);root.append(pager);
+  if(plan.experiments.length){
+    const chooseLabel=el('label','Candidate number (all eligible candidates available)','inline-label'),index=el('input');index.type='number';index.min='1';index.max=String(plan.experiments.length);index.value=String(planPage*25+1);chooseLabel.append(index,button('Use candidate',()=>selectCandidate(Number(index.value)-1)));root.append(chooseLabel);
+    const table=el('table'),head=el('thead'),header=el('tr');for(const title of ['Candidate','Context','Prompt','Generation','Optimization','Details']){const th=el('th',title);th.scope='col';header.append(th)}head.append(header);table.append(head);const body=el('tbody');
+    plan.experiments.slice(planPage*25,planPage*25+25).forEach((experiment,i)=>{
+      const index=planPage*25+i,row=el('tr'),cell=el('td');cell.append(button('Use #'+(index+1),()=>selectCandidate(index)));row.append(cell);
+      for(const value of [context(experiment.context_tokens),num(experiment.prompt_tokens,0),num(experiment.generation_tokens,0),experiment.optimization?.speculator_type??'Not reported'])row.append(el('td',value));
+      const detail=el('details');detail.append(el('summary','Configuration'),definition(experiment));const td=el('td');td.append(detail);row.append(td);body.append(row);
+    });table.append(body);const scroll=el('div',undefined,'table-scroll');scroll.tabIndex=0;scroll.setAttribute('role','region');scroll.setAttribute('aria-label','Eligible experiment candidates');scroll.append(table);root.append(scroll);
+  }
+  if(plan.exclusions.length){
+    const details=el('details');details.append(el('summary',`Exclusions (${plan.exclusions.length}; first 25 shown, all in download)`));
+    for(const exclusion of plan.exclusions.slice(0,25)){const item=el('div');item.append(el('p',exclusion.reason_code+': '+exclusion.reason),definition(exclusion.candidate));details.append(item)}root.append(details);
+  }
+}
+function selectCandidate(index){
+  try{
+    if(!planData||planData.fingerprint!==planFingerprint())throw new Error('Preview the current matrix first.');
+    const candidate=planData.plan.experiments[index];if(!Number.isInteger(index)||!candidate)throw new Error('Choose an eligible candidate number.');
+    const template=readTemplate();
+    for(const key of ['artifact','runtime','hardware','workload'])if(candidate[key+'_id']!==template[key].id)throw new Error('Candidate '+key+' reference does not match the template. Load matching metadata or edit the matrix and preview again.');
+    template.experiment=JSON.parse(JSON.stringify(candidate));byId('template-json').value=pretty(template);
+    editorGenerations.set('template-json',(editorGenerations.get('template-json')||0)+1);selectedCandidate=candidate;describeCandidate();invalidatePreview('Candidate selected. Choose repetition, status, command, and result file (if any), then prepare.');
+    byId('template-section').open=true;byId('repetition').focus();byId('template-section').scrollIntoView({block:'start'});
+  }catch(e){message('plan-status',e.message,true)}
+}
+
+for(const id of sourceIds)byId(id).addEventListener('input',()=>{
+  editorGenerations.set(id,(editorGenerations.get(id)||0)+1);
+  if(id==='template-json'){selectedCandidate=null;describeCandidate()}
+  if(id==='plan-source'||id==='plan-format')invalidatePlan();
+  invalidatePreview();
+});
+byId('template-file').onchange=()=>{selectedCandidate=null;describeCandidate();loadTextFile('template-file','template-json')};
+byId('bundle-file').onchange=()=>loadTextFile('bundle-file','bundle-json');
+byId('plan-file').onchange=()=>{invalidatePlan();loadTextFile('plan-file','plan-source',file=>{byId('plan-format').value=/\.ya?ml$/i.test(file.name)?'yaml':'json'})};
+byId('llama-file').onchange=loadLlama;
+byId('template-example').onclick=()=>{selectedCandidate=null;describeCandidate();loadExample('template-json','template.json')};
+byId('bundle-example').onclick=()=>loadExample('bundle-json','bundle.json');
+byId('plan-example').onclick=()=>{invalidatePlan();loadExample('plan-source','matrix.'+byId('plan-format').value)};
+byId('save-template').onclick=saveTemplate;byId('load-template').onclick=loadSavedTemplate;byId('clear-template').onclick=clearTemplate;
+byId('prepare').onclick=prepare;byId('validate-bundle').onclick=()=>validateBundle();byId('validate-llama').onclick=()=>validateBundle(true);byId('plan').onclick=previewPlan;
+byId('confirm-import').onclick=confirmImport;
+byId('download-preview').onclick=()=>{if(currentPreview())downloadJSON(prepared.bundle,'benchmark-bundle.json');else invalidatePreview()};
+byId('download-plan').onclick=()=>{if(planData?.fingerprint===planFingerprint())downloadJSON(planData.plan,'benchmark-plan.json');else invalidatePlan()};
+byId('detail-close').onclick=closeDetail;
+byId('detail').addEventListener('cancel',e=>{e.preventDefault();closeDetail()});
+byId('detail').addEventListener('close',()=>{detailGeneration++;detailAbort?.abort();if(detailTrigger?.isConnected)detailTrigger.focus()});
+byId('detail-retry').onclick=()=>showDetail(detailId);
+byId('detail-download').onclick=()=>{if(detailRawText!==null)downloadText(detailRawText,'benchmark-run-detail.json')};
+byId('memory-metric').onchange=()=>drawScatter(state.items);
+for(const format of ['jsonl','csv'])byId('export-'+format).onclick=()=>{const p=params(false);p.set('format',format);location.href='/api/benchmarks/export?'+p};
 for(const id of ['family','backend','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
-let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.page=1;load()},250)};
+let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);loadGeneration++;searchTimer=setTimeout(()=>{state.page=1;load()},250)};
 byId('prev').onclick=()=>{if(state.page>1){state.page--;load()}};byId('next').onclick=()=>{if(state.page<state.totalPages){state.page++;load()}};
-loadFilters().then(load).catch(e=>byId('message').textContent=e.message);
+byId('reload').onclick=load;
+window.addEventListener('hashchange',openHashRun);initializeExplorer();
 </script>
 </body>
 </html>

@@ -34,6 +34,7 @@ pub(super) struct PrepareImport {
 
 impl BenchmarkStore {
     pub(super) fn prepare_import(&self, input: PrepareImport) -> BenchmarkResult<IngestBundle> {
+        require_sqlite_integer("repetition", input.repetition)?;
         let ImportTemplate {
             model,
             mut artifact,

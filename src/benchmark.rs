@@ -490,6 +490,18 @@ impl HardwareProfile {
                 "hardware.gpus[].name must not be empty".into(),
             ));
         }
+        if self
+            .gpus
+            .iter()
+            .map(|gpu| gpu.index)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.gpus.len()
+        {
+            return Err(BenchmarkError::Validation(
+                "hardware.gpus[].index must be unique".into(),
+            ));
+        }
         require_optional_sqlite_integer("hardware.physical_cores", self.physical_cores)?;
         require_optional_sqlite_integer("hardware.logical_cores", self.logical_cores)?;
         require_sqlite_integer("hardware.system_ram_bytes", self.system_ram_bytes)?;
@@ -1371,11 +1383,21 @@ struct LlamaBenchIngest {
 }
 
 fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> BenchmarkResult<()> {
-    let rows = output
-        .as_array()
-        .cloned()
-        .or_else(|| output.get("results").and_then(Value::as_array).cloned())
-        .unwrap_or_else(|| vec![output.clone()]);
+    let rows = match output {
+        Value::Array(rows) => rows.as_slice(),
+        Value::Object(object) if object.contains_key("results") => object["results"]
+            .as_array()
+            .ok_or_else(|| {
+                BenchmarkError::Validation("llama_bench.results must be an array".into())
+            })?
+            .as_slice(),
+        Value::Object(_) => std::slice::from_ref(output),
+        _ => {
+            return Err(BenchmarkError::Validation(
+                "llama_bench must be an object or array".into(),
+            ))
+        }
+    };
     let mut prompt_tps = None;
     let mut generation_tps = None;
     let mut ttft_ms = None;
@@ -1386,48 +1408,143 @@ fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> Bench
                     .into(),
             ));
         };
-        let value = ["avg_ts", "tokens_per_second", "tps"]
+        let aliases = ["avg_ts", "tokens_per_second", "tps"];
+        if aliases
             .iter()
-            .find_map(|key| object.get(*key).and_then(Value::as_f64));
-        let test = object
-            .get("test")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let prompt_tokens = object
-            .get("n_prompt")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let generation_tokens = object
-            .get("n_gen")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let explicit_prompt_tps = object.get("prompt_tps").and_then(Value::as_f64);
-        let explicit_generation_tps = object.get("generation_tps").and_then(Value::as_f64);
-        let is_combined = (test.contains("pp") && test.contains("tg"))
-            || (prompt_tokens > 0 && generation_tokens > 0);
+            .filter(|key| object.contains_key(**key))
+            .count()
+            > 1
+        {
+            return Err(BenchmarkError::Validation(
+                "llama_bench row has multiple throughput aliases; supply only one of avg_ts, tokens_per_second, tps".into()
+            ));
+        }
+        let value = aliases
+            .iter()
+            .map(|key| llama_number(object, key))
+            .collect::<BenchmarkResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .next();
+        let mut labelled_prompt = None;
+        let mut labelled_generation = None;
+        if let Some(test) = object.get("test") {
+            let test = test.as_str().ok_or_else(|| {
+                BenchmarkError::Validation("llama_bench.test must be a string".into())
+            })?;
+            for phase in test.to_ascii_lowercase().split('+') {
+                let (target, count) = if let Some(count) = phase.strip_prefix("pp") {
+                    (&mut labelled_prompt, count)
+                } else if let Some(count) = phase.strip_prefix("tg") {
+                    (&mut labelled_generation, count)
+                } else {
+                    return Err(BenchmarkError::Validation(
+                        "llama_bench.test must identify ppN, tgN, or ppN+tgN".into(),
+                    ));
+                };
+                let count = count
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or_else(|| {
+                        BenchmarkError::Validation(
+                            "llama_bench.test token counts must be positive integers".into(),
+                        )
+                    })?;
+                if target.replace(count).is_some() {
+                    return Err(BenchmarkError::Validation(
+                        "llama_bench.test repeats a phase".into(),
+                    ));
+                }
+            }
+        }
+        let token_count = |key: &str, labelled: Option<u64>| -> BenchmarkResult<u64> {
+            let reported = object
+                .get(key)
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        BenchmarkError::Validation(format!(
+                            "llama_bench.{key} must be a non-negative integer"
+                        ))
+                    })
+                })
+                .transpose()?;
+            if labelled.is_some() && reported.is_some() && labelled != reported {
+                return Err(BenchmarkError::Validation(format!(
+                    "llama_bench.test contradicts {key}"
+                )));
+            }
+            Ok(reported.or(labelled).unwrap_or_default())
+        };
+        let prompt_tokens = token_count("n_prompt", labelled_prompt)?;
+        let generation_tokens = token_count("n_gen", labelled_generation)?;
+        if (labelled_prompt.is_some() && labelled_generation.is_none() && generation_tokens > 0)
+            || (labelled_generation.is_some() && labelled_prompt.is_none() && prompt_tokens > 0)
+        {
+            return Err(BenchmarkError::Validation(
+                "llama_bench.test contradicts the reported prompt/generation phase".into(),
+            ));
+        }
+        if (prompt_tokens > 0 && prompt_tokens != bundle.experiment.prompt_tokens)
+            || (generation_tokens > 0 && generation_tokens != bundle.experiment.generation_tokens)
+        {
+            return Err(BenchmarkError::Validation(
+                "llama_bench token counts do not match the experiment; select one configuration and update the template token counts".into()
+            ));
+        }
+        let explicit_prompt_tps = llama_number(object, "prompt_tps")?;
+        let explicit_generation_tps = llama_number(object, "generation_tps")?;
+        let row_ttft = llama_number(object, "ttft_ms")?;
+        let is_combined = prompt_tokens > 0 && generation_tokens > 0;
         if is_combined && (explicit_prompt_tps.is_none() || explicit_generation_tps.is_none()) {
             return Err(BenchmarkError::Validation(
                 "combined llama_bench rows require distinct prompt_tps and generation_tps fields"
                     .into(),
             ));
         }
+        if !is_combined
+            && ((prompt_tokens > 0 && explicit_generation_tps.is_some())
+                || (generation_tokens > 0 && explicit_prompt_tps.is_some()))
+        {
+            return Err(BenchmarkError::Validation(
+                "llama_bench explicit metrics contradict the reported phase".into(),
+            ));
+        }
+        if value.is_some()
+            && !is_combined
+            && (explicit_prompt_tps.is_some() || explicit_generation_tps.is_some())
+        {
+            return Err(BenchmarkError::Validation(
+                "llama_bench row supplies both an alias and explicit phase throughput".into(),
+            ));
+        }
+        let mut recognized = false;
         if let Some(value) = explicit_prompt_tps {
             set_llama_bench_metric("prompt TPS", &mut prompt_tps, value)?;
-        } else if (test.starts_with("pp") || prompt_tokens > 0) && generation_tokens == 0 {
+            recognized = true;
+        } else if prompt_tokens > 0 && generation_tokens == 0 {
             if let Some(value) = value {
                 set_llama_bench_metric("prompt TPS", &mut prompt_tps, value)?;
+                recognized = true;
             }
         }
         if let Some(value) = explicit_generation_tps {
             set_llama_bench_metric("generation TPS", &mut generation_tps, value)?;
-        } else if (test.starts_with("tg") || generation_tokens > 0) && prompt_tokens == 0 {
+            recognized = true;
+        } else if generation_tokens > 0 && prompt_tokens == 0 {
             if let Some(value) = value {
                 set_llama_bench_metric("generation TPS", &mut generation_tps, value)?;
+                recognized = true;
             }
         }
-        if let Some(value) = object.get("ttft_ms").and_then(Value::as_f64) {
+        if let Some(value) = row_ttft {
             set_llama_bench_metric("TTFT", &mut ttft_ms, value)?;
+            recognized = true;
+        }
+        if !recognized || (value.is_some() && prompt_tokens == 0 && generation_tokens == 0) {
+            return Err(BenchmarkError::Validation(
+                "every llama_bench row must have recognized, unambiguous metrics; split unrelated configurations into separate imports".into()
+            ));
         }
     }
     if prompt_tps.is_none() && generation_tps.is_none() && ttft_ms.is_none() {
@@ -1435,9 +1552,10 @@ fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> Bench
             "llama_bench output contains no recognized throughput or TTFT metrics".into(),
         ));
     }
-    let metrics = bundle
+    let mut metrics = bundle
         .performance_metrics
-        .get_or_insert_with(|| PerformanceMetrics {
+        .clone()
+        .unwrap_or_else(|| PerformanceMetrics {
             run_id: bundle.run.id.clone(),
             model_load_ms: None,
             prompt_processing_ms: None,
@@ -1454,16 +1572,53 @@ fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> Bench
             energy_joules: None,
             avg_power_watts: None,
         });
-    if prompt_tps.is_some() {
-        metrics.prompt_tps = prompt_tps;
+    for (name, reported, target) in [
+        ("prompt TPS", prompt_tps, &mut metrics.prompt_tps),
+        (
+            "generation TPS",
+            generation_tps,
+            &mut metrics.generation_tps,
+        ),
+        ("TTFT", ttft_ms, &mut metrics.ttft_ms),
+    ] {
+        if let Some(reported) = reported {
+            if target.is_some_and(|existing| existing != reported) {
+                return Err(BenchmarkError::Validation(format!(
+                    "llama_bench {name} conflicts with the bundle metric; remove stale metrics before importing"
+                )));
+            }
+            *target = Some(reported);
+        }
     }
-    if generation_tps.is_some() {
-        metrics.generation_tps = generation_tps;
+    metrics.validate()?;
+    let raw = bundle.run.raw_result.get_or_insert_with(BTreeMap::new);
+    if raw
+        .get("llama_bench")
+        .is_some_and(|existing| existing != output)
+    {
+        return Err(BenchmarkError::Validation(
+            "raw_result.llama_bench conflicts with the uploaded output".into(),
+        ));
     }
-    if ttft_ms.is_some() {
-        metrics.ttft_ms = ttft_ms;
-    }
-    metrics.validate()
+    raw.insert("llama_bench".into(), output.clone());
+    bundle.performance_metrics = Some(metrics);
+    Ok(())
+}
+
+fn llama_number(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> BenchmarkResult<Option<f64>> {
+    object
+        .get(key)
+        .map(|value| {
+            let value = value.as_f64().ok_or_else(|| {
+                BenchmarkError::Validation(format!("llama_bench.{key} must be a number"))
+            })?;
+            require_finite_non_negative(&format!("llama_bench.{key}"), Some(value))?;
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn set_llama_bench_metric(name: &str, target: &mut Option<f64>, value: f64) -> BenchmarkResult<()> {
@@ -2962,8 +3117,8 @@ fn html_response(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Er
 mod tests {
     use super::*;
 
-    struct TestStore {
-        store: BenchmarkStore,
+    pub(super) struct TestStore {
+        pub(super) store: BenchmarkStore,
         path: PathBuf,
     }
 
@@ -2975,7 +3130,7 @@ mod tests {
         }
     }
 
-    fn test_store() -> TestStore {
+    pub(super) fn test_store() -> TestStore {
         let path = std::env::temp_dir().join(format!("brainrouter-bench-{}.sqlite3", new_id()));
         TestStore {
             store: BenchmarkStore::open(&path).expect("create benchmark store"),
@@ -3423,6 +3578,8 @@ mod tests {
     #[test]
     fn llama_bench_adapter_extracts_prompt_and_generation_rates() {
         let mut bundle = bundle("run-a", 0, RunStatus::Succeeded);
+        bundle.experiment.prompt_tokens = 512;
+        bundle.experiment.generation_tokens = 128;
         bundle.performance_metrics = None;
         apply_llama_bench_metrics(
             &mut bundle,
@@ -3440,6 +3597,8 @@ mod tests {
     #[test]
     fn llama_bench_adapter_rejects_ambiguous_rows() {
         let mut bundle = bundle("run-a", 0, RunStatus::Succeeded);
+        bundle.experiment.prompt_tokens = 512;
+        bundle.experiment.generation_tokens = 128;
         bundle.performance_metrics = None;
         assert!(apply_llama_bench_metrics(
             &mut bundle,
@@ -3457,7 +3616,7 @@ mod tests {
         .is_err());
     }
 
-    fn example_bundle() -> IngestBundle {
+    pub(super) fn example_bundle() -> IngestBundle {
         serde_json::from_str(include_str!("../examples/benchmarks/synthetic-bundle.json")).unwrap()
     }
 
@@ -3571,6 +3730,125 @@ mod tests {
                 .total,
             0
         );
+    }
+
+    #[test]
+    fn prepared_import_rejects_mismatched_plan_and_preserves_failed_identity() {
+        let test = test_store();
+        let mut sample = example_bundle();
+        sample.run.status = RunStatus::Failed;
+        test.store.ingest(&sample).unwrap();
+        let template: Value = serde_json::from_str(
+            &imports::example("/api/benchmarks/examples/template.json")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let request = json!({
+            "template":template, "repetition":0, "status":"succeeded",
+            "exact_command":"synthetic"
+        });
+        let prepared = test
+            .store
+            .prepare_import(serde_json::from_value(request.clone()).unwrap())
+            .unwrap();
+        assert_eq!(prepared.run.id, sample.run.id);
+        assert_eq!(prepared.run.experiment_id, sample.run.experiment_id);
+        assert!(prepared.quality_results.is_empty());
+        assert!(prepared.telemetry_samples.is_empty());
+        assert!(
+            prepared.performance_metrics.is_none(),
+            "never copy stale results from definitions"
+        );
+        let mut wrong = request.clone();
+        let mut experiment = sample.experiment.clone();
+        experiment.artifact_id = "wrong-template".into();
+        wrong["experiment"] = serde_json::to_value(experiment).unwrap();
+        assert!(matches!(
+            test.store
+                .prepare_import(serde_json::from_value(wrong).unwrap()),
+            Err(BenchmarkError::Validation(_))
+        ));
+        let mut huge = request;
+        huge["repetition"] = json!(u64::MAX);
+        assert!(matches!(
+            test.store
+                .prepare_import(serde_json::from_value(huge).unwrap()),
+            Err(BenchmarkError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_pages_and_exports_are_complete_ordered_and_csv_safe() {
+        let test = test_store();
+        let mut sample = example_bundle();
+        sample.model.family = "=synthetic,\"quoted\"\nline".into();
+        test.store.ingest(&sample).unwrap();
+        let writer = test.store.connect().unwrap();
+        writer
+            .execute(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<101)
+             INSERT INTO runs(id,experiment_id,repetition,status,exact_command)
+             SELECT printf('page-%03d',x),?1,x,'planned','synthetic' FROM n",
+                params![sample.experiment.id],
+            )
+            .unwrap();
+        let mut reader = test.store.connect().unwrap();
+        let snapshot = reader
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .unwrap();
+        let mut query = RunQuery::parse(Some("sort=family&order=asc&per_page=100")).unwrap();
+        let first = test.store.query_runs_connection(&snapshot, &query).unwrap();
+        assert_eq!(first.total, 102);
+        writer
+            .execute(
+                "INSERT INTO runs(id,experiment_id,repetition,status,exact_command)
+            VALUES('page-000',?1,102,'planned','synthetic')",
+                params![sample.experiment.id],
+            )
+            .unwrap();
+        query.page = 2;
+        let second = test.store.query_runs_connection(&snapshot, &query).unwrap();
+        assert_eq!(second.total, 102);
+        assert_eq!(
+            second.items.len(),
+            2,
+            "concurrent insert must not shift snapshot pages"
+        );
+        assert_eq!(second.items[0].run_id, "page-101");
+        assert_eq!(second.items[1].run_id, sample.run.id);
+        let jsonl = test.store.export_runs(query.clone(), "jsonl").unwrap();
+        let exported: Vec<Value> = jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            exported.len(),
+            103,
+            "export ignores requested page and exports all current rows"
+        );
+        assert_eq!(exported[0]["run_id"], "page-000");
+        assert_eq!(
+            jsonl,
+            test.store.export_runs(query.clone(), "jsonl").unwrap()
+        );
+        let csv = test.store.export_runs(query, "csv").unwrap();
+        assert!(csv.contains(&csv_field(&sample.model.family)));
+        assert_eq!(
+            csv.matches("\"'=synthetic,\"\"quoted\"\"\nline\"").count(),
+            103
+        );
+        writer
+            .execute(
+                "UPDATE models SET family=?1 WHERE id=?2",
+                params!["x".repeat(MAX_RESPONSE_BYTES / 100), sample.model.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .export_runs(RunQuery::parse(None).unwrap(), "jsonl"),
+            Err(BenchmarkError::Limit(_))
+        ));
     }
 
     #[test]

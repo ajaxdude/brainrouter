@@ -60,7 +60,35 @@ impl BenchmarkStore {
 
 struct AdmittedBody {
     inner: UnsyncBoxBody<Bytes, anyhow::Error>,
-    _permit: OwnedSemaphorePermit,
+    pending: Bytes,
+    permit: Arc<OwnedSemaphorePermit>,
+}
+
+struct AdmittedBytes {
+    bytes: Bytes,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for AdmittedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+impl AdmittedBody {
+    fn new(inner: UnsyncBoxBody<Bytes, anyhow::Error>, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            pending: Bytes::new(),
+            permit: Arc::new(permit),
+        }
+    }
+
+    fn next_chunk(&mut self) -> Poll<Option<Result<Frame<Bytes>, anyhow::Error>>> {
+        Poll::Ready(Some(Ok(Frame::data(
+            self.pending.split_to(self.pending.len().min(16 * 1024)),
+        ))))
+    }
 }
 
 impl Body for AdmittedBody {
@@ -71,14 +99,38 @@ impl Body for AdmittedBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        Pin::new(&mut self.inner).poll_frame(cx)
+        if !self.pending.is_empty() {
+            return self.next_chunk();
+        }
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(bytes) => {
+                    // Hyper may drop a completed body before flushing its Bytes.
+                    // The allocation itself owns admission; sliced/cloned frames
+                    // retain it too. Small frames also bound transport-side copies.
+                    self.pending = Bytes::from_owner(AdmittedBytes {
+                        bytes,
+                        _permit: Arc::clone(&self.permit),
+                    });
+                    self.next_chunk()
+                }
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            other => other,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.pending.is_empty() && self.inner.is_end_stream()
     }
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        let mut hint = self.inner.size_hint();
+        let pending = self.pending.len() as u64;
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper + pending);
+        }
+        hint.set_lower(hint.lower() + pending);
+        hint
     }
 }
 
@@ -139,13 +191,7 @@ pub async fn handle_request(
                 Err(error) => error_response(error),
             };
             // Slow readers retain their bounded response allocation and its permit.
-            Ok(response.map(|inner| {
-                AdmittedBody {
-                    inner,
-                    _permit: permit,
-                }
-                .boxed_unsync()
-            }))
+            Ok(response.map(|inner| AdmittedBody::new(inner, permit).boxed_unsync()))
         })
         .await;
     Ok(response.unwrap_or_else(error_response))
@@ -260,3 +306,7 @@ fn preview_response(store: &BenchmarkStore, bundle: IngestBundle) -> BenchmarkRe
         }),
     ))
 }
+
+#[cfg(test)]
+#[path = "http_tests.rs"]
+mod tests;
