@@ -20,3 +20,4 @@ pub mod stream;
 pub mod types;
 pub mod routing_events;
 pub mod inflight;
+pub mod observability;

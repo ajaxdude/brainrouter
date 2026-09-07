@@ -284,7 +284,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         prompt_rewrite,
         inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
         benchmark_store,
+        observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
     });
+
+    brainrouter::observability::start(&state);
 
     // Background task: compute versions once, then refresh every 30 minutes.
     {

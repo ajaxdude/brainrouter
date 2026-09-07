@@ -40,7 +40,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Headless CLI.** `brainrouter cli` mirrors every dashboard action from the terminal: status, versions, Bonsai/nudge/context/routing toggles, restarts, upgrades, config, and the full review lifecycle. See the [Headless CLI](#headless-cli-brainrouter-cli) section.
 - **VRAM control.** The dashboard or CLI can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
 - **In-flight request tracker.** The dashboard shows every active request as it runs — elapsed, model, user agent, address, session, bytes received, PP progress, and a live activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button. No need to open the llama-swap UI.
-- **Per-request throughput.** Conversation cards surface averaged prompt-tokens/s (pp) and generation-tokens/s (tg) chips, so you can see how a conversation performs across its turns.
+- **Per-request throughput.** Conversation cards surface generation-tokens/s (tg) estimates from uniquely correlated completed streams. Missing measurements remain hidden; prompt-processing throughput is not inferred from first-output latency.
 - **Four-column Sankey.** The flow diagram is HARNESS (Pi / OMP / Opencode / Claude / Droid) → SESSION (OMP session title) → ROUTING (auto / cloud / local / fallback chain) → MODEL (resolved key). Click any node to highlight its start-to-end path; click a conversation card to highlight the matching Sankey path.
 
 ---
@@ -384,7 +384,7 @@ The panel is hidden while no requests are in flight. Card progress bars show the
 
 ### Throughput chips on cards
 
-Each conversation card shows averaged **pp** (prompt tokens/s) and **tg** (generation tokens/s) chips, computed from the OpenAI SSE `usage` chunk at each request's end. Builds whose llama-server does not emit a `usage` chunk leave the chips hidden.
+Each conversation card shows averaged **tg** (generation tokens/s) estimates from the OpenAI SSE `usage` count and observed output-frame interval of each successfully completed request. Builds without valid usage counts, or whose output is observed in a single frame, leave the chip hidden. **pp** is not inferred: time to first output includes more than prompt processing. See [Model observability and regression alerts](#model-observability-and-regression-alerts) for measurement definitions and limits.
 
 ### Version header and upgrades
 
@@ -430,6 +430,22 @@ A collapsible panel on the dashboard lets you control how code reviews run:
 | **Local model** | dropdown of llama-swap models | When forcing local, which specific model to use |
 
 Changes take effect immediately for new review requests. The setting persists across daemon restarts.
+
+## Model observability and regression alerts
+
+Open **`http://127.0.0.1:9099/models`** or select **Model activity** in the dashboard. An exact local model key connects read-only backend status, active registry requests, completed stream measurements, recent routing results, and an explicitly selected historical benchmark reference. `/models?model=<URL-encoded-key>` links to a model. `/running` and `/v1/models` are polled with two-second timeouts and 1 MiB response limits; `/props` is queried only for up to four already-ready proxies. Polls run independently of routing, with a five-second pause between polls. Missing quantization, runtime identity, RAM/VRAM, live token rates, or prefill progress remain unavailable, never inferred from model names, file sizes, elapsed time, or benchmark peaks.
+
+Performance measurements are keyed by the unique routing event ID, not the conversation. Only `[DONE]` followed by clean EOF records a completed sample; stream errors, cancellation, oversized/malformed frames, and incomplete streams are excluded. **Measured TTFT** is router-observed time from routing-body entry, including classification/retries but excluding outer profile selection, to the first complete SSE frame containing nonempty content, reasoning, or tool-call arguments. Role-only frames and heartbeats do not count. It is not client end-to-end latency. **Generation TPS** estimates `(provider completion_tokens - 1) / (last output frame time - first output frame time)`, requiring more than one reported token and distinct output times; usage/DONE tail time is excluded. Batched deltas, hidden reasoning tokens, buffering and backpressure limit precision. Missing or conflicting usage stays unknown; prompt-processing TPS is not fabricated. Route latency still means time until the router returns its result, not TTFT or completion latency.
+
+The Anthropic adapter keeps content streaming while consuming final usage and confirming EOF before its terminal events. Waiting after the first finish marker is limited to two seconds; ready data/EOF wins over the timer so client backpressure does not discard a completed response. Continuously ready tails are separately capped at 256 KiB total, 64 KiB per line, and 1,024 subsequent chunks. Tail errors, timeout, or budget exhaustion do not produce completed measurements.
+
+The default policy compares medians in the latest **five-minute window** with the preceding, disjoint five minutes. Each metric needs **five samples in each window**. Indicative warnings require a **20% generation drop**, a **30% TTFT rise**, or a **20-percentage-point error/fallback rate increase with at least three occurrences**. Two evaluations with new sample evidence activate a warning; two with new non-regressing evidence recover it. Repeated polls cannot advance debounce, and insufficient data is not recovery. The page exposes all thresholds and permits bounded operator changes. OOM/timeout categories require explicit recorded error text; fallback stages mean fallback-served routes, not that the fallback model caused a failure. Unattributed/cloud routing errors are shown separately. Router success does not guarantee stream success, so router-error counts are not an exhaustive stream-error rate.
+
+**These are indicative live trends, not controlled benchmark regressions.** Selecting a successful reference preserves its full artifact/runtime/hardware/workload identity and requires a mapping rationale plus confirmation of the inspected experiment hash. No model-family matching is performed. References older than the policy limit (30 days by default), changed references, and unavailable benchmark storage are surfaced explicitly. Even a valid reference is **not comparable** until per-sample artifact SHA, build, hardware, context/workload, concurrency and equivalent metric definitions can be established. Benchmark reference failure does not disable live observations or routing.
+
+Retention is bounded to **500 routing events and 500 completed stream samples globally**, in memory only. High traffic can evict a reference window early. Restart clears samples and alert state; policy or mapping changes reset debounce. Only explicit mappings and alert policy persist in the config-adjacent `*.observability.json` file (for example `brainrouter.observability.json`). Writes use a size-bounded atomic replacement and revision checks. Errors remain visible; unreadable/corrupt settings disable saves until repaired and the daemon restarted, but do not stop routing. There is no traffic-history database, automatic benchmarking, model switching, scheduling, or outbound notification.
+
+Read APIs are `GET /api/observability/models`, `/settings`, `/reference?run_id=...`, and `/baseline?model_key=...` under `/api/observability`. `POST /api/observability/settings` accepts `{ "revision": 0, "policy": { ... } }`; `POST /api/observability/baseline` accepts `{ "revision": 0, "model_key": "...", "run_id": "...", "expected_experiment_hash": "...", "note": "..." }`. Set `run_id` to `null` to clear a mapping, including while benchmark storage is unavailable. Writes use the existing localhost/CSRF guard, 128 KiB body limit, five-second body deadline, and conflict responses for stale revisions.
 
 ## Benchmark explorer
 

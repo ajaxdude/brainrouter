@@ -140,6 +140,8 @@ pub struct AppState {
     pub inflight: Arc<crate::inflight::InflightRegistry>,
     /// Optional benchmark storage; an initialization error disables only the explorer.
     pub benchmark_store: Result<Arc<BenchmarkStore>, String>,
+    /// Read-only model observations and separately persisted operator settings.
+    pub observability: Arc<crate::observability::Observability>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -231,6 +233,7 @@ async fn handle_request(
             || path.starts_with("/review/api/")
             || path.starts_with("/api/benchmarks/")
             || path == "/api/inflight/cancel"
+            || path.starts_with("/api/observability/")
         ));
 
     if is_destructive {
@@ -276,6 +279,10 @@ async fn handle_request(
             Ok(store) => benchmark::handle_request(req, store).await,
             Err(reason) => Ok(benchmark::unavailable_response(reason)),
         };
+    }
+
+    if path == "/models" || path == "/models/" || path.starts_with("/api/observability/") {
+        return crate::observability::handle_request(req, &state).await;
     }
 
     let response = match (method, path) {

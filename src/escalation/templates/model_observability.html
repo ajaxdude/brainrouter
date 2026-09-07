@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Model activity - Brainrouter</title>
+<link rel="icon" href="/favicon.svg">
+<style>
+:root{color-scheme:dark;--bg:#101318;--panel:#191e26;--line:#323a48;--text:#e9edf5;--muted:#a6b2c5;--accent:#85c7ff;--warn:#ffd083;--bad:#ff929b;--good:#89dfb1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 system-ui,sans-serif}a{color:var(--accent)}header{padding:18px 28px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:24px;flex-wrap:wrap}header strong{font-size:18px}nav{display:flex;gap:20px}main{max-width:1400px;margin:auto;padding:24px}h1{margin:0;font-size:26px}h2{font-size:18px;margin:0 0 12px}h3{font-size:15px;margin:0 0 8px}.muted,small{color:var(--muted)}.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:18px;overflow-wrap:anywhere}.grid .panel{margin-bottom:0}.wide{margin:18px 0}.value{font-size:24px;font-weight:650}.badge{border:1px solid var(--line);border-radius:20px;padding:2px 10px;font-size:12px;white-space:nowrap}.active{color:var(--bad)}.pending,.recovering,.stale,.mismatched{color:var(--warn)}.ok,.recovered{color:var(--good)}.error{color:var(--bad);white-space:pre-wrap}.notice{border-left:3px solid var(--warn);padding:10px 15px;background:#28251d}.notice:empty,.error:empty{display:none}button,input,select{font:inherit;background:#111720;border:1px solid var(--line);color:var(--text);padding:8px 12px;border-radius:6px}button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:default}select{max-width:100%;min-width:260px}input{width:100%}label{display:block;margin:8px 0;color:var(--muted)}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;text-align:left}th,td{padding:9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}pre{white-space:pre-wrap;font-size:12px;max-height:420px;overflow:auto}details{margin-top:12px}summary{cursor:pointer;color:var(--accent)}.hidden{display:none}.spark{width:100%;height:50px}.spark line{stroke:var(--line)}.spark polyline{fill:none;stroke:var(--accent);stroke-width:2}footer{margin-top:20px;color:var(--muted)}@media(max-width:650px){main{padding:14px}header{padding:14px;gap:10px}.bar{align-items:stretch;flex-direction:column}select{min-width:0}th,td{padding:6px}}
+</style>
+</head>
+<body>
+<header><strong>Brainrouter</strong><nav aria-label="Main"><a href="/dashboard">Dashboard</a><a href="/models" aria-current="page">Model activity</a><a href="/benchmarks">Benchmarks</a></nav></header>
+<main>
+<div class="bar"><h1>Model observability</h1><span class="muted" id="updated">Awaiting status</span><button id="refresh" type="button">Refresh</button></div>
+<p class="muted">Read-only backend observation and in-app alerts. No model loads, automatic benchmarks, model switching, or outbound notifications.</p>
+<p id="error" class="error" role="alert"></p><p id="backend-error" class="notice"></p>
+<div class="bar"><label for="model">Exact local model key</label><select id="model" aria-label="Exact local model key"></select><span id="model-state" class="badge"></span></div>
+<div id="empty" class="panel">No local models or completed measurements yet. Backend failures are shown above, not represented as zero usage.</div>
+<div id="detail" class="hidden">
+<section class="grid" aria-label="Current model">
+<div class="panel"><h3>Model / artifact identity</h3><div id="model-name" class="value"></div><p id="artifact" class="muted"></p><div id="quant"></div></div>
+<div class="panel"><h3>Runtime / build identity</h3><div id="build"></div><p id="context" class="muted"></p><small>Provider-reported only. Cached service versions below are not proof of this model's running binary.</small></div>
+<div class="panel"><h3>Measured memory</h3><div class="value">Unavailable</div><p id="memory-reason" class="muted"></p><small>Never inferred from GGUF file size, configured limits, or benchmark peak memory.</small></div>
+<div class="panel"><h3>Current requests</h3><div id="active-count" class="value"></div><p>Live token rate: <strong>unavailable</strong></p><small>Elapsed time, bytes and prefill progress are not token throughput. Exact registry labels only.</small></div>
+</section>
+<section class="panel wide"><h2>Active requests</h2><div id="active"></div><p id="phase" class="muted"></p></section>
+<section class="panel"><h2>Recent measurements and regression evidence</h2><p class="notice">Live trend alerts are indicative, not controlled benchmark regressions. Different prompts, context lengths, concurrency, loading and hardware changes can explain changes. TTFT is first generated output latency, not routing latency.</p><p class="muted" id="windows"></p><div id="alerts" class="grid"></div><details><summary>Definitions, debounce and missing data</summary><p id="definitions"></p><p>Only successfully completed, uniquely correlated streams enter performance samples. Missing usage does not become zero throughput. Both windows must meet the minimum sample count for each metric independently. Repeated polling does not advance debounce or recovery. A no-data state is not recovery.</p><p>Fallback counts indicate the model served a fallback route, not that it caused the fallback. Error categories use explicit router error text only; they do not diagnose thermal throttling or memory pressure. Stream failures are excluded from performance samples but may not be recorded as router errors.</p></details></section>
+<section class="panel"><h2>Historical benchmark reference</h2><div id="baseline">No reference selected.</div><p class="muted">Choose a successful run explicitly. The full model, artifact, build, hardware and experiment identities remain visible. No family-name matching; selecting a reference does not make live traffic experimentally comparable.</p>
+<form id="baseline-form"><div class="form-grid"><label>Benchmark run ID<input id="run-id" maxlength="256" required placeholder="Paste an exact run ID from the explorer"></label><label>Operator mapping rationale<input id="baseline-note" maxlength="1000" required placeholder="Why this exact run is a useful reference"></label></div><div class="bar"><button type="button" id="preview">Inspect reference</button><button id="save-baseline" type="submit" disabled>Confirm this reference</button><button id="clear-baseline" type="button">Clear mapping</button></div></form>
+<div id="preview-result"></div><p id="baseline-message" role="status"></p></section>
+<section class="panel"><h2>Recent routing results</h2><div id="recent"></div><p class="muted">At most 25 rows here. Router latency ends when the router returns its result; it is neither measured TTFT nor total completion latency. A successful router result is not proof that the stream completed.</p></section>
+<section class="panel"><h2>Completed stream measurements</h2><div id="measurements"></div><p class="muted">At most 25 recent completions, correlated by event ID. Duration ends at upstream [DONE]; completion time is when clean EOF was confirmed. Usage counts are provider-reported; missing counts remain unknown. These records are never persisted.</p></section>
+</div>
+<section class="panel"><h2>Unresolved or unattributed activity</h2><div id="unresolved"></div><p id="unattributed" class="muted"></p><div id="unattributed-alerts" class="grid"></div></section>
+<section class="panel"><h2>Alert policy</h2><p class="muted">Two adjacent time windows use the same source and exact provider/model. Minimum counts apply separately to each window and metric. Error/fallback rates must rise by the configured percentage points and reach the repeated-evidence count.</p>
+<form id="policy-form"><div class="form-grid" id="policy-fields"></div><button type="submit">Save policy</button></form><p id="policy-message" role="status"></p><p id="settings-error" class="error"></p><p id="storage" class="muted"></p>
+</section>
+<details class="panel"><summary>Cached service versions (not a per-model runtime attestation)</summary><pre id="versions"></pre></details>
+<footer id="retention">Samples and alert state are bounded and in-memory only; restart resets them.</footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const unavailable = 'Unavailable / unknown';
+const initialModel = new URLSearchParams(location.search).get('model');
+let snapshot = null, settings = null, selected = initialModel || '', preferredModel = initialModel, preview = null, busy = false;
+let baselineSequence = 0, lastBaselineRefresh = 0;
+const policyFields = [
+  ['window_seconds','Each window (seconds)',30,3600,1],
+  ['min_samples','Minimum samples per window',3,100,1],
+  ['generation_drop_percent','Generation drop (%)',5,95,'any'],
+  ['ttft_rise_percent','TTFT rise (%)',5,500,'any'],
+  ['rate_increase_points','Error/fallback rise (points)',1,100,'any'],
+  ['repeated_count','Minimum repeated evidence',2,100,1],
+  ['debounce_samples','New samples to activate',1,10,1],
+  ['recovery_samples','New samples to recover',1,10,1],
+  ['baseline_max_age_days','Reference max age (days)',1,3650,1]
+];
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+function text(id, value) { $(id).textContent = value == null || value === '' ? unavailable : String(value); }
+function number(value, unit = '') { return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(1) + (unit ? ' ' + unit : '') : unavailable; }
+function time(value) { return value ? new Date(value).toLocaleString() : unavailable; }
+async function request(path, body) {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(path, {signal:controller.signal, cache:'no-store',
+      ...(body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+function table(target, headers, rows, empty) {
+  target.replaceChildren();
+  if (!rows.length) { target.append(el('p', empty, 'muted')); return; }
+  const wrap = el('div', undefined, 'scroll'), t = el('table'), head = el('tr');
+  headers.forEach(header => head.append(el('th', header)));
+  const thead = el('thead'); thead.append(head); t.append(thead);
+  const tbody = el('tbody');
+  rows.forEach(values => { const row = el('tr'); values.forEach(value => row.append(el('td', value == null ? unavailable : String(value)))); tbody.append(row); });
+  t.append(tbody); wrap.append(t); target.append(wrap);
+}
+function alertCards(target, alerts) {
+  target.replaceChildren();
+  const titles = {generation:'Generation throughput',ttft:'Measured first output latency',error:'Router errors',oom:'Explicit OOM error text',timeout:'Explicit timeout error text',fallback:'Fallback-served routes'};
+  for (const alert of alerts || []) {
+    const card = el('article', undefined, 'panel');
+    card.append(el('h3',titles[alert.kind] || alert.kind),el('span',alert.status.replaceAll('_',' '),'badge '+alert.status));
+    card.append(el('p',`${number(alert.reference,alert.unit)} reference \u2192 ${number(alert.current,alert.unit)} current`));
+    if (alert.change_percent != null) card.append(el('strong',`${number(alert.change_percent)}% change`));
+    if (alert.increase_points != null) card.append(el('strong',`${number(alert.increase_points)} percentage-point change`));
+    card.append(el('p',`Samples: ${alert.reference_count} reference / ${alert.current_count} current`,'muted'));
+    if (alert.current_occurrences != null) card.append(el('p',`Occurrences: ${alert.reference_occurrences} reference / ${alert.current_occurrences} current`));
+    if (alert.event_ids && alert.event_ids.length) card.append(el('small','Evidence event IDs: '+alert.event_ids.join(', ')));
+    card.append(el('p',alert.scope,'muted')); target.append(card);
+  }
+}
+function render() {
+  if (!snapshot) return;
+  const models = snapshot.models || [];
+  const old = selected;
+  if (!models.some(model => model.model_key === selected)) selected = models.find(model => model.model_key === preferredModel)?.model_key || models[0]?.model_key || '';
+  $('model').replaceChildren(...models.map(model => {
+    const option = el('option', `${model.model_key} (${model.state})`);
+    option.value = model.model_key; return option;
+  }));
+  $('model').value = selected;
+  if (old !== selected) resetReference();
+  text('updated',snapshot.sampled_at ? `Sampled ${time(snapshot.sampled_at)}` : (snapshot.status || 'Awaiting first observation'));
+  const backend = snapshot.backend || {};
+  $('backend-error').textContent = [snapshot.error, backend.catalog_error && 'Catalog: '+backend.catalog_error,
+    backend.running_error && 'Running status: '+backend.running_error].filter(Boolean).join('\n');
+  text('retention',snapshot.retention?.limits);
+  table($('unresolved'),['Request','Unresolved model label','Activity','Elapsed'],(snapshot.unresolved_requests || []).map(row =>
+    [row.id,row.model_label,row.activity,number(row.elapsed_ms,'ms')]),'No unresolved registry entries.');
+  text('unattributed',`${snapshot.unattributed_route_count || 0} retained routes cannot be assigned to an exact local model, including ${snapshot.unattributed_error_count || 0} router errors. Cloud/unresolved events are never merged into a local model's baseline.`);
+  alertCards($('unattributed-alerts'),snapshot.unattributed_alerts);
+  text('versions',JSON.stringify(snapshot.service_versions || {},null,2));
+  const model = models.find(model => model.model_key === selected);
+  $('empty').classList.toggle('hidden',!!model); $('detail').classList.toggle('hidden',!model);
+  if (!model) return;
+  text('model-state',model.state); text('model-name',model.model_key);
+  text('artifact',model.backend?.artifact_path ? `Provider path: ${model.backend.artifact_path}. Verified artifact SHA: unavailable.` : 'Artifact identity/path: not reported');
+  text('quant','Quantization: '+(model.backend?.quantization || unavailable));
+  text('build',model.backend?.runtime_build == null ? unavailable : JSON.stringify(model.backend.runtime_build));
+  text('context',`Reported per-slot context: ${model.backend?.context_tokens || unavailable}${model.backend?.metadata_error ? '; metadata: '+model.backend.metadata_error : ''}`);
+  text('memory-reason',model.memory?.source);
+  text('active-count',(model.active_requests || []).length);
+  table($('active'),['Request','Activity','Elapsed','Bytes received','Prefill progress'],(model.active_requests || []).map(row =>
+    [row.id,row.activity || 'Waiting / unknown',number(row.elapsed_ms,'ms'),row.bytes_received,row.pp_progress == null ? unavailable : number(row.pp_progress*100,'%')]),'No exact-model active registry entries.');
+  const phase = snapshot.latest_inference_phase;
+  text('phase',phase ? `Latest tracker: ${phase.phase}, model ${phase.model || 'unresolved'}, ${number(phase.elapsed_ms,'ms')}. ${snapshot.inference_scope}` : unavailable);
+  text('windows',snapshot.retention ? `Reference: ${time(snapshot.retention.reference_from)} to ${time(snapshot.retention.current_from)}. Current: ${time(snapshot.retention.current_from)} to ${time(snapshot.retention.until)}.` : unavailable);
+  text('definitions',snapshot.measurement_definitions || 'Performance definitions are awaiting the first observation.');
+  alertCards($('alerts'),model.alerts);
+  table($('recent'),['Event','Time','Stage','Router result','Router latency','Error'],(model.recent_events || []).map(row =>
+    [row.id,time(row.timestamp),row.stage,row.router_success ? 'Stream returned' : 'Failed',number(row.router_latency_ms,'ms'),row.error || '-']),'No recent exact-model routing results in the retained windows.');
+  table($('measurements'),['Event','Completed','Measured TTFT','Generation estimate','Prompt tokens','Completion tokens','Route to DONE'],(model.recent_measurements || []).map(row =>
+    [row.event_id,time(row.completed_at),number(row.measured_ttft_ms,'ms'),number(row.generation_tps,'tokens/s'),row.prompt_tokens,row.completion_tokens,number(row.stream_duration_ms,'ms')]),'No successfully completed stream measurements in the retained windows.');
+}
+function referenceView(target, reference) {
+  const config = reference.configuration || {};
+  const p = reference.performance_metrics || {};
+  target.append(el('p',`Run ${reference.run_id}; completed ${time(reference.ended_at)}; one benchmark run (not aggregated).`));
+  target.append(el('p',`Model ID: ${config.model?.id}; quantization: ${config.artifact?.quant_name}; artifact SHA: ${config.artifact?.sha256}`));
+  target.append(el('p',`Runtime: ${config.runtime?.id} @ ${config.runtime?.commit_sha}; hardware: ${config.hardware?.id}; context: ${config.experiment?.context_tokens}; workload: ${config.workload?.id}`));
+  target.append(el('p',`Benchmark generation: ${number(p.generation_tps,'tokens/s')}; TTFT: ${number(p.ttft_ms,'ms')}. These are historical, not current runtime measurements.`));
+  const link = el('a','Open this run in the benchmark explorer'); link.href = '/benchmarks?run_id='+encodeURIComponent(reference.run_id); target.append(link);
+  const detail = el('details'); detail.append(el('summary','Full reference identity and provenance'),el('pre',JSON.stringify(reference,null,2))); target.append(detail);
+}
+async function loadBaseline() {
+  const sequence = ++baselineSequence, model = selected;
+  if (!model) return;
+  try {
+    const baseline = await request('/api/observability/baseline?model_key='+encodeURIComponent(model));
+    if (sequence !== baselineSequence || model !== selected) return;
+    $('baseline').replaceChildren(el('span',baseline.status.replaceAll('_',' '),'badge '+baseline.status),el('p',baseline.reason));
+    if (baseline.reference) referenceView($('baseline'),baseline.reference);
+    if (baseline.missing_dimensions) $('baseline').append(el('p','Unverified dimensions: '+baseline.missing_dimensions.join(', '),'notice'));
+    lastBaselineRefresh = Date.now();
+  } catch (error) {
+    if (sequence === baselineSequence) $('baseline').replaceChildren(el('p','Reference unavailable: '+error.message,'error'));
+  }
+}
+function resetReference() {
+  preview = null; $('save-baseline').disabled = true; $('preview-result').replaceChildren();
+  $('run-id').value = ''; $('baseline-note').value = ''; $('baseline-message').textContent = '';
+  lastBaselineRefresh = 0; baselineSequence++;
+  $('baseline').textContent = 'Loading reference...';
+}
+async function refresh() {
+  if (busy) return;
+  busy = true; $('refresh').disabled = true;
+  try {
+    snapshot = await request('/api/observability/models');
+    $('error').textContent = ''; render();
+    if (selected && Date.now()-lastBaselineRefresh > 60000) await loadBaseline();
+  } catch (error) { $('error').textContent = 'Observation refresh failed; displayed data may be stale: '+error.message; }
+  finally { busy = false; $('refresh').disabled = false; }
+}
+async function loadSettings() {
+  try {
+    settings = await request('/api/observability/settings');
+    $('policy-fields').replaceChildren();
+    policyFields.forEach(([key,title,min,max,step]) => {
+      const label = el('label',title), input = el('input');
+      input.name=key; input.type='number'; input.min=min; input.max=max; input.step=step;
+      input.required=true; input.value=settings.settings.policy[key]; label.append(input); $('policy-fields').append(label);
+    });
+    $('settings-error').textContent = [settings.read_error,settings.write_error].filter(Boolean).join('\n');
+    text('storage',settings.scope+' File: '+settings.path);
+  } catch (error) { settings=null; $('settings-error').textContent='Settings unavailable: '+error.message; }
+}
+$('model').addEventListener('change',() => {
+  selected=$('model').value; preferredModel=selected; const url=new URL(location.href); url.searchParams.set('model',selected); history.replaceState(null,'',url);
+  resetReference(); render(); loadBaseline();
+});
+$('refresh').addEventListener('click',refresh);
+$('run-id').addEventListener('input',() => { preview=null; $('save-baseline').disabled=true; });
+$('preview').addEventListener('click',async () => {
+  const model=selected, id=$('run-id').value.trim(); preview=null; $('save-baseline').disabled=true;
+  $('baseline-message').textContent=''; $('preview-result').replaceChildren();
+  try {
+    const result=await request('/api/observability/reference?run_id='+encodeURIComponent(id));
+    if (model!==selected || id!==$('run-id').value.trim()) return;
+    preview={model,reference:result}; referenceView($('preview-result'),result); $('save-baseline').disabled=false;
+  } catch (error) { $('baseline-message').textContent=error.message; }
+});
+$('baseline-form').addEventListener('submit',async event => {
+  event.preventDefault();
+  if (!settings || !preview || preview.model!==selected) return;
+  $('save-baseline').disabled=true;
+  try {
+    await request('/api/observability/baseline',{revision:settings.revision,model_key:selected,
+      run_id:preview.reference.run_id,expected_experiment_hash:preview.reference.experiment_hash,note:$('baseline-note').value.trim()});
+    $('baseline-message').textContent='Explicit reference mapping saved. Controlled comparison remains gated.';
+    await loadSettings(); await loadBaseline(); preview=null;
+  } catch (error) { $('baseline-message').textContent=error.message; await loadSettings(); }
+});
+$('clear-baseline').addEventListener('click',async () => {
+  if (!settings || !selected) return;
+  try {
+    await request('/api/observability/baseline',{revision:settings.revision,model_key:selected,run_id:null,expected_experiment_hash:null,note:''});
+    resetReference(); $('baseline-message').textContent='Mapping cleared.'; await loadSettings(); await loadBaseline();
+  } catch (error) { $('baseline-message').textContent=error.message; await loadSettings(); }
+});
+$('policy-form').addEventListener('submit',async event => {
+  event.preventDefault(); if (!settings) return;
+  const policy={}; new FormData(event.target).forEach((value,key) => { policy[key]=Number(value); });
+  try {
+    await request('/api/observability/settings',{revision:settings.revision,policy});
+    $('policy-message').textContent='Policy saved. Debounce resets on the next observation.';
+    await loadSettings(); await refresh();
+  } catch (error) { $('policy-message').textContent=error.message; await loadSettings(); }
+});
+loadSettings(); refresh();
+setInterval(() => { if (!document.hidden) refresh(); },5000);
+</script>
+</body>
+</html>

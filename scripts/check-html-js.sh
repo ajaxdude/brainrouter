@@ -14,6 +14,7 @@ if [[ ${#files[@]} -eq 0 ]]; then
         src/escalation/templates/main_dashboard.html
         src/escalation/templates/session.html
         src/escalation/templates/benchmarks.html
+        src/escalation/templates/model_observability.html
     )
 fi
 
