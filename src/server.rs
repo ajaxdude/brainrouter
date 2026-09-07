@@ -75,6 +75,7 @@ static VERSION_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to build HTTP client")
 });
 use crate::anthropic::{anthropic_to_openai, AnthropicMessagesRequest, AnthropicSseAdapter};
+use crate::benchmark::{self, BenchmarkStore};
 use crate::escalation;
 use crate::peer_cwd::peer_cwd;
 use crate::review::ReviewService;
@@ -138,6 +139,8 @@ pub struct AppState {
     pub prompt_rewrite: Arc<AtomicBool>,
     /// In-flight request registry (dashboard tracking + cancel).
     pub inflight: Arc<crate::inflight::InflightRegistry>,
+    /// Persistent imported benchmark data and query service.
+    pub benchmark_store: Arc<BenchmarkStore>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -183,6 +186,25 @@ fn into_unsync(resp: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, any
     resp.map(|body| body.map_err(|e: Infallible| match e {}).boxed_unsync())
 }
 
+fn is_loopback_http_url(value: &str, expected_port: u16) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "http"
+        || url.port_or_known_default() != Some(expected_port)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 
 /// Handle incoming HTTP requests
 async fn handle_request(
@@ -211,6 +233,9 @@ async fn handle_request(
             // project paths read into cloud prompts) and can approve/resolve
             // sessions. Gate it like the rest.
             || path.starts_with("/review/api/")
+            || path == "/api/benchmarks/ingest"
+            || path == "/api/benchmarks/ingest/llama-bench"
+            || path == "/api/benchmarks/plan"
             || path == "/api/inflight/cancel"
         ));
 
@@ -225,12 +250,15 @@ async fn handle_request(
         }
         
         // Anti-CSRF: Check Origin/Referer for browser-originated POSTs.
+        let dashboard_port = state
+            .tcp_addr
+            .parse::<SocketAddr>()
+            .map(|address| address.port())
+            .unwrap_or(9099);
         let has_allowed_origin = if let Some(origin) = req.headers().get("Origin") {
-            let s = origin.to_str().unwrap_or("");
-            s == "null" || s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
+            is_loopback_http_url(origin.to_str().unwrap_or(""), dashboard_port)
         } else if let Some(referer) = req.headers().get("Referer") {
-            let s = referer.to_str().unwrap_or("");
-            s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
+            is_loopback_http_url(referer.to_str().unwrap_or(""), dashboard_port)
         } else {
             // Non-browser client (curl, MCP) doesn't send Origin usually.
             true
@@ -244,12 +272,17 @@ async fn handle_request(
             );
             return Ok(into_unsync(resp));
         }
+
     }
 
     // Route /review/* to the escalation module
     if path.starts_with("/review") {
         let result = escalation::handle_review_request(req, Arc::clone(&state.review_service), cwd).await;
         return result;
+    }
+
+    if path == "/benchmarks" || path == "/benchmarks/" || path.starts_with("/api/benchmarks/") {
+        return benchmark::handle_request(req, &state.benchmark_store).await;
     }
 
     let response = match (method, path) {
@@ -2497,6 +2530,17 @@ mod tests {
     #[test]
     fn display_name_full_model_id() {
         assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-amdvlk"), "Qwen3.6 27B Q6 AMDVLK");
+    }
+
+    #[test]
+    fn destructive_api_origins_require_real_loopback_urls() {
+        assert!(is_loopback_http_url("http://localhost:9099", 9099));
+        assert!(is_loopback_http_url("http://127.0.0.1:9099/dashboard", 9099));
+        assert!(is_loopback_http_url("http://[::1]:9099", 9099));
+        assert!(!is_loopback_http_url("null", 9099));
+        assert!(!is_loopback_http_url("http://localhost.example.com:9099", 9099));
+        assert!(!is_loopback_http_url("https://localhost:9099", 9099));
+        assert!(!is_loopback_http_url("http://localhost:8080", 9099));
     }
 
     #[test]

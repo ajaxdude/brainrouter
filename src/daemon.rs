@@ -11,6 +11,7 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
 use brainrouter::{
+    benchmark::BenchmarkStore,
     bonsai_server::BonsaiControl,
     classifier::Classifier,
     config,
@@ -79,6 +80,15 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let config = config::load(&config_path).with_context(|| {
         format!("Failed to load config from {}", config_path.display())
     })?;
+
+    let benchmark_store = Arc::new(
+        BenchmarkStore::open(config.benchmarks.database_path.clone()).with_context(|| {
+            format!(
+                "Failed to initialize benchmark database at {}",
+                config.benchmarks.database_path.display()
+            )
+        })?,
+    );
 
     let tcp_addr: std::net::SocketAddr = args
         .tcp_addr
@@ -265,6 +275,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         nudge_budgets: config.llama_swap.nudge.budgets,
         prompt_rewrite,
         inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
+        benchmark_store,
     });
 
     // Background task: compute versions once, then refresh every 30 minutes.

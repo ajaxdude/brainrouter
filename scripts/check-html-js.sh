@@ -5,12 +5,16 @@
 # of dashboard bug the Rust suite cannot catch.
 #
 # Usage: scripts/check-html-js.sh [file.html ...]
-#        (default: the two templates embedded via include_str!)
+#        (default: all templates embedded via include_str!)
 set -euo pipefail
 
 files=("$@")
 if [[ ${#files[@]} -eq 0 ]]; then
-    files=(src/escalation/templates/main_dashboard.html src/escalation/templates/session.html)
+    files=(
+        src/escalation/templates/main_dashboard.html
+        src/escalation/templates/session.html
+        src/escalation/templates/benchmarks.html
+    )
 fi
 
 node_bin="$(command -v node || command -v bun || true)"

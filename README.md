@@ -36,6 +36,7 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 - **Manifest cloud failover.** When Manifest is enabled, `cloud` traffic goes through it (runs locally in Docker, picks the cloud provider) and falls back to llama-swap's `fallback_model` on failure.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
 - **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
+- **Benchmark explorer.** Import reproducible model/runtime/hardware results, compare throughput, memory, context scaling, quantizations, runtimes, speculation, and quality, inspect configurations, and export filtered CSV or JSONL at `http://127.0.0.1:9099/benchmarks`.
 - **Headless CLI.** `brainrouter cli` mirrors every dashboard action from the terminal: status, versions, Bonsai/nudge/context/routing toggles, restarts, upgrades, config, and the full review lifecycle. See the [Headless CLI](#headless-cli-brainrouter-cli) section.
 - **VRAM control.** The dashboard or CLI can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
 - **In-flight request tracker.** The dashboard shows every active request as it runs — elapsed, model, user agent, address, session, bytes received, PP progress, and a live activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button. No need to open the llama-swap UI.
@@ -50,9 +51,10 @@ coding harness (omp / claude / vibe / opencode / codex / droid)
 2. [Configure](#configure)
 3. [Connect your harness](#connect-your-harness)
 4. [Dashboard guide](#dashboard-guide)
-5. [MCP code review guide](#mcp-code-review-guide)
-6. [Bridge: Discord and Signal](#bridge-discord-and-signal)
-7. [Reference](#reference)
+5. [Benchmark explorer](#benchmark-explorer)
+6. [MCP code review guide](#mcp-code-review-guide)
+7. [Bridge: Discord and Signal](#bridge-discord-and-signal)
+8. [Reference](#reference)
 
 ---
 
@@ -429,6 +431,18 @@ A collapsible panel on the dashboard lets you control how code reviews run:
 
 Changes take effect immediately for new review requests. The setting persists across daemon restarts.
 
+## Benchmark explorer
+
+Open **`http://127.0.0.1:9099/benchmarks`** or select **Benchmarks** in the dashboard navigation. Brainrouter initializes a normalized SQLite database at `~/.local/share/brainrouter/benchmarks.sqlite3` by default. The explorer only imports and analyzes completed or externally managed benchmark runs; it never starts a model or benchmark process.
+
+The explorer provides deterministic filtering and pagination, throughput-vs-memory Pareto visualization, 8K/32K/128K context scaling, runtime and quantization comparisons, pass@1-per-GB analysis, full configuration/result inspection, and filtered CSV or JSONL downloads.
+
+Import a complete result bundle with `POST /api/benchmarks/ingest`. The JSON object contains `model`, `artifact`, `runtime`, `hardware`, `workload`, `experiment`, and `run`, plus optional `performance_metrics`, `speculative_metrics`, `quality_results`, and `telemetry_samples`. IDs in the bundle must reference each other. SHA-256 fields use lowercase 64-character hex, counts and metrics enforce their documented bounds, and unknown fields are rejected.
+
+Successful run payloads are immutable. To preserve reproducibility, corrections must use a new repetition or experiment. Planned, running, or failed attempts may be updated in place until they become successful. Registry rows and experiment configurations are insert-once.
+
+`POST /api/benchmarks/ingest/llama-bench` accepts `{ "bundle": { ... }, "llama_bench": ... }` and extracts prompt/generation throughput from llama-bench JSON (`avg_ts`, `tokens_per_second`, or `tps`) before using the same ingestion validation. `POST /api/benchmarks/plan` accepts a JSON or YAML experiment matrix and expands it deterministically without executing it; matrices are capped at 10,000 configurations.
+
 ---
 
 ## Headless CLI (`brainrouter cli`)
@@ -664,6 +678,9 @@ models:
   path: /opt/models                                    # shared GGUF dir; ${models_path} expands to this
   shared_write: false                                  # true = all aistack members can add/delete models
 
+benchmarks:
+  database_path: "/home/you/.local/share/brainrouter/benchmarks.sqlite3"
+
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
   forced_mode: "auto"         # "auto" | "cloud" | "local" — default "auto"
@@ -696,6 +713,7 @@ bridge:
 | `HOME` | User home directory. Used for default paths |
 | `XDG_RUNTIME_DIR` | Runtime directory for UDS socket (default `/run/user/$UID`) |
 | `XDG_CONFIG_HOME` | Config directory for persisted review state (default `~/.config`) |
+| `XDG_DATA_HOME` | Data directory containing the default benchmark SQLite database (default `~/.local/share`) |
 | `BRAINROUTER_MANIFEST_DIR` | Override Manifest docker-compose directory for restart/upgrade |
 | `<manifest.api_key_env>` | Dynamic: whatever env var name is set in `manifest.api_key_env` (e.g. `MANIFEST_API_KEY`) holds the Manifest API key |
 
@@ -748,6 +766,19 @@ All on `http://127.0.0.1:9099`.
 | `GET/POST` | `/api/context` | llama-swap context size / set `{value}` |
 | `GET/POST` | `/api/routing-mode` | Routing override / set `{mode}` |
 | `GET/POST` | `/api/bridges/toggle` | Bridge status / toggle `{bridge, enabled}` |
+
+#### Benchmarks
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/benchmarks` | Interactive benchmark explorer |
+| `GET` | `/api/benchmarks/runs` | Filtered page; supports `page`, `per_page` (1-100), `q`, `status`, `family`, `backend`, `workload`, `quant_name`, `speculator_type`, `sort`, and `order` |
+| `GET` | `/api/benchmarks/runs/:id` | Run configuration, raw result, quality results, and ordered telemetry |
+| `GET` | `/api/benchmarks/filters` | Deterministically ordered filter values |
+| `GET` | `/api/benchmarks/export?format=csv|jsonl` | Export all rows matching the same filters |
+| `POST` | `/api/benchmarks/ingest` | Validate and transactionally import one result bundle (localhost-only) |
+| `POST` | `/api/benchmarks/ingest/llama-bench` | Import a bundle plus llama-bench JSON output (localhost-only) |
+| `POST` | `/api/benchmarks/plan` | Deterministically expand a JSON/YAML experiment matrix without running it (localhost-only) |
 | `GET` | `/api/toolboxes` | List llama-* toolbox containers |
 | `POST` | `/api/models/flush` | Unload all models from llama-swap memory (no restart) |
 | `POST` | `/api/models/sync-omp` | Sync llama-swap models into OMP's models.yml |
@@ -832,4 +863,3 @@ cargo test
 ```
 
 89 tests across the codebase: circuit breaker, Anthropic protocol translation, idempotent config merging, review session lifecycle, classifier parse logic, request translation, failover, install, review loop, and bridge persistence.
-

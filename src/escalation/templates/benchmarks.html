@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>brainrouter benchmark explorer</title>
+<style>
+:root{--bg:#0b0e13;--panel:#141923;--panel2:#11151c;--border:#252d3a;--text:#e6edf6;--dim:#8a96a9;--mute:#596578;--green:#22d39a;--cyan:#3ec5ff;--amber:#f5b14a;--red:#ff6b6b;--violet:#9d7bff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px Inter,system-ui,sans-serif}button,input,select{font:inherit}
+header{height:64px;display:flex;align-items:center;gap:14px;padding:0 24px;border-bottom:1px solid var(--border);background:var(--panel2);position:sticky;top:0;z-index:2}
+a{color:var(--cyan);text-decoration:none}.brand{font-weight:650}.subtitle{color:var(--mute);font-size:11px}.spacer{flex:1}
+.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:7px 11px;border-radius:7px;cursor:pointer}.btn:hover{border-color:var(--cyan)}.btn.primary{color:var(--green);border-color:#22d39a66}
+main{padding:22px;max-width:1700px;margin:auto}.notice{padding:10px 13px;border:1px solid var(--border);border-radius:8px;color:var(--dim);margin-bottom:16px;background:var(--panel2)}
+.filters{display:grid;grid-template-columns:minmax(180px,2fr) repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:14px}.filters input,.filters select{width:100%;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:8px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.kpi,.chart,.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:10px}.kpi{padding:13px}.kpi-label{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:1px}.kpi-value{font:600 22px ui-monospace,monospace;margin-top:3px}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}.chart{padding:13px;min-height:300px}.chart h2{font-size:12px;margin:0 0 8px}.chart .hint{color:var(--mute);font-size:10px;margin-bottom:8px}svg{width:100%;height:240px;overflow:visible}.axis{stroke:var(--border)}.tick{fill:var(--mute);font-size:9px}.point{cursor:pointer;stroke:#0b0e13;stroke-width:1.5}.point:hover{stroke:#fff;stroke-width:2}
+.table-wrap{overflow:hidden}.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%;min-width:1200px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);white-space:nowrap}th{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:.6px;background:var(--panel2);position:sticky;top:0}tbody tr{cursor:pointer}tbody tr:hover{background:#ffffff08}.mono{font-family:ui-monospace,monospace}.status{padding:3px 7px;border-radius:99px;background:#ffffff0b}.succeeded{color:var(--green)}.failed,.oom,.timeout{color:var(--red)}.running{color:var(--cyan)}
+.pager{display:flex;align-items:center;gap:8px;padding:11px;color:var(--dim)}#message{min-height:18px;color:var(--dim);margin:8px 0}.empty{text-align:center;color:var(--mute);padding:35px}
+dialog{width:min(900px,92vw);max-height:85vh;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:0}dialog::backdrop{background:#000b}.dialog-head{display:flex;align-items:center;padding:14px;border-bottom:1px solid var(--border)}pre{white-space:pre-wrap;word-break:break-word;padding:14px;margin:0;color:var(--dim);font:11px ui-monospace,monospace;overflow:auto}
+@media(max-width:1000px){.filters{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <a href="/dashboard">&larr; Dashboard</a>
+  <div><div class="brand">Benchmark Explorer</div><div class="subtitle">Reproducible imported results; no workloads are launched here</div></div>
+  <div class="spacer"></div>
+  <button class="btn" onclick="downloadExport('jsonl')">Export JSONL</button>
+  <button class="btn" onclick="downloadExport('csv')">Export CSV</button>
+  <button class="btn primary" onclick="document.getElementById('import-file').click()">Import result</button>
+  <input id="import-file" type="file" accept=".json,application/json" hidden>
+</header>
+<main>
+  <div class="notice">Compare throughput, memory, context scaling, runtimes, quantizations, and quality from immutable benchmark records. Import accepts the documented result bundle JSON format.</div>
+  <div class="filters">
+    <input id="q" placeholder="Search model, runtime, workload, run ID">
+    <select id="family"><option value="">All families</option></select>
+    <select id="backend"><option value="">All backends</option></select>
+    <select id="workload"><option value="">All workloads</option></select>
+    <select id="quant_name"><option value="">All quantizations</option></select>
+    <select id="status"><option value="">All statuses</option></select>
+  </div>
+  <div class="kpis">
+    <div class="kpi"><div class="kpi-label">Matching runs</div><div class="kpi-value" id="kpi-runs">0</div></div>
+    <div class="kpi"><div class="kpi-label">Best generation TPS</div><div class="kpi-value" id="kpi-tps">-</div></div>
+    <div class="kpi"><div class="kpi-label">Lowest TTFT</div><div class="kpi-value" id="kpi-ttft">-</div></div>
+    <div class="kpi"><div class="kpi-label">Best pass@1 / disk GB</div><div class="kpi-value" id="kpi-quality">-</div></div>
+  </div>
+  <div class="charts">
+    <section class="chart"><h2>Throughput vs peak memory</h2><div class="hint">Pareto frontier favors higher generation TPS and lower RAM + VRAM.</div><svg id="pareto-chart" viewBox="0 0 600 240"></svg></section>
+    <section class="chart"><h2>Context scaling</h2><div class="hint">Generation TPS by context length; compare 8K, 32K, and 128K configurations.</div><svg id="context-chart" viewBox="0 0 600 240"></svg></section>
+    <section class="chart"><h2>Runtime comparison</h2><div class="hint">Mean generation TPS for each runtime fork/backend.</div><svg id="runtime-chart" viewBox="0 0 600 240"></svg></section>
+    <section class="chart"><h2>Quantization comparison</h2><div class="hint">Mean generation TPS by quantization.</div><svg id="quant-chart" viewBox="0 0 600 240"></svg></section>
+    <section class="chart"><h2>Pass@1 per disk GB</h2><div class="hint">Mean imported pass@1 score divided by artifact size.</div><svg id="quality-chart" viewBox="0 0 600 240"></svg></section>
+  </div>
+  <div id="message"></div>
+  <section class="table-wrap">
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Status</th><th>Model</th><th>Quant</th><th>Runtime</th><th>Backend</th><th>Context</th><th>Workload</th><th>Prompt TPS</th><th>Gen TPS</th><th>TTFT</th><th>Peak RAM</th><th>Peak VRAM</th><th>Speculation</th><th>Started</th></tr></thead>
+        <tbody id="runs"></tbody>
+      </table>
+    </div>
+    <div class="pager"><button class="btn" id="prev">Previous</button><span id="page-label"></span><button class="btn" id="next">Next</button><span class="spacer"></span><select id="sort"><option value="started_at:desc">Newest</option><option value="generation_tps:desc">Generation TPS</option><option value="prompt_tps:desc">Prompt TPS</option><option value="ttft_ms:asc">TTFT</option><option value="context_tokens:desc">Context</option></select></div>
+  </section>
+</main>
+<dialog id="detail">
+  <div class="dialog-head"><strong id="detail-title">Run detail</strong><div class="spacer"></div><button class="btn" onclick="document.getElementById('detail').close()">Close</button></div>
+  <pre id="detail-json"></pre>
+</dialog>
+<script>
+const state={page:1,perPage:25,totalPages:0};
+let loadGeneration=0;
+let detailGeneration=0;
+const colors=['#22d39a','#3ec5ff','#9d7bff','#f5b14a','#ff6b6b','#ff7ac6'];
+const byId=id=>document.getElementById(id);
+const esc=s=>String(s??'');
+const num=(n,d=1)=>n==null?'-':Number(n).toFixed(d);
+const bytes=n=>n==null?'-':(Number(n)/1073741824).toFixed(1)+' GB';
+const context=n=>n==null?'-':(Number(n)/1024).toFixed(Number(n)%1024?1:0)+'K';
+function params(includePage=true){
+  const p=new URLSearchParams();
+  for(const id of ['q','family','backend','workload','quant_name','status']){const v=byId(id).value.trim();if(v)p.set(id,v)}
+  const [sort,order]=byId('sort').value.split(':');p.set('sort',sort);p.set('order',order);
+  if(includePage){p.set('page',state.page);p.set('per_page',state.perPage)}
+  return p;
+}
+async function jsonFetch(url,opts){const r=await fetch(url,opts);let body;try{body=await r.json()}catch{body={error:'Invalid server response'}}if(!r.ok)throw new Error(body.error||r.statusText);return body}
+function optionList(id,values){const s=byId(id);while(s.options.length>1)s.remove(1);for(const value of values){const o=document.createElement('option');o.value=value;o.textContent=value;s.append(o)}}
+async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');optionList('family',f.families);optionList('backend',f.backends);optionList('workload',f.workloads);optionList('quant_name',f.quant_names);optionList('status',f.statuses)}
+async function load(){
+  const generation=++loadGeneration;
+  byId('message').textContent='Loading...';
+  try{
+    const page=await jsonFetch('/api/benchmarks/runs?'+params());
+    if(generation!==loadGeneration)return;
+    state.totalPages=page.total_pages;
+    byId('kpi-runs').textContent=page.total;
+    byId('page-label').textContent=`Page ${page.page} of ${Math.max(1,page.total_pages)}`;
+    byId('prev').disabled=page.page<=1;byId('next').disabled=page.page>=page.total_pages;
+    renderTable(page.items);byId('message').textContent='';
+    await loadAnalytics(generation);
+  }catch(e){if(generation===loadGeneration)byId('message').textContent=e.message}
+}
+async function loadAnalytics(generation){
+  const p=params(false);p.set('page','1');p.set('per_page','100');p.set('sort','generation_tps');p.set('order','desc');
+  if(!p.has('status'))p.set('status','succeeded');
+  const first=await jsonFetch('/api/benchmarks/runs?'+p),items=[...first.items];
+  for(let page=2;page<=first.total_pages;page++){if(generation!==loadGeneration)return;p.set('page',String(page));const next=await jsonFetch('/api/benchmarks/runs?'+p);items.push(...next.items)}
+  if(generation!==loadGeneration)return;
+  const tps=items.map(x=>x.generation_tps).filter(x=>x!=null);
+  const ttft=items.map(x=>x.ttft_ms).filter(x=>x!=null);
+  byId('kpi-tps').textContent=tps.length?num(tps.reduce((best,value)=>Math.max(best,value),-Infinity)):'-';
+  byId('kpi-ttft').textContent=ttft.length?num(ttft.reduce((best,value)=>Math.min(best,value),Infinity))+' ms':'-';
+  const quality=items.filter(x=>x.quality_score!=null&&x.disk_bytes>0).map(x=>x.quality_score/(x.disk_bytes/1073741824));
+  byId('kpi-quality').textContent=quality.length?num(quality.reduce((best,value)=>Math.max(best,value),-Infinity),2):'-';
+  drawScatter(items);drawContext(items);drawBars('runtime-chart',items,x=>x.fork_name+' / '+x.backend);drawBars('quant-chart',items,x=>x.quant_name);drawQuality(items);
+}
+function renderTable(items){
+  const body=byId('runs');body.replaceChildren();
+  if(!items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=14;td.className='empty';td.textContent='No benchmark runs match these filters.';tr.append(td);body.append(tr);return}
+  for(const run of items){
+    const tr=document.createElement('tr');tr.onclick=()=>showDetail(run.run_id);
+    const values=[[run.status,'status '+run.status],[run.family],[run.quant_name,'mono'],[run.fork_name],[run.backend],[context(run.context_tokens),'mono'],[run.workload],[num(run.prompt_tps),'mono'],[num(run.generation_tps),'mono'],[run.ttft_ms==null?'-':num(run.ttft_ms)+' ms','mono'],[bytes(run.peak_rss_bytes),'mono'],[bytes(run.peak_vram_bytes),'mono'],[run.speculator_type||'none'],[run.started_at?new Date(run.started_at).toLocaleString():'-']];
+    for(const [value,cls] of values){const td=document.createElement('td');td.textContent=esc(value);if(cls)td.className=cls;tr.append(td)}body.append(tr);
+  }
+}
+async function showDetail(id){const generation=++detailGeneration;try{const data=await jsonFetch('/api/benchmarks/runs/'+encodeURIComponent(id));if(generation!==detailGeneration)return;byId('detail-title').textContent='Run '+id;byId('detail-json').textContent=JSON.stringify(data,null,2);byId('detail').showModal()}catch(e){if(generation===detailGeneration)byId('message').textContent=e.message}}
+function svgEl(tag,attrs={}){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))e.setAttribute(k,v);return e}
+function axes(svg,xlabel,ylabel){
+  svg.replaceChildren();svg.append(svgEl('line',{x1:52,y1:205,x2:580,y2:205,class:'axis'}),svgEl('line',{x1:52,y1:15,x2:52,y2:205,class:'axis'}));
+  const x=svgEl('text',{x:300,y:232,class:'tick','text-anchor':'middle'});x.textContent=xlabel;const y=svgEl('text',{x:12,y:110,class:'tick',transform:'rotate(-90 12 110)','text-anchor':'middle'});y.textContent=ylabel;svg.append(x,y);
+}
+function drawScatter(items){
+  const svg=byId('pareto-chart');axes(svg,'Peak RAM + VRAM (GB)','Generation TPS');
+  const points=items.filter(x=>x.generation_tps!=null&&(x.peak_rss_bytes!=null||x.peak_vram_bytes!=null)).map(x=>({...x,mem:((x.peak_rss_bytes||0)+(x.peak_vram_bytes||0))/1073741824}));
+  if(!points.length)return;const maxX=points.reduce((best,x)=>Math.max(best,x.mem),1),maxY=points.reduce((best,x)=>Math.max(best,x.generation_tps),1);
+  const sx=x=>52+x/maxX*520,sy=y=>205-y/maxY*180;
+  const sorted=[...points].sort((a,b)=>a.mem-b.mem||b.generation_tps-a.generation_tps),frontier=[];let bestTps=-Infinity;
+  for(const point of sorted){if(point.generation_tps>bestTps){frontier.push(point);bestTps=point.generation_tps}}
+  if(frontier.length>1)svg.append(svgEl('polyline',{points:frontier.map(x=>`${sx(x.mem)},${sy(x.generation_tps)}`).join(' '),fill:'none',stroke:'#22d39a','stroke-width':2,'stroke-dasharray':'4 4'}));
+  for(const [i,p] of points.entries()){const c=svgEl('circle',{cx:sx(p.mem),cy:sy(p.generation_tps),r:5,fill:colors[i%colors.length],class:'point'});c.onclick=()=>showDetail(p.run_id);const t=svgEl('title');t.textContent=`${p.family} ${p.quant_name}: ${num(p.generation_tps)} TPS, ${num(p.mem)} GB`;c.append(t);svg.append(c)}
+}
+function drawContext(items){
+  const svg=byId('context-chart');axes(svg,'Context tokens','Generation TPS');const pts=items.filter(x=>x.generation_tps!=null&&x.context_tokens);
+  if(!pts.length)return;const xs=[...new Set(pts.map(x=>x.context_tokens))].sort((a,b)=>a-b),maxY=pts.reduce((best,x)=>Math.max(best,x.generation_tps),1);const sx=x=>xs.length===1?315:52+xs.indexOf(x)/(xs.length-1)*520,sy=y=>205-y/maxY*180;
+  const groups=new Map();for(const p of pts){const key=p.family+' / '+p.quant_name+' / '+p.backend,group=groups.get(key)||[];group.push(p);groups.set(key,group)}let i=0;
+  for(const [label,group] of groups){const avg=xs.map(x=>{const a=group.filter(v=>v.context_tokens===x);return a.length?{x,y:a.reduce((s,v)=>s+v.generation_tps,0)/a.length}:null}).filter(Boolean);const color=colors[i++%colors.length];if(avg.length>1)svg.append(svgEl('polyline',{points:avg.map(p=>`${sx(p.x)},${sy(p.y)}`).join(' '),fill:'none',stroke:color,'stroke-width':2}));for(const p of avg){const c=svgEl('circle',{cx:sx(p.x),cy:sy(p.y),r:4,fill:color});const t=svgEl('title');t.textContent=`${label}: ${context(p.x)}, ${num(p.y)} TPS`;c.append(t);svg.append(c)}}
+  for(const x of xs){const t=svgEl('text',{x:sx(x),y:220,class:'tick','text-anchor':'middle'});t.textContent=context(x);svg.append(t)}
+}
+function drawBars(id,items,key,metric='generation_tps',ylabel='Mean generation TPS'){
+  const svg=byId(id);axes(svg,'',ylabel);const groups=new Map();
+  for(const x of items){if(x[metric]==null)continue;const k=key(x),a=groups.get(k)||[];a.push(x[metric]);groups.set(k,a)}
+  const rows=[...groups].map(([k,a])=>({k,v:a.reduce((s,x)=>s+x,0)/a.length})).sort((a,b)=>b.v-a.v).slice(0,8);if(!rows.length)return;
+  const max=rows.reduce((best,x)=>Math.max(best,x.v),1),w=Math.min(55,480/rows.length);
+  rows.forEach((r,i)=>{const x=65+i*(500/rows.length),h=r.v/max*175;const rect=svgEl('rect',{x,y:205-h,width:w,height:h,fill:colors[i%colors.length]});const title=svgEl('title');title.textContent=`${r.k}: ${num(r.v)}`;rect.append(title);svg.append(rect);const t=svgEl('text',{x:x+w/2,y:218,class:'tick','text-anchor':'middle'});t.textContent=r.k.length>12?r.k.slice(0,11)+'...':r.k;svg.append(t)})
+}
+function drawQuality(items){
+  const scored=items.filter(x=>x.quality_score!=null&&x.disk_bytes>0).map(x=>({...x,quality_per_gb:x.quality_score/(x.disk_bytes/1073741824)}));
+  drawBars('quality-chart',scored,x=>x.family+' '+x.quant_name,'quality_per_gb','Pass@1 / GB');
+}
+function downloadExport(format){const p=params(false);p.set('format',format);location.href='/api/benchmarks/export?'+p}
+byId('import-file').onchange=async e=>{const file=e.target.files[0];if(!file)return;byId('message').textContent='Importing...';try{const text=await file.text();JSON.parse(text);await jsonFetch('/api/benchmarks/ingest',{method:'POST',headers:{'content-type':'application/json'},body:text});byId('message').textContent='Imported successfully.';state.page=1;await load();await loadFilters()}catch(err){byId('message').textContent=err.message}finally{e.target.value=''}};
+for(const id of ['family','backend','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
+let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.page=1;load()},250)};
+byId('prev').onclick=()=>{if(state.page>1){state.page--;load()}};byId('next').onclick=()=>{if(state.page<state.totalPages){state.page++;load()}};
+loadFilters().then(load).catch(e=>byId('message').textContent=e.message);
+</script>
+</body>
+</html>

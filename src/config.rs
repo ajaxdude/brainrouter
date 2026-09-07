@@ -15,9 +15,38 @@ pub struct BrainrouterConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Persistent imported benchmark results and explorer.
+    #[serde(default)]
+    pub benchmarks: BenchmarkConfig,
     /// Bridge transports (Discord, Signal) — optional, disabled by default.
     #[serde(default)]
     pub bridge: Option<crate::bridge::BridgeConfig>,
+}
+
+/// Storage settings for the benchmark explorer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkConfig {
+    /// SQLite database containing imported benchmark definitions and results.
+    #[serde(default = "default_benchmark_database_path")]
+    pub database_path: PathBuf,
+}
+
+impl Default for BenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            database_path: default_benchmark_database_path(),
+        }
+    }
+}
+
+fn default_benchmark_database_path() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home).join(".local/share")
+        });
+    base.join("brainrouter").join("benchmarks.sqlite3")
 }
 
 /// Configuration for the Manifest cloud LLM router.
@@ -356,6 +385,9 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
             bail!("llama_swap.subs_model must not be empty");
         }
     }
+    if config.benchmarks.database_path.as_os_str().is_empty() {
+        bail!("benchmarks.database_path must not be empty");
+    }
 
     // Validate bonsai.model_path exists (after token expansion) — but only
     // when the classifier is enabled. Disabled Bonsai needs no model file, so
@@ -453,5 +485,11 @@ mod tests {
             "unexpected path: {}",
             p.display()
         );
+    }
+
+    #[test]
+    fn benchmark_database_path_has_a_per_user_default() {
+        let config = BenchmarkConfig::default();
+        assert!(config.database_path.ends_with("brainrouter/benchmarks.sqlite3"));
     }
 }

@@ -79,6 +79,12 @@ models:
   # itself does not modify files in this directory.
   shared_write: false
 
+# Imported benchmark results and explorer storage.
+# The daemon creates and migrates this SQLite database at startup. It only
+# imports and explores results; it never launches benchmark/model workloads.
+# benchmarks:
+#   database_path: "/home/yourname/.local/share/brainrouter/benchmarks.sqlite3"
+
 # Review loop configuration (all fields optional — defaults shown)
 # review:
 #   max_iterations: 5
