@@ -1,0 +1,7 @@
+{
+  "provenance": "SYNTHETIC example, not a measured benchmark",
+  "results": [
+    {"test": "pp512", "n_prompt": 512, "n_gen": 0, "avg_ts": 1200.0},
+    {"test": "tg128", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0}
+  ]
+}

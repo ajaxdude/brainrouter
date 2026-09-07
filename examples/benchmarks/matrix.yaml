@@ -1,0 +1,17 @@
+# SYNTHETIC example only. Planning neither runs commands nor inserts records.
+# Registry IDs match synthetic-bundle.json and the downloadable template.
+name: Synthetic 8K / 32K / 128K planning example
+artifacts: [synthetic-artifact-v1]
+runtimes: [synthetic-runtime-v1]
+hardware: [synthetic-hardware-v1]
+workloads: [synthetic-workload-v1]
+contexts: [8192, 32768, 131072]
+prompt_tokens: [512]
+generation_tokens: [128]
+repetitions: 3
+randomize_order: false
+capture_telemetry: true
+batch_size: 1
+micro_batch_size: 1
+threads: 4
+command_template: "SYNTHETIC ONLY - replace with your externally executed command"

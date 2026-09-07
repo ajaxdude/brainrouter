@@ -1,0 +1,133 @@
+{
+  "model": {
+    "id": "synthetic-model-v1",
+    "family": "SYNTHETIC demo",
+    "architecture": "synthetic-transformer",
+    "checkpoint": "synthetic/example-only",
+    "revision": "fixture-v1",
+    "tokenizer_id": "synthetic/tokenizer",
+    "model_kind": "dense",
+    "parameter_count_total": 1000000000,
+    "native_context_tokens": 131072,
+    "metadata": {"provenance": "SYNTHETIC fixture, not measurements"}
+  },
+  "artifact": {
+    "id": "synthetic-artifact-v1",
+    "model_id": "synthetic-model-v1",
+    "format": "GGUF",
+    "quant_family": "K",
+    "quant_name": "Q4_K_M",
+    "average_bits_per_weight": 4.5,
+    "disk_bytes": 1073741824,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source_uri": "synthetic:example-only",
+    "metadata": {"hash_provenance": "Placeholder digest. Not verified against any file."}
+  },
+  "runtime": {
+    "id": "synthetic-runtime-v1",
+    "repository": "synthetic:llama.cpp",
+    "fork_name": "SYNTHETIC llama.cpp",
+    "commit_sha": "fixture-v1",
+    "compiler": "synthetic",
+    "compiler_version": "fixture-v1",
+    "backend": "cuda",
+    "build_flags": [],
+    "built_at": "2026-01-01T00:00:00Z"
+  },
+  "hardware": {
+    "id": "synthetic-hardware-v1",
+    "cpu_model": "SYNTHETIC CPU",
+    "physical_cores": 4,
+    "logical_cores": 8,
+    "system_ram_bytes": 34359738368,
+    "gpus": [
+      {"index": 0, "name": "SYNTHETIC GPU 0", "vram_bytes": 8589934592},
+      {"index": 1, "name": "SYNTHETIC GPU 1", "vram_bytes": 8589934592}
+    ],
+    "os_name": "synthetic",
+    "os_version": "fixture-v1",
+    "kernel": "fixture-v1",
+    "captured_at": "2026-01-01T00:00:00Z"
+  },
+  "workload": {
+    "id": "synthetic-workload-v1",
+    "name": "SYNTHETIC performance and quality demo",
+    "version": "fixture-v1",
+    "workload_type": "mixed",
+    "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "metadata": {"provenance": "No actual tasks or model calls were executed."}
+  },
+  "experiment": {
+    "id": "synthetic-experiment-8k",
+    "artifact_id": "synthetic-artifact-v1",
+    "runtime_id": "synthetic-runtime-v1",
+    "hardware_id": "synthetic-hardware-v1",
+    "workload_id": "synthetic-workload-v1",
+    "context_tokens": 8192,
+    "prompt_tokens": 512,
+    "generation_tokens": 128,
+    "threads": 4,
+    "command_template": "SYNTHETIC ONLY - replace with your externally executed command"
+  },
+  "run": {
+    "id": "synthetic-run-8k-0",
+    "experiment_id": "synthetic-experiment-8k",
+    "repetition": 0,
+    "status": "succeeded",
+    "started_at": "2026-01-01T00:00:00Z",
+    "ended_at": "2026-01-01T00:00:03Z",
+    "exact_command": "SYNTHETIC fixture; no command was executed",
+    "raw_result": {"provenance": "SYNTHETIC example only"}
+  },
+  "performance_metrics": {
+    "run_id": "synthetic-run-8k-0",
+    "model_load_ms": 100,
+    "prompt_processing_ms": 426.67,
+    "prompt_tps": 1200,
+    "ttft_ms": 500,
+    "generation_ms": 2560,
+    "generation_tps": 50,
+    "inter_token_p50_ms": 20,
+    "inter_token_p95_ms": 25,
+    "inter_token_p99_ms": 30,
+    "peak_rss_bytes": 2147483648,
+    "peak_vram_bytes": 3221225472,
+    "kv_cache_bytes": 268435456,
+    "energy_joules": 300,
+    "avg_power_watts": 100
+  },
+  "quality_results": [
+    {
+      "id": "synthetic-quality-0",
+      "run_id": "synthetic-run-8k-0",
+      "task_id": "synthetic-task-0",
+      "metric_name": "pass@1",
+      "metric_value": 1,
+      "passed": true,
+      "compile_succeeded": true,
+      "tests_passed": 2,
+      "tests_total": 2,
+      "generated_tokens": 128,
+      "duration_ms": 3000,
+      "details": {"provenance": "SYNTHETIC, not evaluated"}
+    },
+    {
+      "id": "synthetic-quality-1",
+      "run_id": "synthetic-run-8k-0",
+      "task_id": "synthetic-task-1",
+      "metric_name": "pass@1",
+      "metric_value": null,
+      "compile_succeeded": false,
+      "passed": null,
+      "tests_passed": null,
+      "tests_total": null
+    }
+  ],
+  "telemetry_samples": [
+    {"run_id": "synthetic-run-8k-0", "sampled_at": "2026-01-01T00:00:02Z", "cpu_percent": 20, "rss_bytes": 2147483648, "gpu_index": 0, "gpu_util_percent": 80, "vram_used_bytes": 2147483648, "power_watts": 120, "temperature_c": 60},
+    {"run_id": "synthetic-run-8k-0", "sampled_at": "2026-01-01T00:00:00Z", "cpu_percent": 0, "rss_bytes": 1073741824, "gpu_index": 0, "gpu_util_percent": 50, "vram_used_bytes": 1073741824, "power_watts": 90, "temperature_c": 50},
+    {"run_id": "synthetic-run-8k-0", "sampled_at": "2026-01-01T00:00:00Z", "cpu_percent": 0, "rss_bytes": 1073741824, "gpu_index": 1, "gpu_util_percent": 40, "vram_used_bytes": 1073741824, "power_watts": 80, "temperature_c": 45},
+    {"run_id": "synthetic-run-8k-0", "sampled_at": "2026-01-01T00:00:01Z", "cpu_percent": null, "gpu_index": 0, "gpu_util_percent": null, "vram_used_bytes": null, "power_watts": null, "temperature_c": null},
+    {"run_id": "synthetic-run-8k-0", "sampled_at": "2026-01-01T00:00:02Z", "cpu_percent": 20, "rss_bytes": 2147483648, "gpu_index": 1, "gpu_util_percent": 60, "vram_used_bytes": 1073741824, "power_watts": 100, "temperature_c": 55}
+  ]
+}

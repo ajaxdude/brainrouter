@@ -19,18 +19,32 @@ use std::{
     convert::Infallible,
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+mod http;
+mod imports;
+pub use http::handle_request;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_benchmark_explorer.sql");
 const EXPLORER_HTML: &str = include_str!("escalation/templates/benchmarks.html");
 const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: u32 = 100;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXPORT_RUNS: u64 = 10_000;
+const MAX_DETAIL_TELEMETRY: usize = 10_000;
+const MAX_DETAIL_QUALITY: usize = 1_000;
+const MAX_FILTER_VALUES: usize = 1_000;
+const MAX_HTTP_WORKERS: usize = 2;
 
 #[derive(Debug)]
 pub enum BenchmarkError {
     Validation(String),
     Conflict(String),
     NotFound(String),
+    Limit(String),
+    Busy(String),
     Database(rusqlite::Error),
     Io(std::io::Error),
 }
@@ -38,9 +52,11 @@ pub enum BenchmarkError {
 impl fmt::Display for BenchmarkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Validation(message) | Self::Conflict(message) | Self::NotFound(message) => {
-                f.write_str(message)
-            }
+            Self::Validation(message)
+            | Self::Conflict(message)
+            | Self::NotFound(message)
+            | Self::Limit(message)
+            | Self::Busy(message) => f.write_str(message),
             Self::Database(error) => write!(f, "benchmark database error: {error}"),
             Self::Io(error) => write!(f, "benchmark database I/O error: {error}"),
         }
@@ -51,7 +67,18 @@ impl std::error::Error for BenchmarkError {}
 
 impl From<rusqlite::Error> for BenchmarkError {
     fn from(error: rusqlite::Error) -> Self {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+        if matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        ) {
+            Self::Busy(
+                "benchmark database is busy; retry later (core routing remains available)".into(),
+            )
+        } else if error.sqlite_error_code() == Some(rusqlite::ErrorCode::TooBig) {
+            Self::Limit(format!(
+                "benchmark SQLite row exceeds the {MAX_ROW_BYTES}-byte HTTP limit; use the synchronous store API or an offline SQLite reader for larger records"
+            ))
+        } else if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
             Self::Conflict(format!(
                 "benchmark data conflicts with an existing record: {error}"
             ))
@@ -911,6 +938,7 @@ impl ExperimentMatrix {
 
         let mut experiments = Vec::new();
         let mut exclusions = Vec::new();
+        let mut plan_budget = BoundedBuffer::new(MAX_RESPONSE_BYTES);
         for artifact_id in &self.artifacts {
             for runtime_id in &self.runtimes {
                 for hardware_id in &self.hardware {
@@ -920,7 +948,7 @@ impl ExperimentMatrix {
                                 for &generation_tokens in &self.generation_tokens {
                                     for optimization in &self.optimizations {
                                         if prompt_tokens > context_tokens {
-                                            exclusions.push(PlanExclusion {
+                                            let exclusion = PlanExclusion {
                                                 candidate: json!({
                                                     "artifact_id": artifact_id,
                                                     "runtime_id": runtime_id,
@@ -933,7 +961,9 @@ impl ExperimentMatrix {
                                                 reason_code: "prompt_exceeds_context",
                                                 reason:
                                                     "prompt_tokens cannot exceed context_tokens",
-                                            });
+                                            };
+                                            plan_budget.json(&exclusion)?;
+                                            exclusions.push(exclusion);
                                             continue;
                                         }
                                         let mut experiment = ExperimentConfig {
@@ -954,6 +984,7 @@ impl ExperimentMatrix {
                                         };
                                         let hash = experiment.experiment_hash()?;
                                         experiment.id = format!("experiment-{hash}");
+                                        plan_budget.json(&experiment)?;
                                         experiments.push(experiment);
                                     }
                                 }
@@ -1657,11 +1688,17 @@ fn non_empty_filter(value: String) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct BenchmarkStore {
     path: PathBuf,
+    http_workers: Arc<tokio::sync::Semaphore>,
+    http_limits: bool,
 }
 
 impl BenchmarkStore {
     pub fn open(path: impl Into<PathBuf>) -> BenchmarkResult<Self> {
-        let store = Self { path: path.into() };
+        let store = Self {
+            path: path.into(),
+            http_workers: Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_WORKERS)),
+            http_limits: false,
+        };
         if let Some(parent) = store
             .path
             .parent()
@@ -1721,12 +1758,24 @@ impl BenchmarkStore {
 
     fn connect(&self) -> BenchmarkResult<Connection> {
         let connection = Connection::open(&self.path)?;
+        if self.http_limits {
+            connection.set_limit(
+                rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+                MAX_ROW_BYTES as i32,
+            );
+            connection.pragma_update(None, "cache_size", -2048)?;
+            connection.pragma_update(None, "temp_store", "FILE")?;
+        }
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(connection)
     }
 
     pub fn ingest(&self, bundle: &IngestBundle) -> BenchmarkResult<String> {
+        self.ingest_checked(bundle, true)
+    }
+
+    fn ingest_checked(&self, bundle: &IngestBundle, persist: bool) -> BenchmarkResult<String> {
         bundle.validate()?;
         let experiment_hash = bundle.experiment.experiment_hash()?;
         let canonical_spec = bundle.experiment.canonical_json()?;
@@ -2158,13 +2207,18 @@ impl BenchmarkStore {
             )?;
         }
 
-        transaction.commit()?;
+        if persist {
+            transaction.commit()?;
+        } else {
+            transaction.rollback()?;
+        }
         Ok(bundle.run.id.clone())
     }
 
     pub fn query_runs(&self, query: &RunQuery) -> BenchmarkResult<RunPage> {
-        let connection = self.connect()?;
-        self.query_runs_connection(&connection, query)
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        self.query_runs_connection(&transaction, query)
     }
 
     fn query_runs_connection(
@@ -2172,6 +2226,11 @@ impl BenchmarkStore {
         connection: &Connection,
         query: &RunQuery,
     ) -> BenchmarkResult<RunPage> {
+        if query.page == 0 || query.per_page == 0 || query.per_page > MAX_PAGE_SIZE {
+            return Err(BenchmarkError::Validation(format!(
+                "page must be positive and per_page must be between 1 and {MAX_PAGE_SIZE}"
+            )));
+        }
         let (where_sql, values) = query_where(query);
         let total = connection.query_row(
             &format!(
@@ -2216,7 +2275,7 @@ impl BenchmarkStore {
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(paged_values.iter()), summary_from_row)?;
-        let items = rows.collect::<Result<Vec<_>, _>>()?;
+        let items = collect_bounded(rows, self.http_limits.then_some(MAX_RESPONSE_BYTES))?;
         Ok(RunPage {
             items,
             page: query.page,
@@ -2228,7 +2287,27 @@ impl BenchmarkStore {
 
     pub fn run_detail(&self, run_id: &str) -> BenchmarkResult<Value> {
         require_text("run_id", run_id)?;
-        let connection = self.connect()?;
+        let mut database = self.connect()?;
+        let connection = database.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if self.http_limits {
+            for (table, limit) in [
+                ("telemetry_samples", MAX_DETAIL_TELEMETRY),
+                ("quality_results", MAX_DETAIL_QUALITY),
+            ] {
+                let count: usize = connection.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM (SELECT 1 FROM {table} WHERE run_id=?1 LIMIT ?2)"
+                    ),
+                    params![run_id, limit + 1],
+                    |row| row.get(0),
+                )?;
+                if count > limit {
+                    return Err(BenchmarkError::Limit(format!(
+                        "run detail exceeds {limit} {table}; nothing was truncated. Use the synchronous store API or an offline SQLite reader for the full run"
+                    )));
+                }
+            }
+        }
         let summary = connection
             .query_row(
                 "SELECT rs.run_id,rs.status,rs.repetition,rs.experiment_hash,rs.family,
@@ -2352,8 +2431,8 @@ impl BenchmarkStore {
                     log_path,details_json
              FROM quality_results WHERE run_id=?1 ORDER BY task_id,metric_name,id",
         )?;
-        let quality = quality_statement
-            .query_map(params![run_id], |row| {
+        let quality = collect_bounded(
+            quality_statement.query_map(params![run_id], |row| {
                 let details: String = row.get(12)?;
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
@@ -2370,16 +2449,17 @@ impl BenchmarkStore {
                     "log_path": row.get::<_, Option<String>>(11)?,
                     "details": parse_json(&details),
                 }))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            })?,
+            self.http_limits.then_some(MAX_RESPONSE_BYTES),
+        )?;
 
         let mut telemetry_statement = connection.prepare(
             "SELECT sampled_at,cpu_percent,rss_bytes,gpu_index,gpu_util_percent,
                     vram_used_bytes,temperature_c,power_watts,metadata_json
              FROM telemetry_samples WHERE run_id=?1 ORDER BY sampled_at,id",
         )?;
-        let telemetry = telemetry_statement
-            .query_map(params![run_id], |row| {
+        let telemetry = collect_bounded(
+            telemetry_statement.query_map(params![run_id], |row| {
                 let metadata: String = row.get(8)?;
                 Ok(json!({
                     "sampled_at": row.get::<_, String>(0)?,
@@ -2392,10 +2472,11 @@ impl BenchmarkStore {
                     "power_watts": row.get::<_, Option<f64>>(7)?,
                     "metadata": parse_json(&metadata),
                 }))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            })?,
+            self.http_limits.then_some(MAX_RESPONSE_BYTES),
+        )?;
 
-        Ok(json!({
+        let detail = json!({
             "run": summary,
             "configuration": parse_json(&configuration),
             "run_record": parse_json(&run_record),
@@ -2403,49 +2484,53 @@ impl BenchmarkStore {
             "speculative_metrics": speculation.as_deref().map(parse_json),
             "quality_results": quality,
             "telemetry_samples": telemetry,
-        }))
+        });
+        if self.http_limits {
+            BoundedBuffer::new(MAX_RESPONSE_BYTES).json(&detail)?;
+        }
+        Ok(detail)
     }
 
     pub fn filter_options(&self) -> BenchmarkResult<Value> {
         let connection = self.connect()?;
         Ok(json!({
-            "statuses": distinct_values(&connection, "SELECT DISTINCT status FROM runs ORDER BY status")?,
-            "families": distinct_values(&connection, "SELECT DISTINCT family FROM run_summary ORDER BY family")?,
-            "backends": distinct_values(&connection, "SELECT DISTINCT backend FROM run_summary ORDER BY backend")?,
-            "workloads": distinct_values(&connection, "SELECT DISTINCT workload FROM run_summary ORDER BY workload")?,
-            "quant_names": distinct_values(&connection, "SELECT DISTINCT quant_name FROM run_summary ORDER BY quant_name")?,
-            "speculator_types": distinct_values(&connection, "SELECT DISTINCT speculator_type FROM run_summary WHERE speculator_type IS NOT NULL ORDER BY speculator_type")?,
+            "statuses": distinct_values(&connection, "SELECT DISTINCT status FROM runs ORDER BY status", self.http_limits)?,
+            "families": distinct_values(&connection, "SELECT DISTINCT family FROM run_summary ORDER BY family", self.http_limits)?,
+            "backends": distinct_values(&connection, "SELECT DISTINCT backend FROM run_summary ORDER BY backend", self.http_limits)?,
+            "workloads": distinct_values(&connection, "SELECT DISTINCT workload FROM run_summary ORDER BY workload", self.http_limits)?,
+            "quant_names": distinct_values(&connection, "SELECT DISTINCT quant_name FROM run_summary ORDER BY quant_name", self.http_limits)?,
+            "speculator_types": distinct_values(&connection, "SELECT DISTINCT speculator_type FROM run_summary WHERE speculator_type IS NOT NULL ORDER BY speculator_type", self.http_limits)?,
         }))
     }
 
     pub fn export_runs(&self, mut query: RunQuery, format: &str) -> BenchmarkResult<String> {
-        let mut connection = self.connect()?;
+        if !matches!(format, "jsonl" | "csv") {
+            return Err(BenchmarkError::Validation(
+                "format must be jsonl or csv".into(),
+            ));
+        }
+        let mut bounded = self.clone();
+        bounded.http_limits = true;
+        let mut connection = bounded.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         query.page = 1;
         query.per_page = MAX_PAGE_SIZE;
-        let mut all = Vec::new();
-        loop {
-            let page = self.query_runs_connection(&transaction, &query)?;
-            all.extend(page.items);
-            if u64::from(query.page) >= page.total_pages {
-                break;
-            }
-            query.page += 1;
+        let mut output = BoundedBuffer::new(MAX_RESPONSE_BYTES);
+        if format == "csv" {
+            output.append(b"run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n")?;
         }
-        let output = match format {
-            "jsonl" => {
-                let mut output = String::new();
-                for run in all {
-                    output.push_str(&to_json(&run)?);
-                    output.push('\n');
-                }
-                Ok(output)
+        loop {
+            let page = bounded.query_runs_connection(&transaction, &query)?;
+            if page.total > MAX_EXPORT_RUNS {
+                return Err(BenchmarkError::Limit(format!(
+                    "export matches {} runs; limit is {MAX_EXPORT_RUNS}. Narrow the filters or export offline from SQLite; nothing was truncated",
+                    page.total
+                )));
             }
-            "csv" => {
-                let mut output = String::from(
-                    "run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n",
-                );
-                for run in all {
+            for run in page.items {
+                if format == "jsonl" {
+                    output.json(&run)?;
+                } else {
                     let row = [
                         run.run_id,
                         run.status,
@@ -2471,23 +2556,98 @@ impl BenchmarkStore {
                         run.disk_bytes.to_string(),
                         option_string(run.quality_score),
                     ];
-                    output.push_str(
+                    output.append(
                         &row.into_iter()
                             .map(|value| csv_field(&value))
                             .collect::<Vec<_>>()
-                            .join(","),
-                    );
-                    output.push('\n');
+                            .join(",")
+                            .into_bytes(),
+                    )?;
                 }
-                Ok(output)
+                output.append(b"\n")?;
             }
-            _ => Err(BenchmarkError::Validation(
-                "format must be jsonl or csv".into(),
-            )),
-        }?;
+            if u64::from(query.page) >= page.total_pages {
+                break;
+            }
+            query.page += 1;
+        }
         transaction.commit()?;
-        Ok(output)
+        String::from_utf8(output.bytes)
+            .map_err(|error| BenchmarkError::Validation(format!("invalid export UTF-8: {error}")))
     }
+}
+
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn limit_error(&self) -> BenchmarkError {
+        BenchmarkError::Limit(format!(
+            "benchmark response exceeds {} bytes; narrow filters or use the synchronous detail API / offline SQLite export. Nothing was truncated",
+            self.limit
+        ))
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> BenchmarkResult<()> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(self.limit_error());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn json<T: Serialize>(&mut self, value: &T) -> BenchmarkResult<()> {
+        serde_json::to_writer(&mut *self, value).map_err(|error| {
+            if error.is_io() {
+                self.limit_error()
+            } else {
+                BenchmarkError::Validation(format!("invalid JSON value: {error}"))
+            }
+        })
+    }
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "benchmark response byte limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn collect_bounded<T: Serialize>(
+    rows: impl Iterator<Item = rusqlite::Result<T>>,
+    budget: Option<usize>,
+) -> BenchmarkResult<Vec<T>> {
+    let mut items = Vec::new();
+    let mut remaining = budget;
+    for row in rows {
+        let row = row?;
+        if let Some(left) = remaining {
+            let mut encoded = BoundedBuffer::new(left);
+            encoded.json(&row)?;
+            remaining = Some(left.saturating_sub(encoded.bytes.len()));
+        }
+        items.push(row);
+    }
+    Ok(items)
 }
 
 fn to_json<T: Serialize>(value: &T) -> BenchmarkResult<String> {
@@ -2626,11 +2786,26 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn distinct_values(connection: &Connection, sql: &str) -> BenchmarkResult<Vec<String>> {
-    let mut statement = connection.prepare(sql)?;
-    let values = statement
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<Vec<String>, _>>()?;
+fn distinct_values(
+    connection: &Connection,
+    sql: &str,
+    bounded: bool,
+) -> BenchmarkResult<Vec<String>> {
+    let sql = if bounded {
+        format!("{sql} LIMIT {}", MAX_FILTER_VALUES + 1)
+    } else {
+        sql.into()
+    };
+    let mut statement = connection.prepare(&sql)?;
+    let values = collect_bounded(
+        statement.query_map([], |row| row.get::<_, String>(0))?,
+        bounded.then_some(MAX_RESPONSE_BYTES),
+    )?;
+    if bounded && values.len() > MAX_FILTER_VALUES {
+        return Err(BenchmarkError::Limit(format!(
+            "filter contains more than {MAX_FILTER_VALUES} distinct values; use explicit run query filters. Nothing was truncated"
+        )));
+    }
     Ok(values)
 }
 
@@ -2669,122 +2844,6 @@ fn body_error_response(
     }
 }
 
-pub async fn handle_request(
-    req: Request<Incoming>,
-    store: &BenchmarkStore,
-) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
-    let method = req.method().as_str();
-    let path = req.uri().path().to_string();
-    let response = match (method, path.as_str()) {
-        ("GET", "/benchmarks") | ("GET", "/benchmarks/") => html_response(EXPLORER_HTML),
-        ("GET", "/api/benchmarks/filters") => result_response(store.filter_options()),
-        ("GET", "/api/benchmarks/export") => {
-            match parse_export_query(req.uri().query()).and_then(|(query, format)| {
-                store.export_runs(query, &format).map(|body| (format, body))
-            }) {
-                Ok((format, body)) => download_response(&format, body),
-                Err(error) => error_response(error),
-            }
-        }
-        ("GET", "/api/benchmarks/runs") => {
-            match RunQuery::parse(req.uri().query()).and_then(|query| store.query_runs(&query)) {
-                Ok(page) => json_response(StatusCode::OK, &page),
-                Err(error) => error_response(error),
-            }
-        }
-        ("GET", path) if path.starts_with("/api/benchmarks/runs/") => {
-            let encoded = path.trim_start_matches("/api/benchmarks/runs/");
-            match url::form_urlencoded::parse(format!("id={encoded}").as_bytes())
-                .next()
-                .map(|(_, value)| value.into_owned())
-            {
-                Some(run_id) => result_response(store.run_detail(&run_id)),
-                None => json_response(StatusCode::BAD_REQUEST, &json!({"error": "invalid run id"})),
-            }
-        }
-        ("POST", "/api/benchmarks/ingest") => {
-            if req
-                .headers()
-                .get(hyper::header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<usize>().ok())
-                .is_some_and(|length| length > MAX_INGEST_BYTES)
-            {
-                json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    &json!({"error": format!("ingest payload exceeds {MAX_INGEST_BYTES} bytes")}),
-                )
-            } else {
-                match collect_body(req).await {
-                    Ok(bytes) => match serde_json::from_slice::<IngestBundle>(&bytes) {
-                        Ok(bundle) => match store.ingest(&bundle) {
-                            Ok(run_id) => {
-                                json_response(StatusCode::CREATED, &json!({"run_id": run_id}))
-                            }
-                            Err(error) => error_response(error),
-                        },
-                        Err(error) => json_response(
-                            StatusCode::BAD_REQUEST,
-                            &json!({"error": format!("invalid ingest payload: {error}")}),
-                        ),
-                    },
-                    Err(error) => body_error_response(error, "ingest"),
-                }
-            }
-        }
-        ("POST", "/api/benchmarks/ingest/llama-bench") => match collect_body(req).await {
-            Ok(bytes) => match serde_json::from_slice::<LlamaBenchIngest>(&bytes) {
-                Ok(mut ingest) => {
-                    match apply_llama_bench_metrics(&mut ingest.bundle, &ingest.llama_bench)
-                        .and_then(|_| store.ingest(&ingest.bundle))
-                    {
-                        Ok(run_id) => {
-                            json_response(StatusCode::CREATED, &json!({"run_id": run_id}))
-                        }
-                        Err(error) => error_response(error),
-                    }
-                }
-                Err(error) => json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("invalid llama-bench ingest payload: {error}")}),
-                ),
-            },
-            Err(error) => body_error_response(error, "ingest"),
-        },
-        ("POST", "/api/benchmarks/plan") => {
-            let is_yaml = req
-                .headers()
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("yaml"));
-            match collect_body(req).await {
-                Ok(bytes) => {
-                    let matrix = if is_yaml {
-                        serde_yaml::from_slice::<ExperimentMatrix>(&bytes)
-                            .map_err(|error| error.to_string())
-                    } else {
-                        serde_json::from_slice::<ExperimentMatrix>(&bytes)
-                            .map_err(|error| error.to_string())
-                    };
-                    match matrix {
-                        Ok(matrix) => match matrix.expand() {
-                            Ok(plan) => json_response(StatusCode::OK, &plan),
-                            Err(error) => error_response(error),
-                        },
-                        Err(error) => json_response(
-                            StatusCode::BAD_REQUEST,
-                            &json!({"error": format!("invalid experiment matrix: {error}")}),
-                        ),
-                    }
-                }
-                Err(error) => body_error_response(error, "plan"),
-            }
-        }
-        _ => json_response(StatusCode::NOT_FOUND, &json!({"error": "not found"})),
-    };
-    Ok(response)
-}
-
 pub fn unavailable_response(reason: &str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     json_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2813,26 +2872,25 @@ fn parse_export_query(query: Option<&str>) -> BenchmarkResult<(RunQuery, String)
     Ok((query, format.unwrap_or_else(|| "jsonl".into())))
 }
 
-fn result_response(
-    result: BenchmarkResult<Value>,
-) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    match result {
-        Ok(value) => json_response(StatusCode::OK, &value),
-        Err(error) => error_response(error),
-    }
-}
-
 fn error_response(error: BenchmarkError) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     let status = match &error {
         BenchmarkError::Validation(_) => StatusCode::BAD_REQUEST,
         BenchmarkError::Conflict(_) => StatusCode::CONFLICT,
         BenchmarkError::NotFound(_) => StatusCode::NOT_FOUND,
+        BenchmarkError::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        BenchmarkError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         BenchmarkError::Database(_) | BenchmarkError::Io(_) => {
             tracing::error!(error = %error, "Benchmark API failure");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    json_response(status, &json!({"error": error.to_string()}))
+    let mut response = json_response(status, &json!({"error": error.to_string()}));
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+    }
+    response
 }
 
 fn download_response(format: &str, body: String) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
@@ -2861,11 +2919,18 @@ fn json_response<T: Serialize>(
     status: StatusCode,
     value: &T,
 ) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
-    let body = match serde_json::to_vec(value) {
-        Ok(body) => body,
+    let mut buffer = BoundedBuffer::new(MAX_RESPONSE_BYTES);
+    let (status, body) = match buffer.json(value) {
+        Ok(()) => (status, buffer.bytes),
+        Err(error @ BenchmarkError::Limit(_)) => {
+            return error_response(error);
+        }
         Err(error) => {
             tracing::error!(error = %error, "Failed to serialize benchmark response");
-            br#"{"error":"internal serialization error"}"#.to_vec()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                br#"{"error":"internal serialization error"}"#.to_vec(),
+            )
         }
     };
     Response::builder()
@@ -3063,6 +3128,7 @@ mod tests {
         let tables = distinct_values(
             &connection,
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            false,
         )
         .unwrap();
         for table in [
@@ -3389,5 +3455,247 @@ mod tests {
             &json!({"test": "pp512+tg128", "avg_ts": 70.0, "n_prompt": 512, "n_gen": 128}),
         )
         .is_err());
+    }
+
+    fn example_bundle() -> IngestBundle {
+        serde_json::from_str(include_str!("../examples/benchmarks/synthetic-bundle.json")).unwrap()
+    }
+
+    #[test]
+    fn synthetic_examples_validate_and_plan_into_reusable_imports() {
+        let test = test_store();
+        let sample = example_bundle();
+        sample.validate().unwrap();
+        test.store.ingest(&sample).unwrap();
+        let template: Value = serde_json::from_str(
+            &imports::example("/api/benchmarks/examples/template.json")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let matrix: ExperimentMatrix =
+            serde_yaml::from_str(include_str!("../examples/benchmarks/matrix.yaml")).unwrap();
+        let first = matrix.expand().unwrap();
+        assert_eq!(
+            to_json(&first).unwrap(),
+            to_json(&matrix.expand().unwrap()).unwrap()
+        );
+        assert_eq!(first.run_count, 9);
+        assert_eq!(
+            first
+                .experiments
+                .iter()
+                .map(|e| e.context_tokens)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([8192, 32768, 131072])
+        );
+        for experiment in first.experiments {
+            let request = json!({
+                "template": template, "experiment": experiment, "repetition": 1,
+                "status": "succeeded", "exact_command": "synthetic test, never executed",
+                "llama_bench": serde_json::from_str::<Value>(include_str!("../examples/benchmarks/llama-bench.json")).unwrap()
+            });
+            let prepared = test
+                .store
+                .prepare_import(serde_json::from_value(request.clone()).unwrap())
+                .unwrap();
+            let repeated = test
+                .store
+                .prepare_import(serde_json::from_value(request).unwrap())
+                .unwrap();
+            assert_eq!(to_json(&prepared).unwrap(), to_json(&repeated).unwrap());
+            assert_eq!(
+                to_json(&prepared.model).unwrap(),
+                to_json(&sample.model).unwrap()
+            );
+            assert_eq!(
+                to_json(&prepared.hardware).unwrap(),
+                to_json(&sample.hardware).unwrap()
+            );
+            if experiment.context_tokens == 8192 {
+                assert_eq!(
+                    prepared.experiment.id, sample.experiment.id,
+                    "reuse legacy/custom ID"
+                );
+            }
+            test.store.ingest_checked(&prepared, false).unwrap();
+            assert!(
+                test.store.run_detail(&prepared.run.id).is_err(),
+                "preview must roll back"
+            );
+            test.store.ingest(&prepared).unwrap();
+            assert!(matches!(
+                test.store.ingest_checked(&prepared, false),
+                Err(BenchmarkError::Conflict(_))
+            ));
+        }
+        let detail = test.store.run_detail(&sample.run.id).unwrap();
+        assert_eq!(detail["quality_results"][1]["passed"], Value::Null);
+        assert_eq!(detail["quality_results"][1]["compile_succeeded"], false);
+        assert_eq!(detail["telemetry_samples"][0]["cpu_percent"], 0.0);
+        assert_eq!(
+            detail["telemetry_samples"][2]["gpu_util_percent"],
+            Value::Null
+        );
+        assert_eq!(detail["telemetry_samples"][3]["gpu_index"], 0);
+        assert_eq!(detail["telemetry_samples"][4]["gpu_index"], 1);
+    }
+
+    #[test]
+    fn preview_leaves_no_registry_or_result_rows() {
+        let test = test_store();
+        test.store.ingest_checked(&example_bundle(), false).unwrap();
+        let connection = test.store.connect().unwrap();
+        for table in [
+            "runs",
+            "models",
+            "experiments",
+            "entity_fingerprints",
+            "quality_results",
+            "telemetry_samples",
+        ] {
+            let count: u64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        let mut invalid = example_bundle();
+        invalid.telemetry_samples[0].run_id = "mismatch".into();
+        assert!(test.store.ingest_checked(&invalid, false).is_err());
+        assert_eq!(
+            test.store
+                .query_runs(&RunQuery::parse(None).unwrap())
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_detail_and_exports_fail_explicitly_without_truncation() {
+        let test = test_store();
+        let mut sample = example_bundle();
+        let telemetry = sample.telemetry_samples[0].clone();
+        sample.telemetry_samples = vec![telemetry; MAX_DETAIL_TELEMETRY + 1];
+        test.store.ingest(&sample).unwrap();
+        let mut bounded = test.store.clone();
+        bounded.http_limits = true;
+        assert!(matches!(
+            bounded.run_detail(&sample.run.id),
+            Err(BenchmarkError::Limit(_))
+        ));
+        assert_eq!(
+            test.store.run_detail(&sample.run.id).unwrap()["telemetry_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_DETAIL_TELEMETRY + 1
+        );
+        let connection = test.store.connect().unwrap();
+        connection
+            .execute(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+             INSERT INTO runs(id,experiment_id,repetition,status,exact_command)
+             SELECT 'generated-'||x,?2,x,'planned','synthetic only' FROM n",
+                params![MAX_EXPORT_RUNS, sample.experiment.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .export_runs(RunQuery::parse(None).unwrap(), "jsonl"),
+            Err(BenchmarkError::Limit(_))
+        ));
+        let filtered = test
+            .store
+            .export_runs(RunQuery::parse(Some("status=succeeded")).unwrap(), "jsonl")
+            .unwrap();
+        assert_eq!(filtered.lines().count(), 1);
+        assert!(test
+            .store
+            .export_runs(RunQuery::parse(None).unwrap(), "invalid")
+            .is_err());
+        let mut buffer = BoundedBuffer::new(3);
+        buffer.append(b"abc").unwrap();
+        assert!(matches!(buffer.append(b"d"), Err(BenchmarkError::Limit(_))));
+        assert_eq!(buffer.bytes, b"abc");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_saturation_and_cancelled_waiters_hold_real_work_permits() {
+        let test = test_store();
+        let mut releases = Vec::new();
+        let mut jobs = Vec::new();
+        for _ in 0..MAX_HTTP_WORKERS {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let store = test.store.clone();
+            jobs.push(tokio::spawn(async move {
+                store
+                    .run_blocking(move |_| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            }));
+            started_rx.await.unwrap();
+            releases.push(release_tx);
+        }
+        assert!(matches!(
+            test.store.run_blocking(|_| Ok(())).await,
+            Err(BenchmarkError::Busy(_))
+        ));
+        for job in jobs {
+            job.abort();
+            assert!(job.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(test.store.http_workers.available_permits(), 0);
+        assert!(matches!(
+            test.store.run_blocking(|_| Ok(())).await,
+            Err(BenchmarkError::Busy(_))
+        ));
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while test.store.http_workers.available_permits() != MAX_HTTP_WORKERS {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        test.store.run_blocking(|_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_sqlite_keeps_async_runtime_responsive() {
+        let test = test_store();
+        let lock = test.store.connect().unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let store = test.store.clone();
+        let job = tokio::spawn(async move {
+            store
+                .run_blocking(move |store| {
+                    started_tx.send(()).unwrap();
+                    store.ingest(&example_bundle())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::time::sleep(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !job.is_finished(),
+            "SQLite writer must still be waiting while runtime ticks"
+        );
+        lock.execute_batch("ROLLBACK").unwrap();
+        job.await.unwrap().unwrap();
     }
 }
