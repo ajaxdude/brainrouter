@@ -62,17 +62,41 @@ impl MockUpstream {
                                 let requests = Arc::clone(&requests);
                                 async move {
                                     let response = if req.method() == "POST"
-                                        && req.uri().path() == "/v1/chat/completions"
+                                        && matches!(req.uri().path(),
+                                            "/v1/chat/completions" | "/cloud/v1/chat/completions")
                                     {
+                                        let path = req.uri().path().to_string();
                                         let body = req.collect().await.unwrap().to_bytes();
-                                        requests.lock().unwrap().push(
-                                            serde_json::from_slice(&body).unwrap(),
-                                        );
+                                        let mut payload: Value = serde_json::from_slice(&body).unwrap();
+                                        let model = payload["model"].clone();
+                                        let content = if payload["model"].as_str().unwrap().contains("review") {
+                                            json!({"status": "approved", "feedback": "synthetic review"}).to_string()
+                                        } else {
+                                            "routing-ok".to_string()
+                                        };
+                                        payload["_test_path"] = json!(path);
+                                        requests.lock().unwrap().push(payload);
+                                        let frames = [
+                                            json!({"id": "stub", "model": model, "choices": [{
+                                                "index": 0, "delta": {"role": "assistant"}, "finish_reason": null,
+                                            }]}),
+                                            json!({"id": "stub", "model": model, "choices": [{
+                                                "index": 0, "delta": {"content": content}, "finish_reason": null,
+                                            }]}),
+                                            json!({"id": "stub", "model": model, "choices": [{
+                                                "index": 0, "delta": {}, "finish_reason": "stop",
+                                            }]}),
+                                            json!({"id": "stub", "model": model, "choices": [],
+                                                "usage": {"prompt_tokens": 64, "completion_tokens": 8, "total_tokens": 72},
+                                            }),
+                                        ];
+                                        let mut body = frames.iter()
+                                            .map(|frame| format!("data: {frame}\n\n"))
+                                            .collect::<String>();
+                                        body.push_str("data: [DONE]\n\n");
                                         Response::builder()
                                             .header("content-type", "text/event-stream")
-                                            .body(Full::new(Bytes::from_static(
-                                                b"data: {\"id\":\"stub\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"routing-ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
-                                            )))
+                                            .body(Full::new(Bytes::from(body)))
                                             .unwrap()
                                     } else {
                                         // Also rejects CONNECT requests from version-check clients
@@ -120,11 +144,23 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(directory: &Path, database: &Path, upstream: &str) -> Self {
+        Self::start_with_cloud(directory, database, upstream, false)
+    }
+
+    fn start_with_cloud(
+        directory: &Path,
+        database: &Path,
+        upstream: &str,
+        cloud_enabled: bool,
+    ) -> Self {
         let config = directory.join("config.yaml");
         fs::write(
             &config,
             serde_yaml::to_string(&json!({
-                "manifest": {"base_url": format!("{upstream}/v1"), "enabled": false},
+                "manifest": {
+                    "base_url": format!("{upstream}/cloud/v1"),
+                    "enabled": cloud_enabled,
+                },
                 "llama_swap": {
                     "base_url": format!("{upstream}/v1"),
                     "fallback_model": "test-only-model",
@@ -144,7 +180,7 @@ impl TestDaemon {
         let log = directory.join("daemon.log");
         let log_file = fs::File::create(&log).unwrap();
         let empty_bin = directory.join("empty-bin");
-        fs::create_dir(&empty_bin).unwrap();
+        fs::create_dir_all(&empty_bin).unwrap();
         drop(reservation);
         let child = Command::new(env!("CARGO_BIN_EXE_brainrouter"))
             .args(["serve", "--config"])
@@ -204,6 +240,129 @@ impl TestDaemon {
                 fs::read_to_string(&self.log).unwrap()
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn get_json(&self, path: &str) -> Value {
+        self.client
+            .get(format!("{}{path}", self.url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn post_json(&self, path: &str, body: &Value) -> Value {
+        self.client
+            .post(format!("{}{path}", self.url))
+            .header("Origin", "http://localhost:8080")
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn synthetic_chat(&self, model: &str) {
+        let response = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.url))
+            .json(&json!({
+                "model": model, "stream": true,
+                "messages": [{"role": "user", "content": "synthetic request"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(response.contains("routing-ok"), "{response}");
+        assert!(response.contains("[DONE]"), "{response}");
+    }
+
+    async fn synthetic_anthropic_chat(&self, model: &str) {
+        let response = self
+            .client
+            .post(format!("{}/v1/messages", self.url))
+            .json(&json!({
+                "model": model, "stream": true, "max_tokens": 64,
+                "messages": [{"role": "user", "content": "synthetic Anthropic request"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(response.contains("routing-ok"), "{response}");
+        assert!(response.contains("message_stop"), "{response}");
+    }
+
+    async fn synthetic_review(&self, directory: &Path) {
+        let created = self
+            .post_json(
+                "/review/api/request-async",
+                &json!({
+                    "taskId": "synthetic-review", "summary": "synthetic review", "cwd": directory,
+                }),
+            )
+            .await;
+        let session_id = created["sessionId"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let session = self
+                .get_json(&format!("/review/api/sessions/{session_id}"))
+                .await;
+            if session["status"] == "approved" {
+                return;
+            }
+            assert_eq!(session["status"], "pending", "{session}");
+            assert!(
+                Instant::now() < deadline,
+                "review did not finish: {session}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn assert_completed_observations(&self, model_key: &str, expected_count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let snapshot = self.get_json("/api/observability/models").await;
+            let samples = snapshot["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["model_key"] == model_key)
+                .and_then(|model| model["recent_measurements"].as_array());
+            if let Some(samples) = samples.filter(|samples| samples.len() == expected_count) {
+                let mut event_ids = std::collections::BTreeSet::new();
+                for sample in samples {
+                    assert!(event_ids.insert(sample["event_id"].as_u64().unwrap()));
+                    assert!(sample["measured_ttft_ms"].as_f64().unwrap() >= 0.0);
+                    assert_eq!(sample["prompt_tokens"], 64);
+                    assert_eq!(sample["completion_tokens"], 8);
+                }
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completed measurements missing: {snapshot}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -440,4 +599,247 @@ async fn remapped_loopback_origins_and_referers_can_mutate_but_untrusted_origins
         .await
         .unwrap();
     assert_eq!(page["total"], 0, "healthy benchmark storage still works");
+}
+
+#[tokio::test]
+async fn profile_and_model_page_remain_available_without_benchmark_storage() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    fs::write(&database, b"not a SQLite database").unwrap();
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
+    daemon.wait_until_ready().await;
+
+    for path in ["/dashboard", "/models", "/api/routing-profile"] {
+        let response = daemon
+            .client
+            .get(format!("{}{path}", daemon.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+    }
+    let catalog = daemon.get_json("/api/routing-models").await;
+    assert_eq!(catalog["cloud_enabled"], false);
+    assert!(catalog["cloud"]["models"].as_array().unwrap().is_empty());
+    let models = daemon.get_json("/api/observability/models").await;
+    assert!(models["models"].is_array());
+    let baseline = daemon
+        .get_json("/api/observability/baseline?model_key=test-only-model")
+        .await;
+    assert_eq!(baseline["status"], "not_selected");
+    let reference = daemon
+        .client
+        .get(format!(
+            "{}/api/observability/reference?run_id=example",
+            daemon.url,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reference.status(), 503);
+    let settings = daemon.get_json("/api/observability/settings").await;
+    let clear = json!({
+        "revision": settings["revision"],
+        "model_key": "test-only-model",
+        "run_id": null,
+        "expected_experiment_hash": null,
+        "note": "Synthetic test: clear reference without a database",
+    });
+    let denied = daemon
+        .client
+        .post(format!("{}/api/observability/baseline", daemon.url))
+        .header("Origin", "null")
+        .json(&clear)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    daemon
+        .post_json("/api/observability/baseline", &clear)
+        .await;
+    assert!(upstream.requests.lock().unwrap().is_empty());
+    daemon.assert_explorer_unavailable().await;
+    daemon.assert_core_routing(&upstream).await;
+}
+
+#[tokio::test]
+async fn benchmark_previews_check_csrf_before_storage_availability() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    fs::write(&database, b"not a SQLite database").unwrap();
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
+    daemon.wait_until_ready().await;
+
+    for path in [
+        "/api/benchmarks/prepare",
+        "/api/benchmarks/validate",
+        "/api/benchmarks/validate/llama-bench",
+    ] {
+        for origin in ["null", "http://example.com:8080"] {
+            let response = daemon
+                .client
+                .post(format!("{}{path}", daemon.url))
+                .header("Origin", origin)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403, "{path}, Origin: {origin}");
+        }
+        let response = daemon
+            .client
+            .post(format!("{}{path}", daemon.url))
+            .header("Origin", "http://localhost:8080")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "{path}");
+    }
+    assert!(upstream.requests.lock().unwrap().is_empty());
+    daemon.assert_core_routing(&upstream).await;
+}
+
+#[tokio::test]
+async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    fs::write(&database, b"not a SQLite database").unwrap();
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start_with_cloud(&directory.0, &database, &upstream.url, true);
+    daemon.wait_until_ready().await;
+    let mut profile = json!({
+        "preset": "local_main_cloud_review",
+        "main": {"backend": "local", "model": "main-local-test"},
+        "reviewer": {"backend": "cloud", "model": "review-cloud-test"},
+        "subagent_model": "subagent-local-test",
+    });
+    let saved = daemon.post_json("/api/routing-profile", &profile).await;
+    assert_eq!(saved["profile"], profile);
+    daemon.synthetic_chat("auto").await;
+    daemon.synthetic_anthropic_chat("auto").await;
+    daemon.synthetic_chat("subs").await;
+    daemon.synthetic_chat("brainrouter/pinned-test-model").await;
+    daemon.synthetic_review(&directory.0).await;
+    daemon
+        .assert_completed_observations("main-local-test", 2)
+        .await;
+
+    profile["preset"] = json!("cloud_main_local_review");
+    profile["main"] = json!({"backend": "cloud", "model": "main-cloud-test"});
+    profile["reviewer"] = json!({"backend": "local", "model": "review-local-test"});
+    let saved = daemon.post_json("/api/routing-profile", &profile).await;
+    assert_eq!(saved["profile"], profile);
+    daemon.synthetic_chat("auto").await;
+    daemon.synthetic_review(&directory.0).await;
+    {
+        let captured = upstream.requests.lock().unwrap();
+        let choices: Vec<_> = captured
+            .iter()
+            .map(|request| {
+                (
+                    request["_test_path"].as_str().unwrap(),
+                    request["model"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                ("/v1/chat/completions", "main-local-test"),
+                ("/v1/chat/completions", "main-local-test"),
+                ("/v1/chat/completions", "subagent-local-test"),
+                ("/v1/chat/completions", "pinned-test-model"),
+                ("/cloud/v1/chat/completions", "review-cloud-test"),
+                ("/cloud/v1/chat/completions", "main-cloud-test"),
+                ("/v1/chat/completions", "review-local-test"),
+            ]
+        );
+    }
+    daemon.assert_explorer_unavailable().await;
+    drop(daemon);
+
+    let mut restarted = TestDaemon::start_with_cloud(&directory.0, &database, &upstream.url, true);
+    restarted.wait_until_ready().await;
+    let restored = restarted.get_json("/api/routing-profile").await;
+    assert_eq!(restored["profile"], profile);
+    assert_eq!(restored["cloud_enabled"], true);
+    restarted.synthetic_chat("auto").await;
+    restarted.synthetic_anthropic_chat("auto").await;
+    assert_eq!(
+        upstream.requests.lock().unwrap().last().unwrap()["model"],
+        "main-cloud-test"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_example_can_be_prepared_validated_and_imported_without_inference() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
+    daemon.wait_until_ready().await;
+    let profile_before = daemon.get_json("/api/routing-profile").await;
+    let template = daemon
+        .get_json("/api/benchmarks/examples/template.json")
+        .await;
+    let matrix = daemon
+        .get_json("/api/benchmarks/examples/matrix.json")
+        .await;
+    let llama_bench = daemon
+        .get_json("/api/benchmarks/examples/llama-bench.json")
+        .await;
+    let plan = daemon.post_json("/api/benchmarks/plan", &matrix).await;
+    let experiment = plan["experiments"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let preview = daemon
+        .post_json(
+            "/api/benchmarks/prepare",
+            &json!({
+                "template": template,
+                "experiment": experiment,
+                "repetition": 0,
+                "status": "succeeded",
+                "exact_command": "synthetic example; no process executed",
+                "started_at": now,
+                "ended_at": now,
+                "llama_bench": llama_bench,
+            }),
+        )
+        .await;
+    assert_eq!(preview["valid"], true);
+    assert_eq!(preview["persisted"], false);
+    let bundle = &preview["bundle"];
+    assert_eq!(bundle["performance_metrics"]["generation_tps"], 50.0);
+    assert_eq!(bundle["experiment"]["id"], plan["experiments"][0]["id"]);
+    let validation = daemon.post_json("/api/benchmarks/validate", bundle).await;
+    assert_eq!(validation["valid"], true);
+    assert_eq!(validation["persisted"], false);
+    assert_eq!(daemon.get_json("/api/benchmarks/runs").await["total"], 0);
+
+    let imported = daemon.post_json("/api/benchmarks/ingest", bundle).await;
+    assert_eq!(imported["run_id"], bundle["run"]["id"]);
+    let page = daemon.get_json("/api/benchmarks/runs").await;
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["run_id"], imported["run_id"]);
+    let run_id = imported["run_id"].as_str().unwrap();
+    let reference = daemon
+        .client
+        .get(format!("{}/api/observability/reference", daemon.url))
+        .query(&[("run_id", run_id)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reference.status(), 200);
+    let profile_after = daemon.get_json("/api/routing-profile").await;
+    assert_eq!(profile_after["profile"], profile_before["profile"]);
+    assert!(upstream.requests.lock().unwrap().is_empty());
+    daemon.assert_core_routing(&upstream).await;
 }

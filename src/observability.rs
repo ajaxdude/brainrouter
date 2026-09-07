@@ -577,7 +577,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         values[middle - 1] / 2.0 + values[middle] / 2.0
     } else {
         values[middle]
@@ -1366,9 +1366,10 @@ mod tests {
     #[test]
     fn unknown_measurements_exact_matching_and_predictable_sorting() {
         let now = Utc::now();
-        let mut backend = BackendSnapshot::default();
-        backend.models =
-            parse_catalog(&json!({"data":[{"id":"z-model"},{"id":"a-model"}]})).unwrap();
+        let backend = BackendSnapshot {
+            models: parse_catalog(&json!({"data":[{"id":"z-model"},{"id":"a-model"}]})).unwrap(),
+            ..BackendSnapshot::default()
+        };
         let events = vec![event(1, 5, "a-model-extra", "", now)];
         let samples = vec![measurement(1, 5, "a-model-extra", Some(7.0), None, now)];
         let snapshot = build_snapshot(
@@ -1683,11 +1684,15 @@ mod tests {
 
     #[test]
     fn policy_bounds_and_status_parsing_are_conservative() {
-        let mut policy = AlertPolicy::default();
-        policy.min_samples = 1;
+        let policy = AlertPolicy {
+            min_samples: 1,
+            ..AlertPolicy::default()
+        };
         assert!(policy.validate().is_err());
-        policy = AlertPolicy::default();
-        policy.generation_drop_percent = f64::NAN;
+        let policy = AlertPolicy {
+            generation_drop_percent: f64::NAN,
+            ..AlertPolicy::default()
+        };
         assert!(policy.validate().is_err());
         let mut models = parse_catalog(&json!({"data":[{"id":"model"}]})).unwrap();
         assert_eq!(models["model"].state, "idle");
