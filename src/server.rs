@@ -57,10 +57,13 @@ use hyper::{body::Incoming, body::Frame, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use tracing::{debug, error, info, warn};
 use std::sync::LazyLock;
@@ -2335,24 +2338,41 @@ pub async fn sync_omp_models(llama_swap_url: &str, tcp_addr: &str) -> anyhow::Re
     let resp = VERSION_CLIENT.get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .send().await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch llama-swap models: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to fetch llama-swap models: {}", e))?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("llama-swap models request failed: {}", e))?;
     let body: serde_json::Value = resp.json().await
         .map_err(|e| anyhow::anyhow!("Failed to parse llama-swap models response: {}", e))?;
-    let model_ids: Vec<String> = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let model_ids = parse_llama_swap_model_ids(&body)?;
 
     // All filesystem + YAML work runs off the async executor.
     let tcp_addr_owned = tcp_addr.to_string();
     tokio::task::spawn_blocking(move || write_omp_models_yml(&home, &model_ids, &tcp_addr_owned))
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {}", e))?
+}
+
+fn parse_llama_swap_model_ids(body: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow::anyhow!("llama-swap models response is missing a data array"))?
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            model
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+                .map(String::from)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "llama-swap models response has an invalid id at data[{}]",
+                        index
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Blocking: read models.yml, merge brainrouter models, write atomically.
@@ -2364,7 +2384,8 @@ fn write_omp_models_yml(home: &str, model_ids: &[String], tcp_addr: &str) -> any
     let mut doc: serde_yaml::Value = if path.exists() {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", models_path, e))?;
-        serde_yaml::from_str(&content).unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+        serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", models_path, e))?
     } else {
         serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
     };
@@ -2423,9 +2444,13 @@ fn write_omp_models_yml(home: &str, model_ids: &[String], tcp_addr: &str) -> any
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("Failed to create directory {}: {}", parent.display(), e))?;
     }
-    let tmp_path = format!("{}.{}.tmp", models_path, std::process::id());
+    let tmp_path = format!("{}.{}.tmp", models_path, uuid::Uuid::new_v4());
     std::fs::write(&tmp_path, &yaml_str)
         .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", tmp_path, e))?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        std::fs::set_permissions(&tmp_path, metadata.permissions())
+            .map_err(|e| anyhow::anyhow!("Failed to preserve permissions on {}: {}", tmp_path, e))?;
+    }
     std::fs::rename(&tmp_path, path)
         .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path, models_path, e))?;
 
@@ -2479,15 +2504,13 @@ pub async fn run(
     uds_path: PathBuf,
     state: Arc<AppState>,
 ) -> Result<()> {
-    if uds_path.exists() {
-        info!("Removing existing Unix socket at {:?}", uds_path);
-        std::fs::remove_file(&uds_path)?;
-    }
-
     let tcp_listener = TcpListener::bind(tcp_addr).await?;
     info!("TCP listener bound to {}", tcp_addr);
 
+    let _uds_lock = acquire_uds_lock(&uds_path)?;
+    prepare_uds_path(&uds_path).await?;
     let uds_listener = UnixListener::bind(&uds_path)?;
+    let uds_identity = socket_identity(&uds_path)?;
     info!("Unix socket listener bound to {:?}", uds_path);
 
     let tcp_state = state.clone();
@@ -2560,12 +2583,114 @@ pub async fn run(
         _ = uds_task => info!("Unix socket listener task ended"),
     }
 
-    if uds_path_for_cleanup.exists() {
-        info!("Cleaning up Unix socket at {:?}", uds_path_for_cleanup);
-        let _ = std::fs::remove_file(&uds_path_for_cleanup);
-    }
+    remove_owned_uds(&uds_path_for_cleanup, uds_identity);
 
     Ok(())
+}
+
+fn acquire_uds_lock(uds_path: &std::path::Path) -> Result<File> {
+    let mut lock_name = uds_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+
+    lock_uds_file(&lock, uds_path)?;
+    Ok(lock)
+}
+
+#[cfg(not(target_os = "solaris"))]
+fn lock_uds_file(lock: &File, uds_path: &std::path::Path) -> Result<()> {
+    // flock is tied to the open file description, so holding `lock` for the
+    // lifetime of `run` serializes socket inspection, removal, and binding.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "Another brainrouter instance is using Unix socket {}",
+                uds_path.display()
+            );
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "solaris")]
+fn lock_uds_file(_lock: &File, uds_path: &std::path::Path) -> Result<()> {
+    anyhow::bail!(
+        "Unix socket startup locking is not supported on Solaris for {}",
+        uds_path.display()
+    )
+}
+
+fn socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if (metadata.dev(), metadata.ino()) != expected {
+        warn!(
+            path = %path.display(),
+            "Skipping Unix socket cleanup because the path is now owned by another socket"
+        );
+        return;
+    }
+    info!("Cleaning up Unix socket at {:?}", path);
+    if let Err(error) = std::fs::remove_file(path) {
+        warn!(path = %path.display(), error = %error, "Failed to clean up Unix socket");
+    }
+}
+
+async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(uds_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!(
+            "Refusing to replace non-socket path at {}",
+            uds_path.display()
+        );
+    }
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        UnixStream::connect(uds_path),
+    )
+    .await
+    {
+        Ok(Ok(_)) => anyhow::bail!(
+            "Another brainrouter instance is already listening at {}",
+            uds_path.display()
+        ),
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            info!("Removing stale Unix socket at {:?}", uds_path);
+            std::fs::remove_file(uds_path)?;
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => anyhow::bail!(
+            "Timed out probing existing Unix socket at {}",
+            uds_path.display()
+        ),
+    }
 }
 
 
@@ -2632,7 +2757,10 @@ mod tests {
     #[test]
     fn write_omp_preserves_other_providers() {
         // Create a temp dir to simulate ~/.omp/agent/
-        let tmp = std::env::temp_dir().join(format!("brainrouter-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "brainrouter-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         let agent_dir = tmp.join(".omp/agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let models_file = agent_dir.join("models.yml");
@@ -2663,5 +2791,107 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn malformed_omp_models_file_is_not_replaced() {
+        let tmp = std::env::temp_dir().join(format!(
+            "brainrouter-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent_dir = tmp.join(".omp/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let models_file = agent_dir.join("models.yml");
+        let original = "providers: [invalid\n";
+        std::fs::write(&models_file, original).unwrap();
+
+        let result = write_omp_models_yml(
+            tmp.to_str().unwrap(),
+            &["model-a".to_string()],
+            "127.0.0.1:9099",
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&models_file).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn invalid_llama_swap_model_payload_is_rejected() {
+        assert!(parse_llama_swap_model_ids(&serde_json::json!({})).is_err());
+        assert!(parse_llama_swap_model_ids(&serde_json::json!({
+            "data": [{"id": "model-a"}, {"name": "missing-id"}]
+        }))
+        .is_err());
+        assert_eq!(
+            parse_llama_swap_model_ids(&serde_json::json!({
+                "data": [{"id": "model-a"}, {"id": "model-b"}]
+            }))
+            .unwrap(),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_uds_is_not_unlinked() {
+        let dir = PathBuf::from(format!("/tmp/br-uds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("brainrouter.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error = prepare_uds_path(&socket_path).await.unwrap_err();
+        assert!(error.to_string().contains("already listening"));
+        assert!(UnixStream::connect(&socket_path).await.is_ok());
+
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stale_uds_is_removed_before_binding() {
+        let dir = PathBuf::from(format!("/tmp/br-uds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("brainrouter.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        prepare_uds_path(&socket_path).await.unwrap();
+        assert!(!socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    #[test]
+    fn uds_lock_rejects_a_second_owner() {
+        let path = PathBuf::from(format!("/tmp/br-uds-{}.sock", uuid::Uuid::new_v4()));
+        let first = acquire_uds_lock(&path).unwrap();
+        let second = acquire_uds_lock(&path);
+        assert!(second.is_err());
+
+        drop(first);
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock_name));
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_unlink_replaced_socket() {
+        let dir = PathBuf::from(format!("/tmp/br-uds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("brainrouter.sock");
+        let first = UnixListener::bind(&socket_path).unwrap();
+        let first_identity = socket_identity(&socket_path).unwrap();
+        drop(first);
+        std::fs::remove_file(&socket_path).unwrap();
+
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        remove_owned_uds(&socket_path, first_identity);
+        assert!(UnixStream::connect(&socket_path).await.is_ok());
+
+        drop(replacement);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

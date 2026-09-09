@@ -92,6 +92,11 @@ pub async fn run_loop(
                 escalation_reason = Some(EscalationReason::LlmError);
                 feedback = format!("LLM error: {}", e);
 
+                session_history.push(format!(
+                    "Iteration {}:\nStatus: {}\nFeedback: {}",
+                    iteration_count, status, feedback
+                ));
+
                 sessions.update_session(
                     session_id,
                     SessionUpdate {
@@ -122,6 +127,11 @@ pub async fn run_loop(
                             "LLM returned review decision"
                         );
 
+                        session_history.push(format!(
+                            "Iteration {}:\nStatus: {}\nFeedback: {}",
+                            iteration_count, status, feedback
+                        ));
+
                         sessions.update_session(
                             session_id,
                             SessionUpdate {
@@ -138,11 +148,6 @@ pub async fn run_loop(
                             },
                         );
 
-                        session_history.push(format!(
-                            "Iteration {}:\nStatus: {}\nFeedback: {}",
-                            iteration_count, status, feedback
-                        ));
-
                         if matches!(status, ReviewStatus::Approved | ReviewStatus::Escalated) {
                             break;
                         }
@@ -157,6 +162,10 @@ pub async fn run_loop(
                             status = ReviewStatus::Escalated;
                             escalation_reason = Some(EscalationReason::LlmError);
                             feedback = format!("Failed to parse LLM response: {}", e);
+                            session_history.push(format!(
+                                "Iteration {}:\nStatus: {}\nFeedback: {}",
+                                iteration_count, status, feedback
+                            ));
 
                             sessions.update_session(
                                 session_id,
@@ -366,9 +375,10 @@ fn parse_llm_response(text: &str) -> Result<LlmReviewResponse> {
         return Ok(resp);
     }
 
+    let preview: String = text.chars().take(500).collect();
     Err(anyhow::anyhow!(
         "Could not parse JSON from LLM response: truncated or malformed. First 500 chars: {}",
-        &text[..text.len().min(500)]
+        preview
     ))
 }
 
@@ -471,5 +481,17 @@ fn map_status(s: &str) -> ReviewStatus {
         "approved" => ReviewStatus::Approved,
         "needs_revision" => ReviewStatus::NeedsRevision,
         _ => ReviewStatus::Escalated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_unicode_response_returns_error_without_panicking() {
+        let text = format!("{}é malformed", "x".repeat(499));
+        let error = parse_llm_response(&text).unwrap_err();
+        assert!(error.to_string().contains("Could not parse JSON"));
     }
 }

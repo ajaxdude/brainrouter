@@ -6,11 +6,10 @@ use bytes::Bytes;
 use futures_util::{pin_mut, stream, StreamExt};
 use tokio::time;
 
-/// OpenAI keepalive is a real `data:` SSE frame carrying a newline delta —
-/// the SDK yields it to the application-level iterator (SDK silently drops
-/// comment lines and some SDK versions filter zero-length content).
+/// OpenAI keepalive is a role-only `data:` SSE frame. The SDK yields it to the
+/// application-level iterator without adding generated content.
 const KEEPALIVE_OPENAI: &[u8] =
-    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null}]}\n\n";
+    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
 
 /// Anthropic keepalive is an SSE comment line — Anthropic SDK and OMP treat
 /// comment lines as ignorable heartbeats.
@@ -30,6 +29,12 @@ async fn keepalive_emits_openai_frame_when_idle() {
 
     let chunk = ka.next().await.expect("expected Some").expect("expected Ok");
     assert_eq!(chunk.as_ref(), KEEPALIVE_OPENAI, "expected OpenAI keepalive frame");
+    let payload = std::str::from_utf8(&chunk).unwrap()
+        .strip_prefix("data: ")
+        .unwrap()
+        .trim();
+    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert!(json["choices"][0]["delta"].get("content").is_none());
 }
 
 /// Anthropic-format idle stream emits SSE comment.

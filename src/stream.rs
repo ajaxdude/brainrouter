@@ -213,12 +213,10 @@ const KEEPALIVE_ANTHROPIC: &[u8] = b": ping\n\n";
 /// We must emit a valid `data:` frame that the SDK will parse into a
 /// `ChatCompletionChunk` and yield, which resets OMP's idle watchdog.
 ///
-/// A newline delta is used instead of empty string: some SDK versions filter
-/// zero-length content before yielding, causing the keepalive to be invisible
-/// to the idle timer. The cost: the newline is real content, so a long idle
-/// pause inserts a stray blank line into the accumulated response output.
+/// A role-only delta is observable to the iterator but carries no generated
+/// content, so keepalives cannot alter source code or structured output.
 const KEEPALIVE_OPENAI: &[u8] =
-    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null}]}\n\n";
+    b"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
 
 /// A stream wrapper that emits a periodic keepalive frame while the inner stream
 /// is idle (`Poll::Pending`). Once the inner stream yields data or terminates this

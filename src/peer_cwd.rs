@@ -36,6 +36,10 @@ pub fn cwd_from_pid(pid: i32) -> Option<String> {
 /// Returns the socket inode number.
 fn find_inode_for_client_port(client_port: u16, path: &str) -> Option<u64> {
     let data = std::fs::read_to_string(path).ok()?;
+    find_inode_in_table(client_port, &data)
+}
+
+fn find_inode_in_table(client_port: u16, data: &str) -> Option<u64> {
     for line in data.lines().skip(1) {
         // Fields are whitespace-separated; split_ascii_whitespace handles variable spacing.
         let mut cols = line.split_ascii_whitespace();
@@ -49,8 +53,10 @@ fn find_inode_for_client_port(client_port: u16, path: &str) -> Option<u64> {
             .and_then(|s| u16::from_str_radix(s, 16).ok())?;
 
         if local_port == client_port {
-            // Skip: st tx_queue rx_queue tr tm->when retrnsmt uid timeout
-            for _ in 0..7 { cols.next(); }
+            // Skip: st, tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout.
+            for _ in 0..6 {
+                cols.next()?;
+            }
             let inode_str = cols.next()?;
             return inode_str.parse::<u64>().ok();
         }
@@ -94,4 +100,36 @@ fn find_cwd_for_inode(inode: u64) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str =
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+    #[test]
+    fn parses_ipv4_socket_inode_column() {
+        let table = format!(
+            "{HEADER}   0: 0100007F:C350 0100007F:238B 01 00000000:00000000 02:00000000 00000000  1000 0 424242 2 0000000000000000\n"
+        );
+        assert_eq!(find_inode_in_table(0xC350, &table), Some(424242));
+    }
+
+    #[test]
+    fn parses_ipv6_socket_inode_column() {
+        let table = format!(
+            "{HEADER}  12: 00000000000000000000000001000000:ABCD 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 987654 1 0000000000000000\n"
+        );
+        assert_eq!(find_inode_in_table(0xABCD, &table), Some(987654));
+    }
+
+    #[test]
+    fn ignores_non_matching_ports() {
+        let table = format!(
+            "{HEADER}   0: 0100007F:C350 0100007F:238B 01 00000000:00000000 02:00000000 00000000  1000 0 424242\n"
+        );
+        assert_eq!(find_inode_in_table(0xC351, &table), None);
+    }
 }

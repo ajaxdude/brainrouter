@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Decision returned by the classifier for an incoming request.
 #[derive(Debug, Clone)]
@@ -37,6 +38,8 @@ pub enum BudgetTier {
 const CLASSIFY_MAX_TOKENS: usize = 10;
 /// Truncate the user message to this many characters before classifying.
 const USER_MSG_TRUNCATE: usize = 800;
+const CLASSIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLASSIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// External Bonsai classifier. Sends prompts to a running llama-server process.
 pub struct Classifier {
@@ -47,6 +50,7 @@ pub struct Classifier {
     default_local_model: String,
     /// Shared HTTP client.
     http: Client,
+    request_timeout: Duration,
     /// Shared "Bonsai server is on" flag. When the dashboard stops the
     /// llama-server this is cleared and classification skips HTTP, returning
     /// the local default directly (no cloud hop).
@@ -72,10 +76,32 @@ impl Classifier {
         nudge_enabled: Arc<AtomicBool>,
         nudge_model_key: Option<String>,
     ) -> Self {
+        Self::with_timeout(
+            server_url,
+            default_local_model,
+            enabled,
+            nudge_enabled,
+            nudge_model_key,
+            CLASSIFY_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn with_timeout(
+        server_url: String,
+        default_local_model: String,
+        enabled: Arc<AtomicBool>,
+        nudge_enabled: Arc<AtomicBool>,
+        nudge_model_key: Option<String>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             server_url,
             default_local_model,
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(CLASSIFY_CONNECT_TIMEOUT)
+                .build()
+                .expect("Failed to build classifier HTTP client"),
+            request_timeout,
             enabled,
             nudge_enabled,
             nudge_model_key,
@@ -111,14 +137,13 @@ impl Classifier {
         let http = self.http.clone();
         let result = http
             .post(format!("{}/v1/chat/completions", server_url))
+            .timeout(self.request_timeout)
             .json(&ChatCompletionInput {
                 model: "bonsai".to_string(),
                 messages: vec![
                     ChatMessageInput {
                         role: "system".to_string(),
-                        content: format!(
-                            "You are a routing classifier. Reply with exactly one word: \"cloud\" for complex tasks that need the cloud (large architecture, multi-system debugging, heavy refactoring), \"local\" for simple tasks (short answers, simple questions, single-line code, quick explanations), or \"deep\" for complex tasks that should still run locally (focused multi-step reasoning, moderate debugging). Output nothing else."
-                        ),
+                        content: "You are a routing classifier. Reply with exactly one word: \"cloud\" for complex tasks that need the cloud (large architecture, multi-system debugging, heavy refactoring), \"local\" for simple tasks (short answers, simple questions, single-line code, quick explanations), or \"deep\" for complex tasks that should still run locally (focused multi-step reasoning, moderate debugging). Output nothing else.".to_string(),
                     },
                     ChatMessageInput {
                         role: "user".to_string(),
@@ -137,7 +162,8 @@ impl Classifier {
                 chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
             })
             .send()
-            .await;
+            .await
+            .and_then(reqwest::Response::error_for_status);
 
         let raw = match result {
             Ok(resp) => match resp.text().await {
@@ -282,6 +308,7 @@ struct Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChatMessage;
 
     #[test]
     fn parse_cloud() {
@@ -307,5 +334,46 @@ mod tests {
         assert!(matches!(parse_decision("Deep"), ParsedDecision::Deep));
         assert!(matches!(parse_decision("  deep"), ParsedDecision::Deep));
         assert!(matches!(parse_decision("d"), ParsedDecision::Deep));
+    }
+
+    #[tokio::test]
+    async fn stalled_classifier_request_defaults_to_cloud_within_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let classifier = Classifier::with_timeout(
+            format!("http://{addr}"),
+            "local-model".to_string(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Duration::from_millis(50),
+        );
+        let request = ChatCompletionRequest {
+            model: "auto".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(serde_json::Value::String("hello".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: Some(true),
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            extra: serde_json::Value::Object(serde_json::Map::new()),
+        };
+
+        assert!(matches!(
+            classifier.classify_async(request).await,
+            RoutingDecision::Cloud
+        ));
+        server.abort();
     }
 }
