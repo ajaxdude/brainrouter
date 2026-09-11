@@ -75,6 +75,9 @@ pub struct InflightRow {
     pub bytes_received: u64,
     pub activity: &'static str,
     pub pp_progress: f64,
+    pub generated_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,8 +97,12 @@ pub struct InflightEntry {
     pub conv_id: String,
     pub bytes_received: AtomicU64,
     pub activity: AtomicU8,
-    /// PP progress fraction (0.0..=1.0) stored as f64 bits.
+    /// Prompt-prefill progress fraction (0.0..=1.0) stored as f64 bits.
     pub pp_progress: AtomicU64,
+    /// Output tokens decoded for the active request.
+    pub generated_tokens: AtomicU64,
+    /// Requested or slot-reported output-token ceiling; zero means unknown.
+    pub max_tokens: AtomicU64,
     cancelled: AtomicBool,
     started_ms: AtomicU64,
 }
@@ -208,6 +215,11 @@ impl InflightRegistry {
                 bytes_received: e.bytes_received.load(AtomicOrdering::Relaxed),
                 activity: activity_label(e.activity.load(AtomicOrdering::Relaxed)),
                 pp_progress: f64::from_bits(e.pp_progress.load(AtomicOrdering::Relaxed)),
+                generated_tokens: e.generated_tokens.load(AtomicOrdering::Relaxed),
+                max_tokens: match e.max_tokens.load(AtomicOrdering::Relaxed) {
+                    0 => None,
+                    value => Some(value),
+                },
             })
             .collect()
     }
@@ -224,17 +236,35 @@ impl InflightRegistry {
         }
     }
 
-    /// Feed llama-server /slots PP progress onto every in-flight row whose
-    /// resolved model matches `model`. Called by a daemon poller; no-op when
-    /// the active model doesn't match or the build exposes no /slots.
-    pub fn set_pp_progress_for_model(&self, model: &str, frac: f64) {
+    /// Feed llama-server /slots progress onto in-flight rows whose resolved
+    /// model matches `model`. Values are monotonic for the lifetime of a row.
+    pub fn set_slot_progress_for_model(
+        &self,
+        model: &str,
+        prefill_progress: Option<f64>,
+        generated_tokens: u64,
+        slot_max_tokens: Option<u64>,
+    ) {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let frac = frac.clamp(0.0, 1.0);
         for e in entries.iter() {
             let m = e.model.lock().unwrap_or_else(|e| e.into_inner());
-            if m.as_str() == model {
-                drop(m);
-                e.pp_progress.store(frac.to_bits(), AtomicOrdering::Relaxed);
+            if m.as_str() != model {
+                continue;
+            }
+            drop(m);
+            if let Some(frac) = prefill_progress {
+                let frac = frac.clamp(0.0, 1.0);
+                let current = f64::from_bits(e.pp_progress.load(AtomicOrdering::Relaxed));
+                e.pp_progress.store(current.max(frac).to_bits(), AtomicOrdering::Relaxed);
+            }
+            e.generated_tokens.fetch_max(generated_tokens, AtomicOrdering::Relaxed);
+            if let Some(max_tokens) = slot_max_tokens.filter(|value| *value > 0) {
+                let _ = e.max_tokens.compare_exchange(
+                    0,
+                    max_tokens,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                );
             }
         }
     }
@@ -254,6 +284,7 @@ impl InflightRegistry {
         session_id: String,
         conv_id: String,
         bytes_received: u64,
+        max_tokens: Option<u32>,
     ) -> Arc<InflightHandle> {
         let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
         let (tx, _rx) = watch::channel(false);
@@ -268,6 +299,8 @@ impl InflightRegistry {
             bytes_received: AtomicU64::new(bytes_received),
             activity: AtomicU8::new(ACT_PREFILLING),
             pp_progress: AtomicU64::new(0f64.to_bits()),
+            generated_tokens: AtomicU64::new(0),
+            max_tokens: AtomicU64::new(max_tokens.unwrap_or(0) as u64),
             cancelled: AtomicBool::new(false),
             started_ms: AtomicU64::new(now_ms()),
         });
@@ -396,8 +429,8 @@ mod tests {
     #[tokio::test]
     async fn registry_lists_and_cancels_rows() {
         let reg = Arc::new(InflightRegistry::new());
-        let h1 = reg.register("POST /v1/chat/completions".into(), "qwen".into(), "ua".into(), "127.0.0.1:1234".into(), "sess".into(), "conv".into(), 1234);
-        let h2 = reg.register("POST /v1/messages".into(), "qwen".into(), "ua".into(), "::1".into(), "sess2".into(), "conv2".into(), 7);
+        let h1 = reg.register("POST /v1/chat/completions".into(), "qwen".into(), "ua".into(), "127.0.0.1:1234".into(), "sess".into(), "conv".into(), 1234, None);
+        let h2 = reg.register("POST /v1/messages".into(), "qwen".into(), "ua".into(), "::1".into(), "sess2".into(), "conv2".into(), 7, None);
         assert!(reg.cancel(h1.id()));
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2);
@@ -412,20 +445,23 @@ mod tests {
     #[tokio::test]
     async fn handle_updates_are_visible_in_snapshot() {
         let reg = Arc::new(InflightRegistry::new());
-        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0);
+        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0, None);
         h.set_activity(ACT_TOOL);
         h.add_bytes(12345);
         h.set_pp_progress(0.25);
+        reg.set_slot_progress_for_model("m", Some(0.5), 40, Some(200));
         let rows = reg.json()["requests"].as_array().unwrap().clone();
         assert_eq!(rows[0]["activity"].as_str().unwrap(), "tool calling");
         assert_eq!(rows[0]["bytes_received"].as_u64().unwrap(), 12345);
-        assert_eq!(rows[0]["pp_progress"].as_f64().unwrap(), 0.25);
+        assert_eq!(rows[0]["pp_progress"].as_f64().unwrap(), 0.5);
+        assert_eq!(rows[0]["generated_tokens"].as_u64().unwrap(), 40);
+        assert_eq!(rows[0]["max_tokens"].as_u64().unwrap(), 200);
     }
 
     #[tokio::test]
     async fn cancel_ended_stream_stops_stream() {
         let reg = Arc::new(InflightRegistry::new());
-        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0);
+        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0, None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Result<Bytes>>();
         let mut s = SniffStream::new(UnboundedReceiverStream::new(rx), Arc::clone(&h));
         tx.send(Ok(Bytes::from("data: hello\n\n"))).unwrap();
@@ -443,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn sniff_detects_tool_reasoning_asking_with_sticky_priority() {
         let reg = Arc::new(InflightRegistry::new());
-        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0);
+        let h = reg.register("POST /x".into(), "m".into(), "ua".into(), "127.0.0.1:1".into(), "s".into(), "c".into(), 0, None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Result<Bytes>>();
         let mut s = SniffStream::new(UnboundedReceiverStream::new(rx), Arc::clone(&h));
         tx.send(Ok(Bytes::from("{\"tool_calls\":[]}"))).unwrap();
@@ -458,8 +494,8 @@ mod tests {
     #[tokio::test]
     async fn stale_entries_are_swept_on_read() {
         let reg = Arc::new(InflightRegistry::new());
-        let h1 = reg.register("POST /a".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1);
-        let h2 = reg.register("POST /b".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1);
+        let h1 = reg.register("POST /a".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1, None);
+        let h2 = reg.register("POST /b".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1, None);
         // Age the first entry past the sweep threshold and re-read: the
         // stale row must be swept on the next read, leaving h2.
         h1.entry.started_ms.store(0, AtomicOrdering::Relaxed);
@@ -471,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_handle_removes_row() {
         let reg = Arc::new(InflightRegistry::new());
-        let h = reg.register("POST /a".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1);
+        let h = reg.register("POST /a".into(), "m".into(), "ua".into(), "1".into(), "s".into(), "c".into(), 1, None);
         assert_eq!(reg.snapshot().len(), 1);
         drop(h);
         assert_eq!(reg.snapshot().len(), 0);

@@ -284,28 +284,28 @@ impl Router {
 
         let tracker = &self.inference_tracker;
         let max_tokens = request.max_tokens;
-        let (bonsai_decision, result) = match requested_model.as_str() {
+        let (bonsai_decision, routing_class, result) = match requested_model.as_str() {
             // Managed local token: route to the local/fallback model, rewrite prompt.
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
                 tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
                 request.messages = self.maybe_rewrite_local(request.messages);
                 request.model = self.fallback_model.clone();
-                ("local-direct", self.route_local(request, true).await)
+                ("local-direct", "local", self.route_local(request, true).await)
             }
             // Direct cloud: skip Bonsai, go straight to Manifest
             "cloud" | "brainrouter/cloud" => {
                 info!("Direct cloud mode — routing to Manifest");
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                ("cloud-direct", self.route_cloud(request).await)
+                ("cloud-direct", "cloud", self.route_cloud(request).await)
             }
             model if model.starts_with("cloud/") => {
                 let model = model.strip_prefix("cloud/").unwrap();
                 crate::routing_profile::validate_model_id(model)?;
                 request.model = model.to_string();
                 tracker.set(Phase::CloudWaiting, Some(model.into()), Some("Manifest".into()), max_tokens);
-                ("cloud-direct", self.route_cloud(request).await)
+                ("cloud-direct", "cloud", self.route_cloud(request).await)
             }
             // Managed routing: Bonsai classify + subs pool. Only these tokens get
             // nudge/bonsai/subs treatment. Direct model keys are authoritative.
@@ -319,7 +319,7 @@ impl Router {
                         info!(model = %subs, "Subs pool routing — direct to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
                         request.model = subs;
-                        ("local-subs", self.route_local(request, false).await)
+                        ("local-subs", "local · subs", self.route_local(request, false).await)
                     } else {
                         warn!("Subs pool requested but llama_swap.subs_model is not configured — falling back to auto");
                         self.route_auto(request, tracker, max_tokens).await
@@ -332,7 +332,7 @@ impl Router {
                         info!(model = specific, "Direct model mode — routing to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
                         request.model = specific.to_string();
-                        ("local-specific", self.route_local(request, false).await)
+                        ("local-specific", "local · selected model", self.route_local(request, false).await)
                     } else {
                         // Empty suffix, treat as auto — fall through to Bonsai
                         self.route_auto(request, tracker, max_tokens).await
@@ -344,7 +344,7 @@ impl Router {
                     info!(model = %requested_model, "Known local model — routing directly to llama-swap");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
                     // request.model is already correct (it's the llama-swap model key)
-                    ("local-specific", self.route_local(request, false).await)
+                    ("local-specific", "local · selected model", self.route_local(request, false).await)
                 } else {
                     // A named model that isn't a reserved routing token (auto/local/
                     // cloud/subs). The user picked it explicitly — route Local directly
@@ -352,7 +352,7 @@ impl Router {
                     // without a classifier hop; works even when Bonsai is off.
                     info!(model = %requested_model, "Named model — routing directly to llama-swap");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    ("local-specific", self.route_local(request, false).await)
+                    ("local-specific", "local · selected model", self.route_local(request, false).await)
                 }
             }
         };
@@ -385,6 +385,7 @@ impl Router {
                         success: false,
                         error: f.error.clone(),
                         bonsai_decision,
+                        routing_class,
                         cwd: cwd.clone(),
                         session_id: session_id.clone(),
                         user_agent: user_agent.clone(),
@@ -405,6 +406,7 @@ impl Router {
                     success: true,
                     error: String::new(),
                     bonsai_decision,
+                    routing_class,
                     cwd: cwd.clone(),
                     session_id: session_id.clone(),
                     user_agent: user_agent.clone(),
@@ -436,6 +438,7 @@ impl Router {
                     success: false,
                     error: e.to_string(),
                     bonsai_decision,
+                    routing_class,
                     cwd,
                     session_id: session_id.clone(),
                     user_agent,
@@ -451,28 +454,30 @@ impl Router {
     }
 
     /// Auto path: consult the Bonsai classifier and route Cloud or Local.
-    /// Returns the (decision tag, result) pair consumed by `route_tagged`.
+    /// Returns the internal decision tag, dashboard label, and provider result.
     async fn route_auto(
         &self,
         mut request: ChatCompletionRequest,
         tracker: &Arc<InferenceTracker>,
         max_tokens: Option<u32>,
-    ) -> (&'static str, Result<(ProviderResponse, RouteInfo)>) {
+    ) -> (&'static str, &'static str, Result<(ProviderResponse, RouteInfo)>) {
         tracker.set(Phase::Classifying, None, None, max_tokens);
+        let used_bonsai = self.classifier.is_enabled();
         let decision = self.classifier.classify_async(request.clone()).await;
         info!(?decision, "Bonsai routing decision");
         match decision {
             RoutingDecision::Cloud => {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                ("cloud", self.route_cloud(request).await)
+                ("cloud", "bonsai → cloud", self.route_cloud(request).await)
             }
             RoutingDecision::Local { model, tier } => {
                 tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
                 request.model = model;
                 request.messages = self.maybe_rewrite_local(request.messages);
                 self.inject_nudge_budget(&mut request, tier);
-                ("local", self.route_local(request, true).await)
+                let routing_class = if used_bonsai { "bonsai → local" } else { "auto → local" };
+                ("local", routing_class, self.route_local(request, true).await)
             }
         }
     }
@@ -1381,6 +1386,7 @@ mod tests {
             success: true,
             error: String::new(),
             bonsai_decision: "local",
+            routing_class: "bonsai → local",
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
@@ -1410,6 +1416,7 @@ mod tests {
             success: true,
             error: String::new(),
             bonsai_decision: "local",
+            routing_class: "bonsai → local",
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),

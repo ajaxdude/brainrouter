@@ -64,6 +64,11 @@ pub struct Classifier {
 }
 
 impl Classifier {
+    /// Whether auto requests currently consult the Bonsai model.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     /// Create a classifier pointing at the external Bonsai llama-server.
     /// `enabled` is the shared flag flipped by `BonsaiControl` when the
     /// server is started or stopped at runtime. `nudge_enabled` is the

@@ -25,10 +25,18 @@ use brainrouter::{
     session::SessionManager,
 };
 
+/// Progress exposed by the active llama-server slot.
+#[derive(Debug, Clone, PartialEq)]
+struct SlotProgress {
+    model: String,
+    prefill_progress: Option<f64>,
+    generated_tokens: u64,
+    max_tokens: Option<u64>,
+}
+
 /// Poll llama-swap /running for the active llama-server proxy, then its /slots
-/// array for prefill progress (n_prompt_processed / n_prompt_tokens). Returns
-/// None when the build exposes no /slots or nothing is prefilling.
-async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<(f64, String)> {
+/// array for prompt-prefill and generation progress.
+async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<SlotProgress> {
     let running = client.get(format!("{}/running", ls_url))
         .timeout(std::time::Duration::from_secs(3))
         .send().await.ok()?
@@ -39,17 +47,55 @@ async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<(f64, Str
         .timeout(std::time::Duration::from_secs(3))
         .send().await.ok()?
         .json::<serde_json::Value>().await.ok()?;
-    let arr = slots.as_array()?;
+    parse_slot_progress(&slots, active_model)
+}
+
+fn parse_slot_progress(slots: &serde_json::Value, model: String) -> Option<SlotProgress> {
+    let arr = slots.as_array().or_else(|| slots.get("slots")?.as_array())?;
+    let mut best: Option<(u64, SlotProgress)> = None;
     for slot in arr {
+        let processing = slot.get("is_processing").and_then(|v| v.as_bool()).unwrap_or(false);
         let total = slot.get("n_prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let processed = slot.get("n_prompt_processed")
             .or_else(|| slot.get("n_prompt_tokens_processed"))
             .and_then(|v| v.as_u64()).unwrap_or(0);
-        if total > 0 {
-            return Some(((processed as f64 / total as f64).clamp(0.0, 1.0), active_model));
+        let next_token = slot.get("next_token").and_then(|value| {
+            if value.is_array() { value.as_array()?.first() } else { Some(value) }
+        });
+        let generated_tokens = slot.get("n_decoded")
+            .and_then(|v| v.as_u64())
+            .or_else(|| next_token.and_then(|value| value.get("n_decoded")).and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        if !processing && generated_tokens == 0 {
+            continue;
+        }
+        let remaining = next_token
+            .and_then(|value| value.get("n_remain"))
+            .and_then(|v| v.as_i64())
+            .filter(|value| *value >= 0)
+            .map(|value| value as u64);
+        let configured_max = slot.pointer("/params/n_predict")
+            .and_then(|v| v.as_i64())
+            .filter(|value| *value > 0)
+            .map(|value| value as u64);
+        let max_tokens = remaining.map(|value| generated_tokens.saturating_add(value)).or(configured_max);
+        let prefill_progress = if generated_tokens == 0 && total > 0 {
+            Some((processed as f64 / total as f64).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        let score = generated_tokens.saturating_mul(1_000_000).saturating_add(processed);
+        let progress = SlotProgress {
+            model: model.clone(),
+            prefill_progress,
+            generated_tokens,
+            max_tokens,
+        };
+        if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            best = Some((score, progress));
         }
     }
-    None
+    best.map(|(_, progress)| progress)
 }
 
 /// Arguments for the `serve` subcommand.
@@ -302,9 +348,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         });
     }
-    // Background task: feed the active llama-server's PP progress into the
-    // in-flight registry so the dashboard progress bar tracks prefill. The
-    // ds4 build exposes no /slots, so this gracefully no-ops there.
+    // Background task: feed the active llama-server's prefill and generation
+    // progress into the in-flight registry. Builds without /slots no-op.
     {
         let ls_url = state.llama_swap_url.clone();
         let inflight = Arc::clone(&state.inflight);
@@ -312,10 +357,15 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             let client = reqwest::Client::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let Some((frac, model)) = fetch_slots(&client, &ls_url).await else {
+                let Some(progress) = fetch_slots(&client, &ls_url).await else {
                     continue;
                 };
-                inflight.set_pp_progress_for_model(&model, frac);
+                inflight.set_slot_progress_for_model(
+                    &progress.model,
+                    progress.prefill_progress,
+                    progress.generated_tokens,
+                    progress.max_tokens,
+                );
             }
         });
     }
@@ -348,4 +398,47 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     server::run(tcp_addr, socket, state).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod slot_progress_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_prefill_progress() {
+        let slots = json!([{
+            "is_processing": true,
+            "n_prompt_tokens": 100,
+            "n_prompt_processed": 40,
+            "next_token": {"n_decoded": 0}
+        }]);
+        let progress = parse_slot_progress(&slots, "model-a".into()).unwrap();
+        assert_eq!(progress.model, "model-a");
+        assert_eq!(progress.prefill_progress, Some(0.4));
+        assert_eq!(progress.generated_tokens, 0);
+    }
+
+    #[test]
+    fn parses_generation_progress_and_limit() {
+        let slots = json!({"slots": [{
+            "is_processing": true,
+            "n_prompt_tokens": 100,
+            "next_token": [{"n_decoded": 24, "n_remain": 76}]
+        }]});
+        let progress = parse_slot_progress(&slots, "model-b".into()).unwrap();
+        assert_eq!(progress.prefill_progress, None);
+        assert_eq!(progress.generated_tokens, 24);
+        assert_eq!(progress.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn ignores_idle_slots() {
+        let slots = json!([{
+            "is_processing": false,
+            "n_prompt_tokens": 100,
+            "next_token": {"n_decoded": 0}
+        }]);
+        assert!(parse_slot_progress(&slots, "model".into()).is_none());
+    }
 }

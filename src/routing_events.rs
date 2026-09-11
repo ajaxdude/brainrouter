@@ -51,8 +51,10 @@ pub struct RouteEvent {
     pub success: bool,
     /// Error description (empty on success).
     pub error: String,
-    /// "cloud" or "local" — what Bonsai decided for this request.
+    /// Internal routing tag used by aggregate statistics and stage derivation.
     pub bonsai_decision: &'static str,
+    /// Human-readable reason the route was selected, shown in the dashboard.
+    pub routing_class: &'static str,
     /// Working directory of the OMP process that sent this request.
     /// Empty string when the cwd cannot be resolved (e.g. UDS connections).
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -328,6 +330,7 @@ mod tests {
             success: true,
             error: String::new(),
             bonsai_decision: "local",
+            routing_class: "bonsai → local",
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),

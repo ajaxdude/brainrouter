@@ -52,6 +52,14 @@ textarea { resize: vertical; }
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
+@keyframes brIndeterminate {
+  0% { transform: translateX(-140%); }
+  100% { transform: translateX(440%); }
+}
+.br-progress-indeterminate {
+  width: 24% !important;
+  animation: brIndeterminate 1.25s ease-in-out infinite !important;
+}
 .shimmer-bar {
   position: absolute; top: 0; left: 0; right: 0; height: 2px;
   background: linear-gradient(90deg, transparent, rgba(34,211,154,0.4), transparent);
@@ -406,7 +414,7 @@ textarea { resize: vertical; }
         <div style="overflow-x:auto">
           <table id="inflight-table">
             <thead><tr>
-              <th></th><th>Elapsed</th><th>Model</th><th>Request</th><th>Activity</th><th>PP</th><th>Address</th><th>User Agent</th><th>Session</th><th>Bytes</th>
+              <th></th><th>Elapsed</th><th>Model</th><th>Request</th><th>Activity</th><th>Progress</th><th>Address</th><th>User Agent</th><th>Session</th><th>Bytes</th>
             </tr></thead>
             <tbody id="inflight-tbody"></tbody>
           </table>
@@ -558,11 +566,18 @@ function fmtUptime(secs) {
 function deriveSource(e) { return 'local'; }
 
 function deriveRoute(e) {
-  if (e.stage === 'cloud_primary') return e.bonsai_decision === 'cloud' ? 'cloud-direct' : 'cloud-auto';
-  if (e.stage === 'cloud_fallback') return 'cloud-fallback';
-  if (e.stage === 'local_primary') return 'local-auto';
-  if (e.stage === 'local_fallback') return 'local-auto';
-  return e.bonsai_decision === 'cloud' ? 'cloud-auto' : 'local-auto';
+  if (e.stage === 'cloud_fallback') return 'hybrid · cloud → local';
+  if (e.stage === 'local_fallback') return 'local · fallback';
+  if (e.routing_class) return e.routing_class;
+  switch (e.bonsai_decision) {
+    case 'cloud-direct': return 'cloud';
+    case 'local-direct': return 'local';
+    case 'local-subs': return 'local · subs';
+    case 'local-specific': return 'local · selected model';
+    case 'cloud': return 'bonsai → cloud';
+    case 'local': return 'auto → local';
+    default: return 'unknown';
+  }
 }
 
 function deriveStatus(e, sess, inf) {
@@ -843,69 +858,73 @@ function turnsOf(group) {
 
 // Progress percentage for a request card.
 //
-// Phase bands (so the bar always moves left-to-right):
-//   0–5%   : idle / error
-//   5–30%  : model loading (inf.state='loading', inf.progress=0–1)
-//   30%    : prefill in progress (local_processing, no decoded tokens yet)
-//   30–85% : generation (local_generating, inf.progress=n_decoded/max)
-//   55%    : generation running but max_tokens unknown
-//   75%    : cloud streaming
-//   90%    : review pending
-//   60%    : needs_revision / escalated
-//   100%   : done
+// Phase bands keep determinate progress moving left-to-right. When the
+// provider exposes no output ceiling, the bar is explicitly indeterminate
+// rather than pretending that generated tokens imply a completion percentage.
 function requestProgress(group, inf) {
-  const sess = group.session;
-  if (sess) {
-    if (sess.status === 'approved')       return 100;
-    if (sess.status === 'needs_revision') return 60;
-    if (sess.status === 'escalated')      return 60;
-    if (sess.status === 'pending')        return 90;  // inference done, review in flight
-  }
   const last = group.events[group.events.length - 1];
   if (!last) return 0;
   if (last.error) return 0;
 
-  // Live inference — check this BEFORE treating success=true as done.
-  // success=true is set when the provider *accepts* the request (stream starts),
-  // not when the full response is delivered.  If inference is still running,
-  // use the real live state.
   const liveState = inf && !['idle', 'ready'].includes(inf.state) ? inf.state : null;
-
-  if (!liveState && last.success) return 95;  // stream finished, nothing live
-
-  if (!liveState) return 5;  // error/stall before acceptance
-
-  const p = typeof inf.progress === 'number' ? inf.progress : null;  // 0.0–1.0 or null
-
-  switch (liveState) {
-    case 'loading':
-      // Model weight loading: 5–30%.
-      return 5 + (p !== null ? p * 25 : 0);
-
-    case 'local_processing':
-      // Prefill phase: GPU is processing the prompt, no tokens emitted yet.
-      return 30;
-
-    case 'local_generating':
-      // Token generation, 30–95%.  inf.progress is now the slot's *total*
-      // n_tokens / max_tokens (monotonic within the request), so the bar
-      // advances incrementally instead of sawtoothing.
-      if (p !== null) return Math.min(Math.round(30 + p * 65), 95);
-      return 30;
-
-    case 'local_waiting':  return 25;
-    case 'classifying':    return 10;
-    case 'cloud_waiting':  return 20;
-    case 'cloud_streaming':return 75;
-    default:               return 10;
+  if (liveState) {
+    const p = typeof inf.progress === 'number' ? inf.progress : null;
+    switch (liveState) {
+      case 'loading': return 5 + (p !== null ? p * 25 : 0);
+      case 'local_processing': return 30;
+      case 'local_generating': return p !== null ? Math.min(Math.round(30 + p * 65), 95) : 55;
+      case 'local_waiting': return 25;
+      case 'classifying': return 10;
+      case 'cloud_waiting': return 20;
+      case 'cloud_streaming': return 75;
+      default: return 10;
+    }
   }
+
+  const sess = group.session;
+  if (sess) {
+    if (sess.status === 'approved') return 100;
+    if (sess.status === 'needs_revision' || sess.status === 'escalated') return 60;
+    if (sess.status === 'pending') return 90;
+  }
+  return last.success ? 100 : 5;
 }
 
-function progressBar(pct, isLive, ppId) {
+function inflightProgress(r, inf) {
+  const generated = Number(r && r.generated_tokens) || 0;
+  const maxTokens = Number((r && r.max_tokens) || (inf && inf.max_tokens)) || 0;
+  if (generated > 0) {
+    if (maxTokens > 0) {
+      return { pct: Math.min(Math.round(30 + Math.min(generated / maxTokens, 1) * 65), 95), indeterminate: false };
+    }
+    return { pct: 55, indeterminate: true };
+  }
+
+  const pp = Number(r && r.pp_progress);
+  if (Number.isFinite(pp) && pp > 0) {
+    return { pct: Math.min(Math.round(5 + Math.min(pp, 1) * 25), 30), indeterminate: false };
+  }
+
+  const state = inf && inf.state;
+  const pct = state === 'loading' && typeof inf.progress === 'number'
+    ? 5 + inf.progress * 25
+    : state === 'classifying' ? 10
+    : state === 'cloud_waiting' ? 20
+    : state === 'local_waiting' ? 25
+    : state === 'local_processing' ? 30
+    : state === 'cloud_streaming' ? 75
+    : 30;
+  return { pct: Math.round(pct), indeterminate: state !== 'loading' || typeof inf.progress !== 'number' };
+}
+
+function progressBar(progress, isLive, requestId) {
+  const pct = Math.max(0, Math.min(100, progress.pct));
+  const indeterminate = !!progress.indeterminate;
   const color = isLive ? 'var(--green)' : (pct >= 100 ? 'var(--green)' : pct >= 70 ? 'var(--cyan)' : 'var(--textMute)');
-  const shimmer = isLive ? 'background-image:linear-gradient(90deg,transparent,rgba(34,211,154,0.35),transparent);background-size:200% 100%;animation:brShimmer 1.8s linear infinite;' : '';
-  return `<div${ppId != null ? ` data-pp-id="${ppId}"` : ''} style="height:3px;background:var(--border);border-radius:99px;overflow:hidden;margin:0 16px 0">
-    <div style="height:100%;width:${pct}%;background:${color};border-radius:99px;transition:width 0.4s;${shimmer}"></div>
+  const shimmer = isLive && !indeterminate ? 'background-image:linear-gradient(90deg,transparent,rgba(34,211,154,0.35),transparent);background-size:200% 100%;animation:brShimmer 1.8s linear infinite;' : '';
+  const cls = indeterminate ? ' class="br-progress-indeterminate"' : '';
+  return `<div${requestId != null ? ` data-progress-id="${requestId}"` : ''} style="height:3px;background:var(--border);border-radius:99px;overflow:hidden;margin:0 16px 0">
+    <div${cls} style="height:100%;width:${pct}%;background:${color};border-radius:99px;transition:width 0.4s;${shimmer}"></div>
   </div>`;
 }
 
@@ -960,7 +979,7 @@ function renderGroup(group, index) {
 
   // Live request matching this card (by conv_id or session_id).
   const infReq = inflightFor(group);
-  const st = deriveStatus(latest, sess, inferenceStatus);
+  const st = deriveStatus(latest, sess, infReq ? inferenceStatus : null);
   const isLive = !!infReq || ['generating','reviewing','routing','iterating'].includes(st);
   const src = SOURCES[latest._source] || SOURCES.local;
 
@@ -975,9 +994,9 @@ function renderGroup(group, index) {
 
   const folder = latest._folder || first._folder || '';
   const age    = fmtAge(group.latestTs);
-  const pct    = infReq
-    ? Math.max(2, Math.round((typeof infReq.pp_progress === 'number' ? infReq.pp_progress : 0) * 100))
-    : requestProgress(group, inferenceStatus);
+  const progress = infReq
+    ? inflightProgress(infReq, inferenceStatus)
+    : { pct: requestProgress(group, null), indeterminate: false };
 
   // Turns: a conversation group (conv_id) holds every harness turn; each one
   // renders as a nested sub-card.  A one-turn group renders flat, exactly as
@@ -1040,7 +1059,7 @@ function renderGroup(group, index) {
       <button onclick="dismissCard(${index})" title="Hide this card"
         style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
     </header>
-    ${progressBar(pct, isLive, infReq ? infReq.id : null)}
+    ${progressBar(progress, isLive, infReq ? infReq.id : null)}
     ${body}
     ${reviewHtml(sess, latest.id)}
   </article>`;
@@ -1049,10 +1068,8 @@ function renderGroup(group, index) {
 <script>
 // ─── Sankey SVG ───────────────────────────────────────────────────────────────
 // Four columns, built from raw routing events + review sessions:
-//   PROMPT → CLASSIFICATION → MODEL → REVIEWER
-// Prompts and reviews are separate flows: a review iteration is its own
-// prompt-source category, and the reviewer column only carries events that
-// belong to a review session. Clicking any bar filters the card list.
+//   HARNESS → SESSION → ROUTING DECISION → MODEL
+// Clicking any bar filters the card list to requests that crossed that node.
 
 const SK_COLS = [
   { name: 'harness', header: 'HARNESS', x: 16   },
@@ -1141,14 +1158,7 @@ function skSession(e) {
 // Col 2 — how the request got routed. routing_class comes from the server;
 // the fallback derives the same classes from the event when it is missing.
 function skRouting(e) {
-  if (e.routing_class) return e.routing_class;
-  if (e._route === 'cloud-fallback' || (e.stage || '').includes('fallback')) return 'failover';
-  const m = (e.requested_model || '').replace(/^brainrouter\//, '');
-  if (!m || m === 'auto') return 'auto';
-  if (m === 'cloud') return 'cloud';
-  if (m === 'local') return 'local single';
-  if (m === 'subs') return 'local group';
-  return 'named';
+  return e._route || deriveRoute(e);
 }
 
 // Col 3 — the model that served the request.
@@ -1174,7 +1184,12 @@ function skColorFor(col, key) {
   const map = {
     0: { 'omp': '#3ec5ff', 'pi': '#ff7ac6', 'claude': '#f5b14a', 'codex': '#22d39a', 'opencode': '#7dd3fc', 'droid': '#9d7bff', 'kimi': '#ff6b6b', 'review': '#a3e635', 'other': '#5a6679' },
     1: {},
-    2: { 'auto': '#3ec5ff', 'cloud': '#9d7bff', 'failover': '#ff6b6b', 'local group': '#22d39a', 'local single': '#7dd3fc', 'named': '#f5b14a' },
+    2: {
+      'bonsai → cloud': '#9d7bff', 'bonsai → local': '#3ec5ff',
+      'auto → local': '#7dd3fc', 'cloud': '#9d7bff', 'local': '#3ec5ff',
+      'hybrid · cloud → local': '#f5b14a', 'local · fallback': '#ff6b6b',
+      'local · subs': '#22d39a', 'local · selected model': '#7dd3fc',
+    },
     3: {},
   };
   if (map[col] && map[col][key]) return map[col][key];
@@ -2326,7 +2341,7 @@ function inflightFor(group) {
 
 function activityPill(r) {
   const c = '#3ec5ff';
-  const label = r.activity || ((typeof r.pp_progress === 'number' && r.pp_progress < 1) ? 'prefilling' : 'generating');
+  const label = r.activity || ((Number(r.generated_tokens) || 0) > 0 ? 'generating' : 'prefilling');
   const dot = `<span class="pulse-dot" style="width:6px;height:6px;border-radius:99px;background:${c};box-shadow:0 0 6px ${c};display:inline-block"></span>`;
   return `<span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:99px;font-size:11px;background:${c}20;color:${c};border:1px solid ${c}40;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${dot}${escHtml(label)}</span>`;
 }
@@ -2352,7 +2367,12 @@ function renderInflight() {
   if (cnt) cnt.textContent = inflightList.length + (inflightList.length === 1 ? ' request' : ' requests');
   tbody.innerHTML = inflightList.map(r => {
     const pp = typeof r.pp_progress === 'number' ? Math.round(r.pp_progress * 100) : null;
-    const act = r.activity || (pp !== null && pp < 100 ? 'prefilling' : 'generating');
+    const generated = Number(r.generated_tokens) || 0;
+    const maxTokens = Number(r.max_tokens) || 0;
+    const act = r.activity || (generated > 0 ? 'generating' : 'prefilling');
+    const progressText = generated > 0
+      ? (maxTokens > 0 ? `${generated}/${maxTokens} tok` : `${generated} tok`)
+      : (pp === null ? '—' : `${pp}% prefill`);
     const sess = r.session_id || (r.conv_id ? '#' + String(r.conv_id).slice(0, 8) : '—');
     const ua = r.user_agent || '—';
     return `<tr>
@@ -2361,7 +2381,7 @@ function renderInflight() {
       <td style="color:var(--text)">${escHtml(r.model || '—')}</td>
       <td>${escHtml((r.method_path || '').slice(0, 44))}</td>
       <td style="color:var(--cyan)">${escHtml(act)}</td>
-      <td>${pp === null ? '—' : pp + '%'}</td>
+      <td>${progressText}</td>
       <td>${escHtml(r.peer_addr || '—')}</td>
       <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(ua)}">${escHtml(ua)}</td>
       <td>${escHtml(sess)}</td>
@@ -2427,19 +2447,44 @@ function ompTitleForCwd(cwd) {
   });
 })();
 
-// 1s tick: elapsed timers advance between refreshFast polls; PP bars on
-// cards follow the latest inflight snapshot.
+function updateLiveProgressBars() {
+  document.querySelectorAll('[data-progress-id]').forEach(el => {
+    const id = parseInt(el.dataset.progressId, 10);
+    const bar = el.firstElementChild;
+    if (!bar) return;
+    const r = inflightList.find(x => x.id === id);
+    if (!r) {
+      bar.classList.remove('br-progress-indeterminate');
+      bar.style.animation = 'none';
+      bar.style.width = '100%';
+      bar.style.background = 'var(--green)';
+      el.removeAttribute('data-progress-id');
+      return;
+    }
+    const progress = inflightProgress(r, inferenceStatus);
+    bar.classList.toggle('br-progress-indeterminate', progress.indeterminate);
+    if (!progress.indeterminate) bar.style.width = Math.max(2, progress.pct) + '%';
+  });
+}
+
+async function refreshInflightProgress() {
+  const res = await safeFetch('/api/inflight');
+  if (res && Array.isArray(res.requests)) {
+    inflightList = res.requests;
+    inflFetchTs = Date.now();
+    updateLiveProgressBars();
+    renderInflight();
+  }
+}
+
+// 1s tick: fetch real slot progress and advance elapsed timers without
+// rebuilding every card (which would reset selection and scroll position).
 setInterval(() => {
+  refreshInflightProgress();
   const drift = inflFetchTs ? (Date.now() - inflFetchTs) : 0;
   document.querySelectorAll('.inf-elapsed').forEach(el => {
     const base = parseInt(el.dataset.base, 10);
     if (!isNaN(base)) el.textContent = fmtElapsed(base + drift);
-  });
-  document.querySelectorAll('[data-pp-id]').forEach(el => {
-    const id = parseInt(el.dataset.ppId, 10);
-    const r = inflightList.find(x => x.id === id);
-    if (r && typeof r.pp_progress === 'number' && el.firstElementChild)
-      el.firstElementChild.style.width = Math.max(2, Math.round(r.pp_progress * 100)) + '%';
   });
 }, 1000);
 
@@ -2455,6 +2500,7 @@ document.addEventListener('keydown', (e) => {
 
 // Initial load
 refreshFast();
+refreshInflightProgress();
 refreshOmpSessions();
 refreshHealth();
 refreshSlow();

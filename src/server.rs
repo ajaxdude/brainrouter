@@ -1167,6 +1167,7 @@ async fn handle_chat_completion(
         session_id.clone().unwrap_or_default(),
         crate::router::conversation_fingerprint(&request),
         0,
+        request.max_tokens,
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -1220,6 +1221,7 @@ async fn handle_anthropic_messages(
         session_id.clone().unwrap_or_default(),
         crate::router::conversation_fingerprint(&oai_request),
         0,
+        oai_request.max_tokens,
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {

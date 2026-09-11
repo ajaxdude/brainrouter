@@ -778,7 +778,9 @@ fn build_snapshot(
                 json!({
                     "id": row.id, "activity": row.activity, "elapsed_ms": row.elapsed_ms,
                     "bytes_received": row.bytes_received,
-                    "pp_progress": if row.pp_progress > 0.0 { Some(row.pp_progress) } else { None }
+                    "pp_progress": if row.pp_progress > 0.0 { Some(row.pp_progress) } else { None },
+                    "generated_tokens": row.generated_tokens,
+                    "max_tokens": row.max_tokens
                 })
             })
             .collect();
@@ -1321,6 +1323,7 @@ mod tests {
             success: error.is_empty(),
             error: error.into(),
             bonsai_decision: "local",
+            routing_class: "bonsai → local",
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
