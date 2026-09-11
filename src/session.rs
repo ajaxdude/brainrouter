@@ -50,12 +50,32 @@ pub enum EscalationReason {
     ConnectionFailed,
 }
 
+impl EscalationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EscalationReason::MaxIterations => "max_iterations",
+            EscalationReason::LlmError => "llm_error",
+            EscalationReason::LlmEscalated => "llm_escalated",
+            EscalationReason::ConnectionFailed => "connection_failed",
+        }
+    }
+}
+
 /// Who produced the last feedback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerType {
     Llm,
     Human,
+}
+
+impl ReviewerType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewerType::Llm => "llm",
+            ReviewerType::Human => "human",
+        }
+    }
 }
 
 /// A single code-review session.

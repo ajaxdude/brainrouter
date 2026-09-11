@@ -436,10 +436,17 @@ struct SessionSummary {
     task_id: String,
     status: String,
     summary: String,
+    details: Option<String>,
+    llm_feedback: Option<String>,
+    human_feedback: Option<String>,
+    llm_turns: Vec<String>,
+    escalation_reason: Option<String>,
     iteration_count: u32,
-    updated_at: String,
+    reviewer_type: Option<String>,
     review_model: Option<String>,
     review_config: Option<crate::config::ReviewConfig>,
+    created_at: String,
+    updated_at: String,
     cwd: String,
 }
 
@@ -450,10 +457,23 @@ impl From<&Session> for SessionSummary {
             task_id: s.task_id.clone(),
             status: s.status.to_string(),
             summary: s.summary.clone(),
+            details: s.details.clone(),
+            llm_feedback: s.llm_feedback.clone(),
+            human_feedback: s.human_feedback.clone(),
+            llm_turns: s.llm_turns.clone(),
+            escalation_reason: s
+                .escalation_reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string()),
             iteration_count: s.iteration_count,
-            updated_at: s.updated_at.clone(),
+            reviewer_type: s
+                .reviewer_type
+                .as_ref()
+                .map(|reviewer| reviewer.as_str().to_string()),
             review_model: s.review_model.clone(),
             review_config: s.review_config.clone(),
+            created_at: s.created_at.clone(),
+            updated_at: s.updated_at.clone(),
             cwd: s.cwd.clone(),
         }
     }
@@ -468,6 +488,7 @@ struct SessionDetail {
     details: Option<String>,
     llm_feedback: Option<String>,
     human_feedback: Option<String>,
+    llm_turns: Vec<String>,
     escalation_reason: Option<String>,
     iteration_count: u32,
     reviewer_type: Option<String>,
@@ -488,12 +509,16 @@ impl From<&Session> for SessionDetail {
             details: s.details.clone(),
             llm_feedback: s.llm_feedback.clone(),
             human_feedback: s.human_feedback.clone(),
+            llm_turns: s.llm_turns.clone(),
             escalation_reason: s
                 .escalation_reason
                 .as_ref()
-                .map(|r| format!("{:?}", r).to_lowercase()),
+                .map(|reason| reason.as_str().to_string()),
             iteration_count: s.iteration_count,
-            reviewer_type: s.reviewer_type.as_ref().map(|r| format!("{:?}", r).to_lowercase()),
+            reviewer_type: s
+                .reviewer_type
+                .as_ref()
+                .map(|reviewer| reviewer.as_str().to_string()),
             review_model: s.review_model.clone(),
             review_config: s.review_config.clone(),
             created_at: s.created_at.clone(),

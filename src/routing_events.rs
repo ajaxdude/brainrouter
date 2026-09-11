@@ -154,6 +154,7 @@ struct Inner {
 #[derive(Serialize)]
 pub struct RoutingEventsResponse {
     pub events: Vec<RouteEvent>,
+    pub measurements: Vec<CompletedStreamMeasurement>,
 }
 
 impl Default for RoutingEvents {
@@ -240,9 +241,13 @@ impl RoutingEvents {
         inner.events.iter().rev().cloned().collect()
     }
 
-    /// Wrap events in the HTTP response envelope.
+    /// Return a consistent dashboard snapshot of routes and completed streams.
     pub fn get_all_as_response(&self) -> RoutingEventsResponse {
-        RoutingEventsResponse { events: self.get_all() }
+        let inner = self.inner.lock().unwrap();
+        RoutingEventsResponse {
+            events: inner.events.iter().rev().cloned().collect(),
+            measurements: inner.measurements.iter().rev().cloned().collect(),
+        }
     }
 
     /// Aggregate statistics over all events — used by the stat-cards row.
@@ -372,6 +377,10 @@ mod tests {
         }
         assert_eq!(events.get_measurements().len(), MAX_EVENTS);
         assert_eq!(events.get_measurements()[0].event_id, MAX_EVENTS as u64 + 1);
+        let response = events.get_all_as_response();
+        assert_eq!(response.events.len(), MAX_EVENTS);
+        assert_eq!(response.measurements.len(), MAX_EVENTS);
+        assert_eq!(response.measurements[0].event_id, MAX_EVENTS as u64 + 1);
     }
 
     #[test]

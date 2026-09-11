@@ -75,6 +75,34 @@ textarea { resize: vertical; }
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 .br-btn:hover { color: var(--text); border-color: var(--borderHi); background: var(--bg3); }
+.br-icon-btn {
+  all: unset; cursor: pointer; color: var(--textMute); font-size: 12px;
+  line-height: 1; padding: 5px 7px; border-radius: 5px; flex-shrink: 0;
+  border: 1px solid transparent;
+}
+.br-icon-btn:hover { color: var(--text); border-color: var(--border); background: var(--bg3); }
+.br-icon-btn.active { color: var(--amber); border-color: rgba(245,177,74,.35); background: var(--amberDim); }
+.br-facet {
+  min-width: 130px; max-width: 220px; background: var(--bg2); color: var(--textDim);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 11px;
+  font-family: 'JetBrains Mono', monospace; outline: none;
+}
+.br-metric {
+  display: inline-flex; gap: 4px; align-items: center; padding: 3px 7px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg3);
+  color: var(--textDim); font: 10px 'JetBrains Mono', monospace;
+}
+.br-life-step { flex: 1; min-width: 54px; }
+.br-life-line { height: 3px; border-radius: 99px; background: var(--border); margin-bottom: 4px; }
+.br-life-step.done .br-life-line { background: var(--green); }
+.br-life-step.active .br-life-line { background: var(--cyan); box-shadow: 0 0 7px rgba(62,197,255,.45); }
+.br-life-label { color: var(--textMute); font: 9px 'JetBrains Mono', monospace; white-space: nowrap; }
+.br-life-step.done .br-life-label { color: var(--green); }
+.br-life-step.active .br-life-label { color: var(--cyan); }
+.br-prompt-private { filter: blur(5px); user-select: none; transition: filter .15s; }
+.br-prompt-private:hover { filter: blur(3px); }
+details.br-detail > summary { cursor: pointer; color: var(--textDim); font-size: 11px; }
+details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
 .sidebar-btn {
   all: unset; cursor: pointer;
   padding: 7px 10px; border-radius: 6px;
@@ -384,6 +412,9 @@ textarea { resize: vertical; }
       <button class="filter-btn" data-filter="live" onclick="setFilter('live')">live</button>
       <button class="filter-btn" data-filter="approved" onclick="setFilter('approved')">done</button>
       <button class="filter-btn" data-filter="escalated" onclick="setFilter('escalated')">escalated</button>
+      <button class="filter-btn" data-filter="reviews" onclick="setFilter('reviews')">reviews</button>
+      <button class="filter-btn" data-filter="pinned" onclick="setFilter('pinned')">pinned</button>
+      <button class="filter-btn" data-filter="hidden" onclick="setFilter('hidden')">hidden</button>
     </div>
   </div>
 
@@ -392,6 +423,15 @@ textarea { resize: vertical; }
 
     <!-- Stream View -->
     <div id="stream-view" style="display:flex;flex-direction:column;gap:20px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px">
+        <span style="font-size:9px;letter-spacing:1.2px;color:var(--textMute);font-family:'JetBrains Mono',monospace">CARD FILTERS</span>
+        <select id="filter-harness" class="br-facet" onchange="setFacet('harness', this.value)"><option value="">all harnesses</option></select>
+        <select id="filter-session" class="br-facet" onchange="setFacet('session', this.value)"><option value="">all sessions</option></select>
+        <select id="filter-route" class="br-facet" onchange="setFacet('route', this.value)"><option value="">all routes</option></select>
+        <select id="filter-model" class="br-facet" onchange="setFacet('model', this.value)"><option value="">all models</option></select>
+        <button id="prompt-privacy-btn" class="br-btn" onclick="togglePromptPrivacy()" style="margin-left:auto">◉ prompts visible</button>
+        <button class="br-btn" onclick="restoreAllHidden()">restore hidden</button>
+      </div>
       <!-- Sankey panel — full width, click a bar to filter the cards below -->
       <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
@@ -515,7 +555,17 @@ const STATUS_MAP = {
 };
 
 // ─── State ───────────────────────────────────────────────────────────────────
-let allEvents = [], allSessions = [], activeFilter = 'all', activeView = 'stream';
+const CARD_STORAGE = {
+  filter: 'brainrouter.cards.filter', facets: 'brainrouter.cards.facets',
+  pins: 'brainrouter.cards.pins', privacy: 'brainrouter.cards.privacy',
+  hidden: 'brainrouter.cards.hidden',
+};
+let allEvents = [], allMeasurements = [], measurementByEventId = new Map(), allSessions = [];
+let activeFilter = readStoredValue(localStorage, CARD_STORAGE.filter, 'all'), activeView = 'stream';
+let facetFilters = readStoredJson(localStorage, CARD_STORAGE.facets, { harness:'', session:'', route:'', model:'' });
+let pinnedKeys = readStoredSet(localStorage, CARD_STORAGE.pins);
+let dismissedKeys = readStoredSet(sessionStorage, CARD_STORAGE.hidden);
+let promptPrivate = readStoredValue(localStorage, CARD_STORAGE.privacy, 'false') === 'true';
 let inferenceStatus = null, healthData = {}, versionsData = {}, bridgeData = {}, statsData = {};
 let bonsaiData = null, bonsaiBusy = false;
 let searchQuery = '', currentRoutingMode = 'auto';
@@ -523,6 +573,17 @@ let inflightList = [], ompSessions = null, ompHome = '', pollTick = 0;
 let ompTitleBySlug = {}, inflFetchTs = 0, skCardHi = null;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+function readStoredValue(storage, key, fallback) {
+  try { const value = storage.getItem(key); return value == null ? fallback : value; } catch { return fallback; }
+}
+function readStoredJson(storage, key, fallback) {
+  try { const value = storage.getItem(key); return value ? JSON.parse(value) : fallback; } catch { return fallback; }
+}
+function readStoredSet(storage, key) { return new Set(readStoredJson(storage, key, [])); }
+function writeStoredJson(storage, key, value) { try { storage.setItem(key, JSON.stringify(value)); } catch {} }
+function writeStoredValue(storage, key, value) { try { storage.setItem(key, String(value)); } catch {} }
+function saveSet(storage, key, values) { writeStoredJson(storage, key, [...values]); }
+
 async function safeFetch(url) {
   try {
     const r = await fetch(url);
@@ -552,6 +613,18 @@ function fmtLatency(ms) {
   if (!ms || ms === 0) return '—';
   if (ms < 1000) return ms + 'ms';
   return (ms/1000).toFixed(1) + 's';
+}
+
+function fmtTimestamp(ts) {
+  if (!ts) return '—';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+
+function fmtNumber(value, digits = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString([], { maximumFractionDigits: digits }) : '—';
 }
 
 function fmtUptime(secs) {
@@ -665,10 +738,32 @@ function switchView(view) {
 // ─── Filter ───────────────────────────────────────────────────────────────────
 function setFilter(f) {
   activeFilter = f;
+  writeStoredValue(localStorage, CARD_STORAGE.filter, f);
   document.querySelectorAll('.filter-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.filter === f);
   });
   renderStream();
+}
+
+function setFacet(name, value) {
+  facetFilters[name] = value;
+  writeStoredJson(localStorage, CARD_STORAGE.facets, facetFilters);
+  renderStream();
+}
+
+function togglePromptPrivacy() {
+  promptPrivate = !promptPrivate;
+  writeStoredValue(localStorage, CARD_STORAGE.privacy, promptPrivate);
+  updatePromptPrivacyButton();
+  lastStreamHtml = '';
+  renderStream();
+}
+
+function updatePromptPrivacyButton() {
+  const button = document.getElementById('prompt-privacy-btn');
+  if (!button) return;
+  button.textContent = promptPrivate ? '◌ prompts hidden' : '◉ prompts visible';
+  button.style.color = promptPrivate ? 'var(--amber)' : 'var(--textDim)';
 }
 
 function onSearch(q) {
@@ -678,26 +773,54 @@ function onSearch(q) {
 
 function matchesSearch(t) {
   if (!searchQuery) return true;
+  const session = t._session || {};
   const haystack = [
-    t.prompt_excerpt || '',
-    t._displayModel || '',
-    t._folder || '',
-    t.requested_model || '',
-    t.routing_class || '',
-    t.effective_provider || '',
-    t.session_id || '',
-    t.conv_id || '',
+    t.prompt_excerpt || '', t._displayModel || '', t._folder || '',
+    t.requested_model || '', t.routing_class || '', t.effective_provider || '',
+    t.session_id || '', t.conv_id || '', session.summary || '', session.details || '',
+    session.llm_feedback || '', session.human_feedback || '', session.task_id || '',
   ].join(' ').toLowerCase();
   return haystack.includes(searchQuery);
 }
 
 function matchesFilter(t) {
-  if (activeFilter === 'all') return true;
-  if (activeFilter === 'live') return ['queued','generating','reviewing','routing','iterating'].includes(t._status);
+  if (activeFilter === 'all' || activeFilter === 'pinned' || activeFilter === 'hidden') return true;
+  if (activeFilter === 'live') return ['queued','generating','reviewing','routing','iterating','reasoning'].includes(t._status);
   if (activeFilter === 'approved') return t._status === 'approved';
   if (activeFilter === 'escalated') return t._status === 'escalated';
-  if (activeFilter === 'reviews') return t._session && ['pending','needs_revision','escalated'].includes(t._session.status);
+  if (activeFilter === 'reviews') return !!t._session;
   return true;
+}
+
+function sessionLabelForEvent(t) {
+  if (t._session && t._session.summary) return t._session.summary;
+  return ompTitleForCwd(t.cwd) || t.session_id || (t.conv_id ? '#' + t.conv_id.slice(0, 8) : 'one-shot');
+}
+
+function matchesFacets(t) {
+  return (!facetFilters.harness || skHarness(t) === facetFilters.harness) &&
+    (!facetFilters.session || sessionLabelForEvent(t) === facetFilters.session) &&
+    (!facetFilters.route || t._route === facetFilters.route) &&
+    (!facetFilters.model || t._displayModel === facetFilters.model);
+}
+
+function populateFacet(id, placeholder, values, selected) {
+  const select = document.getElementById(id);
+  if (!select) return;
+  const available = selected && !values.includes(selected) ? [selected, ...values] : values;
+  const options = [placeholder, ...available].map((label, index) => {
+    const value = index === 0 ? '' : label;
+    return `<option value="${escHtml(value)}"${value === selected ? ' selected' : ''}>${escHtml(label)}</option>`;
+  }).join('');
+  if (select.innerHTML !== options) select.innerHTML = options;
+}
+
+function updateFacetOptions(events) {
+  const unique = fn => [...new Set(events.map(fn).filter(Boolean))].sort((a,b) => a.localeCompare(b));
+  populateFacet('filter-harness', 'all harnesses', unique(skHarness), facetFilters.harness);
+  populateFacet('filter-session', 'all sessions', unique(sessionLabelForEvent), facetFilters.session);
+  populateFacet('filter-route', 'all routes', unique(event => event._route), facetFilters.route);
+  populateFacet('filter-model', 'all models', unique(event => event._displayModel), facetFilters.model);
 }
 </script>
 <script>
@@ -741,27 +864,40 @@ function miniFlowHtml(t) {
 }
 
 // ─── Review section HTML ──────────────────────────────────────────────────────
-function reviewHtml(sess, eventId) {
+function parseReviewTurn(raw, fallbackIndex) {
+  const match = String(raw || '').match(/^Iteration\s+(\d+):\nStatus:\s*([^\n]+)\nFeedback:\s*([\s\S]*)$/);
+  return match
+    ? { iteration: Number(match[1]), status: match[2].trim(), feedback: match[3] }
+    : { iteration: fallbackIndex + 1, status: 'unknown', feedback: String(raw || '') };
+}
+
+function reviewHistoryHtml(sess) {
+  const turns = Array.isArray(sess.llm_turns) ? sess.llm_turns.map(parseReviewTurn) : [];
+  if (!turns.length) return '';
+  return `<details class="br-detail" style="margin-top:10px">
+    <summary>Review history · ${turns.length} iteration${turns.length === 1 ? '' : 's'}</summary>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${turns.map((turn, index) => `<details class="br-detail"${index === turns.length - 1 ? ' open' : ''} style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;background:var(--bg3)">
+        <summary>Iteration ${turn.iteration} · ${escHtml(turn.status)}</summary>
+        <div style="white-space:pre-wrap;word-break:break-word;color:var(--text);font-size:12px;line-height:1.6">${escHtml(turn.feedback)}</div>
+      </details>`).join('')}
+    </div>
+  </details>`;
+}
+
+function reviewHtml(sess) {
   if (!sess) return '';
   const st = sess.status;
-  // Don't render review block until the review has actually run.
-  if (st === 'pending') return '';
-
-  // Show the requested policy alongside the actual provider, including fallbacks.
-  const rawModel = sess.review_model || '';
-
-  const iters = sess.iteration_count != null ? sess.iteration_count : 0;
-  const iterLabel = iters === 0 ? '1 pass' : `${iters + 1} passes`;
-
-  // Status-dependent colours.
-  const isApproved  = st === 'approved';
+  const rawModel = sess.review_model || reviewSelector(sess);
+  const turns = Array.isArray(sess.llm_turns) ? sess.llm_turns : [];
+  const passes = Math.max(turns.length, (sess.iteration_count || 0) + (st === 'pending' ? 0 : 1));
+  const isApproved = st === 'approved';
   const isEscalated = st === 'escalated';
-  const accentColor  = isApproved ? 'var(--green)' : isEscalated ? 'var(--red)' : 'var(--amber)';
-  const accentBg     = isApproved ? 'var(--greenDim)' : isEscalated ? 'var(--redDim)' : 'var(--amberDim)';
-
-  // Feedback text: prefer llm_feedback (the actual review prose) over summary.
+  const accentColor = isApproved ? 'var(--green)' : isEscalated ? 'var(--red)' : 'var(--amber)';
+  const accentBg = isApproved ? 'var(--greenDim)' : isEscalated ? 'var(--redDim)' : 'var(--amberDim)';
   const feedback = sess.llm_feedback || '';
-  const summaryText = sess.summary || '';
+  const humanFeedback = sess.human_feedback || '';
+  const reason = sess.escalation_reason ? String(sess.escalation_reason).replaceAll('_', ' ') : '';
 
   let actionHtml = '';
   if (isEscalated) {
@@ -772,16 +908,34 @@ function reviewHtml(sess, eventId) {
     </div>`;
   }
 
-  return `<div style="border-top:1px solid var(--border);background:var(--bg2);padding:10px 16px 12px">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
-      <span style="font-size:10px;letter-spacing:1px;color:${accentColor};font-family:'JetBrains Mono',monospace;font-weight:600">↳ REVIEW</span>
+  const taskContext = (sess.summary || sess.details) ? `<details class="br-detail" style="margin-top:8px">
+    <summary>Review task and context</summary>
+    ${sess.summary ? `<div style="font-weight:600;color:var(--text);margin-bottom:6px">${escHtml(sess.summary)}</div>` : ''}
+    ${sess.details ? `<div style="white-space:pre-wrap;word-break:break-word;color:var(--textDim);line-height:1.55">${escHtml(sess.details)}</div>` : ''}
+  </details>` : '';
+
+  const feedbackHtml = feedback ? `<details class="br-detail" open style="margin-top:10px;border:1px solid ${accentColor};border-radius:7px;padding:10px 12px;background:${accentBg}">
+    <summary style="display:flex;align-items:center;gap:8px">
+      <span style="flex:1">Full LLM review · ${fmtNumber(feedback.length)} characters</span>
+      <button class="br-icon-btn" onclick="event.preventDefault();event.stopPropagation();copyReview('${sess.id}')" title="Copy full review">copy</button>
+    </summary>
+    <div style="font-size:13px;color:var(--text);line-height:1.65;white-space:pre-wrap;word-break:break-word">${escHtml(feedback)}</div>
+  </details>` : `<div style="margin-top:8px;padding:10px 12px;border-left:2px solid ${accentColor};background:${accentBg};color:var(--textDim);font-size:12px">${st === 'pending' ? 'The LLM review is running. Full feedback will appear here as soon as the iteration completes.' : 'No LLM feedback was recorded.'}</div>`;
+
+  return `<div style="border-top:1px solid var(--border);background:var(--bg2);padding:12px 16px 14px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span style="font-size:10px;letter-spacing:1px;color:${accentColor};font-family:'JetBrains Mono',monospace;font-weight:600">REVIEW</span>
       ${statusPill(isApproved ? 'approved' : st === 'needs_revision' ? 'reviewing' : st)}
-      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${escHtml(rawModel)}</span>
-      <span style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">· ${iterLabel}</span>
-      ${isEscalated ? `<span style="margin-left:auto;font-size:10px;color:var(--red);font-family:'JetBrains Mono',monospace;font-weight:600">HUMAN NEEDED</span>` : ''}
+      <span class="br-metric">${escHtml(rawModel || 'model pending')}</span>
+      <span class="br-metric">${passes} pass${passes === 1 ? '' : 'es'}</span>
+      ${sess.reviewer_type ? `<span class="br-metric">${escHtml(sess.reviewer_type)} reviewer</span>` : ''}
+      ${reason ? `<span class="br-metric" style="color:var(--red)">${escHtml(reason)}</span>` : ''}
+      <span style="margin-left:auto;color:var(--textMute);font:10px 'JetBrains Mono',monospace">updated ${fmtTimestamp(sess.updated_at)}</span>
     </div>
-    ${summaryText ? `<div style="font-size:11px;color:var(--textMute);font-family:'JetBrains Mono',monospace;margin-bottom:6px;padding:6px 8px;background:var(--bg3);border-radius:4px;line-height:1.4"><strong style="color:var(--textDim)">Task:</strong> ${escHtml(summaryText.slice(0, 180))}${summaryText.length > 180 ? '…' : ''}</div>` : ''}
-    ${feedback ? `<div style="font-size:12px;color:var(--text);line-height:1.55;padding:8px 10px;background:${accentBg};border-left:2px solid ${accentColor};border-radius:4px;white-space:pre-wrap;word-break:break-word">${escHtml(feedback)}</div>` : ''}
+    ${taskContext}
+    ${feedbackHtml}
+    ${reviewHistoryHtml(sess)}
+    ${humanFeedback ? `<details class="br-detail" open style="margin-top:10px"><summary>Human feedback</summary><div style="white-space:pre-wrap;color:var(--text);line-height:1.55">${escHtml(humanFeedback)}</div></details>` : ''}
     ${actionHtml}
   </div>`;
 }
@@ -792,6 +946,113 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function shortId(value) {
+  const id = String(value || '');
+  return id.length > 12 ? id.slice(0, 8) : id;
+}
+
+function promptHtml(value) {
+  const cls = promptPrivate ? ' class="br-prompt-private" title="Prompt hidden by privacy mode"' : '';
+  return `<span${cls}>${escHtml(value || '(no prompt)')}</span>`;
+}
+
+function measurementForEvents(events) {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const measurement = measurementByEventId.get(events[index].id);
+    if (measurement) return measurement;
+  }
+  return null;
+}
+
+function metricChips(events) {
+  const measurement = measurementForEvents(events);
+  if (!measurement) return '';
+  const chips = [];
+  if (measurement.measured_ttft_ms != null) chips.push(`TTFT ${fmtLatency(Math.round(measurement.measured_ttft_ms))}`);
+  if (measurement.generation_tps != null) chips.push(`${fmtNumber(measurement.generation_tps, 1)} tok/s`);
+  if (measurement.stream_duration_ms != null) chips.push(`total ${fmtLatency(Math.round(measurement.stream_duration_ms))}`);
+  if (measurement.prompt_tokens != null) chips.push(`${fmtNumber(measurement.prompt_tokens)} prompt tok`);
+  if (measurement.completion_tokens != null) chips.push(`${fmtNumber(measurement.completion_tokens)} output tok`);
+  return chips.map(chip => `<span class="br-metric">${escHtml(chip)}</span>`).join('');
+}
+
+function actionableError(error) {
+  const value = String(error || '');
+  const lower = value.toLowerCase();
+  if (lower.includes('context')) return 'Increase the model context size or shorten the request.';
+  if (lower.includes('out of memory') || lower.includes('oom')) return 'Unload another model or select a smaller quantization.';
+  if (lower.includes('timeout') || lower.includes('timed out')) return 'Check model loading and provider health, then retry.';
+  if (lower.includes('manifest')) return 'Check Manifest health, credentials, and available credits.';
+  if (lower.includes('not found') || lower.includes('unknown model')) return 'Verify that the selected model key exists in llama-swap.';
+  return value ? 'Inspect the Brainrouter and provider logs for the failed hop.' : '';
+}
+
+function routeColorFor(route) {
+  if ((route || '').includes('hybrid') || (route || '').includes('fallback')) return '#f5b14a';
+  return (route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
+}
+
+function routingDetailsHtml(events) {
+  const realEvents = events.filter(event => !event._virtual);
+  if (!realEvents.length) return '<div style="color:var(--textMute);font-size:11px;margin-top:8px">Waiting for the first routing decision.</div>';
+  return `<details class="br-detail" style="margin-top:9px">
+    <summary>Routing details · ${realEvents.length} hop${realEvents.length === 1 ? '' : 's'}</summary>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      ${realEvents.map((event, index) => {
+        const color = event.success ? 'var(--green)' : 'var(--red)';
+        const action = !event.success ? actionableError(event.error) : '';
+        return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;background:var(--bg3)">
+          <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;font:10px 'JetBrains Mono',monospace">
+            <span style="color:${color}">${event.success ? '✓' : '✕'} hop ${index + 1}</span>
+            <span>${escHtml(event._route || deriveRoute(event))}</span>
+            <span style="color:var(--textMute)">${escHtml(event.effective_provider || 'no provider')} / ${escHtml(event.model_key || 'no model')}</span>
+            <span style="margin-left:auto;color:var(--textMute)">${fmtLatency(event.latency_ms)} · ${fmtTimestamp(event.timestamp)}</span>
+          </div>
+          ${event.error ? `<div style="margin-top:6px;color:var(--red);white-space:pre-wrap;word-break:break-word">${escHtml(event.error)}</div>` : ''}
+          ${action ? `<div style="margin-top:5px;color:var(--amber);font-size:11px"><strong>Next:</strong> ${escHtml(action)}</div>` : ''}
+        </div>`;
+      }).join('')}
+    </div>
+  </details>`;
+}
+
+function lifecycleHtml(group, infReq) {
+  const hasReview = !!group.session;
+  const steps = ['Route', 'Load', 'Prefill', 'Generate', ...(hasReview ? ['Review'] : []), 'Done'];
+  const state = infReq && inferenceStatus ? inferenceStatus.state : '';
+  let active = 0;
+  if (state === 'loading' || state === 'local_waiting' || state === 'cloud_waiting') active = 1;
+  else if (state === 'local_processing') active = 2;
+  else if (infReq || state === 'local_generating' || state === 'cloud_streaming') active = 3;
+  else if (hasReview && group.session.status !== 'approved') active = 4;
+  else active = steps.length - 1;
+  return `<div style="display:flex;gap:5px;padding:10px 16px 8px">${steps.map((label, index) => {
+    const cls = index < active ? 'done' : index === active ? 'active' : '';
+    return `<div class="br-life-step ${cls}"><div class="br-life-line"></div><div class="br-life-label">${label}</div></div>`;
+  }).join('')}</div>`;
+}
+
+function progressLabel(group, infReq, progress) {
+  if (infReq) {
+    const generated = Number(infReq.generated_tokens) || 0;
+    const maxTokens = Number(infReq.max_tokens) || 0;
+    const pp = Number(infReq.pp_progress) || 0;
+    if (generated > 0) return maxTokens > 0 ? `${fmtNumber(generated)} / ${fmtNumber(maxTokens)} output tokens` : `${fmtNumber(generated)} output tokens · final length unknown`;
+    if (pp > 0) return `${Math.round(pp * 100)}% prompt prefill`;
+    return progress.indeterminate ? 'Active · final length unknown' : 'Preparing request';
+  }
+  if (group.session && group.session.status === 'pending') return 'Inference complete · review pending';
+  if (group.session && group.session.status === 'needs_revision') return 'Review complete · revision requested';
+  if (group.session && group.session.status === 'escalated') return 'Review escalated · human action required';
+  return progress.pct >= 100 ? 'Complete · 100%' : `${progress.pct}%`;
+}
+
+function cardTitle(group) {
+  const latest = group.events[group.events.length - 1] || {};
+  if (group.session && group.session.summary) return group.session.summary;
+  return ompTitleForCwd(latest.cwd) || latest._folder || `${skHarness(latest)} conversation`;
+}
+
 // ─── Card aggregation ─────────────────────────────────────────────────────────
 // Group routing events into logical "requests": one card per prompt.
 // Multiple events for the same prompt (retries, review iterations, fallbacks)
@@ -799,21 +1060,38 @@ function escHtml(s) {
 // present, else by conv_id (the server-side conversation fingerprint — one
 // card for the whole harness conversation), otherwise by (prompt_excerpt +
 // cwd) within a 60s window.
-function groupEvents(events) {
-  const groups = []; // { key, events[], session, latestTs }
-  const keyMap = {};
+function reviewSelector(sess) {
+  const config = sess && sess.review_config;
+  if (!config) return 'review';
+  const mode = config.forced_mode || 'auto';
+  return config.forced_model ? `${mode}/${config.forced_model}` : mode;
+}
 
-  // Sort oldest-first so groups build chronologically.
+function virtualSessionEvent(sess) {
+  const timestamp = sess.updated_at || sess.created_at || new Date().toISOString();
+  return {
+    id: 0, timestamp, prompt_excerpt: sess.summary || '(review session)',
+    requested_model: reviewSelector(sess), effective_provider: null,
+    model_key: sess.review_model || '', latency_ms: 0, stage: 'local_primary',
+    success: false, error: '', bonsai_decision: 'review', routing_class: 'review',
+    cwd: sess.cwd || '', session_id: sess.id, user_agent: 'brainrouter/review', conv_id: '',
+    pp_tps: 0, tg_tps: 0, _session: sess, _source: 'local', _route: 'review',
+    _displayModel: sess.review_model || reviewSelector(sess),
+    _folder: sess.cwd ? sess.cwd.split('/').filter(Boolean).pop() : '',
+    _status: deriveStatus({success:false,error:''}, sess, null), _virtual: true,
+  };
+}
+
+function groupEvents(events) {
+  const groups = [];
+  const keyMap = {};
   const sorted = [...events].sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
 
   for (const e of sorted) {
     let key;
-    if (e.session_id) {
-      key = 'sess:' + e.session_id;
-    } else if (e.conv_id) {
-      key = 'conv:' + e.conv_id;
-    } else {
-      // Time-bucket: round down to nearest 60s to catch retries.
+    if (e.session_id) key = 'sess:' + e.session_id;
+    else if (e.conv_id) key = 'conv:' + e.conv_id;
+    else {
       const bucket = Math.floor(new Date(e.timestamp).getTime() / 60000);
       key = 'prompt:' + (e.cwd || '') + ':' + (e.prompt_excerpt || '').slice(0, 80) + ':' + bucket;
     }
@@ -828,7 +1106,16 @@ function groupEvents(events) {
     if (e._session) g.session = e._session;
   }
 
-  // Return newest-first.
+  // Review sessions appear immediately, even before their first route event.
+  for (const sess of allSessions) {
+    const key = 'sess:' + sess.id;
+    if (keyMap[key]) continue;
+    const event = virtualSessionEvent(sess);
+    const group = { key, events: [event], session: sess, latestTs: event.timestamp };
+    keyMap[key] = group;
+    groups.push(group);
+  }
+
   return groups.sort((a,b) => new Date(b.latestTs) - new Date(a.latestTs));
 }
 
@@ -917,14 +1204,17 @@ function inflightProgress(r, inf) {
   return { pct: Math.round(pct), indeterminate: state !== 'loading' || typeof inf.progress !== 'number' };
 }
 
-function progressBar(progress, isLive, requestId) {
+function progressBar(progress, isLive, requestId, label) {
   const pct = Math.max(0, Math.min(100, progress.pct));
   const indeterminate = !!progress.indeterminate;
   const color = isLive ? 'var(--green)' : (pct >= 100 ? 'var(--green)' : pct >= 70 ? 'var(--cyan)' : 'var(--textMute)');
   const shimmer = isLive && !indeterminate ? 'background-image:linear-gradient(90deg,transparent,rgba(34,211,154,0.35),transparent);background-size:200% 100%;animation:brShimmer 1.8s linear infinite;' : '';
   const cls = indeterminate ? ' class="br-progress-indeterminate"' : '';
-  return `<div${requestId != null ? ` data-progress-id="${requestId}"` : ''} style="height:3px;background:var(--border);border-radius:99px;overflow:hidden;margin:0 16px 0">
-    <div${cls} style="height:100%;width:${pct}%;background:${color};border-radius:99px;transition:width 0.4s;${shimmer}"></div>
+  return `<div style="padding:7px 16px 2px">
+    <div${requestId != null ? ` data-progress-id="${requestId}"` : ''} style="height:4px;background:var(--border);border-radius:99px;overflow:hidden">
+      <div${cls} style="height:100%;width:${pct}%;background:${color};border-radius:99px;transition:width 0.4s;${shimmer}"></div>
+    </div>
+    <div${requestId != null ? ` data-progress-label-id="${requestId}"` : ''} style="margin-top:4px;color:var(--textMute);font:9px 'JetBrains Mono',monospace;text-align:right">${escHtml(label)}</div>
   </div>`;
 }
 
@@ -932,136 +1222,86 @@ function progressBar(progress, isLive, requestId) {
 // conversation group has several turns. Mirrors the single-turn card body but
 // without the outer chrome (border-left, header).
 function routingOutcomeHtml(event) {
-  return `<div style="margin-top:6px;font-size:10px;color:var(--textDim);overflow-wrap:anywhere">Requested: ${escHtml(event.requested_model || 'auto')} → actual: ${escHtml(event.effective_provider || 'error')} / ${escHtml(event.model_key || 'unknown')}</div>`;
-}
-
-function renderTurnCard(evs) {
-  const latest = evs[evs.length - 1];
-  const successEv = evs.filter(e => e.success);
-  const displayEv = successEv.length ? successEv[successEv.length - 1] : latest;
-  const routeColor = (displayEv._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
-
-  const totalLatency = evs.reduce((sum, e) => sum + (e.latency_ms || 0), 0);
-  const lat = fmtLatency(totalLatency || latest.latency_ms);
-  const age = fmtAge(latest.timestamp);
-  const prompt = escHtml((latest.prompt_excerpt || '(no prompt)').slice(0, 400));
-
-  const errHtml = (!latest.success && latest.error)
-    ? `<div style="margin-top:6px;padding:8px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:11px;color:var(--text)">${escHtml(latest.error)}</div>`
-    : '';
-
-  let hopSummary = '';
-  if (evs.length > 1) {
-    const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗')).join(' → ');
-    hopSummary = `<div style="margin-top:6px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${evs.length} hops · ${escHtml(chain)} · ${lat}</div>`;
-  }
-
-  return `<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg2);padding:10px 12px;margin-bottom:8px">
-    <div style="font-size:12px;color:var(--text);line-height:1.5">${prompt}</div>
-    ${routingOutcomeHtml(displayEv)}
-    ${errHtml}
-    ${hopSummary}
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">
-      <span style="color:${routeColor}">${escHtml(displayEv._route || '—')}</span>
-      <span>·</span>
-      <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
-      <span style="opacity:0.6">· ${lat}</span>
-      <span style="margin-left:auto;opacity:0.6">${age}</span>
-    </div>
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap">
+    <span class="br-metric">requested ${escHtml(event.requested_model || 'auto')}</span>
+    <span class="br-metric" style="color:${routeColorFor(event._route)}">${escHtml(event._route || deriveRoute(event))}</span>
+    <span class="br-metric">served by ${escHtml(event.effective_provider || 'pending')} / ${escHtml(event.model_key || 'pending')}</span>
   </div>`;
 }
 
+function renderTurnCard(events, index, total) {
+  const latest = events[events.length - 1];
+  const successful = events.filter(event => event.success);
+  const display = successful.length ? successful[successful.length - 1] : latest;
+  const turnNumber = total - index;
+  const prompt = latest.prompt_excerpt || '(no prompt)';
+  const measurement = measurementForEvents(events);
+  const completed = measurement && measurement.completed_at ? ` · completed ${fmtTimestamp(measurement.completed_at)}` : '';
+  return `<details class="br-detail"${index === 0 ? ' open' : ''} style="border:1px solid var(--border);border-radius:8px;background:var(--bg2);padding:10px 12px">
+    <summary style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="color:var(--cyan);font:10px 'JetBrains Mono',monospace">TURN ${turnNumber}</span>
+      <span style="flex:1;min-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${promptHtml(prompt)}</span>
+      <span style="color:${routeColorFor(display._route)};font:10px 'JetBrains Mono',monospace">${escHtml(display._route || 'pending')} · ${escHtml(display._displayModel || 'pending')}</span>
+    </summary>
+    <div style="font-size:13px;color:var(--text);line-height:1.6;white-space:pre-wrap;word-break:break-word;padding:4px 0 2px">${promptHtml(prompt)}</div>
+    <div style="margin-top:8px">${routingOutcomeHtml(display)}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${metricChips(events)}</div>
+    <div style="margin-top:7px;color:var(--textMute);font:10px 'JetBrains Mono',monospace">started ${fmtTimestamp(events[0].timestamp)} · routed ${fmtLatency(events.reduce((sum,event) => sum + (event.latency_ms || 0), 0))}${completed}</div>
+    ${routingDetailsHtml(events)}
+  </details>`;
+}
+
 function renderGroup(group, index) {
-  const evs = group.events;
-  const latest = evs[evs.length - 1];
-  const first  = evs[0];
-  const sess   = group.session;
-
-  // Live request matching this card (by conv_id or session_id).
+  const events = group.events;
+  const latest = events[events.length - 1] || virtualSessionEvent(group.session || {});
+  const session = group.session;
   const infReq = inflightFor(group);
-  const st = deriveStatus(latest, sess, infReq ? inferenceStatus : null);
-  const isLive = !!infReq || ['generating','reviewing','routing','iterating'].includes(st);
-  const src = SOURCES[latest._source] || SOURCES.local;
-
-  // Determine the dominant route and model.
-  const successEv = evs.filter(e => e.success);
-  const displayEv = successEv.length ? successEv[successEv.length - 1] : latest;
-  const routeColor = (displayEv._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
-
-  const totalLatency = evs.reduce((s,e) => s + (e.latency_ms || 0), 0);
-  const lat = fmtLatency(totalLatency || latest.latency_ms);
-  const latColor = totalLatency > 5000 ? '#f5b14a' : 'var(--textDim)';
-
-  const folder = latest._folder || first._folder || '';
-  const age    = fmtAge(group.latestTs);
-  const progress = infReq
-    ? inflightProgress(infReq, inferenceStatus)
-    : { pct: requestProgress(group, null), indeterminate: false };
-
-  // Turns: a conversation group (conv_id) holds every harness turn; each one
-  // renders as a nested sub-card.  A one-turn group renders flat, exactly as
-  // before — no gratuitous nesting for a single request.
+  const status = deriveStatus(latest, session, infReq ? inferenceStatus : null);
+  const isLive = !!infReq || ['generating','reviewing','routing','iterating','reasoning'].includes(status);
+  const source = SOURCES[latest._source] || SOURCES.local;
+  const progress = infReq ? inflightProgress(infReq, inferenceStatus) : { pct: requestProgress(group, null), indeterminate: false };
   const turns = turnsOf(group);
+  const identifier = cardIdentifier(group);
+  const title = cardTitle(group);
+  const pinned = pinnedKeys.has(group.key);
+  const hidden = dismissedKeys.has(group.key);
+  const folder = latest._folder || '';
+  const measurement = measurementForEvents(events);
+  const completedAt = measurement && measurement.completed_at;
+  const display = events.filter(event => event.success).pop() || latest;
 
-  let body;
-  if (turns.length > 1) {
-    body = `<div style="padding:10px 16px 10px">
-      ${turns.map(renderTurnCard).join('')}
-    </div>`;
-  } else {
-    const prompt = escHtml(first.prompt_excerpt || '(no prompt)');
-    const errHtml = (!latest.success && latest.error)
-      ? `<div style="margin-top:8px;padding:10px;background:var(--redDim);border-left:2px solid var(--red);border-radius:4px;font-size:12px;color:var(--text)">${escHtml(latest.error)}</div>`
-      : '';
-    // Hops summary — one compact line, never expanded rows.  Failed fallback
-    // hops and the winner render as a single chain (e.g. "2 hops · manifest ✗ → local ✓").
-    const hopCount = evs.length;
-    let hopSummary = '';
-    if (hopCount > 1) {
-      const chain = evs.map(e => (e.success ? (e._displayModel || e._route || '?') + ' ✓' : (e._displayModel || e._route || '?') + ' ✗' + (e.error && e.error.includes('context') ? ' (ctx too small)' : ''))).join(' → ');
-      hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">${hopCount} hops · ${escHtml(chain)} · ${lat}</div>`;
-    } else {
-      // Single failed hop: surface the actionable error inline.
-      const f = evs.find(e => !e.success && e.error);
-      if (f) {
-        const msg = f.error.includes('context')
-          ? 'request exceeds local context size — adjust n_ctx in the llama-swap model config'
-          : f.error;
-        hopSummary = `<div style="margin-top:8px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--red)">${escHtml(msg)}</div>`;
-      }
-    }
-    body = `<div style="padding:10px 16px 4px">
-      <div style="font-size:13px;color:var(--text);line-height:1.5">${prompt}</div>
-      ${routingOutcomeHtml(displayEv)}
-      ${errHtml}
-      ${hopSummary}
-    </div>
-    <div style="padding:4px 16px 10px;display:flex;gap:8px;align-items:center;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textMute)">
-      <span style="color:${routeColor}">${escHtml(displayEv._route || '—')}</span>
-      <span>·</span>
-      <span style="color:${routeColor}">${escHtml(displayEv._displayModel || '—')}</span>
-      ${hopCount === 1 ? `<span style="opacity:0.6">· ${lat}</span>` : ''}
-      ${tsChips(evs)}
-      <span style="margin-left:auto;opacity:0.6">${age}</span>
-    </div>`;
-  }
-
-  return `<article data-gidx="${index}" style="background:var(--panel);border:1px solid var(--border);border-left:3px solid ${src.color};border-radius:10px;overflow:hidden;position:relative">
+  return `<article data-gidx="${index}" style="background:var(--panel);border:1px solid ${pinned ? 'rgba(245,177,74,.55)' : 'var(--border)'};border-left:3px solid ${pinned ? 'var(--amber)' : source.color};border-radius:10px;overflow:hidden;position:relative">
     ${isLive ? '<div class="shimmer-bar"></div>' : ''}
-    <header style="padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
-      <div style="width:24px;height:24px;border-radius:6px;background:${src.color}22;border:1px solid ${src.color}55;display:flex;align-items:center;justify-content:center;color:${src.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${src.glyph}</div>
+    <header style="padding:11px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
+      <div style="width:28px;height:28px;border-radius:7px;background:${source.color}22;border:1px solid ${source.color}55;display:flex;align-items:center;justify-content:center;color:${source.color};font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;flex-shrink:0">${source.glyph}</div>
       <div style="flex:1;min-width:0">
-        <span style="color:${src.color};font-weight:600;font-size:12px">${src.label}</span>
-        ${latest.cwd ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px">${escHtml(folder)}</span>` : ''}
-        ${turns.length > 1 ? `<span style="color:var(--textMute);margin-left:6px;font-size:11px;font-family:'JetBrains Mono',monospace">· ${turns.length} turns</span>` : ''}
+        <div style="display:flex;align-items:center;gap:7px;min-width:0">
+          <div title="${escHtml(title)}" style="font-size:13px;color:var(--text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(title)}</div>
+          <button class="br-icon-btn" onclick="copyCardId(${index})" title="Copy full session or conversation ID">#${escHtml(shortId(identifier))}</button>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:3px;color:var(--textMute);font:10px 'JetBrains Mono',monospace">
+          <span style="color:${source.color}">${source.label}</span>
+          ${folder ? `<span>· ${escHtml(folder)}</span>` : ''}
+          <span>· ${turns.length} turn${turns.length === 1 ? '' : 's'}</span>
+          <span>· started ${fmtTimestamp(events[0].timestamp)}</span>
+          <span>· updated ${fmtAge(group.latestTs)}</span>
+          ${completedAt ? `<span>· completed ${fmtTimestamp(completedAt)}</span>` : ''}
+        </div>
       </div>
-      ${infReq ? activityPill(infReq) : statusPill(st)}
-      <button onclick="dismissCard(${index})" title="Hide this card"
-        style="all:unset;cursor:pointer;color:var(--textMute);font-size:11px;line-height:1;padding:2px 5px;border-radius:4px;flex-shrink:0">✕</button>
+      ${infReq ? activityPill(infReq) : statusPill(status)}
+      <button class="br-icon-btn ${pinned ? 'active' : ''}" onclick="togglePin(${index})" title="${pinned ? 'Unpin' : 'Pin'} card">${pinned ? '★' : '☆'}</button>
+      <button class="br-icon-btn" onclick="${hidden ? 'restoreCard' : 'dismissCard'}(${index})" title="${hidden ? 'Restore' : 'Hide'} card">${hidden ? '↩' : '✕'}</button>
     </header>
-    ${progressBar(progress, isLive, infReq ? infReq.id : null)}
-    ${body}
-    ${reviewHtml(sess, latest.id)}
+    ${progressBar(progress, isLive, infReq ? infReq.id : null, progressLabel(group, infReq, progress))}
+    ${lifecycleHtml(group, infReq)}
+    <div style="padding:4px 16px 12px;display:flex;flex-direction:column;gap:9px">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        ${routingOutcomeHtml(display)}
+        ${metricChips(events)}
+      </div>
+      ${turns.map((turn, turnIndex) => renderTurnCard(turn, turnIndex, turns.length)).join('')}
+    </div>
+    ${reviewHtml(session)}
   </article>`;
 }
 </script>
@@ -1413,8 +1653,6 @@ function updateKPI() {
 </script>
 <script>
 // ─── Render stream ────────────────────────────────────────────────────────────
-// Groups dismissed via the card X button (in-memory, per page load).
-let dismissedKeys = new Set();
 let renderedGroups = [];
 
 // Fingerprint of the last rendered list.  Re-writing innerHTML every 3s
@@ -1427,37 +1665,90 @@ function renderStream() {
   if (!list) return;
 
   const enriched = enrichEvents(allEvents, allSessions);
-
-  // Group into one card per logical request, then filter each group.
   const groups = groupEvents(enriched);
-  const filtered = groups.filter(g => {
-    if (dismissedKeys.has(g.key)) return false;  // user dismissed this card
-    // A group matches if any of its events matches the filter.
-    return g.events.some(t => matchesFilter(t) && matchesSearch(t) && matchesSankey(t));
+  updateFacetOptions(groups.flatMap(group => group.events));
+
+  const filtered = groups.filter(group => {
+    const hidden = dismissedKeys.has(group.key);
+    if (activeFilter === 'hidden' ? !hidden : hidden) return false;
+    if (activeFilter === 'pinned' && !pinnedKeys.has(group.key)) return false;
+    return group.events.some(event =>
+      matchesFilter(event) && matchesSearch(event) && matchesFacets(event) && matchesSankey(event)
+    );
+  }).sort((left, right) => {
+    const pinOrder = Number(pinnedKeys.has(right.key)) - Number(pinnedKeys.has(left.key));
+    return pinOrder || new Date(right.latestTs) - new Date(left.latestTs);
   });
 
   let html;
   if (filtered.length === 0) {
-    const msg = allEvents.length === 0
-      ? 'No routing events yet. Events appear here as requests flow through brainrouter.'
-      : 'No events match the current filter.';
+    const msg = groups.length === 0
+      ? 'No routing events or review sessions yet.'
+      : activeFilter === 'hidden' ? 'No hidden cards.' : 'No cards match the current filters.';
     html = `<div style="color:var(--textMute);font-size:12px;padding:40px 0;text-align:center;line-height:1.7">${msg}</div>`;
     renderedGroups = [];
   } else {
     renderedGroups = filtered;
-    html = filtered.map((g, i) => renderGroup(g, i)).join('');
+    html = filtered.map((group, index) => renderGroup(group, index)).join('');
   }
 
-  if (html === lastStreamHtml) return;  // nothing changed: keep selection & scroll
+  if (html === lastStreamHtml) return;
   lastStreamHtml = html;
   list.innerHTML = html;
 }
 
-function dismissCard(index) {
-  const g = renderedGroups[index];
-  if (!g) return;
-  dismissedKeys.add(g.key);
+function togglePin(index) {
+  const group = renderedGroups[index];
+  if (!group) return;
+  if (pinnedKeys.has(group.key)) pinnedKeys.delete(group.key); else pinnedKeys.add(group.key);
+  saveSet(localStorage, CARD_STORAGE.pins, pinnedKeys);
+  lastStreamHtml = '';
   renderStream();
+}
+
+function dismissCard(index) {
+  const group = renderedGroups[index];
+  if (!group) return;
+  dismissedKeys.add(group.key);
+  saveSet(sessionStorage, CARD_STORAGE.hidden, dismissedKeys);
+  renderStream();
+}
+
+function restoreCard(index) {
+  const group = renderedGroups[index];
+  if (!group) return;
+  dismissedKeys.delete(group.key);
+  saveSet(sessionStorage, CARD_STORAGE.hidden, dismissedKeys);
+  renderStream();
+}
+
+function restoreAllHidden() {
+  dismissedKeys.clear();
+  saveSet(sessionStorage, CARD_STORAGE.hidden, dismissedKeys);
+  renderStream();
+}
+
+function cardIdentifier(group) {
+  const event = group.events[group.events.length - 1] || {};
+  return (group.session && group.session.id) || event.session_id || event.conv_id || group.key;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    window.prompt('Copy this value:', text);
+  }
+}
+
+function copyCardId(index) {
+  const group = renderedGroups[index];
+  if (group) copyText(cardIdentifier(group));
+}
+
+function copyReview(sessionId) {
+  const session = allSessions.find(item => item.id === sessionId);
+  if (session) copyText(session.llm_feedback || session.human_feedback || '');
 }
 
 // ─── Review badge (sidebar) + reviews category ───────────────────────────────
@@ -2273,7 +2564,11 @@ async function refreshFast() {
     safeFetch('/api/inflight'),
   ]);
 
-  if (evRes) allEvents = Array.isArray(evRes.events) ? evRes.events : (Array.isArray(evRes) ? evRes : []);
+  if (evRes) {
+    allEvents = Array.isArray(evRes.events) ? evRes.events : (Array.isArray(evRes) ? evRes : []);
+    allMeasurements = Array.isArray(evRes.measurements) ? evRes.measurements : [];
+    measurementByEventId = new Map(allMeasurements.map(measurement => [measurement.event_id, measurement]));
+  }
   if (sesRes) allSessions = Array.isArray(sesRes.sessions) ? sesRes.sessions : (Array.isArray(sesRes) ? sesRes : []);
   if (stRes) statsData = stRes;
   if (infRes) inferenceStatus = infRes;
@@ -2453,17 +2748,30 @@ function updateLiveProgressBars() {
     const bar = el.firstElementChild;
     if (!bar) return;
     const r = inflightList.find(x => x.id === id);
+    const label = document.querySelector(`[data-progress-label-id="${id}"]`);
     if (!r) {
       bar.classList.remove('br-progress-indeterminate');
       bar.style.animation = 'none';
       bar.style.width = '100%';
       bar.style.background = 'var(--green)';
+      if (label) {
+        label.textContent = 'Complete · 100%';
+        label.removeAttribute('data-progress-label-id');
+      }
       el.removeAttribute('data-progress-id');
       return;
     }
     const progress = inflightProgress(r, inferenceStatus);
     bar.classList.toggle('br-progress-indeterminate', progress.indeterminate);
     if (!progress.indeterminate) bar.style.width = Math.max(2, progress.pct) + '%';
+    if (label) {
+      const generated = Number(r.generated_tokens) || 0;
+      const maxTokens = Number(r.max_tokens) || 0;
+      const pp = Number(r.pp_progress) || 0;
+      label.textContent = generated > 0
+        ? (maxTokens > 0 ? `${fmtNumber(generated)} / ${fmtNumber(maxTokens)} output tokens` : `${fmtNumber(generated)} output tokens · final length unknown`)
+        : pp > 0 ? `${Math.round(pp * 100)}% prompt prefill` : 'Active · final length unknown';
+    }
   });
 }
 
@@ -2499,6 +2807,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Initial load
+document.querySelectorAll('.filter-btn').forEach(button => {
+  button.classList.toggle('active', button.dataset.filter === activeFilter);
+});
+updatePromptPrivacyButton();
 refreshFast();
 refreshInflightProgress();
 refreshOmpSessions();
