@@ -5,6 +5,8 @@ use futures_util::StreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 /// OpenAI-compatible provider adapter.
 /// Handles OpenAI, GitHub Copilot, Mistral, llama-swap, and other OpenAI-compatible APIs.
 pub struct OpenAiProvider {
@@ -86,10 +88,19 @@ impl Provider for OpenAiProvider {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
 
-            let response = req_builder
-                .json(&request)
-                .send()
+            let response = tokio::time::timeout(
+                RESPONSE_HEADER_TIMEOUT,
+                req_builder.json(&request).send(),
+            )
                 .await
+                .map_err(|_| ProviderError {
+                    message: format!(
+                        "{} timed out waiting for response headers after {} seconds",
+                        self.name,
+                        RESPONSE_HEADER_TIMEOUT.as_secs()
+                    ),
+                    is_backend_fault: true,
+                })?
                 .map_err(|e| ProviderError {
                     message: format!("Failed to connect to {}: {}", self.name, e),
                     is_backend_fault: true,

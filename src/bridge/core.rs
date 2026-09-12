@@ -138,8 +138,11 @@ pub async fn invoke_omp(
     timeout_secs: u64,
 ) -> Result<(String, Option<String>, Option<(String, String)>), String> {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::process::Command;
+
+    const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_STDERR_BYTES: u64 = 1024 * 1024;
 
     let mut cmd = Command::new(omp_path);
     cmd.stdin(Stdio::null());
@@ -180,27 +183,60 @@ pub async fn invoke_omp(
     };
 
     cmd.arg(&query);
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()
         .map_err(|e| format!("OMP process I/O error: {}", e))?;
 
-    // Read stdout line-by-line with an inactivity timeout.
-    // Each line of NDJSON output resets the clock.
     let stdout = child.stdout.take()
         .ok_or_else(|| "failed to capture OMP stdout".to_string())?;
+    let stderr = child.stderr.take()
+        .ok_or_else(|| "failed to capture OMP stderr".to_string())?;
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut bytes = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let count = stderr.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            let remaining = (MAX_STDERR_BYTES as usize).saturating_sub(bytes.len());
+            let retained = remaining.min(count);
+            bytes.extend_from_slice(&chunk[..retained]);
+            truncated |= retained < count;
+        }
+        Ok::<_, std::io::Error>((bytes, truncated))
+    });
     let mut reader = BufReader::new(stdout).lines();
     let inactivity = std::time::Duration::from_secs(timeout_secs);
     let mut collected = Vec::new();
+    let mut collected_bytes = 0usize;
 
     loop {
         match tokio::time::timeout(inactivity, reader.next_line()).await {
             Ok(Ok(Some(line))) => {
+                collected_bytes = collected_bytes.saturating_add(line.len() + 1);
+                if collected_bytes > MAX_STDOUT_BYTES {
+                    drop(reader);
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stderr_task.await;
+                    return Err(format!(
+                        "OMP output exceeded the {} MiB limit",
+                        MAX_STDOUT_BYTES / (1024 * 1024)
+                    ));
+                }
                 collected.push(line);
             }
             Ok(Ok(None)) => break,           // EOF — process closed stdout
             Ok(Err(e)) => {
-                tracing::warn!("OMP stdout read error: {}", e);
-                break;
+                drop(reader);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+                return Err(format!("OMP stdout read error: {e}"));
             }
             Err(_) => {
                 // Inactivity timeout — kill the process and reap to avoid zombies.
@@ -209,6 +245,7 @@ pub async fn invoke_omp(
                 drop(reader);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                let _ = stderr_task.await;
                 return Err(format!(
                     "OMP timed out after {}s of inactivity",
                     timeout_secs
@@ -220,21 +257,22 @@ pub async fn invoke_omp(
     // Wait for the process to finish (should be instant after EOF).
     let status = child.wait().await
         .map_err(|e| format!("OMP wait error: {}", e))?;
+    let (stderr_bytes, truncated) = stderr_task
+        .await
+        .map_err(|e| format!("OMP stderr task failed: {e}"))?
+        .map_err(|e| format!("OMP stderr read error: {e}"))?;
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes)
+        .trim()
+        .to_string();
+    if truncated {
+        stderr.push_str("\n[stderr truncated]");
+    }
 
-    if !status.success() && collected.is_empty() {
-        // Read stderr for diagnostics.
-        let stderr_bytes = if let Some(mut stderr) = child.stderr.take() {
-            let mut buf = Vec::new();
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
-            buf
-        } else {
-            Vec::new()
-        };
-        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+    if !status.success() {
         return Err(if stderr.is_empty() {
             format!("OMP exited with status {}", status)
         } else {
-            stderr
+            format!("OMP exited with status {}: {}", status, stderr)
         });
     }
 
@@ -268,6 +306,7 @@ pub fn parse_omp_json_output(
     let mut model_error: Option<String> = None;
     let mut saw_tool_use = false;
     let mut saw_any_event = false;
+    let mut saw_completed_assistant = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -293,6 +332,7 @@ pub fn parse_omp_json_output(
                 if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
                     continue;
                 }
+                saw_completed_assistant = true;
                 // Capture provider+model from the first assistant message_end.
                 if model_info.is_none() {
                     if let (Some(p), Some(m)) = (
@@ -332,6 +372,10 @@ pub fn parse_omp_json_output(
             }
             _ => {}
         }
+    }
+
+    if !saw_completed_assistant {
+        return Err("OMP exited before completing an assistant response.".to_string());
     }
 
     // Return Err when OMP produced no text at all and signalled an error.
@@ -377,6 +421,23 @@ pub fn sandbox_resolve(candidate: PathBuf, root: &std::path::Path) -> Result<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn executable_script(contents: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-bridge-process-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("omp-test");
+        std::fs::write(&script, contents).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        (root, script)
+    }
 
     fn aliases() -> HashMap<String, String> {
         [
@@ -456,5 +517,55 @@ mod tests {
         assert_eq!(text, "I am Gemma.");
         assert_eq!(session_id.as_deref(), Some("sess1"));
         assert_eq!(model_info.as_ref().map(|(p, _)| p.as_str()), Some("llama.cpp"));
+    }
+
+    #[test]
+    fn omp_session_without_completed_assistant_is_rejected() {
+        let result = parse_omp_json_output(br#"{"type":"session","id":"sess1"}"#);
+        assert_eq!(
+            result.unwrap_err(),
+            "OMP exited before completing an assistant response."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invoke_omp_drains_stderr_without_deadlocking() {
+        let (root, script) = executable_script(
+            "#!/bin/sh\nhead -c 2097152 /dev/zero >&2\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"s\"}' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"stopReason\":\"stop\"}}'\n",
+        );
+        let result = invoke_omp(
+            script.to_str().unwrap(),
+            root.to_str().unwrap(),
+            None,
+            "hello",
+            None,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, "ok");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invoke_omp_rejects_nonzero_exit_even_with_valid_stdout() {
+        let (root, script) = executable_script(
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"s\"}' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"partial\"}],\"stopReason\":\"stop\"}}'\necho failed >&2\nexit 7\n",
+        );
+        let error = invoke_omp(
+            script.to_str().unwrap(),
+            root.to_str().unwrap(),
+            None,
+            "hello",
+            None,
+            5,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("status"));
+        assert!(error.contains("failed"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

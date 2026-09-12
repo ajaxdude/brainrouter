@@ -529,6 +529,7 @@ sessions into a database.
 | Registry | `models`, `artifacts`, `runtimes`, `hardware_profiles`, `workloads`: declared model/tokenizer/quant/build/hardware/corpus identities |
 | Configuration | `experiment_specs`, `experiments`: canonical registry references plus context, token, batch, thread, optimization and sampling settings |
 | Attempts | `runs`: unique ID and `(experiment_id,repetition)`, status, timestamps, command/environment/log pointers and raw result |
+| Native jobs | `benchmark_jobs`: queued/running/terminal Riddllr and Plumebench job state, progress, request identity, workspace and resulting run |
 | Measurements | One-to-one `performance_metrics`/`speculative_metrics`; one-to-many `quality_results`/`telemetry_samples` |
 | Immutability | `entity_fingerprints` rejects changed registry/config payloads under reused IDs |
 | Exclusions | Schema reserves an `exclusions` table; current planning returns exclusions without persisting them |
@@ -540,6 +541,50 @@ compiler/build flags, optimization feature states, and capture timestamps stay
 separate. `unsupported`, `disabled`, `enabled`, and `requested_unavailable` are
 data states, not proof that a backend implements or executed a feature.
 Draft-artifact references must exist.
+
+### Native Benchmark Lab
+
+The opt-in Benchmark Lab runs two integrated suites from `/benchmarks`:
+
+- **Riddllr** discovers matched `prompts/<case>.txt` and
+  `solutions/<case>-solution.txt` files, routes the prompt through Brainrouter,
+  grades cardinal-assignment or ordered-line answers deterministically, and
+  stores `pass@1`, duration, output, route provenance and the declared suite
+  manifest.
+- **Plumebench** discovers complete `tasks/<case>/` directories. Brainrouter
+  takes one immutable private snapshot of the task and grader, copies only
+  `starter/` plus the prompt into a per-job workspace, and invokes OMP through
+  the `brainrouter/<model>` provider inside a Bubblewrap filesystem sandbox.
+  The sandbox receives the starter workspace, a generated credential-free OMP
+  profile, the OMP executable, and read-only system files; it cannot see the
+  suite root, hidden tests, daemon configuration, user home, or sibling job
+  directories. Only after OMP exits does Brainrouter copy `tests_hidden/` from
+  the snapshot into a separate grader stage. Pytest and the snapshotted
+  `elegance.py` run in a second network-isolated Bubblewrap sandbox, with only
+  the grader stage writable. Brainrouter records test counts, pass@1, and raw
+  static metrics when the hidden gate passes.
+
+Execution is localhost-only, explicit, and limited to one heavy job. Job
+identity includes suite, case, model, repetition, source manifest and relevant
+runner settings. Duplicate active identities are rejected; successful run
+identities require a new repetition. Cancellation terminates the spawned Unix
+process group, captured output is bounded, source symlinks and path escapes are
+rejected, and queued/running jobs become `interrupted` after daemon restart.
+Source suite directories are never modified, and the configured workspace may
+not overlap either suite root. OMP requires a CLI exposing `--model`, `--mode`,
+`--max-time`, `--thinking`, `--auto-approve`, `--no-session`, and `--cwd`
+plus the `--no-extensions`, `--no-skills`, and `--no-rules` isolation switches
+(OMP 18.1 or newer is recommended). Brainrouter enforces the configured turn
+limit from OMP `turn_start` events rather than passing an unsupported CLI flag.
+The OMP sandbox has a private network namespace. A short-lived proxy exposes
+only `/v1/models` and `/v1/chat/completions` through a filtered Unix socket, so
+generated code cannot reach Brainrouter's dashboard or administrative APIs.
+
+The lab remains disabled unless `benchmarks.lab.enabled` is true. A missing
+suite root disables that suite in the UI without disabling routing or imported
+benchmark exploration. A missing OMP/Python executable fails only the affected
+job. Completed, timed-out and cancelled executions use the same validated
+registry ingestion path as uploads.
 
 ### Query and export semantics
 
@@ -587,7 +632,9 @@ Successful run payloads are immutable. To preserve reproducibility, corrections 
 | Matrix plan | 10,000 candidates and 8 MiB expansion/response budget |
 | Filtered export | 10,000 runs and 8 MiB; narrow filters or export offline from a consistent SQLite snapshot |
 
-CSV/JSONL exports contain **all matching run summaries or an explicit limit error**, independently of UI pagination; they are not full bundle or telemetry exports. Each export reads a single stable SQLite transaction and writes bounded pages directly into a capped buffer, never an unlimited list. Ordering is deterministic with run-ID ties. CSV quotes commas, quotes and newlines and neutralizes spreadsheet formula prefixes. Use the raw run JSON download for full detail within HTTP limits; larger history remains accessible through the synchronous store detail API or offline SQLite tools. The public synchronous API stays available for tests/offline consumers; async callers must use `store.run_blocking(move |store| store.run_detail(&id)).await` (or `query_runs`) to share admission and HTTP read budgets. These changes require no schema migration and neither remove old records nor turn optional benchmark storage into a daemon-startup dependency.
+CSV/JSONL exports contain **all matching run summaries or an explicit limit error**, independently of UI pagination; they are not full bundle or telemetry exports. Each export reads a single stable SQLite transaction and writes bounded pages directly into a capped buffer, never an unlimited list. Ordering is deterministic with run-ID ties. CSV quotes commas, quotes and newlines and neutralizes spreadsheet formula prefixes. Use the raw run JSON download for full detail within HTTP limits; larger history remains accessible through the synchronous store detail API or offline SQLite tools. The public synchronous API stays available for tests/offline consumers; async callers must use `store.run_blocking(move |store| store.run_detail(&id)).await` (or `query_runs`) to share admission and HTTP read budgets. Schema migration 2 adds only the native job lifecycle table and indexes. It
+does not remove old records or turn optional benchmark storage/execution into a
+daemon-startup dependency.
 
 ### API walkthrough: synthetic fixtures, no inference
 
@@ -952,6 +999,18 @@ models:
 
 benchmarks:
   database_path: "/home/you/.local/share/brainrouter/benchmarks.sqlite3"
+  lab:
+    enabled: false                       # opt in to native Riddllr/Plumebench jobs
+    riddllr_root: "/home/you/ai/projects/riddllr"
+    plumebench_root: "/home/you/ai/projects/plumebench"
+    workspace_path: "/home/you/.local/share/brainrouter/benchmark-lab"
+    omp_bin: "/home/you/.bun/bin/omp"
+    plumebench_sandbox_bin: "/usr/bin/bwrap"
+    python_bin: "python3"
+    max_job_seconds: 900                 # whole suite job deadline, 1..86400
+    riddllr_max_tokens: 4096
+    plumebench_max_turns: 40
+    plumebench_thinking: "low"           # off|minimal|low|medium|high|xhigh|max|auto
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
@@ -1090,7 +1149,12 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/benchmarks` | Interactive benchmark explorer |
+| `GET` | `/benchmarks` | Native Benchmark Lab plus interactive benchmark explorer/import workflow |
+| `GET` | `/api/benchmarks/lab/suites` | Configured Riddllr/Plumebench availability, cases and source manifest hashes |
+| `GET` | `/api/benchmarks/lab/jobs` | Recent persisted native jobs; optional `limit` 1-100 |
+| `GET` | `/api/benchmarks/lab/jobs/:id` | Current or persisted job detail |
+| `POST` | `/api/benchmarks/lab/jobs` | Queue `{suite,case_id,model,repetition}`; localhost-only, one heavy execution slot |
+| `POST` | `/api/benchmarks/lab/jobs/:id/cancel` | Cancel a queued/running job and terminate its process group |
 | `GET` | `/api/benchmarks/runs` | Filtered page; supports `page`, `per_page` (1-100), `q`, `status`, `family`, `backend`, `workload`, `quant_name`, `speculator_type`, `sort`, and `order` |
 | `GET` | `/api/benchmarks/runs/:id` | Full run detail within row/sample/byte limits; explicit 413 otherwise |
 | `GET` | `/api/benchmarks/filters` | Deterministically ordered filter values |
@@ -1196,15 +1260,15 @@ bash scripts/check-html-js.sh
 cargo build --locked --bin brainrouter
 ```
 
-At baseline `3691dcc` (2026-09-07), **192 Rust tests and 31 Node browser-logic tests
-passed**, with four embedded HTML templates syntax-checked and a debug binary
-built. Fixtures cover core routing/failover, both protocols, exact role choices,
-review snapshots, event-correlated measurements, real-daemon startup under bad
-benchmark storage and legacy auto state, strict write APIs, transactional
-imports/previews, backpressure/limits, inspector workflows and alert rules.
-They do not execute real model or benchmark workloads. Node DOM tests are not a
-real-browser/accessibility certification. Existing unrelated Clippy warnings
-remain; do not confuse baseline warnings with new diagnostics.
+The repository test suite covers core routing/failover, both protocols, exact
+role choices, review snapshots, event-correlated measurements, real-daemon
+startup under bad benchmark storage and legacy auto state, strict write APIs,
+transactional imports/previews, Benchmark Lab discovery/grading/lifecycle
+helpers, backpressure/limits, inspector workflows and alert rules. Automated
+tests use fixtures and mock processes rather than consuming a real model slot.
+Node DOM tests are not a real-browser/accessibility certification. Existing
+unrelated Clippy warnings remain; do not confuse baseline warnings with new
+diagnostics.
 
 ## Planned, not shipped
 

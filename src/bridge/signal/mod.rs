@@ -16,18 +16,24 @@ use crate::bridge::persist::{
 
 const TRANSPORT: &str = "signal";
 
-// Non-blocking persistence — fire-and-forget on a background thread.
+// Persistence is sequenced and coalesced by bridge::persist.
 fn spawn_save_sessions(sessions: &HashMap<String, String>) {
-    let snapshot = sessions.clone();
-    tokio::task::spawn_blocking(move || save_sessions(TRANSPORT, &snapshot));
+    save_sessions(TRANSPORT, sessions);
 }
 fn spawn_save_channel_models(models: &HashMap<String, String>) {
-    let snapshot = models.clone();
-    tokio::task::spawn_blocking(move || save_channel_models(TRANSPORT, &snapshot));
+    save_channel_models(TRANSPORT, models);
 }
 
 type SessionMap = Arc<Mutex<HashMap<String, String>>>;
 type ModelMap = Arc<Mutex<HashMap<String, String>>>;
+
+fn signal_message_allowed(
+    configured_group: Option<&str>,
+    reply_to: &str,
+    is_group: bool,
+) -> bool {
+    configured_group.is_none_or(|group| is_group && reply_to == group)
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -509,6 +515,7 @@ pub struct Contact {
 
 pub struct SignalService {
     account: String,
+    group_id: Option<String>,
     prefix: String,
     llama_swap_url: String,
     omp_path: String,
@@ -532,6 +539,12 @@ impl SignalService {
         manager: Arc<super::BridgeManager>,
     ) -> anyhow::Result<Self> {
         let account = signal_config.account_or_err()?.to_string();
+        let group_id = signal_config
+            .group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let prefix = signal_config.prefix_str().to_string();
         let llama_swap_url = signal_config.llama_url().to_string();
 
@@ -548,6 +561,7 @@ impl SignalService {
         info!("Signal service ready");
         Ok(Self {
             account,
+            group_id,
             prefix,
             llama_swap_url,
             omp_path: omp_path.to_string(),
@@ -573,6 +587,7 @@ impl SignalService {
     /// Spawn a background task polling signal-cli for incoming messages every 3 seconds.
     pub fn start_receive_loop(&self) {
         let account = self.account.clone();
+        let group_id = self.group_id.clone();
         let sessions = self.sessions.clone();
         let channel_models = self.channel_models.clone();
         let prefix = self.prefix.clone();
@@ -591,6 +606,14 @@ impl SignalService {
                     Ok(msgs) => {
                         if manager.signal_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                             for (reply_to, content, is_group) in msgs {
+                                if !signal_message_allowed(group_id.as_deref(), &reply_to, is_group) {
+                                    tracing::debug!(
+                                        reply_to,
+                                        is_group,
+                                        "Ignoring Signal message outside the configured group"
+                                    );
+                                    continue;
+                                }
                                 handle_message(
                                     &reply_to,
                                     &content,
@@ -609,6 +632,7 @@ impl SignalService {
                                 )
                                 .await;
                             }
+
                         } else {
                             tracing::debug!("Signal bridge paused (disabled via dashboard); skipping {} message(s)", msgs.len());
                         }
@@ -695,5 +719,17 @@ mod tests {
         let json = r#"{"envelope":{"source":"+1555000001","sourceNumber":"+1555000001","sourceUuid":"abc","sourceName":"Alice","sourceDevice":1,"timestamp":1000,"typingMessage":{"action":"STARTED","timestamp":1000}}}"#;
         let msgs = parse_received_messages(json.as_bytes()).unwrap();
         assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn configured_group_rejects_other_groups_and_direct_messages() {
+        assert!(signal_message_allowed(Some("AAAA="), "AAAA=", true));
+        assert!(!signal_message_allowed(Some("AAAA="), "BBBB=", true));
+        assert!(!signal_message_allowed(
+            Some("AAAA="),
+            "+1555000001",
+            false
+        ));
+        assert!(signal_message_allowed(None, "+1555000001", false));
     }
 }

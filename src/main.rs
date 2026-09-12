@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod cli;
@@ -33,6 +34,16 @@ enum Command {
     Cli(cli::CliArgs),
     /// Install brainrouter into a coding harness config
     Install(install::InstallArgs),
+    /// Internal inference-only proxy used inside Benchmark Lab sandboxes.
+    #[command(hide = true)]
+    BenchmarkSandbox {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        listen: SocketAddr,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<OsString>,
+    },
 }
 
 #[tokio::main]
@@ -58,5 +69,10 @@ async fn main() -> Result<()> {
             install::run(args)?;
             Ok(())
         }
+        Command::BenchmarkSandbox {
+            socket,
+            listen,
+            command,
+        } => brainrouter::inference_proxy::run_sandbox_command(listen, socket, command).await,
     }
 }

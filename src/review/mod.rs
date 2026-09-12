@@ -8,7 +8,10 @@ pub mod prompt;
 pub mod review_loop;
 
 use anyhow::Result;
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -34,6 +37,18 @@ pub struct ReviewService {
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     preferences: Arc<ProfileStore>,
+    active_reviews: Arc<Mutex<HashSet<String>>>,
+}
+
+struct ActiveReviewGuard {
+    session_id: String,
+    active_reviews: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ActiveReviewGuard {
+    fn drop(&mut self) {
+        self.active_reviews.lock().unwrap().remove(&self.session_id);
+    }
 }
 
 impl ReviewService {
@@ -55,7 +70,19 @@ impl ReviewService {
             router,
             sessions,
             preferences,
+            active_reviews: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn begin_review(&self, session_id: &str) -> Result<ActiveReviewGuard> {
+        let mut active = self.active_reviews.lock().unwrap();
+        if !active.insert(session_id.to_string()) {
+            anyhow::bail!("Review session {session_id} is already running");
+        }
+        Ok(ActiveReviewGuard {
+            session_id: session_id.to_string(),
+            active_reviews: Arc::clone(&self.active_reviews),
+        })
     }
 
     /// Create a session and run the review loop to completion.
@@ -81,6 +108,7 @@ impl ReviewService {
             Some(config_snapshot.clone()),
         );
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
+        let active_review = self.begin_review(&session.id)?;
 
         // Register a notifier *before* the loop so we never miss a notification
         // that arrives between the loop returning Escalated and our first wait.
@@ -91,13 +119,21 @@ impl ReviewService {
             &task_id,
             &summary,
             details.as_deref(),
-            &[],
+            &session.conversation_history,
             &self.router,
             &self.sessions,
             &config_snapshot,
             &cwd,
         )
-        .await?;
+        .await;
+        drop(active_review);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.sessions.remove_notifier(&session.id);
+                return Err(error);
+            }
+        };
 
         let (loop_status, loop_feedback, loop_reviewer_type, iteration_count, loop_session_id) = (
             result.status,
@@ -116,6 +152,7 @@ impl ReviewService {
                     // the await.
                     let next = notifier.notified();
                     tokio::pin!(next);
+                    next.as_mut().enable();
                     // Re-read session to get the latest status.
                     if let Some(s) = self.sessions.get_session(&session.id) {
                         match s.status {
@@ -237,6 +274,7 @@ impl ReviewService {
             .sessions
             .get_session(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+        let active_review = self.begin_review(session_id)?;
 
         // Continuations retain the original reviewer, even after profile changes.
         let mut config_snapshot = session.review_config.clone().unwrap_or_else(|| self.get_config());
@@ -264,18 +302,36 @@ impl ReviewService {
         // and our first wait (same race-avoidance as start_review).
         let notifier = self.sessions.register_notifier(session_id);
 
+        let history = if session
+            .llm_turns
+            .starts_with(&session.conversation_history)
+        {
+            session.llm_turns.clone()
+        } else {
+            let mut history = session.conversation_history.clone();
+            history.extend(session.llm_turns.clone());
+            history
+        };
         let result = run_loop(
             session_id,
             &session.task_id,
             &session.summary,
             session.details.as_deref(),
-            &session.llm_turns,
+            &history,
             &self.router,
             &self.sessions,
             &config_snapshot,
             &session.cwd,
         )
-        .await?;
+        .await;
+        drop(active_review);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.sessions.remove_notifier(session_id);
+                return Err(error);
+            }
+        };
 
         let (status, feedback, reviewer_type) = if result.status == ReviewStatus::Escalated {
             info!(session_id = %session_id, "Continuation escalated — waiting for human resolution");
@@ -284,6 +340,7 @@ impl ReviewService {
                 // cannot miss a notification that fires between check and await.
                 let next = notifier.notified();
                 tokio::pin!(next);
+                next.as_mut().enable();
                 if let Some(s) = self.sessions.get_session(session_id) {
                     match s.status {
                         ReviewStatus::Escalated => {
@@ -366,6 +423,9 @@ impl ReviewService {
         );
         let session_id = session.id.clone();
         info!(session_id = %session_id, task_id = %task_id, "Created review session (async mode)");
+        let active_review = self
+            .begin_review(&session_id)
+            .expect("new review session cannot already be active");
 
         // Spawn the review loop directly on the already-created session.
         // We do NOT call start_review() here — that would create a second session.
@@ -376,6 +436,7 @@ impl ReviewService {
         let summ = summary.clone();
         let det = details.clone();
         let cwd2 = cwd.clone();
+        let history = session.conversation_history.clone();
         let notifier = self.sessions.register_notifier(&session_id);
 
         tokio::spawn(async move {
@@ -384,23 +445,26 @@ impl ReviewService {
                 &tid,
                 &summ,
                 det.as_deref(),
-                &[],
+                &history,
                 &router,
                 &sessions,
                 &config_snapshot,
                 &cwd2,
             )
             .await;
+            drop(active_review);
 
             match result {
                 Err(e) => {
                     warn!(session_id = %sid, error = %e, "Background review task failed");
+                    sessions.remove_notifier(&sid);
                 }
                 Ok(r) if r.status == ReviewStatus::Escalated => {
                     // Wait for human resolution, same as start_review.
                     loop {
                         let next = notifier.notified();
                         tokio::pin!(next);
+                        next.as_mut().enable();
                         if let Some(s) = sessions.get_session(&sid) {
                             match s.status {
                                 ReviewStatus::Escalated => { next.await; }

@@ -184,7 +184,15 @@ async fn handle_request_review(
             "iterationCount": result.iteration_count,
             "reviewerType": format!("{:?}", result.reviewer_type).to_lowercase()
         })),
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let message = e.to_string();
+            let status = if message.contains("is already running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            json_error(status, &message)
+        }
     }
 }
 
@@ -343,7 +351,15 @@ async fn handle_continue_review(
             "sessionId": result.session_id,
             "iterationCount": result.iteration_count,
         })),
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let message = e.to_string();
+            let status = if message.contains("is already running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            json_error(status, &message)
+        }
     }
 }
 
@@ -380,6 +396,17 @@ fn extract_session_id_from_resolve_path(path: &str) -> String {
     path.trim_start_matches("/review/session/")
         .trim_end_matches("/resolve")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dashboard_review_actions_use_api_field_names_and_surface_errors() {
+        let html = include_str!("templates/main_dashboard.html");
+        assert!(html.contains("body: JSON.stringify({ sessionId })"));
+        assert!(!html.contains("body: JSON.stringify({ session_id: sessionId })"));
+        assert!(html.contains("if (!response.ok) throw new Error"));
+    }
 }
 
 // ─── Response helpers ────────────────────────────────────────────────────────

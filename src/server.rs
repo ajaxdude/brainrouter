@@ -143,6 +143,9 @@ pub struct AppState {
     pub inflight: Arc<crate::inflight::InflightRegistry>,
     /// Optional benchmark storage; an initialization error disables only the explorer.
     pub benchmark_store: Result<Arc<BenchmarkStore>, String>,
+    /// Optional native benchmark execution; disabled or invalid configuration
+    /// does not affect the proxy or imported benchmark explorer.
+    pub benchmark_lab: Result<Arc<crate::benchmark_lab::BenchmarkLab>, String>,
     /// Read-only model observations and separately persisted operator settings.
     pub observability: Arc<crate::observability::Observability>,
 }
@@ -275,6 +278,13 @@ async fn handle_request(
     if path.starts_with("/review") {
         let result = escalation::handle_review_request(req, Arc::clone(&state.review_service), cwd).await;
         return result;
+    }
+
+    if path.starts_with("/api/benchmarks/lab/") || path == "/api/benchmarks/lab" {
+        return match &state.benchmark_lab {
+            Ok(lab) => crate::benchmark_lab::handle_request(req, Arc::clone(lab)).await,
+            Err(reason) => Ok(crate::benchmark_lab::unavailable_response(reason)),
+        };
     }
 
     if path == "/benchmarks" || path == "/benchmarks/" || path.starts_with("/api/benchmarks/") {
@@ -885,9 +895,12 @@ async fn handle_request(
                         );
                         into_unsync(resp)
                     }
-                    Ok(config) => {
-                        if let Err(error) = config.review.validate().and_then(|_| config.routing_profile().map(|_| ())) {
+                    Ok(mut config) => {
+                        if let Err(error) = config.review.validate() {
                             return Ok(routing_error(StatusCode::BAD_REQUEST, error));
+                        }
+                        if let Err(error) = crate::config::validate(&mut config, &state.config_path) {
+                            return Ok(routing_error(StatusCode::BAD_REQUEST, error.to_string()));
                         }
                         // Atomic write: write to .tmp then rename.
                         let tmp_path = state.config_path.with_extension("yaml.tmp");
@@ -1170,8 +1183,11 @@ async fn handle_chat_completion(
         request.max_tokens,
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let result = state.router.route_tagged(request, session_id, cwd, user_agent).await;
+    let routing_task = tokio::spawn(async move {
+        let result = tokio::select! {
+            result = state.router.route_tagged(request, session_id, cwd, user_agent) => result,
+            _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
+        };
         let stream_result = result.map(|(resp, info)| {
             if !info.model_key.is_empty() {
                 handle.set_model(info.model_key.clone());
@@ -1184,7 +1200,13 @@ async fn handle_chat_completion(
         let _ = tx.send(stream_result);
     });
 
-    let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::OpenAi);
+    let deferred = DeferredStream::new(
+        rx,
+        routing_task.abort_handle(),
+        KEEPALIVE_INTERVAL,
+        DEFERRED_STREAM_TIMEOUT,
+        StreamFormat::OpenAi,
+    );
     let safe_stream = SafeStream::new(deferred, StreamFormat::OpenAi);
     let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));
     let response = Response::builder()
@@ -1224,8 +1246,11 @@ async fn handle_anthropic_messages(
         oai_request.max_tokens,
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let result = state.router.route_tagged(oai_request, session_id, cwd, user_agent).await;
+    let routing_task = tokio::spawn(async move {
+        let result = tokio::select! {
+            result = state.router.route_tagged(oai_request, session_id, cwd, user_agent) => result,
+            _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
+        };
         let stream_result = result.map(|(resp, info)| {
             if !info.model_key.is_empty() {
                 handle.set_model(info.model_key.clone());
@@ -1238,7 +1263,13 @@ async fn handle_anthropic_messages(
         let _ = tx.send(stream_result);
     });
 
-    let deferred = DeferredStream::new(rx, KEEPALIVE_INTERVAL, DEFERRED_STREAM_TIMEOUT, StreamFormat::Anthropic);
+    let deferred = DeferredStream::new(
+        rx,
+        routing_task.abort_handle(),
+        KEEPALIVE_INTERVAL,
+        DEFERRED_STREAM_TIMEOUT,
+        StreamFormat::Anthropic,
+    );
     let adapted = AnthropicSseAdapter::new(Box::pin(deferred), model);
     let safe_stream = SafeStream::new(adapted, StreamFormat::Anthropic);
     let stream_body = StreamBody::new(safe_stream.map(|chunk| chunk.map(Frame::data)));

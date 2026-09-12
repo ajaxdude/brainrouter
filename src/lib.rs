@@ -1,6 +1,7 @@
 pub mod bonsai_server;
 pub mod anthropic;
 pub mod benchmark;
+pub mod benchmark_lab;
 pub mod daemon_client;
 pub mod bridge;
 pub mod classifier;
@@ -20,4 +21,5 @@ pub mod stream;
 pub mod types;
 pub mod routing_events;
 pub mod inflight;
+pub mod inference_proxy;
 pub mod observability;

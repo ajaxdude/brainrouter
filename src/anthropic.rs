@@ -24,12 +24,13 @@
 //!   - Vision/image/PDF content
 //!   - Batch API
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use bytes::Bytes;
 use futures_util::Stream;
 use pin_project::pin_project;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -107,7 +108,7 @@ pub fn anthropic_to_openai(req: AnthropicMessagesRequest) -> ChatCompletionReque
 
     // Convert Anthropic messages
     for msg in req.messages {
-        messages.push(anthropic_message_to_openai(msg));
+        messages.extend(anthropic_message_to_openai(msg));
     }
 
     // Convert Anthropic tools to OpenAI tools
@@ -157,41 +158,130 @@ pub fn anthropic_to_openai(req: AnthropicMessagesRequest) -> ChatCompletionReque
     }
 }
 
-fn anthropic_message_to_openai(msg: AnthropicMessage) -> ChatMessage {
-    let content = match &msg.content {
-        // Simple string content (common for user/assistant turns)
-        Value::String(s) => Some(Value::String(s.clone())),
-
-        // Array of content blocks
-        Value::Array(blocks) => {
-            // Flatten text blocks into a single string; ignore non-text (image, etc.)
-            let combined: String = blocks
-                .iter()
-                .filter_map(|block| {
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        block.get("text").and_then(Value::as_str).map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if combined.is_empty() {
-                // Fall through with the original array — downstream may handle it
-                Some(msg.content.clone())
-            } else {
-                Some(Value::String(combined))
-            }
-        }
-        other => Some(other.clone()),
+fn anthropic_message_to_openai(msg: AnthropicMessage) -> Vec<ChatMessage> {
+    let Value::Array(blocks) = &msg.content else {
+        return vec![ChatMessage {
+            role: msg.role,
+            content: Some(msg.content),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
     };
 
-    ChatMessage {
+    if msg.role == "assistant" {
+        let mut text = Vec::new();
+        let mut tool_calls = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(value) = block.get("text").and_then(Value::as_str) {
+                        text.push(value.to_string());
+                    }
+                }
+                Some("tool_use") => {
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        warn!("Dropping Anthropic tool_use block without id");
+                        continue;
+                    };
+                    let Some(name) = block.get("name").and_then(Value::as_str) else {
+                        warn!(tool_id = id, "Dropping Anthropic tool_use block without name");
+                        continue;
+                    };
+                    let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    tool_calls.push(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".into()),
+                        }
+                    }));
+                }
+                Some(other) => warn!(block_type = other, "Dropping unsupported Anthropic assistant block"),
+                None => warn!("Dropping Anthropic assistant block without type"),
+            }
+        }
+        return vec![ChatMessage {
+            role: "assistant".into(),
+            content: (!text.is_empty()).then(|| Value::String(text.join("\n"))),
+            name: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        }];
+    }
+
+    if msg.role == "user" {
+        let mut messages = Vec::new();
+        let mut text = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(value) = block.get("text").and_then(Value::as_str) {
+                        text.push(value.to_string());
+                    }
+                }
+                Some("tool_result") => {
+                    let Some(tool_call_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        warn!("Dropping Anthropic tool_result block without tool_use_id");
+                        continue;
+                    };
+                    let mut content = anthropic_block_text(block.get("content"));
+                    if block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        content = format!("Tool error: {content}");
+                    }
+                    messages.push(ChatMessage {
+                        role: "tool".into(),
+                        content: Some(Value::String(content)),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: Some(tool_call_id.to_string()),
+                    });
+                }
+                Some(other) => warn!(block_type = other, "Dropping unsupported Anthropic user block"),
+                None => warn!("Dropping Anthropic user block without type"),
+            }
+        }
+        if !text.is_empty() {
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some(Value::String(text.join("\n"))),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        return messages;
+    }
+
+    vec![ChatMessage {
         role: msg.role,
-        content,
+        content: Some(msg.content),
         name: None,
         tool_calls: None,
         tool_call_id: None,
+    }]
+}
+
+fn anthropic_block_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) => serde_json::to_string(value).unwrap_or_default(),
+        None => String::new(),
     }
 }
 
@@ -218,6 +308,13 @@ enum AdapterState {
     ContentBlockStarted,
     Streaming,
     Done,
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 /// Bound waiting from the first finish_reason or [DONE]. Ready upstream items
@@ -255,6 +352,11 @@ pub struct AnthropicSseAdapter {
     line_buf: Vec<u8>,
     /// Outgoing events queued to be flushed before pulling from inner
     pending: std::collections::VecDeque<Bytes>,
+    text_block_index: Option<u32>,
+    text_block_open: bool,
+    next_block_index: u32,
+    tool_calls: BTreeMap<u64, PendingToolCall>,
+    tool_blocks_emitted: bool,
 }
 
 impl AnthropicSseAdapter {
@@ -276,6 +378,11 @@ impl AnthropicSseAdapter {
             tail_chunks: 0,
             line_buf: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            text_block_index: None,
+            text_block_open: false,
+            next_block_index: 0,
+            tool_calls: BTreeMap::new(),
+            tool_blocks_emitted: false,
         }
     }
 
@@ -283,6 +390,136 @@ impl AnthropicSseAdapter {
     fn frame(event: &str, data: Value) -> Bytes {
         let data_str = serde_json::to_string(&data).unwrap_or_default();
         Bytes::from(format!("event: {}\ndata: {}\n\n", event, data_str))
+    }
+
+    fn ensure_message_started(&mut self, frames: &mut Vec<Bytes>) {
+        if self.state != AdapterState::Initial {
+            return;
+        }
+        frames.push(Self::frame(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 0, "output_tokens": 0 }
+                }
+            }),
+        ));
+        frames.push(Bytes::from("event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+        self.state = AdapterState::MessageStarted;
+    }
+
+    fn ensure_text_block(&mut self, frames: &mut Vec<Bytes>) -> u32 {
+        if let Some(index) = self.text_block_index {
+            return index;
+        }
+        let index = self.next_block_index;
+        self.next_block_index = self.next_block_index.saturating_add(1);
+        self.text_block_index = Some(index);
+        self.text_block_open = true;
+        frames.push(Self::frame(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": { "type": "text", "text": "" }
+            }),
+        ));
+        self.state = AdapterState::ContentBlockStarted;
+        index
+    }
+
+    fn close_text_block(&mut self, frames: &mut Vec<Bytes>) {
+        if self.text_block_open {
+            frames.push(Self::frame(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": self.text_block_index.unwrap_or_default()
+                }),
+            ));
+            self.text_block_open = false;
+        }
+    }
+
+    fn collect_tool_call_deltas(&mut self, delta: Option<&Value>) {
+        let Some(calls) = delta
+            .and_then(|value| value.get("tool_calls"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for call in calls {
+            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let pending = self.tool_calls.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                pending.id = Some(id.to_string());
+            }
+            if let Some(function) = call.get("function") {
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    pending.name = Some(name.to_string());
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    pending.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    fn emit_tool_blocks(&mut self, frames: &mut Vec<Bytes>) -> Result<()> {
+        if self.tool_blocks_emitted || self.tool_calls.is_empty() {
+            return Ok(());
+        }
+        self.close_text_block(frames);
+        for (_, tool) in std::mem::take(&mut self.tool_calls) {
+            let id = tool
+                .id
+                .context("OpenAI tool call completed without an id")?;
+            let name = tool
+                .name
+                .context("OpenAI tool call completed without a function name")?;
+            let index = self.next_block_index;
+            self.next_block_index = self.next_block_index.saturating_add(1);
+            frames.push(Self::frame(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": {}
+                    }
+                }),
+            ));
+            if !tool.arguments.is_empty() {
+                frames.push(Self::frame(
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tool.arguments
+                        }
+                    }),
+                ));
+            }
+            frames.push(Self::frame(
+                "content_block_stop",
+                serde_json::json!({ "type": "content_block_stop", "index": index }),
+            ));
+        }
+        self.tool_blocks_emitted = true;
+        Ok(())
     }
 
     /// Process one parsed OpenAI SSE JSON value, returning any Anthropic frames.
@@ -294,9 +531,11 @@ impl AnthropicSseAdapter {
         {
             return Err(anyhow!("Upstream reported an SSE error"));
         }
-        // DeferredStream supplies Anthropic keepalives while waiting/draining.
+        // DeferredStream supplies JSON keepalives while waiting/draining.
         if chunk.get("type").and_then(Value::as_str) == Some("ping") {
-            return Ok(frames);
+            return Ok(vec![Bytes::from(
+                "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            )]);
         }
         if self.done_seen {
             return Err(anyhow!("Unexpected upstream data after [DONE]"));
@@ -308,6 +547,7 @@ impl AnthropicSseAdapter {
         let content = delta
             .and_then(|d| d.get("content"))
             .and_then(Value::as_str);
+        self.collect_tool_call_deltas(delta);
         let finish_reason = choice
             .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str);
@@ -315,48 +555,19 @@ impl AnthropicSseAdapter {
             return Err(anyhow!("Upstream ended generation with an error"));
         }
 
-        // On first chunk, emit message_start + content_block_start
-        if self.state == AdapterState::Initial {
-            self.state = AdapterState::MessageStarted;
-            frames.push(Self::frame(
-                "message_start",
-                serde_json::json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": self.message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": self.model,
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
-                    }
-                }),
-            ));
-            frames.push(Self::frame(
-                "content_block_start",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": { "type": "text", "text": "" }
-                }),
-            ));
-            // Ping
-            frames.push(Bytes::from("event: ping\ndata: {\"type\":\"ping\"}\n\n"));
-            self.state = AdapterState::ContentBlockStarted;
-        }
+        self.ensure_message_started(&mut frames);
 
         // Emit content delta
         if let Some(text) = content {
             if !text.is_empty() {
+                let index = self.ensure_text_block(&mut frames);
                 self.state = AdapterState::Streaming;
                 self.output_tokens += 1; // rough estimate; real count comes from usage
                 frames.push(Self::frame(
                     "content_block_delta",
                     serde_json::json!({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": index,
                         "delta": { "type": "text_delta", "text": text }
                     }),
                 ));
@@ -382,6 +593,9 @@ impl AnthropicSseAdapter {
                 "tool_calls" => "tool_use",
                 _ => "end_turn",
             });
+            if fr == "tool_calls" {
+                self.emit_tool_blocks(&mut frames)?;
+            }
             self.start_tail_drain();
         }
 
@@ -425,6 +639,11 @@ impl AnthropicSseAdapter {
 
     fn process_openai_line(&mut self, line: &[u8]) -> Result<Vec<Bytes>> {
         let line = std::str::from_utf8(line)?.trim();
+        if line.starts_with(':') {
+            return Ok(vec![Bytes::from(
+                "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            )]);
+        }
         if line.strip_prefix("event:").map(str::trim) == Some("error") {
             return Err(anyhow!("Upstream reported an SSE error event"));
         }
@@ -510,65 +729,36 @@ impl Stream for AnthropicSseAdapter {
 /// Close only after actual upstream EOF, using any previously observed finish
 /// reason and final usage. EOF without [DONE] retains legacy wire compatibility.
 fn close_stream_gracefully(adapter: &mut AnthropicSseAdapter) -> Vec<Bytes> {
-    if matches!(
-        adapter.state,
-        AdapterState::Initial | AdapterState::MessageStarted | AdapterState::ContentBlockStarted | AdapterState::Streaming
-    ) {
+    if adapter.state != AdapterState::Done {
         let mut frames = Vec::new();
-        
-        // Ensure protocol compliance: message_start -> content_block_start
-        if adapter.state == AdapterState::Initial {
-            frames.push(AnthropicSseAdapter::frame(
-                "message_start",
+        adapter.ensure_message_started(&mut frames);
+        if let Err(error) = adapter.emit_tool_blocks(&mut frames) {
+            return vec![AnthropicSseAdapter::frame(
+                "error",
                 serde_json::json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": adapter.message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": adapter.model,
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": error.to_string()
                     }
                 }),
-            ));
-            frames.push(AnthropicSseAdapter::frame(
-                "content_block_start",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": { "type": "text", "text": "" }
-                }),
-            ));
-        } else if adapter.state == AdapterState::MessageStarted {
-             // We started the message but not the block.
-             frames.push(AnthropicSseAdapter::frame(
-                "content_block_start",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": { "type": "text", "text": "" }
-                }),
-            ));
+            )];
         }
-
+        if adapter.next_block_index == 0 {
+            adapter.ensure_text_block(&mut frames);
+        }
+        adapter.close_text_block(&mut frames);
         frames.push(AnthropicSseAdapter::frame(
-                "content_block_stop",
-                serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": adapter.stop_reason.unwrap_or("end_turn"), "stop_sequence": null },
+                "usage": { "output_tokens": adapter.output_tokens }
+            }),
         ));
         frames.push(AnthropicSseAdapter::frame(
-                "message_delta",
-                serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": adapter.stop_reason.unwrap_or("end_turn"), "stop_sequence": null },
-                    "usage": { "output_tokens": adapter.output_tokens }
-                }),
-        ));
-        frames.push(AnthropicSseAdapter::frame(
-                "message_stop",
-                serde_json::json!({ "type": "message_stop" }),
+            "message_stop",
+            serde_json::json!({ "type": "message_stop" }),
         ));
         frames
     } else {
@@ -659,6 +849,52 @@ mod tests {
         };
         let oai = anthropic_to_openai(req);
         assert_eq!(oai.messages[0].content.as_ref().unwrap().as_str().unwrap(), "block 1\nblock 2");
+    }
+
+    #[test]
+    fn translates_tool_use_and_tool_result_messages() {
+        let request = AnthropicMessagesRequest {
+            model: "m".to_string(),
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "checking"},
+                        {"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {"q": "rust"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [{"type": "text", "text": "found"}]},
+                        {"type": "text", "text": "continue"}
+                    ]),
+                },
+            ],
+            system: None,
+            max_tokens: Some(100),
+            stop_sequences: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: vec![],
+            tool_choice: None,
+            stream: true,
+        };
+
+        let translated = anthropic_to_openai(request);
+        assert_eq!(translated.messages.len(), 3);
+        assert_eq!(translated.messages[0].role, "assistant");
+        assert_eq!(translated.messages[0].content.as_ref().and_then(Value::as_str), Some("checking"));
+        let tool_call = &translated.messages[0].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call["id"], "tool-1");
+        assert_eq!(tool_call["function"]["name"], "lookup");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"q":"rust"}"#);
+        assert_eq!(translated.messages[1].role, "tool");
+        assert_eq!(translated.messages[1].tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(translated.messages[1].content.as_ref().and_then(Value::as_str), Some("found"));
+        assert_eq!(translated.messages[2].role, "user");
+        assert_eq!(translated.messages[2].content.as_ref().and_then(Value::as_str), Some("continue"));
     }
 
     #[test]
@@ -771,6 +1007,7 @@ mod tests {
 
         assert_eq!(event_types, vec![
             "message_start",
+            "ping",
             "content_block_start",
             "content_block_stop",
             "message_delta",
@@ -779,6 +1016,75 @@ mod tests {
 
         let all_text = frame_texts.join("");
         assert!(all_text.contains("end_turn"), "must emit end_turn for empty stream");
+    }
+
+    #[tokio::test]
+    async fn fragmented_tool_calls_emit_anthropic_tool_blocks() {
+        let chunks = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let adapter = AnthropicSseAdapter::new(
+            Box::pin(futures_util::stream::iter(chunks)),
+            "model".to_string(),
+        );
+        let output = adapter
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let events = output
+            .iter()
+            .filter_map(|frame| {
+                String::from_utf8_lossy(frame)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            })
+            .collect::<Vec<_>>();
+        let tool_start = events
+            .iter()
+            .find(|event| event["content_block"]["type"] == "tool_use")
+            .expect("tool_use block");
+        assert_eq!(tool_start["content_block"]["id"], "call-1");
+        assert_eq!(tool_start["content_block"]["name"], "lookup");
+        let tool_delta = events
+            .iter()
+            .find(|event| event["delta"]["type"] == "input_json_delta")
+            .expect("tool input delta");
+        assert_eq!(tool_delta["delta"]["partial_json"], r#"{"q":"rust"}"#);
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["stop_reason"] == "tool_use"));
+    }
+
+    #[tokio::test]
+    async fn forwards_keepalive_before_first_provider_output() {
+        let chunks = vec![
+            Ok(Bytes::from_static(b": keepalive\n\n")),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let adapter = AnthropicSseAdapter::new(
+            Box::pin(futures_util::stream::iter(chunks)),
+            "model".to_string(),
+        );
+        let output = adapter
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output[0]).contains("event: ping"));
+        assert!(output
+            .iter()
+            .any(|frame| String::from_utf8_lossy(frame).contains("message_start")));
     }
 
     #[tokio::test]

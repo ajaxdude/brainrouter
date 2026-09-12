@@ -65,7 +65,7 @@ fn install_omp(bin: &Path, yes: bool) -> Result<()> {
         }
     });
 
-    let current: serde_json::Value = read_json_or_empty(&mcp_path);
+    let current: serde_json::Value = read_json_or_empty(&mcp_path)?;
 
     // Check if already installed
     if current.get("mcpServers").and_then(|m| m.get("brainrouter")).is_some() {
@@ -143,7 +143,7 @@ fn install_opencode(bin: &Path, yes: bool) -> Result<()> {
         }
     });
 
-    let current = read_json_or_empty(&config_path);
+    let current = read_json_or_empty(&config_path)?;
     let merged = merge_json(current, new_section);
     write_json_with_preview(&config_path, &merged, yes)?;
     println!("OpenCode configured.");
@@ -192,7 +192,7 @@ fn install_droid(bin: &Path, yes: bool) -> Result<()> {
         }
     });
 
-    let current = read_json_or_empty(&mcp_path);
+    let current = read_json_or_empty(&mcp_path)?;
     let merged = merge_json(current, new_entry);
     write_json_with_preview(&mcp_path, &merged, yes)?;
 
@@ -282,11 +282,20 @@ fn uds_socket_path() -> String {
         .into_owned()
 }
 
-fn read_json_or_empty(path: &PathBuf) -> serde_json::Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({}))
+fn read_json_or_empty(path: &Path) -> Result<serde_json::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("Refusing to overwrite malformed JSON in {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                bail!("Refusing to replace dangling config symlink {}", path.display());
+            }
+            Ok(serde_json::json!({}))
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
 }
 
 /// Deep-merge `patch` into `base`. Array fields in `patch` replace those in `base`.
@@ -307,8 +316,9 @@ fn merge_json(mut base: serde_json::Value, patch: serde_json::Value) -> serde_js
     }
 }
 
-fn write_json_with_preview(path: &PathBuf, value: &serde_json::Value, yes: bool) -> Result<()> {
-    let pretty = serde_json::to_string_pretty(value)?;
+fn write_json_with_preview(path: &Path, value: &serde_json::Value, yes: bool) -> Result<()> {
+    let mut pretty = serde_json::to_string_pretty(value)?;
+    pretty.push('\n');
 
     println!("Will write to {}:", path.display());
     println!("{}", pretty);
@@ -324,11 +334,55 @@ fn write_json_with_preview(path: &PathBuf, value: &serde_json::Value, yes: bool)
         }
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    let write_path = if std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve config symlink {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(parent) = write_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    std::fs::write(path, pretty.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    let file_name = write_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let temp_path = write_path.with_file_name(format!(
+        ".{file_name}.brainrouter-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        let mut file = options
+            .open(&temp_path)
+            .with_context(|| format!("Failed to create {}", temp_path.display()))?;
+        if let Ok(metadata) = std::fs::metadata(&write_path) {
+            file.set_permissions(metadata.permissions())
+                .with_context(|| format!("Failed to preserve permissions for {}", write_path.display()))?;
+        }
+        file.write_all(pretty.as_bytes())
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, &write_path)
+            .with_context(|| format!("Failed to replace {}", write_path.display()))?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("Failed to sync {}", parent.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result?;
     Ok(())
 }
 
@@ -345,4 +399,77 @@ fn append_if_missing(path: &PathBuf, line: &str) -> Result<()> {
         .with_context(|| format!("Failed to open {}", path.display()))?;
     writeln!(file, "{}", line)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_existing_json_is_never_treated_as_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-install-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let error = read_json_or_empty(&path).unwrap_err().to_string();
+        assert!(error.contains("Refusing to overwrite malformed JSON"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn json_replacement_leaves_complete_document() {
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-install-write-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        let value = serde_json::json!({"new": {"enabled": true}});
+
+        write_json_with_preview(&path, &value, true).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written, value);
+        assert!(std::fs::read_dir(&root)
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_replacement_preserves_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-install-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("managed.json");
+        let link = root.join("config.json");
+        std::fs::write(&target, "{\"old\":true}\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let value = serde_json::json!({"new": true});
+
+        write_json_with_preview(&link, &value, true).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written, value);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

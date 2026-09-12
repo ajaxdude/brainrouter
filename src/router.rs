@@ -500,26 +500,29 @@ impl Router {
             info!(provider = MANIFEST_KEY, "Attempting Manifest");
             match self.manifest.chat_completion(request.clone()).await {
                 Ok(ProviderResponse::Stream(stream)) => {
-                    let (stream, model_key) = peek_manifest_model(stream).await;
-                    // Manifest returns HTTP 200 even for errors (credits exhausted,
-                    // missing auth) — it sends a single SSE chunk with model="manifest"
-                    // and an error message as content. Detect this and fall through
-                    // to llama-swap instead of forwarding the error to the client.
-                    if model_key == "manifest" {
+                    match peek_manifest_model(stream).await {
+                        ManifestPeek::Accepted { stream, model } => {
+                            let model_key = model.unwrap_or_else(|| requested_cloud_model.clone());
+                            self.health.report_success(MANIFEST_KEY);
+                            info!(provider = MANIFEST_KEY, model = %model_key, "Manifest accepted request");
+                            return Ok((
+                                wrap_with_timeout(stream),
+                                RouteInfo {
+                                    bonsai_decision: "cloud",
+                                    effective_provider: Some("manifest".to_string()),
+                                    model_key,
+                                    failed_attempts: Vec::new(),
+                                },
+                            ));
+                        }
+                        ManifestPeek::PseudoError => {
                         warn!(provider = MANIFEST_KEY, "Manifest returned pseudo-success (model=manifest) — likely credits exhausted or auth error, falling back");
                         // Don't report health failure — Manifest is reachable, just can't fulfill.
-                    } else {
-                        self.health.report_success(MANIFEST_KEY);
-                        info!(provider = MANIFEST_KEY, model = %model_key, "Manifest accepted request");
-                        return Ok((
-                            wrap_with_timeout(stream),
-                            RouteInfo {
-                                bonsai_decision: "cloud",
-                                effective_provider: Some("manifest".to_string()),
-                                model_key,
-                                failed_attempts: Vec::new(),
-                            },
-                        ));
+                        }
+                        ManifestPeek::Failed(error) => {
+                            warn!(provider = MANIFEST_KEY, error = %error, "Manifest stream failed before metadata, falling back");
+                            self.health.report_failure(MANIFEST_KEY);
+                        }
                     }
                 }
                 Err(e) => {
@@ -709,65 +712,112 @@ fn sanitize_assistant_messages(messages: &mut [ChatMessage]) {
     }
 }
 
-/// Consume the first chunk of a Manifest SSE stream, extract the `model` field
-/// from the JSON payload, then reassemble the stream so the chunk is not lost.
+/// Consume a bounded prefix of a Manifest SSE stream, extract the `model`
+/// field from complete frames, then reassemble the stream so no bytes are lost.
 ///
 /// Manifest's first SSE frame looks like:
 ///   `data: {"id":"...","model":"claude-3-7-sonnet-20250219","choices":[...]}\n\n`
 ///
-/// Returns the reassembled stream and the model name, falling back to
-/// `"manifest"` if the chunk is absent or the field cannot be parsed.
-async fn peek_manifest_model(
-    mut stream: crate::provider::SseStream,
-) -> (crate::provider::SseStream, String) {
-    let first = match tokio::time::timeout(TTFT_TIMEOUT, stream.next()).await {
-        Ok(Some(Ok(chunk))) => chunk,
-        Ok(Some(Err(e))) => {
-            let err_stream: crate::provider::SseStream =
-                Box::pin(fstream::once(async move { Err(e) }).chain(stream));
-            return (err_stream, "manifest".to_string());
-        }
-        Ok(None) => return (Box::pin(fstream::empty()), "manifest".to_string()),
-        Err(_elapsed) => {
-            // First chunk timed out — surface as a stall error
-            let err: anyhow::Error = anyhow!("Manifest stream stalled before first chunk ({}s timeout)", TTFT_TIMEOUT.as_secs());
-            let err_stream: crate::provider::SseStream =
-                Box::pin(fstream::once(async move { Err(err) }).chain(stream));
-            return (err_stream, "manifest".to_string());
-        }
-    };
-
-    // Scan the chunk for a `data: {` line and attempt to pull out `model`.
-    let model = extract_model_from_sse_chunk(&first)
-        .unwrap_or_else(|| "manifest".to_string());
-
-    // Prepend the chunk back so downstream consumers see a complete stream.
-    let reassembled: crate::provider::SseStream = Box::pin(
-        fstream::once(async move { Ok(first) }).chain(stream),
-    );
-    (reassembled, model)
+/// Missing metadata is not an error: fragmented or non-standard events are
+/// forwarded unchanged. Only an explicit Manifest error payload triggers the
+/// pseudo-success fallback path.
+enum ManifestPeek {
+    Accepted {
+        stream: crate::provider::SseStream,
+        model: Option<String>,
+    },
+    PseudoError,
+    Failed(anyhow::Error),
 }
 
-/// Scan raw SSE bytes for the first `data: {` line and extract the `model` field.
-/// Returns `None` if parsing fails for any reason.
-fn extract_model_from_sse_chunk(chunk: &bytes::Bytes) -> Option<String> {
-    let text = std::str::from_utf8(chunk).ok()?;
-    for line in text.lines() {
-        let json_str = match line.strip_prefix("data: ") {
-            Some(s) if s.starts_with('{') => s,
-            _ => continue,
-        };
-        #[derive(serde::Deserialize)]
-        struct ModelOnly {
-            model: Option<String>,
-        }
-        if let Ok(parsed) = serde_json::from_str::<ModelOnly>(json_str) {
-            if let Some(m) = parsed.model.filter(|s| !s.is_empty()) {
-                return Some(m);
+async fn peek_manifest_model(
+    mut stream: crate::provider::SseStream,
+) -> ManifestPeek {
+    const MAX_PEEK_BYTES: usize = 64 * 1024;
+
+    let deadline = tokio::time::Instant::now() + TTFT_TIMEOUT;
+    let mut chunks = Vec::new();
+    let mut buffered = Vec::new();
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(error))) => return ManifestPeek::Failed(error),
+            Ok(None) if chunks.is_empty() => {
+                return ManifestPeek::Failed(anyhow!("Manifest returned an empty stream"));
             }
+            Ok(None) => break,
+            Err(_) => {
+                return ManifestPeek::Failed(anyhow!(
+                    "Manifest stream stalled before metadata ({}s timeout)",
+                    TTFT_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
+        buffered.extend_from_slice(&chunk);
+        chunks.push(chunk);
+        let complete_frame = buffered.windows(2).any(|window| window == b"\n\n")
+            || buffered.windows(4).any(|window| window == b"\r\n\r\n");
+        let metadata = extract_manifest_metadata(&buffered);
+        if complete_frame
+            && (metadata.explicit_error || metadata.model.as_deref() == Some("manifest"))
+        {
+            return ManifestPeek::PseudoError;
+        }
+        if complete_frame || buffered.len() >= MAX_PEEK_BYTES {
+            let reassembled: crate::provider::SseStream =
+                Box::pin(fstream::iter(chunks.into_iter().map(Ok)).chain(stream));
+            return ManifestPeek::Accepted {
+                stream: reassembled,
+                model: metadata.model,
+            };
         }
     }
-    None
+
+    let metadata = extract_manifest_metadata(&buffered);
+    let reassembled: crate::provider::SseStream =
+        Box::pin(fstream::iter(chunks.into_iter().map(Ok)).chain(stream));
+    ManifestPeek::Accepted {
+        stream: reassembled,
+        model: metadata.model,
+    }
+}
+
+#[derive(Default)]
+struct ManifestMetadata {
+    model: Option<String>,
+    explicit_error: bool,
+    done: bool,
+}
+
+fn extract_manifest_metadata(bytes: &[u8]) -> ManifestMetadata {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return ManifestMetadata::default();
+    };
+    let mut metadata = ManifestMetadata::default();
+    for line in text.lines() {
+        let payload = match line.strip_prefix("data:") {
+            Some(value) => value.trim(),
+            _ => continue,
+        };
+        if payload == "[DONE]" {
+            metadata.done = true;
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        metadata.explicit_error |= value.get("error").is_some()
+            || value.get("type").and_then(|value| value.as_str()) == Some("error");
+        if metadata.model.is_none() {
+            metadata.model = value
+                .get("model")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+        }
+    }
+    metadata
 }
 
 
@@ -1222,6 +1272,49 @@ mod tests {
             stop: None,
             extra: serde_json::Value::Null,
         }
+    }
+
+    #[tokio::test]
+    async fn manifest_peek_reassembles_fragmented_model_frame() {
+        let chunks = vec![
+            Ok(Bytes::from_static(b"data: {\"id\":\"x\",\"mo")),
+            Ok(Bytes::from_static(b"del\":\"claude-test\",\"choices\":[]}\n\n")),
+        ];
+        let peek = peek_manifest_model(Box::pin(fstream::iter(chunks))).await;
+        let ManifestPeek::Accepted { mut stream, model } = peek else {
+            panic!("fragmented metadata should be accepted");
+        };
+        assert_eq!(model.as_deref(), Some("claude-test"));
+        let mut forwarded = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            forwarded.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            forwarded,
+            b"data: {\"id\":\"x\",\"model\":\"claude-test\",\"choices\":[]}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_peek_does_not_treat_unknown_metadata_as_error() {
+        let stream = Box::pin(fstream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        ))]));
+        match peek_manifest_model(stream).await {
+            ManifestPeek::Accepted { model, .. } => assert!(model.is_none()),
+            _ => panic!("missing model metadata must not trigger fallback"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_peek_rejects_explicit_pseudo_success() {
+        let stream = Box::pin(fstream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"model\":\"manifest\",\"error\":{\"message\":\"credits exhausted\"}}\n\n",
+        ))]));
+        assert!(matches!(
+            peek_manifest_model(stream).await,
+            ManifestPeek::PseudoError
+        ));
     }
 
     #[test]

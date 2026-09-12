@@ -1,7 +1,7 @@
 //! Persistent LLM benchmark registry, ingestion boundary, query API, and explorer.
 //!
-//! This module stores imported benchmark results only. It never launches a model
-//! or benchmark process.
+//! Native execution lives in `benchmark_lab`; completed jobs enter the registry
+//! through the same validated ingestion boundary as uploaded results.
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -27,6 +27,7 @@ mod imports;
 pub use http::handle_request;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_benchmark_explorer.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_benchmark_lab.sql");
 const EXPLORER_HTML: &str = include_str!("escalation/templates/benchmarks.html");
 const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: u32 = 100;
@@ -1375,6 +1376,35 @@ pub struct IngestBundle {
     pub telemetry_samples: Vec<TelemetrySample>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkJobRecord {
+    pub id: String,
+    pub identity_sha256: String,
+    pub suite: String,
+    pub case_id: String,
+    pub model: String,
+    pub repetition: u64,
+    pub status: String,
+    pub progress: f64,
+    pub message: String,
+    pub queued_at: DateTime<Utc>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub work_dir: Option<String>,
+    pub request: Value,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LlamaBenchIngest {
@@ -1870,8 +1900,9 @@ impl BenchmarkStore {
             )?;
         if !migrated {
             connection.execute_batch(MIGRATION_0001)?;
+            connection.execute_batch(MIGRATION_0002)?;
         } else {
-            let version = connection
+            let mut version = connection
                 .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get::<_, Option<i64>>(0)
                 })?
@@ -1884,16 +1915,40 @@ impl BenchmarkStore {
                 [],
                 |row| row.get::<_, bool>(0),
             )?;
-            let required_tables = connection.query_row(
+            let required_v1_tables = connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                   WHERE type='table'
                     AND name IN ('models','artifacts','experiments','runs','entity_fingerprints')",
                 [],
                 |row| row.get::<_, u64>(0),
             )?;
-            if version != 1 || !expected_migration || required_tables != 5 {
+            if !(1..=2).contains(&version) || !expected_migration || required_v1_tables != 5 {
                 return Err(BenchmarkError::Validation(format!(
-                    "database is not a complete benchmark explorer schema at version 1 (found version {version})"
+                    "database is not a recognized benchmark explorer schema (found version {version})"
+                )));
+            }
+            if version == 1 {
+                connection.execute_batch(MIGRATION_0002)?;
+                version = 2;
+            }
+            let expected_lab_migration = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM schema_migrations
+                    WHERE version=2 AND name='native_benchmark_lab'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let required_tables = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='table'
+                    AND name IN ('models','artifacts','experiments','runs','entity_fingerprints','benchmark_jobs')",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if version != 2 || !expected_lab_migration || required_tables != 6 {
+                return Err(BenchmarkError::Validation(format!(
+                    "database is not a complete benchmark explorer schema at version 2 (found version {version})"
                 )));
             }
         }
@@ -1928,6 +1983,136 @@ impl BenchmarkStore {
 
     pub fn ingest(&self, bundle: &IngestBundle) -> BenchmarkResult<String> {
         self.ingest_checked(bundle, true)
+    }
+
+    pub fn save_job(&self, job: &BenchmarkJobRecord) -> BenchmarkResult<()> {
+        require_sha256("benchmark_job.identity_sha256", &job.identity_sha256)?;
+        for (name, value) in [
+            ("benchmark_job.id", job.id.as_str()),
+            ("benchmark_job.suite", job.suite.as_str()),
+            ("benchmark_job.case_id", job.case_id.as_str()),
+            ("benchmark_job.model", job.model.as_str()),
+            ("benchmark_job.status", job.status.as_str()),
+        ] {
+            require_text(name, value)?;
+        }
+        require_sqlite_integer("benchmark_job.repetition", job.repetition)?;
+        if !job.progress.is_finite() || !(0.0..=1.0).contains(&job.progress) {
+            return Err(BenchmarkError::Validation(
+                "benchmark_job.progress must be between 0 and 1".into(),
+            ));
+        }
+        let connection = self.connect()?;
+        connection.execute(
+            "INSERT INTO benchmark_jobs(
+                id,identity_sha256,suite,case_id,model,repetition,status,progress,message,
+                queued_at,started_at,ended_at,run_id,work_dir,request_json,result_json,error,updated_at
+             ) VALUES (
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                status=excluded.status,
+                progress=excluded.progress,
+                message=excluded.message,
+                started_at=excluded.started_at,
+                ended_at=excluded.ended_at,
+                run_id=excluded.run_id,
+                work_dir=excluded.work_dir,
+                result_json=excluded.result_json,
+                error=excluded.error,
+                updated_at=excluded.updated_at",
+            params![
+                job.id,
+                job.identity_sha256,
+                job.suite,
+                job.case_id,
+                job.model,
+                job.repetition,
+                job.status,
+                job.progress,
+                job.message,
+                job.queued_at.to_rfc3339(),
+                job.started_at.map(|value| value.to_rfc3339()),
+                job.ended_at.map(|value| value.to_rfc3339()),
+                job.run_id,
+                job.work_dir,
+                serde_json::to_string(&job.request).map_err(|error| {
+                    BenchmarkError::Validation(format!(
+                        "benchmark job request cannot be serialized: {error}"
+                    ))
+                })?,
+                job.result
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| {
+                        BenchmarkError::Validation(format!(
+                            "benchmark job result cannot be serialized: {error}"
+                        ))
+                    })?,
+                job.error,
+                job.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn benchmark_job(&self, id: &str) -> BenchmarkResult<BenchmarkJobRecord> {
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT id,identity_sha256,suite,case_id,model,repetition,status,progress,message,
+                        queued_at,started_at,ended_at,run_id,work_dir,request_json,result_json,error,updated_at
+                   FROM benchmark_jobs WHERE id=?1",
+                [id],
+                benchmark_job_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| BenchmarkError::NotFound(format!("benchmark job {id} was not found")))
+    }
+
+    pub fn benchmark_jobs(&self, limit: u32) -> BenchmarkResult<Vec<BenchmarkJobRecord>> {
+        if !(1..=100).contains(&limit) {
+            return Err(BenchmarkError::Validation(
+                "benchmark job limit must be between 1 and 100".into(),
+            ));
+        }
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT id,identity_sha256,suite,case_id,model,repetition,status,progress,message,
+                    queued_at,started_at,ended_at,run_id,work_dir,request_json,result_json,error,updated_at
+               FROM benchmark_jobs ORDER BY queued_at DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], benchmark_job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn run_status(&self, run_id: &str) -> BenchmarkResult<Option<String>> {
+        let connection = self.connect()?;
+        connection
+            .query_row("SELECT status FROM runs WHERE id=?1", [run_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn interrupt_incomplete_jobs(&self) -> BenchmarkResult<u64> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connect()?;
+        let count = connection.execute(
+            "UPDATE benchmark_jobs
+                SET status='interrupted',
+                    progress=1,
+                    message='Daemon restarted before the job completed',
+                    started_at=COALESCE(started_at, queued_at),
+                    ended_at=COALESCE(started_at, queued_at),
+                    error='Daemon restarted before the job completed',
+                    updated_at=?1
+              WHERE status IN ('queued','running')",
+            [now],
+        )?;
+        Ok(count as u64)
     }
 
     fn ingest_checked(&self, bundle: &IngestBundle, persist: bool) -> BenchmarkResult<String> {
@@ -1968,6 +2153,7 @@ impl BenchmarkStore {
                 repetition_run_id.unwrap_or_default()
             )));
         }
+
         if let Some((status, experiment_id, repetition)) = &existing_run {
             if experiment_id != &bundle.run.experiment_id || repetition != &bundle.run.repetition {
                 return Err(BenchmarkError::Conflict(
@@ -2870,6 +3056,58 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+fn benchmark_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkJobRecord> {
+    fn parse_time(value: String, column: usize) -> rusqlite::Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+    }
+    fn parse_optional_time(
+        value: Option<String>,
+        column: usize,
+    ) -> rusqlite::Result<Option<DateTime<Utc>>> {
+        value.map(|value| parse_time(value, column)).transpose()
+    }
+    fn parse_json(value: String, column: usize) -> rusqlite::Result<Value> {
+        serde_json::from_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    }
+    Ok(BenchmarkJobRecord {
+        id: row.get(0)?,
+        identity_sha256: row.get(1)?,
+        suite: row.get(2)?,
+        case_id: row.get(3)?,
+        model: row.get(4)?,
+        repetition: row.get(5)?,
+        status: row.get(6)?,
+        progress: row.get(7)?,
+        message: row.get(8)?,
+        queued_at: parse_time(row.get(9)?, 9)?,
+        started_at: parse_optional_time(row.get(10)?, 10)?,
+        ended_at: parse_optional_time(row.get(11)?, 11)?,
+        run_id: row.get(12)?,
+        work_dir: row.get(13)?,
+        request: parse_json(row.get(14)?, 14)?,
+        result: row
+            .get::<_, Option<String>>(15)?
+            .map(|value| parse_json(value, 15))
+            .transpose()?,
+        error: row.get(16)?,
+        updated_at: parse_time(row.get(17)?, 17)?,
+    })
+}
+
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
     Ok(RunSummary {
         run_id: row.get(0)?,
@@ -3294,9 +3532,18 @@ mod tests {
             "performance_metrics",
             "quality_results",
             "telemetry_samples",
+            "benchmark_jobs",
         ] {
             assert!(tables.iter().any(|name| name == table), "missing {table}");
         }
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
         assert!(connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
             .unwrap());
@@ -3326,6 +3573,86 @@ mod tests {
         drop(connection);
         assert!(BenchmarkStore::open(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_one_registry_is_upgraded_to_native_job_schema() {
+        let path = std::env::temp_dir().join(format!("brainrouter-bench-v1-{}.sqlite3", new_id()));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_0001).unwrap();
+        drop(connection);
+
+        let store = BenchmarkStore::open(&path).unwrap();
+        let connection = store.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert!(connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_jobs')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        drop(connection);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    #[test]
+    fn native_jobs_persist_dedupe_and_recover() {
+        let test = test_store();
+        let now = Utc::now();
+        let mut first = BenchmarkJobRecord {
+            id: "job-1".into(),
+            identity_sha256: sha('c'),
+            suite: "riddllr".into(),
+            case_id: "heroes".into(),
+            model: "model-a".into(),
+            repetition: 0,
+            status: "queued".into(),
+            progress: 0.0,
+            message: "queued".into(),
+            queued_at: now,
+            started_at: None,
+            ended_at: None,
+            run_id: Some("run-a".into()),
+            work_dir: Some("/tmp/job-1".into()),
+            request: json!({"suite":"riddllr"}),
+            result: None,
+            error: None,
+            updated_at: now,
+        };
+        test.store.save_job(&first).unwrap();
+        let mut duplicate = first.clone();
+        duplicate.id = "job-2".into();
+        assert!(matches!(
+            test.store.save_job(&duplicate),
+            Err(BenchmarkError::Conflict(_))
+        ));
+
+        first.status = "succeeded".into();
+        first.progress = 1.0;
+        first.started_at = Some(now);
+        first.ended_at = Some(now);
+        first.result = Some(json!({"run_id":"run-a","passed":true}));
+        test.store.save_job(&first).unwrap();
+        test.store.save_job(&duplicate).unwrap();
+
+        assert_eq!(test.store.interrupt_incomplete_jobs().unwrap(), 1);
+        let interrupted = test.store.benchmark_job("job-2").unwrap();
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(interrupted.progress, 1.0);
+        assert!(interrupted.started_at.is_some());
+        assert!(interrupted.ended_at.is_some());
+        assert_eq!(test.store.benchmark_jobs(10).unwrap().len(), 2);
     }
 
     #[test]
@@ -3925,6 +4252,15 @@ mod tests {
             test.store.run_blocking(|_| Ok(())).await,
             Err(BenchmarkError::Busy(_))
         ));
+        test.store
+            .run_critical(|store| {
+                store
+                    .connect()?
+                    .query_row("SELECT 1", [], |row| row.get::<_, u64>(0))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         for job in jobs {
             job.abort();
             assert!(job.await.unwrap_err().is_cancelled());

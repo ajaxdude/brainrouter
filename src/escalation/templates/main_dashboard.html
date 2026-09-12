@@ -2441,23 +2441,31 @@ async function sendFeedback(sessionId) {
 
 async function continueReview(sessionId) {
   try {
-    await fetch('/review/api/continue', {
+    const response = await fetch('/review/api/continue', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
+      body: JSON.stringify({ sessionId }),
     });
-  } catch(e) {}
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'HTTP ' + response.status);
+  } catch(e) {
+    alert('Continue failed: ' + e.message);
+  }
   await refreshFast();
 }
 
 async function lgtmReview(sessionId) {
   try {
-    await fetch('/review/api/lgtm', {
+    const response = await fetch('/review/api/lgtm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
+      body: JSON.stringify({ sessionId }),
     });
-  } catch(e) {}
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'HTTP ' + response.status);
+  } catch(e) {
+    alert('LGTM failed: ' + e.message);
+  }
   await refreshFast();
 }
 </script>

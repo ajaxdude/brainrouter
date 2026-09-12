@@ -56,6 +56,25 @@ impl BenchmarkStore {
         })
         .await
     }
+
+    /// Run an internal lifecycle operation without the fail-fast HTTP admission
+    /// pool. Native benchmark execution is already serialized separately, and
+    /// terminal job persistence must not be stranded by unrelated explorer
+    /// requests occupying the two HTTP workers.
+    pub async fn run_critical<T, F>(&self, work: F) -> BenchmarkResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&BenchmarkStore) -> BenchmarkResult<T> + Send + 'static,
+    {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || work(&store))
+            .await
+            .map_err(|error| {
+                BenchmarkError::Io(std::io::Error::other(format!(
+                    "critical benchmark worker failed: {error}"
+                )))
+            })?
+    }
 }
 
 struct AdmittedBody {

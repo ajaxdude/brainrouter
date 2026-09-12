@@ -32,18 +32,15 @@ const TRANSPORT: &str = "discord";
 // ---------------------------------------------------------------------------
 
 fn spawn_save_sessions(sessions: &HashMap<String, String>) {
-    let snapshot = sessions.clone();
-    tokio::task::spawn_blocking(move || save_sessions(TRANSPORT, &snapshot));
+    save_sessions(TRANSPORT, sessions);
 }
 
 fn spawn_save_channel_models(models: &HashMap<String, String>) {
-    let snapshot = models.clone();
-    tokio::task::spawn_blocking(move || save_channel_models(TRANSPORT, &snapshot));
+    save_channel_models(TRANSPORT, models);
 }
 
 fn spawn_save_work_dirs(dirs: &HashMap<String, String>) {
-    let snapshot = dirs.clone();
-    tokio::task::spawn_blocking(move || save_work_dirs(TRANSPORT, &snapshot));
+    save_work_dirs(TRANSPORT, dirs);
 }
 // ---------------------------------------------------------------------------
 // Configuration

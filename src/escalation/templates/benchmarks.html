@@ -8,18 +8,18 @@
 :root{--bg:#0b0e13;--panel:#141923;--panel2:#11151c;--border:#354054;--text:#e6edf6;--dim:#a1aec2;--mute:#a1aec2;--green:#22d39a;--cyan:#3ec5ff;--amber:#f5b14a;--red:#ff6b6b;--violet:#9d7bff}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,sans-serif;line-height:1.5}button,input,select,textarea{font:inherit}a{color:var(--cyan);text-underline-offset:3px}
 header{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--panel2)}h1{font-size:24px;margin:0}h2{font-size:20px;margin:0 0 12px}h3{font-size:16px;margin:22px 0 8px}h4{margin:12px 0 6px}.subtitle,.hint{color:var(--dim);font-size:13px}.spacer{flex:1}
-.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:8px 12px;border-radius:6px;cursor:pointer;text-decoration:none;display:inline-block}.btn:hover:not(:disabled){border-color:var(--cyan)}.btn.primary{color:var(--green);border-color:#258c70}button:disabled{opacity:.5;cursor:not-allowed}
+.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:8px 12px;border-radius:6px;cursor:pointer;text-decoration:none;display:inline-block}.btn:hover:not(:disabled){border-color:var(--cyan)}.btn.primary{color:var(--green);border-color:#258c70}.btn.danger{color:var(--red);border-color:#8f4141}button:disabled{opacity:.5;cursor:not-allowed}
 :focus-visible{outline:2px solid var(--cyan);outline-offset:3px}.skip{position:absolute;top:-100px}.skip:focus{top:8px;left:8px;background:var(--panel);padding:10px;z-index:5}
 main{padding:22px;max-width:1700px;margin:auto}.notice{padding:12px 14px;border:1px solid var(--border);border-radius:6px;color:var(--dim);margin-bottom:18px;background:var(--panel2)}.notice p{margin:0}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
 .filters{display:grid;grid-template-columns:minmax(180px,2fr) repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:14px}label{display:block;color:var(--dim);font-size:13px}input,select,textarea{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:8px;max-width:100%}label>input,label>select,label>textarea{display:block;width:100%;margin-top:4px}textarea{width:100%;min-height:180px;resize:vertical;font:13px ui-monospace,monospace;line-height:1.5}input[type=file]{max-width:100%}input::placeholder,textarea::placeholder{color:var(--dim)}
 .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.kpi,.chart,.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:7px}.kpi{padding:13px}.kpi-label{font-size:12px;color:var(--dim)}.kpi-value{font:600 22px ui-monospace,monospace;margin-top:3px}
 .charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}.chart{padding:14px;min-width:0}.chart h3{font-size:15px;margin:0 0 8px}.chart .hint{margin-bottom:8px}svg{width:100%;height:auto;display:block}.axis{stroke:var(--border)}.tick{fill:var(--dim);font-size:11px}.point{cursor:pointer;stroke:var(--bg);stroke-width:1.5}.point:hover,.point:focus{stroke:#fff;stroke-width:2}
-.table-wrap{overflow:hidden}.table-scroll{overflow:auto;max-height:520px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:12px;color:var(--dim);background:var(--panel2);position:sticky;top:0}#run-table{min-width:1450px}#run-table td{white-space:nowrap}caption{text-align:left;padding:10px;color:var(--dim)}tbody tr:hover{background:#ffffff08}.mono{font-family:ui-monospace,monospace}.succeeded{color:var(--green)}.failed,.oom,.timeout,.error{color:var(--red)}.running{color:var(--cyan)}
+.table-wrap{overflow:hidden}.table-scroll{overflow:auto;max-height:520px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:12px;color:var(--dim);background:var(--panel2);position:sticky;top:0}#run-table{min-width:1450px}#run-table td{white-space:nowrap}#lab-job-table{min-width:1050px}caption{text-align:left;padding:10px;color:var(--dim)}tbody tr:hover{background:#ffffff08}.mono{font-family:ui-monospace,monospace}.succeeded{color:var(--green)}.failed,.oom,.timeout,.cancelled,.interrupted,.error{color:var(--red)}.running{color:var(--cyan)}.queued{color:var(--amber)}
 .pager{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:11px;color:var(--dim)}.message{min-height:22px;color:var(--dim);margin:8px 0;overflow-wrap:anywhere}.message.error{color:var(--red)}.empty{color:var(--dim);padding:22px}
-details{border-top:1px solid var(--border);padding:12px 0}summary{cursor:pointer;font-weight:600;padding:4px 0}fieldset{border:0;padding:0;margin:0;min-width:0}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.workflow{margin:24px 0}.workflow>details{padding:16px 0}.workflow pre{max-height:360px}.inline-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.inline-label>input,.inline-label>select{width:auto}.wide{grid-column:1/-1}
+details{border-top:1px solid var(--border);padding:12px 0}summary{cursor:pointer;font-weight:600;padding:4px 0}fieldset{border:0;padding:0;margin:0;min-width:0}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.workflow{margin:24px 0}.workflow>details{padding:16px 0}.workflow pre{max-height:360px}.inline-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.inline-label>input,.inline-label>select{width:auto}.wide{grid-column:1/-1}.lab{margin-bottom:28px}.lab-grid{display:grid;grid-template-columns:minmax(300px,1fr) minmax(0,2fr);gap:12px}.lab-card{padding:14px}.lab-card .fields{grid-template-columns:repeat(2,minmax(0,1fr))}.progress{width:120px;height:8px;border:0;background:var(--panel2);accent-color:var(--cyan)}
 dialog{width:min(1180px,94vw);max-height:90vh;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:0}dialog::backdrop{background:#000b}.dialog-head{display:flex;align-items:center;gap:12px;padding:14px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);z-index:1}.dialog-head h2{margin:0;overflow-wrap:anywhere;min-width:0}.dialog-body{padding:18px}.detail-section{border-top:1px solid var(--border);padding:16px 0}.detail-section:first-child{border-top:0}.detail-section h3{margin:0 0 12px}.definition{display:grid;grid-template-columns:minmax(130px,1fr) minmax(0,3fr);margin:0;gap:8px 18px}.definition dt{color:var(--dim)}.definition dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.definition .definition{grid-template-columns:minmax(100px,1fr) minmax(0,2fr)}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(--dim);font:12px ui-monospace,monospace;line-height:1.5;overflow:auto;background:var(--panel2)}.spark-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.spark{margin:0;padding:8px 0}.spark figcaption{font-size:13px}.spark svg{height:85px}.quality-table{min-width:1000px}.quality-table td{max-width:260px;overflow-wrap:anywhere}#preview-summary{font-weight:600}#success a{margin-left:8px}#selected-candidate{overflow-wrap:anywhere}
-@media(max-width:1050px){.filters{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}.fields{grid-template-columns:1fr 1fr}}
+@media(max-width:1050px){.filters{grid-template-columns:1fr 1fr}.charts,.lab-grid{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}.fields{grid-template-columns:1fr 1fr}}
 @media(max-width:650px){body{font-size:16px}main{padding:14px}header{padding:14px}.fields,.spark-grid{grid-template-columns:1fr}.definition,.definition .definition{grid-template-columns:1fr;gap:4px}.definition dd{margin-bottom:10px}input,select,textarea{font-size:16px}.dialog-body{padding:12px}.dialog-head{flex-wrap:wrap}.kpi-value{font-size:20px}.filters{grid-template-columns:1fr}}
 </style>
 </head>
@@ -27,14 +27,41 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
 <a class="skip" href="#explorer">Skip to benchmark runs</a>
 <header>
   <a href="/dashboard">&larr; Dashboard</a>
-  <div><h1>Benchmark Explorer</h1><div class="subtitle">Imported evidence, not a workload launcher</div></div>
+  <div><h1>Benchmark Lab</h1><div class="subtitle">Native Riddllr and Plumebench execution with a shared evidence registry</div></div>
   <div class="spacer"></div>
+  <a class="btn primary" href="#lab">Run benchmark</a>
   <a class="btn primary" href="#workflows">Plan &amp; import</a>
   <button class="btn" id="export-jsonl">Export filtered JSONL</button>
   <button class="btn" id="export-csv">Export filtered CSV</button>
 </header>
 <main>
-  <div class="notice">All metadata, hashes, capabilities, commands, and paths are declarations, not artifact verification or runtime capability checks. Commands and paths are inert text: this page never executes them or opens referenced files.</div>
+  <div class="notice">Benchmark Lab execution is explicit, localhost-only, limited to one heavy job, and disabled unless configured. The explorer also accepts imported evidence. Registry metadata and artifact hashes remain declarations, not file attestation.</div>
+  <section id="lab" class="lab" aria-labelledby="lab-title">
+    <h2 id="lab-title">Run Riddllr or Plumebench</h2>
+    <p class="hint">Riddllr routes a selected prompt through Brainrouter and grades the response locally. Plumebench copies only the starter workspace for OMP, waits for the agent to exit, then stages hidden tests separately. Source suites are read-only; job files live under the configured Benchmark Lab workspace.</p>
+    <div class="lab-grid">
+      <div class="chart lab-card">
+        <h3>New job</h3>
+        <div class="fields">
+          <label>Suite<select id="lab-suite"><option value="">Loading suites…</option></select></label>
+          <label>Case<select id="lab-case"><option value="">Choose a suite first</option></select></label>
+          <label>Model<input id="lab-model" list="lab-models" placeholder="llama-swap model key" autocomplete="off"><datalist id="lab-models"></datalist></label>
+          <label>Repetition<input id="lab-repetition" type="number" min="0" max="9007199254740991" step="1" value="0"></label>
+        </div>
+        <div class="toolbar"><button class="btn primary" id="lab-start">Start benchmark</button><button class="btn" id="lab-refresh">Refresh</button></div>
+        <p id="lab-message" class="message" role="status">Loading Benchmark Lab configuration…</p>
+      </div>
+      <div class="table-wrap">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Benchmark Lab jobs">
+          <table id="lab-job-table">
+            <caption>Recent native jobs. A completed run opens in the shared explorer.</caption>
+            <thead><tr><th scope="col">Status</th><th scope="col">Suite / case</th><th scope="col">Model</th><th scope="col">Rep</th><th scope="col">Progress</th><th scope="col">Result</th><th scope="col">Queued</th><th scope="col">Action</th></tr></thead>
+            <tbody id="lab-jobs"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
   <section id="explorer" aria-labelledby="explorer-title">
     <h2 id="explorer-title">Explore benchmark runs</h2>
     <div class="filters">
@@ -148,6 +175,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
 <script>
 'use strict';
 const state={page:1,perPage:25,totalPages:0,items:[]};
+const labState={suites:[],jobs:[],timer:null,generation:0};
 const colors=['#22d39a','#3ec5ff','#9d7bff','#f5b14a','#ff6b6b','#ff7ac6'];
 const byId=id=>document.getElementById(id);
 const finite=n=>typeof n==='number'&&Number.isFinite(n);
@@ -203,6 +231,78 @@ function downloadText(text,name){
   const link=el('a');link.href=url;link.download=name;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function downloadJSON(value,name){assertSafeNumbers(value,'Download');downloadText(pretty(value)+'\n',name)}
+function labActive(job){return job.status==='queued'||job.status==='running'}
+function selectedLabSuite(){return labState.suites.find(suite=>suite.id===byId('lab-suite').value)}
+function renderLabCases(){
+  const select=byId('lab-case'),suite=selectedLabSuite(),selected=select.value;select.replaceChildren();
+  if(!suite){const option=el('option','Choose a suite first');option.value='';select.append(option);return}
+  for(const item of suite.cases){const option=el('option',item.name);option.value=item.id;select.append(option)}
+  if(suite.cases.some(item=>item.id===selected))select.value=selected;
+  else if(suite.cases.length)select.value=suite.cases[0].id;
+  byId('lab-start').disabled=!suite.available||!suite.cases.length;
+  if(!suite.available)message('lab-message',suite.reason||'This suite is unavailable.',true);
+}
+function renderLabSuites(){
+  const select=byId('lab-suite'),selected=select.value;select.replaceChildren();
+  for(const suite of labState.suites){const option=el('option',suite.name+(suite.available?'':' · unavailable'));option.value=suite.id;option.disabled=!suite.available;select.append(option)}
+  if(labState.suites.some(suite=>suite.id===selected&&suite.available))select.value=selected;
+  else{const first=labState.suites.find(suite=>suite.available);if(first)select.value=first.id}
+  renderLabCases();
+}
+function renderLabJobs(){
+  const body=byId('lab-jobs');body.replaceChildren();
+  if(!labState.jobs.length){const row=el('tr'),cell=el('td','No native benchmark jobs yet.','empty');cell.colSpan=8;row.append(cell);body.append(row);return}
+  for(const job of labState.jobs){
+    const row=el('tr'),status=el('td',job.status,job.status),suite=el('td',job.suite+' / '+job.case_id),model=el('td',job.model,'mono'),rep=el('td',job.repetition);
+    const progressCell=el('td'),progress=el('progress',undefined,'progress');progress.max=1;progress.value=finite(job.progress)?job.progress:0;progress.setAttribute('aria-label',Math.round(progress.value*100)+' percent');progressCell.append(progress,el('div',job.message,'hint'));
+    const resultCell=el('td');if(job.result?.run_id){const link=el('a','Open evidence');link.href='/benchmarks?run_id='+encodeURIComponent(job.result.run_id);resultCell.append(link)}else resultCell.textContent=job.error||'—';
+    const queued=el('td',job.queued_at?new Date(job.queued_at).toLocaleString():'—'),action=el('td');
+    if(labActive(job)){const cancel=button('Cancel',()=>cancelLabJob(job.id));cancel.classList.add('danger');action.append(cancel)}
+    row.append(status,suite,model,rep,progressCell,resultCell,queued,action);body.append(row);
+  }
+}
+function scheduleLabRefresh(){
+  clearTimeout(labState.timer);labState.timer=null;
+  if(labState.jobs.some(labActive))labState.timer=setTimeout(refreshLabJobs,2000);
+}
+async function refreshLabJobs(){
+  const generation=++labState.generation;
+  try{
+    const data=await jsonFetch('/api/benchmarks/lab/jobs?limit=25');if(generation!==labState.generation)return;
+    labState.jobs=data.jobs||[];renderLabJobs();scheduleLabRefresh();
+  }catch(e){if(generation===labState.generation){message('lab-message',e.message,true);scheduleLabRefresh()}}
+}
+async function loadLab(){
+  byId('lab-start').disabled=true;
+  try{
+    const [suiteData,modelData]=await Promise.all([jsonFetch('/api/benchmarks/lab/suites'),jsonFetch('/v1/models')]);
+    labState.suites=suiteData.suites||[];renderLabSuites();
+    const models=byId('lab-models');models.replaceChildren();for(const item of modelData.data||[]){const option=el('option');option.value=item.id;models.append(option)}
+    if(!byId('lab-model').value){const preferred=(modelData.data||[]).find(item=>!['auto','local','cloud'].includes(item.id));byId('lab-model').value=preferred?.id||'local'}
+    message('lab-message','Ready. Jobs execute one at a time; use a new repetition for an existing successful run.');
+    await refreshLabJobs();
+  }catch(e){
+    labState.suites=[];renderLabSuites();byId('lab-start').disabled=true;message('lab-message',e.message,true);
+    await refreshLabJobs().catch(()=>{});
+  }
+}
+async function startLabJob(){
+  try{
+    const repetition=Number(byId('lab-repetition').value),suite=byId('lab-suite').value,caseId=byId('lab-case').value,model=byId('lab-model').value.trim();
+    if(!suite||!caseId)throw new Error('Choose an available suite and case.');
+    if(!model)throw new Error('Choose or enter a model.');
+    if(!Number.isSafeInteger(repetition)||repetition<0)throw new Error('Repetition must be a non-negative safe integer.');
+    byId('lab-start').disabled=true;message('lab-message','Submitting benchmark job…');
+    const job=await post('/api/benchmarks/lab/jobs',{suite,case_id:caseId,model,repetition});
+    message('lab-message','Queued '+job.suite+' / '+job.case_id+' for '+job.model+'.');
+    await refreshLabJobs();
+  }catch(e){message('lab-message',e.message,true)}
+  finally{renderLabCases()}
+}
+async function cancelLabJob(id){
+  try{message('lab-message','Cancelling job…');await post('/api/benchmarks/lab/jobs/'+encodeURIComponent(id)+'/cancel',{});message('lab-message','Cancellation requested.');await refreshLabJobs()}
+  catch(e){message('lab-message',e.message,true)}
+}
 function params(includePage=true){
   const p=new URLSearchParams();
   for(const id of ['q','family','backend','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
@@ -571,7 +671,8 @@ for(const id of ['family','backend','workload','quant_name','status','sort'])byI
 let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);loadGeneration++;searchTimer=setTimeout(()=>{state.page=1;load()},250)};
 byId('prev').onclick=()=>{if(state.page>1){state.page--;load()}};byId('next').onclick=()=>{if(state.page<state.totalPages){state.page++;load()}};
 byId('reload').onclick=load;
-window.addEventListener('hashchange',openHashRun);initializeExplorer();
+byId('lab-suite').onchange=renderLabCases;byId('lab-start').onclick=startLabJob;byId('lab-refresh').onclick=refreshLabJobs;
+window.addEventListener('hashchange',openHashRun);initializeExplorer();loadLab();
 </script>
 </body>
 </html>

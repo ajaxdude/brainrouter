@@ -298,6 +298,7 @@ where
 /// return this stream immediately so the client gets SSE headers + keepalives.
 pub struct DeferredStream {
     state: DeferredState,
+    routing_task: AbortOnDrop,
     sleep: Pin<Box<Sleep>>,
     /// Absolute deadline after which we give up waiting for the provider stream.
     deadline: Pin<Box<Sleep>>,
@@ -315,15 +316,33 @@ enum DeferredState {
     Done,
 }
 
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 impl DeferredStream {
     pub fn new(
         rx: tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>,
+        routing_task: tokio::task::AbortHandle,
         interval: Duration,
         max_wait: Duration,
         format: StreamFormat,
     ) -> Self {
         Self {
             state: DeferredState::Waiting(rx),
+            routing_task: AbortOnDrop(Some(routing_task)),
             sleep: Box::pin(sleep(interval)),
             deadline: Box::pin(sleep(max_wait)),
             interval,
@@ -371,6 +390,7 @@ impl Stream for DeferredStream {
                         Poll::Pending => {
                             // Check absolute deadline first.
                             if this.deadline.as_mut().poll(cx).is_ready() {
+                                this.routing_task.abort();
                                 this.state = DeferredState::Done;
                                 return Poll::Ready(Some(Err(anyhow::anyhow!(
                                     "Routing timed out waiting for provider stream"
@@ -395,6 +415,7 @@ impl Stream for DeferredStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
+
                     }
                 }
                 DeferredState::Streaming(stream) => {
@@ -405,5 +426,29 @@ impl Stream for DeferredStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_deferred_stream_aborts_routing_task() {
+        let routing_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = routing_task.abort_handle();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let stream = DeferredStream::new(
+            rx,
+            abort_handle,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            StreamFormat::OpenAi,
+        );
+
+        drop(stream);
+
+        let error = routing_task.await.expect_err("routing task should be aborted");
+        assert!(error.is_cancelled());
     }
 }

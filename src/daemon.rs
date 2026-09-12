@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use brainrouter::{
     benchmark::BenchmarkStore,
+    benchmark_lab::BenchmarkLab,
     bonsai_server::BonsaiControl,
     classifier::Classifier,
     config,
@@ -37,34 +38,66 @@ struct SlotProgress {
 /// Poll llama-swap /running for the active llama-server proxy, then its /slots
 /// array for prompt-prefill and generation progress.
 async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<SlotProgress> {
-    let running = client.get(format!("{}/running", ls_url))
+    let running = client
+        .get(format!("{}/running", ls_url))
         .timeout(std::time::Duration::from_secs(3))
-        .send().await.ok()?
-        .json::<serde_json::Value>().await.ok()?;
-    let active_model = running["running"][0]["model"].as_str().unwrap_or("").to_string();
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let active_model = running["running"][0]["model"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let proxy = running["running"][0]["proxy"].as_str()?.to_string();
-    let slots = client.get(format!("{}/slots", proxy))
+    let slots = client
+        .get(format!("{}/slots", proxy))
         .timeout(std::time::Duration::from_secs(3))
-        .send().await.ok()?
-        .json::<serde_json::Value>().await.ok()?;
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
     parse_slot_progress(&slots, active_model)
 }
 
 fn parse_slot_progress(slots: &serde_json::Value, model: String) -> Option<SlotProgress> {
-    let arr = slots.as_array().or_else(|| slots.get("slots")?.as_array())?;
+    let arr = slots
+        .as_array()
+        .or_else(|| slots.get("slots")?.as_array())?;
     let mut best: Option<(u64, SlotProgress)> = None;
     for slot in arr {
-        let processing = slot.get("is_processing").and_then(|v| v.as_bool()).unwrap_or(false);
-        let total = slot.get("n_prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let processed = slot.get("n_prompt_processed")
-            .or_else(|| slot.get("n_prompt_tokens_processed"))
-            .and_then(|v| v.as_u64()).unwrap_or(0);
-        let next_token = slot.get("next_token").and_then(|value| {
-            if value.is_array() { value.as_array()?.first() } else { Some(value) }
-        });
-        let generated_tokens = slot.get("n_decoded")
+        let processing = slot
+            .get("is_processing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let total = slot
+            .get("n_prompt_tokens")
             .and_then(|v| v.as_u64())
-            .or_else(|| next_token.and_then(|value| value.get("n_decoded")).and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        let processed = slot
+            .get("n_prompt_processed")
+            .or_else(|| slot.get("n_prompt_tokens_processed"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let next_token = slot.get("next_token").and_then(|value| {
+            if value.is_array() {
+                value.as_array()?.first()
+            } else {
+                Some(value)
+            }
+        });
+        let generated_tokens = slot
+            .get("n_decoded")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                next_token
+                    .and_then(|value| value.get("n_decoded"))
+                    .and_then(|v| v.as_u64())
+            })
             .unwrap_or(0);
         if !processing && generated_tokens == 0 {
             continue;
@@ -74,24 +107,32 @@ fn parse_slot_progress(slots: &serde_json::Value, model: String) -> Option<SlotP
             .and_then(|v| v.as_i64())
             .filter(|value| *value >= 0)
             .map(|value| value as u64);
-        let configured_max = slot.pointer("/params/n_predict")
+        let configured_max = slot
+            .pointer("/params/n_predict")
             .and_then(|v| v.as_i64())
             .filter(|value| *value > 0)
             .map(|value| value as u64);
-        let max_tokens = remaining.map(|value| generated_tokens.saturating_add(value)).or(configured_max);
+        let max_tokens = remaining
+            .map(|value| generated_tokens.saturating_add(value))
+            .or(configured_max);
         let prefill_progress = if generated_tokens == 0 && total > 0 {
             Some((processed as f64 / total as f64).clamp(0.0, 1.0))
         } else {
             None
         };
-        let score = generated_tokens.saturating_mul(1_000_000).saturating_add(processed);
+        let score = generated_tokens
+            .saturating_mul(1_000_000)
+            .saturating_add(processed);
         let progress = SlotProgress {
             model: model.clone(),
             prefill_progress,
             generated_tokens,
             max_tokens,
         };
-        if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+        if best
+            .as_ref()
+            .map_or(true, |(best_score, _)| score > *best_score)
+        {
             best = Some((score, progress));
         }
     }
@@ -123,16 +164,19 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_config_path);
 
     // Config
-    let config = config::load(&config_path).with_context(|| {
-        format!("Failed to load config from {}", config_path.display())
-    })?;
+    let config = config::load(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let profiles = Arc::new(brainrouter::routing_profile::ProfileStore::load(
         config::default_config_path().with_file_name("routing_state.json"),
         config.routing_profile()?,
         &config.review,
     )?);
-    let routing_mode = match profiles.profile().main.backend() { "cloud" => 1, "local" => 2, _ => 0 };
+    let routing_mode = match profiles.profile().main.backend() {
+        "cloud" => 1,
+        "local" => 2,
+        _ => 0,
+    };
     let benchmark_store = BenchmarkStore::open(config.benchmarks.database_path.clone())
         .map(Arc::new)
         .map_err(|error| {
@@ -183,7 +227,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     // Nudge (per-request reasoning budget) runtime state — shared between the
     // classifier, the router, and the dashboard API.
-    let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llama_swap.nudge.enabled));
+    let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        config.llama_swap.nudge.enabled,
+    ));
     let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)); // deep — Bonsai is off by default, so there is no classifier to pick a tier
     let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
 
@@ -246,7 +292,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         let p = std::path::Path::new(&dir);
         if !p.exists() {
             warn!(path = %dir, "BRAINROUTER_MANIFEST_DIR does not exist; Manifest upgrade will fail");
-        } else if !p.join("docker-compose.yml").exists() && !p.join("docker-compose.yaml").exists() {
+        } else if !p.join("docker-compose.yml").exists() && !p.join("docker-compose.yaml").exists()
+        {
             warn!(path = %dir, "BRAINROUTER_MANIFEST_DIR has no docker-compose.yml; Manifest upgrade will fail");
         }
     }
@@ -255,23 +302,26 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let inference_tracker = Arc::new(InferenceTracker::new());
 
     // Router — shared between the proxy and the review service
-    let router = Arc::new(Router::new(brainrouter::router::RouterArgs {
-        classifier,
-        manifest,
-        manifest_enabled: config.manifest.enabled,
-        llama_swap,
-        fallback_model: config.llama_swap.fallback_model.clone(),
-        local_models: config.llama_swap.local_models.clone(),
-        subs_model: config.llama_swap.subs_model.clone(),
-        health,
-        routing_events: Arc::clone(&routing_events),
-        local_system_prompt,
-        inference_tracker: Arc::clone(&inference_tracker),
-        nudge_budgets: config.llama_swap.nudge.budgets,
-        nudge_enabled: Arc::clone(&nudge_enabled),
-        nudge_tier: Arc::clone(&nudge_tier),
-        prompt_rewrite: Arc::clone(&prompt_rewrite),
-    }).with_profiles(profiles));
+    let router = Arc::new(
+        Router::new(brainrouter::router::RouterArgs {
+            classifier,
+            manifest,
+            manifest_enabled: config.manifest.enabled,
+            llama_swap,
+            fallback_model: config.llama_swap.fallback_model.clone(),
+            local_models: config.llama_swap.local_models.clone(),
+            subs_model: config.llama_swap.subs_model.clone(),
+            health,
+            routing_events: Arc::clone(&routing_events),
+            local_system_prompt,
+            inference_tracker: Arc::clone(&inference_tracker),
+            nudge_budgets: config.llama_swap.nudge.budgets,
+            nudge_enabled: Arc::clone(&nudge_enabled),
+            nudge_tier: Arc::clone(&nudge_tier),
+            prompt_rewrite: Arc::clone(&prompt_rewrite),
+        })
+        .with_profiles(profiles),
+    );
 
     // Session manager (in-memory; ephemeral per process lifetime)
     let session_manager = Arc::new(SessionManager::new());
@@ -284,13 +334,36 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         review_config,
     ));
 
-    let llama_swap_url = config.llama_swap.base_url
+    let benchmark_lab = if !config.benchmarks.lab.enabled {
+        Err("disabled in benchmarks.lab.enabled".to_string())
+    } else {
+        match &benchmark_store {
+            Ok(store) => BenchmarkLab::new(
+                config.benchmarks.lab.clone(),
+                socket.clone(),
+                Arc::clone(&router),
+                Arc::clone(store),
+            )
+            .map(Arc::new)
+            .map_err(|error| {
+                warn!(error = %error, "Benchmark Lab unavailable; continuing core daemon startup");
+                error.to_string()
+            }),
+            Err(reason) => Err(format!("benchmark registry unavailable: {reason}")),
+        }
+    };
+
+    let llama_swap_url = config
+        .llama_swap
+        .base_url
         .trim_end_matches('/')
         .strip_suffix("/v1")
         .unwrap_or(&config.llama_swap.base_url)
         .to_string();
 
-    let manifest_url = config.manifest.base_url
+    let manifest_url = config
+        .manifest
+        .base_url
         .trim_end_matches('/')
         .strip_suffix("/v1")
         .unwrap_or(&config.manifest.base_url)
@@ -330,6 +403,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         prompt_rewrite,
         inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
         benchmark_store,
+        benchmark_lab,
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
     });
 
@@ -389,7 +463,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             match server::sync_omp_models(&ls_url, &own_addr).await {
                 Ok(n) => tracing::info!(model_count = n, "Auto-synced OMP models.yml on startup"),
-                Err(e) => tracing::warn!(error = %e, "Failed to auto-sync OMP models.yml (llama-swap may not be ready)"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to auto-sync OMP models.yml (llama-swap may not be ready)")
+                }
             }
         });
     }

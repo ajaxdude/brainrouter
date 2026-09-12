@@ -32,12 +32,66 @@ pub struct BenchmarkConfig {
     /// SQLite database containing imported benchmark definitions and results.
     #[serde(default = "default_benchmark_database_path")]
     pub database_path: PathBuf,
+    /// Optional native Riddllr and Plumebench execution.
+    #[serde(default)]
+    pub lab: BenchmarkLabConfig,
 }
 
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
             database_path: default_benchmark_database_path(),
+            lab: BenchmarkLabConfig::default(),
+        }
+    }
+}
+
+/// Native benchmark execution settings.
+///
+/// Execution is disabled by default. When enabled, Brainrouter reads suite
+/// inputs from the configured roots, creates isolated per-job workspaces, and
+/// stores results in the benchmark registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkLabConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub riddllr_root: Option<PathBuf>,
+    #[serde(default)]
+    pub plumebench_root: Option<PathBuf>,
+    #[serde(default = "default_benchmark_workspace_path")]
+    pub workspace_path: PathBuf,
+    #[serde(default = "default_omp_binary")]
+    pub omp_bin: PathBuf,
+    #[serde(default = "default_plumebench_sandbox_binary")]
+    pub plumebench_sandbox_bin: PathBuf,
+    #[serde(default = "default_python_binary")]
+    pub python_bin: PathBuf,
+    #[serde(default = "default_benchmark_job_timeout_seconds")]
+    pub max_job_seconds: u64,
+    #[serde(default = "default_riddllr_max_tokens")]
+    pub riddllr_max_tokens: u32,
+    #[serde(default = "default_plumebench_max_turns")]
+    pub plumebench_max_turns: u32,
+    #[serde(default = "default_plumebench_thinking")]
+    pub plumebench_thinking: String,
+}
+
+impl Default for BenchmarkLabConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            riddllr_root: None,
+            plumebench_root: None,
+            workspace_path: default_benchmark_workspace_path(),
+            omp_bin: default_omp_binary(),
+            plumebench_sandbox_bin: default_plumebench_sandbox_binary(),
+            python_bin: default_python_binary(),
+            max_job_seconds: default_benchmark_job_timeout_seconds(),
+            riddllr_max_tokens: default_riddllr_max_tokens(),
+            plumebench_max_turns: default_plumebench_max_turns(),
+            plumebench_thinking: default_plumebench_thinking(),
         }
     }
 }
@@ -50,6 +104,44 @@ fn default_benchmark_database_path() -> PathBuf {
             PathBuf::from(home).join(".local/share")
         });
     base.join("brainrouter").join("benchmarks.sqlite3")
+}
+
+fn default_benchmark_workspace_path() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home).join(".local/share")
+        });
+    base.join("brainrouter").join("benchmark-lab")
+}
+
+fn default_omp_binary() -> PathBuf {
+    PathBuf::from("omp")
+}
+
+fn default_plumebench_sandbox_binary() -> PathBuf {
+    PathBuf::from("bwrap")
+}
+
+fn default_python_binary() -> PathBuf {
+    PathBuf::from("python3")
+}
+
+fn default_benchmark_job_timeout_seconds() -> u64 {
+    900
+}
+
+fn default_riddllr_max_tokens() -> u32 {
+    4096
+}
+
+fn default_plumebench_max_turns() -> u32 {
+    40
+}
+
+fn default_plumebench_thinking() -> String {
+    "low".to_string()
 }
 
 /// Configuration for the Manifest cloud LLM router.
@@ -194,12 +286,16 @@ pub struct BonsaiConfig {
     #[serde(default = "default_fork_path")]
     pub fork_path: PathBuf,
 }
-fn default_bonsai_port() -> u16 { 9200 }
+fn default_bonsai_port() -> u16 {
+    9200
+}
 fn default_fork_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(format!("{}/.local/share/brainrouter/llama-prism/llama-server", home))
+    PathBuf::from(format!(
+        "{}/.local/share/brainrouter/llama-prism/llama-server",
+        home
+    ))
 }
-
 
 /// Shared model storage directory configuration.
 ///
@@ -251,7 +347,11 @@ impl ModelsConfig {
     /// - `shared_write: false` → `0o750`  (owner rwx, group r-x, others ---)
     /// - `shared_write: true`  → `0o770`  (owner rwx, group rwx, others ---)
     pub fn dir_mode(&self) -> u32 {
-        if self.shared_write { 0o770 } else { 0o750 }
+        if self.shared_write {
+            0o770
+        } else {
+            0o750
+        }
     }
 
     /// Apply the configured permissions to `path` (and recursively to all
@@ -270,8 +370,8 @@ impl ModelsConfig {
 fn apply_dir_mode(dir: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("Failed to chmod {:o} on {}", mode, dir.display()))?;
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("Failed to read dir {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("Failed to read dir {}", dir.display()))?
     {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -329,7 +429,10 @@ impl ReviewConfig {
     }
 
     pub fn model_choice(&self) -> Result<crate::routing_profile::ModelChoice> {
-        crate::routing_profile::ModelChoice::from_legacy(&self.forced_mode, self.forced_model.clone())
+        crate::routing_profile::ModelChoice::from_legacy(
+            &self.forced_mode,
+            self.forced_model.clone(),
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -378,7 +481,16 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
 
     let mut config: BrainrouterConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("Failed to parse YAML config: {}", path.display()))?;
+    validate(&mut config, path)?;
+    Ok(config)
+}
 
+/// Normalize and semantically validate a parsed configuration.
+///
+/// Both daemon startup and the dashboard editor must call this before using or
+/// persisting a configuration so a successful save cannot create a file that
+/// the next daemon restart rejects.
+pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
     // Expand ${models_path} in bonsai.model_path.
     // This lets users write a single `models.path` and reference it everywhere
     // without repeating the absolute prefix.
@@ -427,10 +539,48 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
     if config.benchmarks.database_path.as_os_str().is_empty() {
         bail!("benchmarks.database_path must not be empty");
     }
+    if config.benchmarks.lab.workspace_path.as_os_str().is_empty() {
+        bail!("benchmarks.lab.workspace_path must not be empty");
+    }
+    if config.benchmarks.lab.omp_bin.as_os_str().is_empty() {
+        bail!("benchmarks.lab.omp_bin must not be empty");
+    }
+    if config
+        .benchmarks
+        .lab
+        .plumebench_sandbox_bin
+        .as_os_str()
+        .is_empty()
+    {
+        bail!("benchmarks.lab.plumebench_sandbox_bin must not be empty");
+    }
+    if config.benchmarks.lab.python_bin.as_os_str().is_empty() {
+        bail!("benchmarks.lab.python_bin must not be empty");
+    }
+    if !(1..=86_400).contains(&config.benchmarks.lab.max_job_seconds) {
+        bail!("benchmarks.lab.max_job_seconds must be between 1 and 86400");
+    }
+    if config.benchmarks.lab.riddllr_max_tokens == 0 {
+        bail!("benchmarks.lab.riddllr_max_tokens must be positive");
+    }
+    if config.benchmarks.lab.plumebench_max_turns == 0 {
+        bail!("benchmarks.lab.plumebench_max_turns must be positive");
+    }
+    if !matches!(
+        config.benchmarks.lab.plumebench_thinking.as_str(),
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto"
+    ) {
+        bail!(
+            "benchmarks.lab.plumebench_thinking must be off, minimal, low, medium, high, xhigh, max, or auto"
+        );
+    }
     config.review.normalize_legacy_read(path);
-    config.review.validate()
+    config
+        .review
+        .validate()
         .with_context(|| format!("Invalid review configuration in {}", path.display()))?;
-    config.routing_profile()
+    config
+        .routing_profile()
         .with_context(|| format!("Invalid routing configuration in {}", path.display()))?;
 
     // Validate bonsai.model_path exists (after token expansion) — but only
@@ -447,9 +597,8 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
         }
     }
 
-    Ok(config)
+    Ok(())
 }
-
 
 /// Default Unix domain socket path for the brainrouter daemon.
 /// Prefers $XDG_RUNTIME_DIR/brainrouter.sock, falls back to /run/brainrouter.sock.
@@ -475,7 +624,6 @@ pub fn default_config_path() -> PathBuf {
     base.join("brainrouter").join("brainrouter.yaml")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,9 +634,7 @@ mod tests {
 
     #[test]
     fn local_models_defaults_to_empty() {
-        let cfg = parse_llama_swap(
-            "base_url: http://localhost:8081/v1\nfallback_model: default\n",
-        );
+        let cfg = parse_llama_swap("base_url: http://localhost:8081/v1\nfallback_model: default\n");
         assert!(cfg.local_models.is_empty());
     }
 
@@ -534,6 +680,13 @@ mod tests {
     #[test]
     fn benchmark_database_path_has_a_per_user_default() {
         let config = BenchmarkConfig::default();
-        assert!(config.database_path.ends_with("brainrouter/benchmarks.sqlite3"));
+        assert!(config
+            .database_path
+            .ends_with("brainrouter/benchmarks.sqlite3"));
+        assert!(config
+            .lab
+            .workspace_path
+            .ends_with("brainrouter/benchmark-lab"));
+        assert!(!config.lab.enabled);
     }
 }

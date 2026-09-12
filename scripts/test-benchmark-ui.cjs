@@ -24,7 +24,10 @@ class Element {
     this.open = false;
     this.isConnected = true;
     this.files = [];
-    this.classList = { toggle: (name, enabled) => { this.attributes[name] = enabled; } };
+    this.classList = {
+      toggle: (name, enabled) => { this.attributes[name] = enabled; },
+      add: name => { this.attributes[name] = true; },
+    };
   }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map(x => x.textContent).join(''); }
@@ -81,6 +84,9 @@ function browser(handler = async () => response({}), settings = {}) {
       removeItem(key) { storageCalls.push('clear'); storage.delete(key); },
     },
     async fetch(address, options) {
+      if (!settings.labFetch && address === '/api/benchmarks/lab/suites') return response({ suites: [] });
+      if (!settings.labFetch && address.startsWith('/api/benchmarks/lab/jobs')) return response({ jobs: [] });
+      if (!settings.labFetch && address === '/v1/models') return response({ data: [] });
       calls.push({ url: address, options });
       if (settings.fetch) return settings.fetch(address, options);
       if (address.startsWith('/api/benchmarks/runs?')) return response(emptyPage);
@@ -184,6 +190,42 @@ test('rich inspector renders malicious paths/commands as inert text and covers m
   assert(all.every(x => !Object.keys(x.attributes).some(name => /^(href|src|onerror)$/.test(name))));
   assert(!script.includes('innerHTML'));
   assert(!script.includes('insertAdjacentHTML'));
+});
+
+test('benchmark lab renders suites, submits explicit jobs, and links only persisted evidence', async () => {
+  let jobs = [];
+  const app = browser(undefined, {
+    labFetch: true,
+    fetch: async (url, options) => {
+      if (url.startsWith('/api/benchmarks/runs?')) return response(emptyPage);
+      if (url === '/api/benchmarks/filters') return response(filters);
+      if (url === '/v1/models') return response({ data: [{ id: 'model-a' }] });
+      if (url === '/api/benchmarks/lab/suites') return response({ suites: [{
+        id: 'riddllr', name: 'Riddllr', available: true, reason: null,
+        cases: [{ id: 'heroes', name: 'heroes', manifest_sha256: 'a'.repeat(64) }],
+      }] });
+      if (url === '/api/benchmarks/lab/jobs' && options?.method === 'POST') {
+        jobs = [{
+          id: 'job-1', suite: 'riddllr', case_id: 'heroes', model: 'model-a',
+          repetition: 0, status: 'succeeded', progress: 1, message: 'done',
+          queued_at: '2026-01-01T00:00:00Z', run_id: 'run-1',
+          result: { run_id: 'run-1', passed: true },
+        }];
+        return response(jobs[0], 202);
+      }
+      if (url.startsWith('/api/benchmarks/lab/jobs?')) return response({ jobs });
+      throw new Error('unexpected URL ' + url);
+    },
+  });
+  await app.sandbox.loadLab();
+  assert.equal(app.nodes.get('lab-suite').value, 'riddllr');
+  assert.equal(app.nodes.get('lab-case').value, 'heroes');
+  assert.equal(app.nodes.get('lab-model').value, 'model-a');
+  await app.sandbox.startLabJob();
+  const write = app.calls.find(call => call.url === '/api/benchmarks/lab/jobs' && call.options?.method === 'POST');
+  assert.deepEqual(JSON.parse(write.options.body), { suite: 'riddllr', case_id: 'heroes', model: 'model-a', repetition: 0 });
+  const link = walk(app.nodes.get('lab-jobs')).find(node => node.tagName === 'A');
+  assert.equal(link.href, '/benchmarks?run_id=run-1');
 });
 
 test('dialog opens immediately, rejects stale requests, reports 413 inline, closes on Escape and returns focus', async () => {

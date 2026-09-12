@@ -38,6 +38,54 @@ impl Drop for TestDirectory {
     }
 }
 
+#[cfg(unix)]
+fn write_fake_bwrap(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        r#"#!/bin/sh
+omp=
+python=
+work=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ro-bind)
+      if [ "$3" = "/opt/omp" ]; then omp="$2"; fi
+      if [ "$3" = "/opt/python" ]; then python="$2"; fi
+      shift 3
+      ;;
+    --bind)
+      if [ "$3" = "/work" ]; then work="$2"; fi
+      shift 3
+      ;;
+    --)
+      shift
+      cd "$work" || exit 126
+      if [ "$1" = "/opt/brainrouter" ]; then
+        while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+        [ "$#" -gt 0 ] && shift
+        [ "$1" = "/opt/omp" ] && shift
+        exec "$omp" "$@"
+      fi
+      if [ "$1" = "/opt/python" ]; then
+        shift
+        exec "$python" "$@"
+      fi
+      exit 127
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+exit 127
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 struct MockUpstream {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -163,7 +211,26 @@ impl TestDaemon {
         cloud_enabled: bool,
         review: Value,
     ) -> Self {
+        Self::start_with_review_and_lab(directory, database, upstream, cloud_enabled, review, None)
+    }
+
+    fn start_with_lab(directory: &Path, database: &Path, upstream: &str, lab: Value) -> Self {
+        Self::start_with_review_and_lab(directory, database, upstream, false, json!({}), Some(lab))
+    }
+
+    fn start_with_review_and_lab(
+        directory: &Path,
+        database: &Path,
+        upstream: &str,
+        cloud_enabled: bool,
+        review: Value,
+        lab: Option<Value>,
+    ) -> Self {
         let config = directory.join("config.yaml");
+        let mut benchmarks = json!({"database_path": database});
+        if let Some(lab) = lab {
+            benchmarks["lab"] = lab;
+        }
         fs::write(
             &config,
             serde_yaml::to_string(&json!({
@@ -179,7 +246,7 @@ impl TestDaemon {
                     "enabled": false,
                     "fork_path": directory.join("no-model-server"),
                 },
-                "benchmarks": {"database_path": database},
+                "benchmarks": benchmarks,
                 "review": review,
             }))
             .unwrap(),
@@ -495,7 +562,7 @@ async fn forward_benchmark_schema_does_not_stop_core_routing() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO schema_migrations(version,name) VALUES(2,'future_schema')",
+            "INSERT INTO schema_migrations(version,name) VALUES(3,'future_schema')",
             [],
         )
         .unwrap();
@@ -513,9 +580,417 @@ async fn forward_benchmark_schema_does_not_stop_core_routing() {
         })
         .unwrap();
     assert_eq!(
-        version, 2,
+        version, 3,
         "startup must not downgrade an unsupported database"
     );
+}
+
+#[tokio::test]
+async fn native_riddllr_job_routes_grades_persists_and_preserves_sources() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let riddllr = directory.0.join("riddllr");
+    let prompts = riddllr.join("prompts");
+    let solutions = riddllr.join("solutions");
+    fs::create_dir_all(&prompts).unwrap();
+    fs::create_dir_all(&solutions).unwrap();
+    fs::write(
+        prompts.join("smoke.txt"),
+        "Reply with exactly routing-ok.\n",
+    )
+    .unwrap();
+    fs::write(solutions.join("smoke-solution.txt"), "routing-ok\n").unwrap();
+    let original_prompt = fs::read(prompts.join("smoke.txt")).unwrap();
+    let original_solution = fs::read(solutions.join("smoke-solution.txt")).unwrap();
+
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start_with_lab(
+        &directory.0,
+        &database,
+        &upstream.url,
+        json!({
+            "enabled": true,
+            "riddllr_root": riddllr,
+            "workspace_path": directory.0.join("lab-work"),
+            "omp_bin": directory.0.join("missing-omp"),
+            "python_bin": "python3",
+            "max_job_seconds": 10,
+            "riddllr_max_tokens": 64,
+        }),
+    );
+    daemon.wait_until_ready().await;
+
+    let suites = daemon
+        .client
+        .get(format!("{}/api/benchmarks/lab/suites", daemon.url))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(suites["suites"][0]["cases"][0]["id"], "smoke");
+
+    let response = daemon
+        .client
+        .post(format!("{}/api/benchmarks/lab/jobs", daemon.url))
+        .json(&json!({
+            "suite": "riddllr",
+            "case_id": "smoke",
+            "model": "test-only-model",
+            "repetition": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let queued = response.json::<Value>().await.unwrap();
+    let job_id = queued["id"].as_str().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let job = daemon
+            .client
+            .get(format!("{}/api/benchmarks/lab/jobs/{job_id}", daemon.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "benchmark job did not complete");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(completed["status"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["passed"], true, "{completed}");
+    let run_id = completed["result"]["run_id"].as_str().unwrap();
+
+    let detail = daemon
+        .client
+        .get(format!(
+            "{}/api/benchmarks/runs/{}",
+            daemon.url,
+            url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(detail["run_record"]["status"], "succeeded");
+    assert_eq!(detail["quality_results"][0]["metric_name"], "pass@1");
+    assert_eq!(detail["quality_results"][0]["metric_value"], 1.0);
+
+    let repeated = daemon
+        .client
+        .post(format!("{}/api/benchmarks/lab/jobs", daemon.url))
+        .json(&json!({
+            "suite": "riddllr",
+            "case_id": "smoke",
+            "model": "test-only-model",
+            "repetition": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), 202);
+    let repeated_id = repeated.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repeated_deadline = Instant::now() + Duration::from_secs(10);
+    let repeated = loop {
+        let job = daemon
+            .client
+            .get(format!(
+                "{}/api/benchmarks/lab/jobs/{repeated_id}",
+                daemon.url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(
+            Instant::now() < repeated_deadline,
+            "repeated benchmark job did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(repeated["status"], "succeeded", "{repeated}");
+    let connection = Connection::open(&database).unwrap();
+    let mut statement = connection
+        .prepare("SELECT repetition,experiment_id FROM runs ORDER BY repetition")
+        .unwrap();
+    let runs = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].0, 0);
+    assert_eq!(runs[1].0, 1);
+    assert_eq!(runs[0].1, runs[1].1);
+
+    assert_eq!(
+        fs::read(prompts.join("smoke.txt")).unwrap(),
+        original_prompt
+    );
+    assert_eq!(
+        fs::read(solutions.join("smoke-solution.txt")).unwrap(),
+        original_solution
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_plumebench_job_hides_tests_runs_tools_and_persists_quality() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let plumebench = directory.0.join("plumebench");
+    let task = plumebench.join("tasks/t1_smoke");
+    fs::create_dir_all(task.join("starter")).unwrap();
+    fs::create_dir_all(task.join("tests_hidden")).unwrap();
+    fs::create_dir_all(task.join("reference")).unwrap();
+    fs::write(task.join("task.md"), "Create generated.py.\n").unwrap();
+    fs::write(task.join("starter/base.py"), "VALUE = 1\n").unwrap();
+    fs::write(
+        task.join("tests_hidden/test_generated.py"),
+        "def test_generated(): assert True\n",
+    )
+    .unwrap();
+    fs::write(task.join("reference/generated.py"), "GENERATED = True\n").unwrap();
+
+    let fake_omp = directory.0.join("fake-omp");
+    fs::write(
+        &fake_omp,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' '--model --mode --max-time --thinking --auto-approve --no-session --no-extensions --no-skills --no-rules --cwd'; exit 0; fi\nprintf 'GENERATED = True\\n' > generated.py\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"fake\"}' '{\"type\":\"turn_start\"}' '{\"type\":\"turn_end\",\"stopReason\":\"stop\",\"usage\":{\"input\":5,\"output\":7}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_bwrap = directory.0.join("fake-bwrap");
+    write_fake_bwrap(&fake_bwrap);
+    let fake_python = directory.0.join("fake-python");
+    fs::write(
+        &fake_python,
+        "#!/bin/sh\nprintf '%s\\n' '2 passed in 0.01s'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_python, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start_with_lab(
+        &directory.0,
+        &database,
+        &upstream.url,
+        json!({
+            "enabled": true,
+            "plumebench_root": plumebench,
+            "workspace_path": directory.0.join("lab-work"),
+            "omp_bin": fake_omp,
+            "plumebench_sandbox_bin": fake_bwrap,
+            "python_bin": fake_python,
+            "max_job_seconds": 10,
+            "plumebench_max_turns": 3,
+            "plumebench_thinking": "minimal",
+        }),
+    );
+    daemon.wait_until_ready().await;
+
+    let response = daemon
+        .client
+        .post(format!("{}/api/benchmarks/lab/jobs", daemon.url))
+        .json(&json!({
+            "suite": "plumebench",
+            "case_id": "t1_smoke",
+            "model": "test-only-model",
+            "repetition": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let queued = response.json::<Value>().await.unwrap();
+    let job_id = queued["id"].as_str().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let job = daemon
+            .client
+            .get(format!("{}/api/benchmarks/lab/jobs/{job_id}", daemon.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "benchmark job did not complete");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(completed["status"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["passed"], true, "{completed}");
+    let run_id = completed["result"]["run_id"].as_str().unwrap();
+
+    let detail = daemon
+        .client
+        .get(format!(
+            "{}/api/benchmarks/runs/{}",
+            daemon.url,
+            url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(detail["run_record"]["status"], "succeeded");
+    assert_eq!(detail["quality_results"][0]["metric_name"], "pass@1");
+    assert_eq!(detail["quality_results"][0]["tests_passed"], 2);
+    assert_eq!(detail["quality_results"][0]["tests_total"], 2);
+    assert_eq!(detail["quality_results"][0]["generated_tokens"], 7);
+    assert!(!task.join("starter/generated.py").exists());
+    assert!(!task.join("starter/tests_hidden").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_plumebench_cancellation_terminates_the_active_process_group() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new();
+    let database = directory.0.join("benchmarks.sqlite3");
+    let plumebench = directory.0.join("plumebench");
+    let task = plumebench.join("tasks/t1_cancel");
+    fs::create_dir_all(task.join("starter")).unwrap();
+    fs::create_dir_all(task.join("tests_hidden")).unwrap();
+    fs::create_dir_all(task.join("reference")).unwrap();
+    fs::write(task.join("task.md"), "Wait until cancelled.\n").unwrap();
+    fs::write(task.join("starter/base.py"), "VALUE = 1\n").unwrap();
+    fs::write(
+        task.join("tests_hidden/test_never.py"),
+        "def test_never(): assert False\n",
+    )
+    .unwrap();
+    fs::write(task.join("reference/base.py"), "VALUE = 1\n").unwrap();
+
+    let fake_omp = directory.0.join("slow-omp");
+    fs::write(
+        &fake_omp,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' '--model --mode --max-time --thinking --auto-approve --no-session --no-extensions --no-skills --no-rules --cwd'; exit 0; fi\ntrap 'exit 0' TERM INT\n/bin/sh -c 'trap \"\" TERM INT; while :; do /bin/sleep 1; done' &\nwait\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_bwrap = directory.0.join("fake-bwrap");
+    write_fake_bwrap(&fake_bwrap);
+    let fake_python = directory.0.join("fake-python");
+    fs::write(&fake_python, "#!/bin/sh\nexit 99\n").unwrap();
+    fs::set_permissions(&fake_python, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let upstream = MockUpstream::start().await;
+    let mut daemon = TestDaemon::start_with_lab(
+        &directory.0,
+        &database,
+        &upstream.url,
+        json!({
+            "enabled": true,
+            "plumebench_root": plumebench,
+            "workspace_path": directory.0.join("lab-work"),
+            "omp_bin": fake_omp,
+            "plumebench_sandbox_bin": fake_bwrap,
+            "python_bin": fake_python,
+            "max_job_seconds": 30,
+            "plumebench_max_turns": 3,
+            "plumebench_thinking": "minimal",
+        }),
+    );
+    daemon.wait_until_ready().await;
+
+    let queued = daemon
+        .client
+        .post(format!("{}/api/benchmarks/lab/jobs", daemon.url))
+        .json(&json!({
+            "suite": "plumebench",
+            "case_id": "t1_cancel",
+            "model": "test-only-model",
+            "repetition": 0,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let job_id = queued["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let job = daemon
+            .client
+            .get(format!("{}/api/benchmarks/lab/jobs/{job_id}", daemon.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if job["status"] == "running" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "benchmark job never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let cancel_started = Instant::now();
+    let response = daemon
+        .client
+        .post(format!(
+            "{}/api/benchmarks/lab/jobs/{job_id}/cancel",
+            daemon.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let completed = loop {
+        let job = daemon
+            .client
+            .get(format!("{}/api/benchmarks/lab/jobs/{job_id}", daemon.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled benchmark job did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(completed["status"], "cancelled", "{completed}");
+    assert!(
+        cancel_started.elapsed() < Duration::from_secs(5),
+        "process group cancellation exceeded the grace window"
+    );
+    assert_eq!(completed["result"]["passed"], Value::Null);
 }
 
 #[tokio::test]

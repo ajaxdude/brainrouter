@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::future::Future;
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -104,6 +105,7 @@ pub struct InflightEntry {
     /// Requested or slot-reported output-token ceiling; zero means unknown.
     pub max_tokens: AtomicU64,
     cancelled: AtomicBool,
+    cancel_tx: watch::Sender<bool>,
     started_ms: AtomicU64,
 }
 
@@ -113,9 +115,6 @@ pub struct InflightEntry {
 pub struct InflightHandle {
     entry: Arc<InflightEntry>,
     registry: Arc<InflightRegistry>,
-    /// Kept alive so `cancel()` can notify even after the entry's own
-    /// Arc-ness is gone; the entry itself is shared with the registry.
-    _tx: watch::Sender<bool>,
 }
 
 impl InflightHandle {
@@ -150,7 +149,23 @@ impl InflightHandle {
 
     pub fn cancel(&self) {
         self.entry.cancelled.store(true, AtomicOrdering::SeqCst);
+        let _ = self.entry.cancel_tx.send(true);
         debug!(id = self.entry.id, "in-flight request cancelled from dashboard");
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let mut receiver = self.entry.cancel_tx.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow() {
+                return;
+            }
+        }
     }
 }
 
@@ -230,6 +245,7 @@ impl InflightRegistry {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = entries.iter().find(|e| e.id == id) {
             e.cancelled.store(true, AtomicOrdering::SeqCst);
+            let _ = e.cancel_tx.send(true);
             true
         } else {
             false
@@ -287,7 +303,7 @@ impl InflightRegistry {
         max_tokens: Option<u32>,
     ) -> Arc<InflightHandle> {
         let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
-        let (tx, _rx) = watch::channel(false);
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
         let entry = Arc::new(InflightEntry {
             id,
             method_path,
@@ -302,12 +318,12 @@ impl InflightRegistry {
             generated_tokens: AtomicU64::new(0),
             max_tokens: AtomicU64::new(max_tokens.unwrap_or(0) as u64),
             cancelled: AtomicBool::new(false),
+            cancel_tx,
             started_ms: AtomicU64::new(now_ms()),
         });
         let handle = Arc::new(InflightHandle {
             entry: Arc::clone(&entry),
             registry: Arc::clone(self),
-            _tx: tx,
         });
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -330,10 +346,10 @@ impl InflightRegistry {
 /// (tool calling > reasoning > asking > generating) from the raw SSE bytes.
 /// Windows never span chunks; a window is exactly one chunk. Items are the
 /// provider's `anyhow::Result<Bytes>`; `Err` chunks pass through untouched.
-#[derive(Debug)]
 pub struct SniffStream<S> {
     inner: S,
     handle: Arc<InflightHandle>,
+    cancellation: Pin<Box<dyn Future<Output = ()> + Send>>,
     window: Vec<u8>,
     finished: bool,
 }
@@ -347,7 +363,14 @@ where
     S: Stream<Item = anyhow::Result<Bytes>> + Unpin,
 {
     pub fn new(inner: S, handle: Arc<InflightHandle>) -> Self {
-        Self { inner, handle, window: Vec::new(), finished: false }
+        let cancel_handle = Arc::clone(&handle);
+        Self {
+            inner,
+            handle,
+            cancellation: Box::pin(async move { cancel_handle.cancelled().await }),
+            window: Vec::new(),
+            finished: false,
+        }
     }
 
     pub fn handle(&self) -> &Arc<InflightHandle> {
@@ -383,14 +406,12 @@ where
         if s.finished {
             return Poll::Ready(None);
         }
+        if s.handle.is_cancelled() || s.cancellation.as_mut().poll(cx).is_ready() {
+            s.finished = true;
+            return Poll::Ready(Some(Err(anyhow::anyhow!("Request cancelled"))));
+        }
         match Pin::new(&mut s.inner).poll_next(cx) {
             Poll::Ready(Some(item)) => {
-                if s.handle.is_cancelled() {
-                    // The cancel sentinel: end the stream so the client job
-                    // tears the request down and the row is dropped.
-                    s.finished = true;
-                    return Poll::Ready(None);
-                }
                 if let Ok(bytes) = &item {
                     s.handle.add_bytes(bytes.len() as u64);
                     if bytes.len() <= SNIFF_WINDOW {
@@ -471,9 +492,41 @@ mod tests {
         // Cancel: next poll ends the stream.
         h.cancel();
         tx.send(Ok(Bytes::from("data: late\n\n"))).unwrap();
+        assert_eq!(
+            s.next().await.unwrap().unwrap_err().to_string(),
+            "Request cancelled"
+        );
         assert!(s.next().await.is_none());
         // Row stays listed but flagged.
         assert!(entry(&h).cancelled.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_an_idle_stream() {
+        let reg = Arc::new(InflightRegistry::new());
+        let handle = reg.register(
+            "POST /x".into(),
+            "m".into(),
+            "ua".into(),
+            "127.0.0.1:1".into(),
+            "s".into(),
+            "c".into(),
+            0,
+            None,
+        );
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Result<Bytes>>();
+        let mut stream = SniffStream::new(UnboundedReceiverStream::new(rx), Arc::clone(&handle));
+        let waiter = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+        handle.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation should wake the pending stream")
+            .unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "Request cancelled"
+        );
     }
 
     #[tokio::test]

@@ -147,7 +147,7 @@ pub struct SessionUpdate {
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
     /// Per-session notifiers: fired when a session's status changes (e.g. human resolves).
-    notifiers: Mutex<HashMap<String, Arc<Notify>>>,
+    notifiers: Mutex<HashMap<String, (Arc<Notify>, usize)>>,
 }
 
 impl Default for SessionManager {
@@ -233,8 +233,8 @@ impl SessionManager {
         session.updated_at = chrono::Utc::now().to_rfc3339();
         // Notify any waiter (e.g. start_review blocked on human escalation).
         let notifier = self.notifiers.lock().unwrap().get(id).cloned();
-        if let Some(n) = notifier {
-            n.notify_one();
+        if let Some((notifier, _)) = notifier {
+            notifier.notify_waiters();
         }
     }
 
@@ -249,14 +249,28 @@ impl SessionManager {
     /// Register a `Notify` for a session so that `start_review` can be woken
     /// when human feedback arrives via `update_session`.
     pub fn register_notifier(&self, session_id: &str) -> Arc<Notify> {
-        let n = Arc::new(Notify::new());
-        self.notifiers.lock().unwrap().insert(session_id.to_string(), Arc::clone(&n));
-        n
+        let mut notifiers = self.notifiers.lock().unwrap();
+        let (notifier, registrations) = notifiers
+            .entry(session_id.to_string())
+            .or_insert_with(|| (Arc::new(Notify::new()), 0));
+        *registrations += 1;
+        Arc::clone(notifier)
     }
 
-    /// Remove and return the `Notify` for a session, cleaning up the registry.
+    /// Release one notifier registration, removing the entry after the last waiter.
     pub fn remove_notifier(&self, session_id: &str) {
-        self.notifiers.lock().unwrap().remove(session_id);
+        let mut notifiers = self.notifiers.lock().unwrap();
+        let should_remove = match notifiers.get_mut(session_id) {
+            Some((_, registrations)) if *registrations > 1 => {
+                *registrations -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if should_remove {
+            notifiers.remove(session_id);
+        }
     }
 
     /// List all sessions (snapshot).
@@ -267,5 +281,62 @@ impl SessionManager {
     /// Delete a session by ID. Used by the human-resolve flow.
     pub fn delete_session(&self, id: &str) {
         self.sessions.lock().unwrap().remove(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn notifier_registrations_share_wakeups_until_last_waiter_leaves() {
+        let manager = Arc::new(SessionManager::new());
+        let session = manager.create_session(
+            "task".into(),
+            "summary".into(),
+            None,
+            Vec::new(),
+            ".".into(),
+        );
+        let first = manager.register_notifier(&session.id);
+        let second = manager.register_notifier(&session.id);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let first_wait = {
+            let notifier = Arc::clone(&first);
+            tokio::spawn(async move { notifier.notified().await })
+        };
+        let second_wait = {
+            let notifier = Arc::clone(&second);
+            tokio::spawn(async move { notifier.notified().await })
+        };
+        tokio::task::yield_now().await;
+        manager.update_session(
+            &session.id,
+            SessionUpdate {
+                status: Some(ReviewStatus::Approved),
+                feedback: Some("lgtm".into()),
+                reviewer_type: Some(ReviewerType::Human),
+                escalation_reason: None,
+                review_model: None,
+                llm_turns: None,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_wait)
+            .await
+            .expect("first waiter should wake")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_wait)
+            .await
+            .expect("second waiter should wake")
+            .unwrap();
+
+        manager.remove_notifier(&session.id);
+        let still_registered = manager.register_notifier(&session.id);
+        assert!(Arc::ptr_eq(&first, &still_registered));
+        manager.remove_notifier(&session.id);
+        manager.remove_notifier(&session.id);
+        let replacement = manager.register_notifier(&session.id);
+        assert!(!Arc::ptr_eq(&first, &replacement));
     }
 }

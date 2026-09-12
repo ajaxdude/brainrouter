@@ -5,6 +5,11 @@ use std::process::Command;
 
 const MAX_FILE_SIZE: usize = 200 * 1024; // 200 KB
 pub(crate) const MAX_SECTION_SIZE: usize = 150 * 1024; // 150 KB per section
+const MAX_UNTRACKED_FILES: usize = 100;
+const MAX_UNTRACKED_DIFF: usize = 70 * 1024;
+const MAX_DIRTY_DIFF: usize = 50 * 1024;
+const MAX_COMMITTED_DIFF: usize = 25 * 1024;
+const MAX_UNTRACKED_FILE_CONTENT: usize = 32 * 1024;
 
 /// Gathered context for a single review pass.
 pub struct ReviewContext {
@@ -27,45 +32,122 @@ fn load_prd(project_root: &Path) -> Option<String> {
 
 /// Collect the most relevant git diff for review.
 ///
-/// Strategy:
-/// 1. `git diff HEAD` — uncommitted changes (working tree + staged vs HEAD).
-/// 2. If empty, `git diff HEAD~1..HEAD` — the last commit's changes.
-/// 3. If still empty, return empty string.
-///
-/// This layered approach ensures the review sees something useful whether the
-/// agent is mid-work (uncommitted changes) or has already committed (typical
-/// end-of-task flow).
 fn load_git_diff(project_root: &Path) -> String {
-    // Try uncommitted changes first.
-    let uncommitted = run_git(project_root, &["diff", "HEAD"]);
+    let mut sections = Vec::new();
+    let untracked = load_untracked_files(project_root);
+    if !untracked.is_empty() {
+        sections.push(format!(
+            "[Untracked files]\n\n{}",
+            truncate(untracked, MAX_UNTRACKED_DIFF)
+        ));
+    }
+    let uncommitted = run_git(project_root, &["diff", "--find-renames", "HEAD"]);
     if !uncommitted.is_empty() {
-        return truncate(uncommitted, MAX_FILE_SIZE);
+        sections.push(format!(
+            "[Staged and unstaged tracked changes]\n\n{}",
+            truncate(uncommitted, MAX_DIRTY_DIFF)
+        ));
     }
-
-    // Uncommitted diff is empty — the agent likely committed already.
-    // Show what the most recent commit changed.
-    let last_commit = run_git(project_root, &["diff", "HEAD~1..HEAD"]);
-    if !last_commit.is_empty() {
-        let header = "[Note: No uncommitted changes found. Showing diff from the most recent commit.]\n\n";
-        return truncate(format!("{}{}", header, last_commit), MAX_FILE_SIZE);
+    if let Some(base) = review_base(project_root) {
+        let committed = run_git(project_root, &["diff", "--find-renames", &format!("{base}..HEAD")]);
+        if !committed.is_empty() {
+            sections.push(format!(
+                "[Committed changes from merge base {base} to HEAD]\n\n{}",
+                truncate(committed, MAX_COMMITTED_DIFF)
+            ));
+        }
     }
+    if sections.is_empty() {
+        let last_commit = run_git(project_root, &["diff", "--find-renames", "HEAD~1..HEAD"]);
+        if !last_commit.is_empty() {
+            sections.push(format!(
+                "[No task base or working-tree changes found; showing the most recent commit]\n\n{last_commit}"
+            ));
+        }
+    }
+    if sections.is_empty() {
+        tracing::debug!(project_root = %project_root.display(), "No git review diff found");
+    }
+    sections.join("\n\n")
+}
 
-    tracing::debug!(
-        project_root = %project_root.display(),
-        "No git diff found (neither uncommitted nor HEAD~1..HEAD)"
+fn review_base(project_root: &Path) -> Option<String> {
+    if let Ok(base) = std::env::var("BRAINROUTER_REVIEW_BASE") {
+        let base = base.trim();
+        if !base.is_empty()
+            && !run_git(project_root, &["rev-parse", "--verify", base]).is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    for reference in ["@{upstream}", "origin/HEAD", "origin/main", "origin/master"] {
+        let base = run_git(project_root, &["merge-base", "HEAD", reference]);
+        if !base.is_empty() && base != run_git(project_root, &["rev-parse", "HEAD"]) {
+            return Some(base);
+        }
+    }
+    None
+}
+
+fn load_untracked_files(project_root: &Path) -> String {
+    let output = run_git_raw(
+        project_root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
     );
-    String::new()
+    let paths = output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .take(MAX_UNTRACKED_FILES)
+        .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut sections = vec![format!(
+        "Files:\n{}",
+        paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )];
+    for relative in paths {
+        let path = project_root.join(&relative);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() as usize > MAX_FILE_SIZE {
+            sections.push(format!("--- /dev/null\n+++ b/{relative}\n[untracked file exceeds review limit]"));
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            sections.push(format!("--- /dev/null\n+++ b/{relative}\n[binary or unreadable untracked file]"));
+            continue;
+        };
+        sections.push(format!(
+            "--- /dev/null\n+++ b/{relative}\n{}",
+            truncate(content, MAX_UNTRACKED_FILE_CONTENT)
+        ));
+    }
+    sections.join("\n\n")
 }
 
 /// Run a git command and return its stdout, or empty string on failure.
 fn run_git(project_dir: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&run_git_raw(project_dir, args))
+        .trim()
+        .to_string()
+}
+
+fn run_git_raw(project_dir: &Path, args: &[&str]) -> Vec<u8> {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(project_dir);
     match cmd.output() {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => String::new(),
+        Ok(output) if output.status.success() => output.stdout,
+        _ => Vec::new(),
     }
 }
 
@@ -162,6 +244,60 @@ mod tests {
         assert_eq!(ctx.prd.as_deref(), Some("updated readme\n"));
         assert!(ctx.git_diff.contains("README.md"));
         assert!(ctx.git_diff.contains("Cargo.toml"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn includes_commits_since_merge_base_and_untracked_files() {
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-review-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "brainrouter@example.invalid"]);
+        git(&root, &["config", "user.name", "Brainrouter Test"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        std::fs::write(root.join("committed.txt"), "committed change\n").unwrap();
+        git(&root, &["add", "committed.txt"]);
+        git(&root, &["commit", "-q", "-m", "feature"]);
+        std::fs::write(root.join("untracked.txt"), "untracked change\n").unwrap();
+
+        let ctx = gather(root.to_str().unwrap());
+        assert!(ctx.git_diff.contains("committed.txt"));
+        assert!(ctx.git_diff.contains("committed change"));
+        assert!(ctx.git_diff.contains("untracked.txt"));
+        assert!(ctx.git_diff.contains("untracked change"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untracked_inventory_survives_large_tracked_diff_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "brainrouter-review-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "brainrouter@example.invalid"]);
+        git(&root, &["config", "user.name", "Brainrouter Test"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+
+        std::fs::write(root.join("tracked.txt"), "x".repeat(200 * 1024)).unwrap();
+        std::fs::write(root.join("important-new.rs"), "pub fn important() {}\n").unwrap();
+
+        let prompt_sized = truncate(load_git_diff(&root), MAX_SECTION_SIZE);
+        assert!(prompt_sized.contains("important-new.rs"));
+        assert!(prompt_sized.contains("pub fn important()"));
 
         let _ = std::fs::remove_dir_all(root);
     }
