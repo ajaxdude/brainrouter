@@ -374,12 +374,21 @@ fn signal_daemon_args(
     args
 }
 
-fn signal_daemon_socket_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+fn default_signal_storage_path() -> PathBuf {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(data_home).join("signal-cli");
+    }
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(format!("brainrouter-signal-{}.sock", std::process::id()))
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".local/share/signal-cli")
+}
+
+fn signal_daemon_socket_path(storage_path: Option<&Path>) -> PathBuf {
+    storage_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_signal_storage_path)
+        .join(format!(".brainrouter-{}.sock", std::process::id()))
 }
 
 fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
@@ -1001,7 +1010,7 @@ impl SignalService {
     }
 
     async fn run_daemon_session(&self) -> anyhow::Result<()> {
-        let socket_path = signal_daemon_socket_path();
+        let socket_path = signal_daemon_socket_path(self.storage_path.as_deref());
         remove_stale_socket(&socket_path)?;
 
         let mut child =
@@ -1227,6 +1236,15 @@ mod tests {
                 "--no-receive-stdout",
                 "--receive-mode=on-connection",
             ]
+        );
+    }
+
+    #[test]
+    fn daemon_socket_uses_signal_storage_visible_to_sandboxed_launchers() {
+        let path = signal_daemon_socket_path(Some(Path::new("/var/lib/signal")));
+        assert_eq!(
+            path,
+            Path::new("/var/lib/signal").join(format!(".brainrouter-{}.sock", std::process::id()))
         );
     }
 
