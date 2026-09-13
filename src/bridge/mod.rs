@@ -157,6 +157,10 @@ impl BridgeManager {
         *self.signal_last_error.lock().unwrap() = Some(err);
     }
 
+    pub fn clear_signal_error(&self) {
+        *self.signal_last_error.lock().unwrap() = None;
+    }
+
     pub fn status(&self) -> BridgeStatus {
         let uptime = self.start_time.elapsed().as_secs();
 
@@ -267,7 +271,6 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
                 let mgr = Arc::clone(&manager);
                 tokio::spawn(async move {
                     info!("starting Signal bridge transport");
-                    mgr.set_signal_connected(true);
                     if let Err(e) = signal::start(&scfg, &omp_path, &work_dir, &aliases, timeout, &default_model, mgr.clone()).await {
                         mgr.set_signal_connected(false);
                         mgr.set_signal_error(e.to_string());

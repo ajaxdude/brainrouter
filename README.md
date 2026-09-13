@@ -1041,9 +1041,15 @@ bridge:
     account: "+15551234567"                       # E.164 phone — required when enabled
     group_id: "base64..."                         # restrict to one Signal group
     prefix: "!"                                   # command prefix
-    storage_path: "/path/to/signal-cli/data"      # signal-cli storage
+    storage_path: "/path/to/signal-cli/data"      # passed to signal-cli --config
     llama_swap_url: "http://localhost:8081"        # for llama-list command
 ```
+
+The Signal bridge supervises one persistent `signal-cli daemon` and uses its
+private Unix JSON-RPC socket for incoming events, messages, and typing
+indicators. It no longer launches `signal-cli receive` every three seconds.
+If the daemon or socket fails, the bridge reports itself disconnected and
+restarts the daemon after a short backoff.
 
 ### State and restart behavior
 
