@@ -388,15 +388,50 @@ fn signal_daemon_socket_path(storage_path: Option<&Path>) -> PathBuf {
     storage_path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_signal_storage_path)
-        .join(format!(".brainrouter-{}.sock", std::process::id()))
+        .join(".brainrouter.sock")
 }
 
-fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
+async fn prepare_signal_socket(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove stale Signal socket {}", path.display())),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(path)).await {
+                Ok(Ok(_)) => anyhow::bail!(
+                    "another signal-cli daemon is already listening on {}",
+                    path.display()
+                ),
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("failed to remove stale Signal socket {}", path.display())
+                    })
+                }
+                Ok(Err(error)) => Err(error)
+                    .with_context(|| format!("failed to probe Signal socket {}", path.display())),
+                Err(_) => {
+                    anyhow::bail!("existing Signal socket {} did not respond", path.display())
+                }
+            }
+        }
         Ok(_) => anyhow::bail!(
             "refusing to replace non-socket Signal daemon path {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Signal socket {}", path.display())),
+    }
+}
+
+fn remove_owned_socket(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove Signal socket {}", path.display())),
+        Ok(_) => anyhow::bail!(
+            "refusing to remove non-socket Signal daemon path {}",
             path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1011,7 +1046,7 @@ impl SignalService {
 
     async fn run_daemon_session(&self) -> anyhow::Result<()> {
         let socket_path = signal_daemon_socket_path(self.storage_path.as_deref());
-        remove_stale_socket(&socket_path)?;
+        prepare_signal_socket(&socket_path).await?;
 
         let mut child =
             spawn_signal_daemon(&self.account, self.storage_path.as_deref(), &socket_path)?;
@@ -1029,7 +1064,7 @@ impl SignalService {
                 stop_signal_daemon(&mut child, pid).await;
                 process_group.disarm();
                 let stderr = stderr_task.await.unwrap_or_default();
-                let _ = remove_stale_socket(&socket_path);
+                let _ = remove_owned_socket(&socket_path);
                 if stderr.trim().is_empty() {
                     return Err(error);
                 }
@@ -1083,7 +1118,7 @@ impl SignalService {
         stop_signal_daemon(&mut child, pid).await;
         process_group.disarm();
         let stderr = stderr_task.await.unwrap_or_default();
-        if let Err(error) = remove_stale_socket(&socket_path) {
+        if let Err(error) = remove_owned_socket(&socket_path) {
             warn!("{error}");
         }
 
@@ -1242,10 +1277,37 @@ mod tests {
     #[test]
     fn daemon_socket_uses_signal_storage_visible_to_sandboxed_launchers() {
         let path = signal_daemon_socket_path(Some(Path::new("/var/lib/signal")));
-        assert_eq!(
-            path,
-            Path::new("/var/lib/signal").join(format!(".brainrouter-{}.sock", std::process::id()))
-        );
+        assert_eq!(path, Path::new("/var/lib/signal").join(".brainrouter.sock"));
+    }
+
+    #[tokio::test]
+    async fn socket_preparation_removes_stale_socket() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let directory = std::env::temp_dir().join(format!("brs-{}", &suffix[..8]));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".brainrouter.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        prepare_signal_socket(&path).await.unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_preparation_refuses_live_daemon() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let directory = std::env::temp_dir().join(format!("brs-{}", &suffix[..8]));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".brainrouter.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let error = prepare_signal_socket(&path).await.unwrap_err();
+        assert!(error.to_string().contains("already listening"));
+
+        drop(listener);
+        remove_owned_socket(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
     }
 
     #[test]
