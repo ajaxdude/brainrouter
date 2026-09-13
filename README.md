@@ -1051,6 +1051,10 @@ indicators. It no longer launches `signal-cli receive` every three seconds.
 If the daemon or socket fails, the bridge reports itself disconnected and
 restarts the daemon after a short backoff.
 
+When `signal-cli` is provided through a Flatpak wrapper, invoke
+`flatpak run --die-with-parent ...` so stopping or restarting Brainrouter also
+terminates the sandboxed daemon instead of leaving an account-locking orphan.
+
 ### State and restart behavior
 
 | State | Location / behavior |
