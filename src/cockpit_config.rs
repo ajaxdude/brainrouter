@@ -50,6 +50,15 @@ pub struct CockpitConfig {
     pub active_platform: Option<String>,
     #[serde(default)]
     pub backends: BTreeMap<String, BackendSettings>,
+    /// A top-level (not per-backend) saved Hugging Face token, mirroring
+    /// upstream's `huggingface.py::get_hf_token()` (`get_setting`/
+    /// `set_setting("hf_token", ...)`, verified live against upstream source
+    /// during PR6's design pass — see design doc §10). Read-only for now:
+    /// brainrouter never *writes* this field (no `apply_*` function touches
+    /// it) — see §10's flagged open item on whether a save-token write path
+    /// should ever be added.
+    #[serde(default)]
+    pub hf_token: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -58,6 +67,15 @@ pub struct CockpitConfig {
 pub struct BackendSettings {
     #[serde(default)]
     pub default_toolboxes: BTreeMap<String, String>,
+    /// Per-backend model download directory, mirroring upstream's
+    /// `<backend>/model_manager.py::get_models_dir()` (`backends.<id>
+    /// .models_dir` in config.json; falls back to the catalog's own
+    /// `backends.<id>.storage.default` when absent — see design doc §10 and
+    /// `src/model_downloads.rs`). Read-only: brainrouter does not currently
+    /// expose a way to change this value (no `apply_*` writer), only to
+    /// read whatever cockpit itself already saved.
+    #[serde(default)]
+    pub models_dir: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -73,6 +91,13 @@ impl CockpitConfig {
             .default_toolboxes
             .get(platform_id)
             .map(String::as_str)
+    }
+
+    /// The cockpit-saved model directory override for `backend_id`, if any
+    /// (§10). `None` means "no override" — callers fall back to the
+    /// catalog's own `storage.default` for that backend.
+    pub fn models_dir(&self, backend_id: &str) -> Option<&str> {
+        self.backends.get(backend_id)?.models_dir.as_deref()
     }
 }
 
@@ -370,5 +395,43 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(mode.mode() & 0o777, 0o600);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hf_token_and_models_dir_round_trip_and_fall_back_to_none() {
+        let json = r#"{
+            "hf_token": "hf_abc123",
+            "backends": {
+                "ds4": { "models_dir": "/data/ds4-models" },
+                "halogen": {}
+            }
+        }"#;
+        let cfg: CockpitConfig = serde_json::from_str(json).expect("parses");
+        assert_eq!(cfg.hf_token.as_deref(), Some("hf_abc123"));
+        assert_eq!(cfg.models_dir("ds4"), Some("/data/ds4-models"));
+        // Present backend with no models_dir set falls back to None (caller
+        // then falls back to the catalog's own storage.default, per §10).
+        assert_eq!(cfg.models_dir("halogen"), None);
+        // Absent backend entirely also falls back to None, not a panic.
+        assert_eq!(cfg.models_dir("vllm"), None);
+
+        // Round-trip through write_atomic + reparse must preserve both new
+        // fields exactly, alongside the existing extra/default_toolboxes
+        // behavior already covered above.
+        let dir = std::env::temp_dir().join(format!("brainrouter-cockpit-config-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("config.json");
+        write_atomic(&path, &cfg).expect("atomic write");
+        let written: CockpitConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.hf_token.as_deref(), Some("hf_abc123"));
+        assert_eq!(written.models_dir("ds4"), Some("/data/ds4-models"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_hf_token_and_models_dir_are_none_not_an_error() {
+        let cfg: CockpitConfig = serde_json::from_str("{}").expect("parses");
+        assert_eq!(cfg.hf_token, None);
+        assert_eq!(cfg.models_dir("llama_cpp"), None);
     }
 }

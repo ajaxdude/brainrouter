@@ -156,6 +156,11 @@ pub struct AppState {
     /// racing `podman`/`toolbox` invocations against each other. Different
     /// container names never contend (see design doc §5c).
     pub toolbox_container_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Model-download job registry (PR6, §10): single-flight `hf download`
+    /// orchestration for the download-capable catalog backends
+    /// (ds4/halogen/llama_cpp/r9v; vllm is out of scope, see
+    /// `model_downloads.rs` module docs).
+    pub model_downloads: Arc<crate::model_downloads::ModelDownloadRegistry>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -240,6 +245,10 @@ async fn handle_request(
         // PR3: cockpit config.json explicit "apply" writes (§4) — these write
         // to a file outside brainrouter's own state, so gate them the same way.
         || (method == "POST" && path.starts_with("/api/cockpit-config/"))
+        // PR6: model-download orchestration (§10) — starting/cancelling a
+        // job spawns `hf download`/reads local files; prefix-gated like
+        // /api/toolbox-containers so any future sub-path stays covered.
+        || (method == "POST" && path.starts_with("/api/model-downloads"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -900,6 +909,41 @@ async fn handle_request(
         ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/adopt") => {
             let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/adopt").trim_end_matches('/');
             let resp = adopt_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        // ── PR6: model-download orchestration (§10) ──────────────────────────
+        ("GET", "/api/model-downloads/status") => {
+            let resp = model_downloads_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads/verify") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_verify_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/model-downloads") => {
+            let resp = model_downloads_list_response(&state).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/model-downloads/") && p.ends_with("/cancel") => {
+            let id = p.trim_start_matches("/api/model-downloads/").trim_end_matches("/cancel").trim_end_matches('/');
+            let resp = model_downloads_cancel_response(&state, id).await;
+            into_unsync(resp)
+        }
+
+        ("GET", p) if p.starts_with("/api/model-downloads/") => {
+            let id = p.trim_start_matches("/api/model-downloads/").trim_end_matches('/');
+            let resp = model_downloads_get_response(&state, id).await;
             into_unsync(resp)
         }
 
@@ -2410,6 +2454,104 @@ pub async fn delete_toolbox_container(state: &AppState, container_name: &str) ->
                 error: format!("Failed to exec toolbox: {}", e),
             })
         }
+    }
+}
+
+// ── PR6: model-download orchestration (§10) ──────────────────────────────
+
+/// `GET /api/model-downloads/status` — read-only local-presence sweep
+/// across every download-capable backend's catalog entries (ds4/halogen/
+/// r9v; llama_cpp and vllm are excluded — see `model_downloads.rs` docs).
+pub async fn model_downloads_status_response() -> Response<Full<Bytes>> {
+    match crate::model_downloads::local_presence_snapshot() {
+        Ok(presence) => json_response(StatusCode::OK, &serde_json::json!({ "models": presence })),
+        Err(e) => {
+            error!(error = %e, "Failed to compute model-download presence snapshot");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e })
+        }
+    }
+}
+
+/// `GET /api/model-downloads` — list all known jobs (most-recent-first,
+/// bounded by the registry's own `MAX_JOB_HISTORY`).
+pub async fn model_downloads_list_response(state: &AppState) -> Response<Full<Bytes>> {
+    let jobs = state.model_downloads.list(crate::model_downloads::MAX_JOB_HISTORY).await;
+    json_response(StatusCode::OK, &serde_json::json!({ "jobs": jobs }))
+}
+
+/// `GET /api/model-downloads/{id}` — poll a single job's current state.
+pub async fn model_downloads_get_response(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    match state.model_downloads.get(id).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads` — start a new download job. Body:
+/// `{"backend": "...", "model_id": "...", "quant_pattern": "..." (llama_cpp only)}`.
+pub async fn model_downloads_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::model_downloads::StartDownloadRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match state.model_downloads.start(request).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/{id}/cancel` — request cancellation of a
+/// running (or queued) job. Idempotent-ish: cancelling an already-terminal
+/// job returns a Conflict, not a silent no-op, so the caller's UI can
+/// surface it plainly.
+pub async fn model_downloads_cancel_response(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    match state.model_downloads.cancel(id).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/verify` — explicit SHA256 verification pass,
+/// only meaningful for backends whose catalog entries carry a `sha256`
+/// (today, only `r9v`). Body: `{"backend": "...", "model_id": "..."}`.
+pub async fn model_downloads_verify_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    let (Some(backend_raw), Some(model_id)) = (
+        val.get("backend").and_then(|v| v.as_str()),
+        val.get("model_id").and_then(|v| v.as_str()),
+    ) else {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: "Missing \"backend\" or \"model_id\" in request body".into(),
+        });
+    };
+    let catalog_id = crate::toolbox_catalog::types::CatalogBackendId::from_str(backend_raw);
+    let Ok(backend) = SupportedServingBackend::try_from(&catalog_id) else {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: format!("unsupported or unknown backend `{backend_raw}`"),
+        });
+    };
+    match crate::model_downloads::verify_checksums(backend, model_id).await {
+        Ok(results) => json_response(StatusCode::OK, &serde_json::json!({ "files": results })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
     }
 }
 

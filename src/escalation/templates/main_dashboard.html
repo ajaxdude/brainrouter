@@ -226,6 +226,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⬢</span>
       <span>Models</span>
     </button>
+    <button class="nav-item" id="nav-toolbox-models" onclick="switchView('toolbox-models')">
+      <span class="nav-icon">⇩</span>
+      <span>Downloads</span>
+    </button>
     <a class="nav-item" href="/models">
       <span class="nav-icon">M</span>
       <span>Model activity</span>
@@ -525,6 +529,34 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
     </div>
 
+    <!-- PR6: toolbox model catalog browsing + native download orchestration
+         (design doc §10). Distinct from #models-view above, which is the
+         unrelated OMP routing-model picker (llama-swap's already-loaded
+         models) — this view is about pulling catalog GGUF/HF assets onto
+         disk for the ds4/halogen/llama_cpp/r9v toolboxes to use. -->
+    <div id="toolbox-models-view" style="display:none;max-width:1100px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+        <div id="toolbox-models-backend-tabs" style="display:flex;gap:6px"></div>
+        <div style="margin-left:auto;display:flex;gap:8px">
+          <button onclick="loadToolboxModels()" style="font-size:11px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer">Refresh</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
+        Browse ai-toolbox-cockpit's model catalog and download models straight onto this host — no cockpit install required.
+        <code style="font-family:'JetBrains Mono',monospace">vllm</code> is excluded: it pulls from Hugging Face at server
+        start instead of a separate download step. Downloads run one at a time; progress is coarse (queued/downloading/
+        complete), not a byte percentage — see the design doc §10.
+      </div>
+      <div id="toolbox-models-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:22px">
+        <div style="color:var(--textMute);font-size:12px">Loading...</div>
+      </div>
+
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">Downloads</div>
+      <div id="toolbox-download-jobs" style="display:flex;flex-direction:column;gap:6px">
+        <div style="color:var(--textMute);font-size:12px">No downloads started yet.</div>
+      </div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 </div><!-- /app -->
@@ -713,19 +745,21 @@ function switchView(view) {
   document.getElementById('stream-view').style.display   = view === 'stream'  ? 'flex'  : 'none';
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
   document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
+  document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
 
-  ['stream','config','models'].forEach(v => {
+  ['stream','config','models','toolbox-models'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  const titles = { stream: 'Routing', config: 'Config', models: 'Models' };
+  const titles = { stream: 'Routing', config: 'Config', models: 'Models', 'toolbox-models': 'Downloads' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
     stream: 'Live routing events · newest first · polling every 3s',
     config: 'Edit configuration files',
     models: 'Pick a model, copy its OMP value, and paste it into OMP',
+    'toolbox-models': 'Catalog models for ds4 / halogen / llama.cpp / r9v — browse, download, verify',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -734,6 +768,7 @@ function switchView(view) {
 
   if (view === 'config') loadConfig();
   if (view === 'models') loadModels();
+  if (view === 'toolbox-models') loadToolboxModels();
 }
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
@@ -2530,6 +2565,190 @@ function renderToolboxRow(tb, c, backend, defaultId) {
     <span style="color:var(--textDim);flex:1">${escHtml(name)}</span>
     ${right}
   </div>`;
+}
+
+// ─── PR6: model-download orchestration (§10) ────────────────────────────────
+// toolboxModelsData holds the vendored model catalog (/api/toolbox-models);
+// toolboxModelPresence holds the read-only local-presence sweep
+// (/api/model-downloads/status); toolboxDownloadJobs holds the job
+// registry's current list (/api/model-downloads). vllm is excluded — see
+// module docs in src/model_downloads.rs.
+let toolboxModelsData = null;
+let toolboxModelPresence = null;
+let toolboxDownloadJobs = [];
+let toolboxModelsActiveBackend = 'llama_cpp';
+let toolboxModelsPollTimer = null;
+const DOWNLOAD_CAPABLE_BACKENDS = ['llama_cpp', 'ds4', 'halogen', 'r9v'];
+const DOWNLOAD_STATUS_COLORS = {
+  queued: 'var(--textMute)', downloading: 'var(--cyan)', verifying: 'var(--violet)',
+  complete: 'var(--green)', failed: 'var(--red)', cancelled: 'var(--textMute)',
+};
+
+async function loadToolboxModels() {
+  const [modelsRes, statusRes, jobsRes] = await Promise.all([
+    safeFetch('/api/toolbox-models'),
+    safeFetch('/api/model-downloads/status'),
+    safeFetch('/api/model-downloads'),
+  ]);
+  if (modelsRes) toolboxModelsData = modelsRes;
+  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (jobsRes) toolboxDownloadJobs = jobsRes.jobs || [];
+  renderToolboxModelsBackendTabs();
+  renderToolboxModelsList();
+  renderToolboxDownloadJobs();
+  scheduleToolboxModelsPoll();
+}
+
+function renderToolboxModelsBackendTabs() {
+  const el = document.getElementById('toolbox-models-backend-tabs');
+  if (!el) return;
+  el.innerHTML = DOWNLOAD_CAPABLE_BACKENDS.map(b => {
+    const active = b === toolboxModelsActiveBackend;
+    const label = TOOLBOX_BACKEND_LABELS[b] || b;
+    return `<button onclick="setToolboxModelsBackend(${JSON.stringify(b)})" style="font-size:11px;padding:5px 12px;border-radius:6px;border:1px solid var(--border);cursor:pointer;background:${active ? 'var(--bg3)' : 'var(--panel)'};color:${active ? 'var(--cyan)' : 'var(--textDim)'}">${escHtml(label)}</button>`;
+  }).join('');
+}
+
+function setToolboxModelsBackend(backend) {
+  toolboxModelsActiveBackend = backend;
+  renderToolboxModelsBackendTabs();
+  renderToolboxModelsList();
+}
+
+function presenceFor(backend, modelId) {
+  return (toolboxModelPresence || []).find(p => p.backend === backend && p.model_id === modelId) || null;
+}
+
+function renderToolboxModelsList() {
+  const el = document.getElementById('toolbox-models-list');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === toolboxModelsActiveBackend);
+  const entries = (bc && bc.entries) || [];
+  if (!entries.length) { el.innerHTML = '<div style="color:var(--textMute);font-size:12px">No catalog entries for this backend.</div>'; return; }
+  el.innerHTML = entries.map(e => renderToolboxModelRow(e)).join('');
+}
+
+function renderToolboxModelRow(entry) {
+  const backend = toolboxModelsActiveBackend;
+  const payload = entry.payload || {};
+  const presence = presenceFor(backend, entry.id);
+  const kind = presence && presence.completeness && presence.completeness.kind;
+  const complete = kind === 'complete';
+  const notChecked = kind === 'not_checked';
+  const dot = complete ? 'var(--green)' : (notChecked ? 'var(--textMute)' : (presence ? 'var(--amber)' : 'var(--border)'));
+  const statusLabel = complete ? 'downloaded' : (notChecked ? 'unknown (no manifest check for this backend)' : (presence ? 'incomplete' : '—'));
+
+  let sizeLabel = '';
+  if (typeof payload.size_gb === 'number') sizeLabel = payload.size_gb.toFixed(1) + ' GB';
+  else if (Array.isArray(payload.files)) {
+    const total = payload.files.reduce((sum, f) => sum + (f.size_bytes || 0), 0);
+    if (total > 0) sizeLabel = (total / 1e9).toFixed(1) + ' GB';
+  }
+
+  const runningJob = toolboxDownloadJobs.find(j => j.backend === backend && j.model_id === entry.id
+    && (j.status === 'queued' || j.status === 'downloading' || j.status === 'verifying'));
+
+  let action;
+  if (runningJob) {
+    action = `<span style="font-size:10px;color:var(--cyan)">${escHtml(runningJob.status)}…</span>
+      <button onclick="cancelModelDownload(${JSON.stringify(runningJob.id)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Cancel</button>`;
+  } else if (backend === 'llama_cpp') {
+    // Upstream itself derives quant_pattern from a *live* HF repo file
+    // listing (llama_cpp_model_manager.py::get_hf_quants), not from the
+    // static catalog — the catalog has no quant/pattern field for
+    // llama_cpp at all. Replicating that live lookup is out of scope for
+    // this PR (design doc §10), so the operator types the pattern
+    // themselves, same info they'd see on the HF repo page.
+    const inputId = 'quant-input-' + entry.id;
+    action = `<input id="${inputId}" placeholder="quant pattern e.g. Q4_K_M.gguf or BF16" style="font-size:11px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);width:200px">
+      <button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, document.getElementById(${JSON.stringify(inputId)}).value)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
+  } else {
+    action = `<button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, null)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
+    if (complete && backend === 'r9v') {
+      action += `<button onclick="verifyModelChecksums(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)})" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--violet);cursor:pointer">Verify</button>`;
+    }
+  }
+
+  return `<div style="display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px;flex-wrap:wrap">
+    <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0"></span>
+    <div style="flex:1;min-width:220px">
+      <div style="font-size:12px;font-weight:600;color:var(--text)">${escHtml(entry.name || entry.id)}</div>
+      <div style="font-size:10px;color:var(--textMute)">${escHtml(payload.repo || '')}${sizeLabel ? ' · ' + sizeLabel : ''} · ${escHtml(statusLabel)}</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">${action}</div>
+  </div>`;
+}
+
+async function startModelDownload(backend, modelId, quantPattern) {
+  if (backend === 'llama_cpp' && !quantPattern) {
+    alert('Enter a quant pattern for this llama.cpp model first (e.g. Q4_K_M.gguf, or a folder name like BF16 — check the Hugging Face repo for available options).');
+    return;
+  }
+  try {
+    const r = await fetch('/api/model-downloads', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend, model_id: modelId, quant_pattern: quantPattern || undefined }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Download failed to start: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadToolboxModels();
+}
+
+async function cancelModelDownload(jobId) {
+  try { await fetch('/api/model-downloads/' + encodeURIComponent(jobId) + '/cancel', { method: 'POST' }); } catch (e) {}
+  loadToolboxModels();
+}
+
+async function verifyModelChecksums(backend, modelId) {
+  try {
+    const r = await fetch('/api/model-downloads/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend, model_id: modelId }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Verify failed: ' + (j.error || r.status)); return; }
+    const files = j.files || [];
+    const bad = files.filter(f => !f.matched);
+    alert(bad.length
+      ? ('Checksum mismatch on ' + bad.length + ' file(s): ' + bad.map(f => f.relative_path).join(', '))
+      : ('All ' + files.length + ' file(s) verified OK.'));
+  } catch (e) {}
+}
+
+function renderToolboxDownloadJobs() {
+  const el = document.getElementById('toolbox-download-jobs');
+  if (!el) return;
+  if (!toolboxDownloadJobs.length) { el.innerHTML = '<div style="color:var(--textMute);font-size:12px">No downloads started yet.</div>'; return; }
+  const sorted = [...toolboxDownloadJobs].sort((a, b) => new Date(b.queued_at) - new Date(a.queued_at));
+  el.innerHTML = sorted.map(renderToolboxDownloadJobRow).join('');
+}
+
+function renderToolboxDownloadJobRow(job) {
+  const color = DOWNLOAD_STATUS_COLORS[job.status] || 'var(--textMute)';
+  const terminal = job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled';
+  const cancelBtn = terminal ? '' : `<button onclick="cancelModelDownload(${JSON.stringify(job.id)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Cancel</button>`;
+  return `<div style="display:flex;flex-direction:column;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0"></span>
+      <span style="font-size:11px;font-weight:600;color:var(--text)">${escHtml(TOOLBOX_BACKEND_LABELS[job.backend] || job.backend)} · ${escHtml(job.model_id)}</span>
+      <span style="font-size:10px;color:${color}">${escHtml(job.status)}</span>
+      <span style="margin-left:auto">${cancelBtn}</span>
+    </div>
+    <div style="font-size:10px;color:var(--textMute);overflow-wrap:anywhere">${escHtml(job.message || '')}</div>
+  </div>`;
+}
+
+// Polls only while a job is in flight and this view is actually visible —
+// mirrors the coarse-progress design decision (§10): no byte percentage,
+// just periodically re-pulling the job's status string until terminal.
+function scheduleToolboxModelsPoll() {
+  if (toolboxModelsPollTimer) { clearTimeout(toolboxModelsPollTimer); toolboxModelsPollTimer = null; }
+  const active = toolboxDownloadJobs.some(j => j.status === 'queued' || j.status === 'downloading' || j.status === 'verifying');
+  if (active && activeView === 'toolbox-models') {
+    toolboxModelsPollTimer = setTimeout(loadToolboxModels, 3000);
+  }
 }
 
 

@@ -24,4 +24,5 @@ pub mod types;
 pub mod routing_events;
 pub mod inflight;
 pub mod inference_proxy;
+pub mod model_downloads;
 pub mod observability;

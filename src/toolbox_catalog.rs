@@ -21,8 +21,8 @@ use serde_json::Value;
 use schema_validate::ValidationReport;
 
 pub use models::{
-    CatalogModelEntry, Ds4Model, HalogenModel, LlamaCppModel, ModelBackendCatalog, ModelCatalog,
-    ModelPayload, R9vModel, VllmModel,
+    CatalogModelEntry, CatalogModelFile, Ds4Model, HalogenModel, LlamaCppModel,
+    ModelBackendCatalog, ModelCatalog, ModelPayload, R9vModel, VllmModel,
 };
 pub use types::{
     CatalogBackendId, CatalogParseError, Channel, FeatureState, Maturity, Platform,
