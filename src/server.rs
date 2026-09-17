@@ -1863,6 +1863,21 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
 
 /// Compute local versions and "latest available" metadata for the /api/versions endpoint.
 /// Called periodically by a background task in daemon.rs.
+/// Cooperative lock checked before spawning any llama-server process for a
+/// version probe. Written by `~/.local/bin/gpu-exclusive-lock acquire` around
+/// GPU-exclusive confirmation/benchmark runs; a stray `llama-server --version`
+/// container is enough to trip those runs' conflict guard. Treated as absent
+/// once older than GPU_EXCLUSIVE_LOCK_MAX_AGE, so a crashed acquirer can't
+/// wedge this off forever.
+fn gpu_exclusive_lock_active() -> bool {
+    const GPU_EXCLUSIVE_LOCK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+    let Some(home) = std::env::var_os("HOME") else { return false };
+    let lock_path = std::path::Path::new(&home).join(".local/state/gpu-exclusive.lock");
+    let Ok(meta) = std::fs::metadata(&lock_path) else { return false };
+    let Ok(modified) = meta.modified() else { return true };
+    modified.elapsed().map(|age| age < GPU_EXCLUSIVE_LOCK_MAX_AGE).unwrap_or(true)
+}
+
 pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
     use tokio::process::Command;
 
@@ -1884,9 +1899,12 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
 
     // 2. llama.cpp version from toolbox container image.
     const PODMAN_VERSION_TIMEOUT_SECS: u64 = 15;
-    let toolbox_ver = {
+    let toolbox_ver = if gpu_exclusive_lock_active() {
+        "unknown".to_string()
+    } else {
         let child = Command::new("podman")
-            .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
+            .args(["run", "--rm", "--name", "brainrouter-versioncheck", "--replace",
+                   "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
             .kill_on_drop(true)
             .output();
         match tokio::time::timeout(std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS), child).await {
