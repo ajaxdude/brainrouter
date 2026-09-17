@@ -861,6 +861,16 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
           </div>
         </div>
       </div>
+
+      <!-- PR11a §16: read-only serving-identity registry. Bookkeeping only
+           — no start/stop controls here, and this data never affects
+           request routing (see `serving_identity` module docs / design
+           doc §16 before changing that). -->
+      <div id="sm-panel-serving-identities" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:900px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">Serving identities</div>
+        <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">Currently-registered Server Mode backends — read-only, informational (§16). Populated when a backend above is started, cleared when stopped.</div>
+        <div id="serving-identities-list" style="font-size:12px;color:var(--textMute)">Loading…</div>
+      </div>
     </div>
 
 
@@ -3114,13 +3124,14 @@ async function loadServerMode() {
   // model/bundle on disk, not just a catalog entry.
   renderServerModeBackendTabs();
   setServerModeBackend(serverModeActiveBackend);
-  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes] = await Promise.all([
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes, servingIdentitiesRes] = await Promise.all([
     safeFetch('/api/toolbox-models'),
     safeFetch('/api/model-downloads/status'),
     safeFetch('/api/server-mode/ds4/status'),
     safeFetch('/api/server-mode/halogen/status'),
     safeFetch('/api/server-mode/vllm/status'),
     safeFetch('/api/server-mode/r9v/status'),
+    safeFetch('/api/serving-identities'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
   if (statusRes) toolboxModelPresence = statusRes.models || [];
@@ -3140,7 +3151,46 @@ async function loadServerMode() {
   renderServerModeR9vToolboxOptions();
   renderServerModeR9vPackageOptions();
   renderServerModeR9vStatus();
+  renderServingIdentities(servingIdentitiesRes && servingIdentitiesRes.identities || []);
 }
+
+/// PR11a §16: renders the read-only serving-identity list. No start/stop
+/// controls — clicking through to actually manage a backend happens via
+/// the per-backend panels above, not here.
+function renderServingIdentities(identities) {
+  const el = document.getElementById('serving-identities-list');
+  if (!el) return;
+  if (!identities.length) {
+    el.innerHTML = '<span style="color:var(--textMute)">No server-mode backends currently registered.</span>';
+    return;
+  }
+  const rows = identities.map(v => {
+    const id = v.identity || {};
+    const runColor = v.container_running ? 'var(--green)' : 'var(--amber)';
+    const runLabel = v.container_running ? 'running' : 'container not found (stale entry)';
+    const compat = id.openai_compatible ? 'yes' : 'no (unverified)';
+    return `<tr>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.toolbox_backend || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.compute_api || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.runtime_profile_id || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.endpoint || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(compat)}</td>
+      <td style="padding:4px 10px 4px 0"><span style="color:${runColor}">●</span> ${escHtml(runLabel)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table style="border-collapse:collapse;width:100%">
+    <thead><tr style="color:var(--textMute);text-align:left">
+      <th style="padding:4px 10px 4px 0">Backend</th>
+      <th style="padding:4px 10px 4px 0">Engine</th>
+      <th style="padding:4px 10px 4px 0">Toolbox</th>
+      <th style="padding:4px 10px 4px 0">Endpoint</th>
+      <th style="padding:4px 10px 4px 0">OpenAI-compatible</th>
+      <th style="padding:4px 10px 4px 0">Container</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 
 function renderServerModeToolboxOptions() {
   const el = document.getElementById('sm-ds4-toolbox');

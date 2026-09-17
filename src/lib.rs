@@ -27,4 +27,5 @@ pub mod inference_proxy;
 pub mod model_downloads;
 pub mod observability;
 pub mod server_mode;
+pub mod serving_identity;
 

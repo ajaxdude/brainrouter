@@ -161,6 +161,13 @@ pub struct AppState {
     /// (ds4/halogen/llama_cpp/r9v; vllm is out of scope, see
     /// `model_downloads.rs` module docs).
     pub model_downloads: Arc<crate::model_downloads::ModelDownloadRegistry>,
+    /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
+    /// of currently-running toolbox Server Mode containers'
+    /// `{toolbox_backend, compute_api, runtime_profile_id, endpoint}`.
+    /// **Does not make any backend a routable Router upstream** — see
+    /// `serving_identity` module docs and design doc §16 before extending
+    /// this to affect request routing.
+    pub serving_identities: Arc<crate::serving_identity::ServingIdentityRegistry>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -958,12 +965,12 @@ async fn handle_request(
 
         ("POST", "/api/server-mode/ds4/start") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_ds4_start_response(&body_bytes).await;
+            let resp = server_mode_ds4_start_response(&state, &body_bytes).await;
             into_unsync(resp)
         }
 
         ("POST", "/api/server-mode/ds4/stop") => {
-            let resp = server_mode_ds4_stop_response().await;
+            let resp = server_mode_ds4_stop_response(&state).await;
             into_unsync(resp)
         }
 
@@ -975,12 +982,12 @@ async fn handle_request(
 
         ("POST", "/api/server-mode/halogen/start") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_halogen_start_response(&body_bytes).await;
+            let resp = server_mode_halogen_start_response(&state, &body_bytes).await;
             into_unsync(resp)
         }
 
         ("POST", "/api/server-mode/halogen/stop") => {
-            let resp = server_mode_halogen_stop_response().await;
+            let resp = server_mode_halogen_stop_response(&state).await;
             into_unsync(resp)
         }
 
@@ -992,12 +999,12 @@ async fn handle_request(
 
         ("POST", "/api/server-mode/vllm/start") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_vllm_start_response(&body_bytes).await;
+            let resp = server_mode_vllm_start_response(&state, &body_bytes).await;
             into_unsync(resp)
         }
 
         ("POST", "/api/server-mode/vllm/stop") => {
-            let resp = server_mode_vllm_stop_response().await;
+            let resp = server_mode_vllm_stop_response(&state).await;
             into_unsync(resp)
         }
 
@@ -1015,12 +1022,12 @@ async fn handle_request(
 
         ("POST", "/api/server-mode/r9v/start") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_r9v_start_response(&body_bytes).await;
+            let resp = server_mode_r9v_start_response(&state, &body_bytes).await;
             into_unsync(resp)
         }
 
         ("POST", "/api/server-mode/r9v/stop") => {
-            let resp = server_mode_r9v_stop_response().await;
+            let resp = server_mode_r9v_stop_response(&state).await;
             into_unsync(resp)
         }
 
@@ -1033,6 +1040,12 @@ async fn handle_request(
         ("POST", "/api/model-downloads/r9v/prepare-ple") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
             let resp = model_downloads_prepare_ple_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        // ── PR11a: serving-identity registry (§16) ──────────────────────────
+        ("GET", "/api/serving-identities") => {
+            let resp = serving_identities_response(&state).await;
             into_unsync(resp)
         }
 
@@ -3148,6 +3161,42 @@ async fn upgrade_manifest() -> Response<Full<Bytes>> {
 
 // ── PR7: ds4 Server Mode (§11/§12) ────────────────────────────────────────
 
+/// Shared helper for the 4 backends' `start_*_response()` handlers
+/// (§16/PR11a): builds a [`crate::serving_identity::ServingIdentity`] from
+/// an already-resolved toolbox/runtime-profile pair and registers it.
+/// Called only after `start_*_server()` itself already succeeded — a
+/// failure here (e.g. an unexpected catalog-resolution error for a
+/// toolbox_id that just successfully started) is logged, not surfaced as
+/// an HTTP error, since the server itself is genuinely running either way
+/// (§16: registration is bookkeeping, never gates the start/stop action).
+async fn register_serving_identity(
+    state: &AppState,
+    backend: crate::toolbox_catalog::SupportedServingBackend,
+    container_name: &str,
+    toolbox_id: String,
+    profile: &crate::toolbox_catalog::RuntimeProfile,
+    endpoint: String,
+) {
+    let identity = crate::serving_identity::ServingIdentity {
+        toolbox_backend: backend.as_str(),
+        compute_api: crate::server_mode::compute_api_for_runtime_profile(profile).to_string(),
+        runtime_profile_id: toolbox_id,
+        endpoint,
+        openai_compatible: crate::serving_identity::openai_compatible_for_backend(backend),
+        registered_at: chrono::Utc::now(),
+    };
+    state.serving_identities.register(container_name, identity).await;
+}
+
+/// `"http://host:port"`, normalizing an all-interfaces bind address
+/// (`0.0.0.0`) to `127.0.0.1` — the dashboard/API reader needs a real
+/// destination to (eventually) reach, and `0.0.0.0` is never a valid one
+/// (§16).
+fn serving_identity_endpoint(host: &str, port: u16) -> String {
+    let host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    format!("http://{host}:{port}")
+}
+
 /// `GET /api/server-mode/ds4/status` — always reads live `podman inspect`
 /// state (§12 item 5: no persisted registry).
 pub async fn server_mode_ds4_status_response() -> Response<Full<Bytes>> {
@@ -3157,7 +3206,7 @@ pub async fn server_mode_ds4_status_response() -> Response<Full<Bytes>> {
 
 /// `POST /api/server-mode/ds4/start` — body:
 /// `{"toolbox_id": "...", "model_id": "...", "ctx": <n>, "host": "...", "port": <n>, "custom_args": "..."}`.
-pub async fn server_mode_ds4_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+pub async fn server_mode_ds4_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
     let request: crate::server_mode::StartDs4ServerRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -3168,6 +3217,17 @@ pub async fn server_mode_ds4_start_response(body: &Bytes) -> Response<Full<Bytes
     };
     match crate::server_mode::start_ds4_server(&request).await {
         Ok(()) => {
+            if let Ok((_, profile)) = crate::server_mode::resolve_ds4_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Ds4,
+                    crate::server_mode::DS4_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
             let status = crate::server_mode::ds4_server_status().await;
             json_response(StatusCode::OK, &status)
         }
@@ -3179,12 +3239,15 @@ pub async fn server_mode_ds4_start_response(body: &Bytes) -> Response<Full<Bytes
 
 /// `POST /api/server-mode/ds4/stop` — graceful `podman stop` then `podman
 /// rm -f`, idempotent if the container is already gone (§12 item 5).
-pub async fn server_mode_ds4_stop_response() -> Response<Full<Bytes>> {
+pub async fn server_mode_ds4_stop_response(state: &AppState) -> Response<Full<Bytes>> {
     match crate::server_mode::stop_ds4_server().await {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "ds4 server stopped.",
-        })),
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::DS4_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "ds4 server stopped.",
+            }))
+        }
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),
@@ -3205,7 +3268,7 @@ pub async fn server_mode_halogen_status_response() -> Response<Full<Bytes>> {
 /// `{"toolbox_id": "...", "bundle_id": "...", "host": "...", "port": <n>,
 /// "context_size": <n>, "kv_pool_positions": <n>, "kv_slots": <n>,
 /// "prompt_cache": "0"|"1"|"2"}`.
-pub async fn server_mode_halogen_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+pub async fn server_mode_halogen_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
     let request: crate::server_mode::StartHalogenServerRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -3216,6 +3279,17 @@ pub async fn server_mode_halogen_start_response(body: &Bytes) -> Response<Full<B
     };
     match crate::server_mode::start_halogen_server(&request).await {
         Ok(()) => {
+            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_halogen_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Halogen,
+                    crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
             let status = crate::server_mode::halogen_server_status().await;
             json_response(StatusCode::OK, &status)
         }
@@ -3227,12 +3301,15 @@ pub async fn server_mode_halogen_start_response(body: &Bytes) -> Response<Full<B
 
 /// `POST /api/server-mode/halogen/stop` — graceful `podman stop` then
 /// `podman rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_halogen_stop_response() -> Response<Full<Bytes>> {
+pub async fn server_mode_halogen_stop_response(state: &AppState) -> Response<Full<Bytes>> {
     match crate::server_mode::stop_halogen_server().await {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "halogen server stopped.",
-        })),
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "halogen server stopped.",
+            }))
+        }
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),
@@ -3255,7 +3332,7 @@ pub async fn server_mode_vllm_status_response() -> Response<Full<Bytes>> {
 /// "max_model_len": "auto"|"<n>", "gpu_memory_utilization": <f>,
 /// "attention_backend": "...", "enforce_eager": <bool>, "dtype": "...",
 /// "api_key": "...", "extra_args": "...", "reset_caches": <bool>}`.
-pub async fn server_mode_vllm_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+pub async fn server_mode_vllm_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
     let request: crate::server_mode::StartVllmServerRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -3266,6 +3343,17 @@ pub async fn server_mode_vllm_start_response(body: &Bytes) -> Response<Full<Byte
     };
     match crate::server_mode::start_vllm_server(&request).await {
         Ok(()) => {
+            if let Ok((_, profile)) = crate::server_mode::resolve_vllm_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Vllm,
+                    crate::server_mode::VLLM_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
             let status = crate::server_mode::vllm_server_status().await;
             json_response(StatusCode::OK, &status)
         }
@@ -3277,12 +3365,15 @@ pub async fn server_mode_vllm_start_response(body: &Bytes) -> Response<Full<Byte
 
 /// `POST /api/server-mode/vllm/stop` — graceful `podman stop` then `podman
 /// rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_vllm_stop_response() -> Response<Full<Bytes>> {
+pub async fn server_mode_vllm_stop_response(state: &AppState) -> Response<Full<Bytes>> {
     match crate::server_mode::stop_vllm_server().await {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "vllm server stopped.",
-        })),
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::VLLM_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "vllm server stopped.",
+            }))
+        }
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),
@@ -3330,7 +3421,7 @@ pub async fn server_mode_r9v_status_response() -> Response<Full<Bytes>> {
 /// "expert_cache_slots"?, "offload"?, "offload_devices"?, "served_model"?,
 /// "api_key"?, "extra_args"?}` — every tuning field is optional, falling
 /// back to upstream's own literal defaults (§15a).
-pub async fn server_mode_r9v_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+pub async fn server_mode_r9v_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
     let request: crate::server_mode::StartR9vServerRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -3341,6 +3432,19 @@ pub async fn server_mode_r9v_start_response(body: &Bytes) -> Response<Full<Bytes
     };
     match crate::server_mode::start_r9v_server(&request).await {
         Ok(()) => {
+            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_r9v_toolbox(&request.toolbox_id) {
+                let host = request.host.as_deref().unwrap_or(crate::server_mode::R9V_DEFAULT_HOST);
+                let port = request.port.unwrap_or(crate::server_mode::R9V_DEFAULT_PORT);
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::R9v,
+                    crate::server_mode::R9V_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(host, port),
+                )
+                .await;
+            }
             let status = crate::server_mode::r9v_server_status().await;
             json_response(StatusCode::OK, &status)
         }
@@ -3352,12 +3456,15 @@ pub async fn server_mode_r9v_start_response(body: &Bytes) -> Response<Full<Bytes
 
 /// `POST /api/server-mode/r9v/stop` — graceful `podman stop` then `podman
 /// rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_r9v_stop_response() -> Response<Full<Bytes>> {
+pub async fn server_mode_r9v_stop_response(state: &AppState) -> Response<Full<Bytes>> {
     match crate::server_mode::stop_r9v_server().await {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "r9v server stopped.",
-        })),
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::R9V_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "r9v server stopped.",
+            }))
+        }
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),
@@ -3409,6 +3516,16 @@ pub async fn model_downloads_prepare_ple_response(state: &AppState, body: &Bytes
             error: e.message().to_string(),
         }),
     }
+}
+
+/// `GET /api/serving-identities` — read-only snapshot of every
+/// currently-registered server-mode backend's serving identity (§16/PR11a).
+/// Purely informational: the dashboard panel this feeds has no start/stop
+/// controls, and no request routing ever consults this endpoint's data
+/// (see `serving_identity` module docs).
+pub async fn serving_identities_response(state: &AppState) -> Response<Full<Bytes>> {
+    let identities = state.serving_identities.snapshot().await;
+    json_response(StatusCode::OK, &serde_json::json!({ "identities": identities }))
 }
 
 /// Look up the image a podman container is running from (full `docker.io/…`

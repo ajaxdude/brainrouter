@@ -398,7 +398,37 @@ fn resolve_toolbox_for_server(
     Ok((tb.clone(), profile))
 }
 
-fn resolve_ds4_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
+/// Derives the compute API (`"rocm"` | `"cuda"` | `"vulkan"`) a resolved
+/// [`RuntimeProfile`] actually runs under, from the same `engine_args` its
+/// own `podman create`/`podman run` invocation is built from — grounded in
+/// the literal podman flags that select the compute device, not a guess
+/// from the profile's name. Added for PR11a (§16)'s serving-identity
+/// registry, which needs this to record `compute_api` at registration
+/// time; verified against every real vendored ds4/halogen/vllm/r9v
+/// `runtime_profiles` entry in `assets/cockpit-catalog/toolboxes.json`
+/// (all are `amd-rocm*`/`nvidia-gb10`/`halogen-strix-halo` today — no
+/// vulkan-profile ds4/halogen/vllm/r9v toolbox currently exists; vulkan
+/// stays the fallback for forward-compat with a future one).
+pub(crate) fn compute_api_for_runtime_profile(profile: &RuntimeProfile) -> &'static str {
+    if profile.engine_args.iter().any(|a| a == "/dev/kfd") {
+        "rocm"
+    } else if profile
+        .engine_args
+        .iter()
+        .any(|a| a.contains("nvidia") || a.to_ascii_uppercase().contains("NVIDIA"))
+    {
+        "cuda"
+    } else {
+        "vulkan"
+    }
+}
+
+/// `pub(crate)`: also called by [`crate::serving_identity`] (PR11a, §16)
+/// to re-resolve a running ds4 server's compute_api/runtime_profile_id at
+/// registration time — cheap (in-memory catalog lookup, no I/O), so
+/// resolving twice (once in `start_ds4_server`, once for registration) is
+/// not wasteful.
+pub(crate) fn resolve_ds4_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
     let catalog = load_typed_toolbox_catalog()?;
     resolve_toolbox_for_server(&catalog, SupportedServingBackend::Ds4, toolbox_id)
 }
@@ -409,7 +439,7 @@ fn resolve_ds4_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimePr
 /// an explicit caller-supplied parameter with no other way to learn it;
 /// brainrouter derives it from the catalog's own `platforms[].toolbox_ids`
 /// instead of adding a redundant platform field to the HTTP request body).
-fn resolve_halogen_toolbox(
+pub(crate) fn resolve_halogen_toolbox(
     toolbox_id: &str,
 ) -> Result<(ToolboxDefinition, RuntimeProfile, String), ServerModeError> {
     let catalog = load_typed_toolbox_catalog()?;
@@ -498,6 +528,19 @@ async fn server_container_label(container_name: &str, label: &str) -> Option<Str
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!value.is_empty() && value != "<no value>").then_some(value)
+}
+
+/// Live "is this container currently running" check, shared by
+/// [`container_server_status`] and (PR11a, §16) the serving-identity
+/// registry's `GET /api/serving-identities` staleness cross-check — same
+/// `podman inspect --format {{.State.Running}}` primitive, factored out so
+/// the registry doesn't need its own duplicate of this exact command.
+pub(crate) async fn container_running(container_name: &str) -> bool {
+    let out = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", "{{.State.Running}}", container_name])
+        .output()
+        .await;
+    matches!(out, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 /// Shared `GET /api/server-mode/<backend>/status` implementation: no
@@ -982,7 +1025,7 @@ pub struct StartVllmServerRequest {
     pub reset_caches: bool,
 }
 
-fn resolve_vllm_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
+pub(crate) fn resolve_vllm_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
     let catalog = load_typed_toolbox_catalog()?;
     resolve_toolbox_for_server(&catalog, SupportedServingBackend::Vllm, toolbox_id)
 }
@@ -1373,8 +1416,8 @@ pub fn save_vllm_cache_paths(req: &VllmCachePathsRequest) -> Result<(), ServerMo
 
 /// Every one of upstream's `DEFAULTS` dict values (`runner.py`), applied
 /// whenever the corresponding [`StartR9vServerRequest`] field is omitted.
-const R9V_DEFAULT_HOST: &str = "127.0.0.1";
-const R9V_DEFAULT_PORT: u16 = 8004;
+pub(crate) const R9V_DEFAULT_HOST: &str = "127.0.0.1";
+pub(crate) const R9V_DEFAULT_PORT: u16 = 8004;
 const R9V_DEFAULT_DEVICES: &str = "0,1";
 const R9V_DEFAULT_CONTEXT: u32 = 131072;
 const R9V_DEFAULT_BATCH: u32 = 1024;
@@ -1465,7 +1508,7 @@ pub struct StartR9vServerRequest {
 /// Same as [`resolve_halogen_toolbox`]/[`resolve_ds4_toolbox`], plus the
 /// owning platform id — [`build_r9v_server_command`]'s upstream-mirrored
 /// `platform_id != "r9700"` check needs it, same rationale as halogen's.
-fn resolve_r9v_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile, String), ServerModeError> {
+pub(crate) fn resolve_r9v_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile, String), ServerModeError> {
     let catalog = load_typed_toolbox_catalog()?;
     let (tb, profile) = resolve_toolbox_for_server(&catalog, SupportedServingBackend::R9v, toolbox_id)?;
     let platform_id = catalog
@@ -1913,6 +1956,32 @@ mod tests {
         assert_eq!(tb.id, "strix-halo-ds4-rocm-10-0");
         assert_eq!(profile.id, "amd-rocm");
         assert!(!profile.engine_args.is_empty());
+    }
+
+    #[test]
+    fn compute_api_for_runtime_profile_detects_rocm_via_dev_kfd() {
+        // Grounds §16's derivation rule against a real vendored profile:
+        // ds4's `amd-rocm` runtime_profile is rocm, not vulkan or cuda.
+        let (_, profile) = resolve_ds4_toolbox("strix-halo-ds4-rocm-10-0").expect("must resolve");
+        assert_eq!(compute_api_for_runtime_profile(&profile), "rocm");
+    }
+
+    #[test]
+    fn compute_api_for_runtime_profile_falls_back_to_vulkan_when_no_gpu_hint_present() {
+        let profile = RuntimeProfile {
+            id: "test-profile".to_string(),
+            engine_args: vec!["--rm".to_string(), "-it".to_string()],
+        };
+        assert_eq!(compute_api_for_runtime_profile(&profile), "vulkan");
+    }
+
+    #[test]
+    fn compute_api_for_runtime_profile_detects_cuda_via_nvidia_hint() {
+        let profile = RuntimeProfile {
+            id: "test-profile".to_string(),
+            engine_args: vec!["--runtime=nvidia-container-runtime".to_string()],
+        };
+        assert_eq!(compute_api_for_runtime_profile(&profile), "cuda");
     }
 
     #[test]

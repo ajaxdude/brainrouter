@@ -428,6 +428,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
         toolbox_container_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         model_downloads: Arc::new(brainrouter::model_downloads::ModelDownloadRegistry::new()),
+        serving_identities: Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new()),
     });
 
     brainrouter::observability::start(&state);
