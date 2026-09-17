@@ -72,7 +72,7 @@ function browser(handler = async () => response({}), settings = {}) {
     node.hidden = /\bhidden\b/.test(tag);
     nodes.set(match[2], node);
   }
-  for (const [id, value] of Object.entries({ sort: 'started_at:desc', 'memory-metric': 'peak_rss_bytes', repetition: '0', 'prepare-mode': 'metadata', 'plan-format': 'json' })) nodes.get(id).value = value;
+  for (const [id, value] of Object.entries({ sort: 'started_at:desc', 'memory-metric': 'peak_rss_bytes', repetition: '0', 'prepare-mode': 'metadata', 'plan-format': 'json', 'spider-series': 'family' })) nodes.get(id).value = value;
   const calls = [], downloads = [], storage = new Map(), storageCalls = [], windowListeners = new Map();
   const sandbox = {
     document, console, URLSearchParams, TextEncoder, AbortController, Blob, setTimeout, clearTimeout,
@@ -684,4 +684,186 @@ test('analytics never fan out over registry pages and run controls are keyboard-
   assert.equal(open.attributes['aria-label'], 'Open run keyboard-run');
   assert(html.includes('aria-labelledby="detail-title"'));
   assert(html.includes('scope="col"'));
+});
+
+const spiderFilters = {
+  families: ['Qwen3', 'Llama3', 'Mixtral', 'Phi4', 'Gemma2', 'Yi'],
+  backends: ['llama_cpp'],
+  toolbox_backends: ['llama_cpp', 'ds4'],
+  compute_apis: ['vulkan', 'rocm'],
+  toolbox_ids: ['strix-vulkan'],
+  workloads: ['coding-agent', 'chat'],
+  quant_names: ['Q4_K_M'],
+  statuses: ['succeeded'],
+};
+function spiderFixtureResponse() {
+  return {
+    axes: ['tepr', 'speed'],
+    min_sample_size: 3,
+    series: [
+      { key: 'Qwen3', label: 'Qwen3', axis_values: { tepr: 130, speed: 42 }, sample_n: { tepr: 5, speed: 5 }, insufficient_data: { tepr: false, speed: false }, aggregated_dimensions: [] },
+      { key: 'Llama3', label: 'Llama3', axis_values: { tepr: null, speed: 10 }, sample_n: { tepr: 1, speed: 1 }, insufficient_data: { tepr: true, speed: true }, aggregated_dimensions: ['family'] },
+    ],
+  };
+}
+async function settle() { await new Promise(resolve => setImmediate(resolve)); }
+
+test('spider chart facets and entity picker populate from the shared filters fetch without a duplicate request', async () => {
+  const app = browser(undefined, { filtersResponse: response(spiderFilters) });
+  await settle();
+  const filterCalls = app.calls.filter(x => x.url === '/api/benchmarks/filters');
+  assert.equal(filterCalls.length, 1, 'loadFilters must be the only consumer of /api/benchmarks/filters');
+  assert.deepEqual(JSON.parse(JSON.stringify(app.evaluate('spiderState').filters)), spiderFilters);
+  assert.equal(app.sandbox.spiderSeriesKind(), 'family');
+  assert.equal(app.evaluate('spiderState').entityChecks.length, spiderFilters.families.length);
+  const picker = app.nodes.get('spider-entity-picker');
+  const checkboxValues = walk(picker).filter(x => x.tagName === 'INPUT').map(x => x.value);
+  assert.deepEqual(checkboxValues, spiderFilters.families);
+  const workloadOptions = app.nodes.get('spider-workload-pin').options.map(o => o.value);
+  assert.deepEqual(workloadOptions, [...spiderFilters.workloads]);
+});
+
+test('spider entity picker switches to workload checkboxes and to a model x harness pair builder', async () => {
+  const app = browser(undefined, { filtersResponse: response(spiderFilters) });
+  await settle();
+  app.nodes.get('spider-series').value = 'workload';
+  app.sandbox.renderSpiderEntityPicker();
+  assert.equal(app.nodes.get('spider-workload-pin-wrap').hidden, true, 'workload pin is only meaningful when comparing models');
+  let values = walk(app.nodes.get('spider-entity-picker')).filter(x => x.tagName === 'INPUT').map(x => x.value);
+  assert.deepEqual(values, spiderFilters.workloads);
+
+  app.nodes.get('spider-series').value = 'family_workload';
+  app.sandbox.renderSpiderEntityPicker();
+  const picker = app.nodes.get('spider-entity-picker');
+  const selects = walk(picker).filter(x => x.tagName === 'SELECT');
+  assert.equal(selects.length, 2, 'pair builder needs a family select and a workload select');
+  const [familySelect, workloadSelect] = selects;
+  const addButton = walk(picker).find(x => x.tagName === 'BUTTON' && x.textContent === 'Add pair');
+  assert(addButton, 'pair builder must expose an Add pair button');
+
+  familySelect.value = '';
+  workloadSelect.value = 'coding-agent';
+  addButton.click();
+  assert.equal(app.evaluate('spiderState').pairs.length, 0, 'incomplete pairs must not be added');
+  assert.match(app.nodes.get('spider-message').textContent, /Choose both a model and a harness/);
+
+  familySelect.value = 'Qwen3';
+  workloadSelect.value = 'coding-agent';
+  addButton.click();
+  familySelect.value = 'Llama3';
+  workloadSelect.value = 'chat';
+  addButton.click();
+  assert.deepEqual([...app.evaluate('spiderState').pairs], ['Qwen3::coding-agent', 'Llama3::chat']);
+  const chips = walk(picker).filter(x => x.tagName === 'SPAN' && x.className === 'chip');
+  assert.equal(chips.length, 2);
+
+  familySelect.value = 'Qwen3';
+  workloadSelect.value = 'coding-agent';
+  addButton.click();
+  assert.equal(app.evaluate('spiderState').pairs.length, 2, 'duplicate pairs must be rejected');
+  assert.match(app.nodes.get('spider-message').textContent, /already added/);
+
+  const removeButtons = walk(picker).filter(x => x.tagName === 'BUTTON' && x.textContent !== 'Add pair');
+  removeButtons[0].click();
+  assert.deepEqual([...app.evaluate('spiderState').pairs], ['Llama3::chat']);
+});
+
+test('spider entity checkboxes cap the comparison at 5 by disabling further selections', async () => {
+  const app = browser(undefined, { filtersResponse: response(spiderFilters) });
+  await settle();
+  const inputs = app.evaluate('spiderState').entityChecks;
+  assert.equal(inputs.length, 6);
+  for (let i = 0; i < 5; i++) { inputs[i].checked = true; inputs[i].onchange(); }
+  assert.equal(inputs[5].disabled, true, 'a 6th entity must be disabled once 5 are checked');
+  inputs[0].checked = false; inputs[0].onchange();
+  assert.equal(inputs[5].disabled, false, 'unchecking must re-enable further selections');
+});
+
+test('plotSpider rejects incomplete selections client-side and never calls the API', async () => {
+  const app = browser(undefined, { filtersResponse: response(spiderFilters) });
+  await settle();
+  const inputs = app.evaluate('spiderState').entityChecks;
+  const callsBefore = () => app.calls.filter(x => x.url.startsWith('/api/benchmarks/spider')).length;
+  // The fake harness does not read the HTML `checked` attribute, so axis checkboxes start unchecked; opt in explicitly.
+  app.nodes.get('spider-axis-tepr').checked = true;
+  app.nodes.get('spider-axis-speed').checked = true;
+
+  // Nothing selected: fewer than 2 entities.
+  await app.sandbox.plotSpider();
+  assert.match(app.nodes.get('spider-message').textContent, /between 2 and 5 entities/);
+  assert.equal(callsBefore(), 0);
+
+  // Two entities but no workload pinned while comparing models.
+  inputs[0].checked = true; inputs[1].checked = true;
+  await app.sandbox.plotSpider();
+  assert.match(app.nodes.get('spider-message').textContent, /Pin a single workload/);
+  assert.equal(callsBefore(), 0);
+
+  // Pin a workload but drop below 2 axes.
+  app.nodes.get('spider-workload-pin').value = 'coding-agent';
+  app.nodes.get('spider-axis-speed').checked = false;
+  await app.sandbox.plotSpider();
+  assert.match(app.nodes.get('spider-message').textContent, /at least 2 axes/);
+  assert.equal(callsBefore(), 0);
+
+  // More than 5 entities.
+  app.nodes.get('spider-axis-speed').checked = true;
+  for (const input of inputs) input.checked = true;
+  await app.sandbox.plotSpider();
+  assert.match(app.nodes.get('spider-message').textContent, /between 2 and 5 entities/);
+  assert.equal(callsBefore(), 0);
+});
+
+test('plotSpider issues the correct request, draws the radar chart, and captions the TEPR formula', async () => {
+  const fixture = spiderFixtureResponse();
+  const app = browser(
+    async address => (address.startsWith('/api/benchmarks/spider') ? response(fixture) : response(spiderFilters)),
+    { filtersResponse: response(spiderFilters) },
+  );
+  await settle();
+  const inputs = app.evaluate('spiderState').entityChecks;
+  inputs[0].checked = true; inputs[1].checked = true;
+  app.nodes.get('spider-workload-pin').value = 'coding-agent';
+  app.nodes.get('spider-axis-tepr').checked = true;
+  app.nodes.get('spider-axis-speed').checked = true;
+  await app.sandbox.plotSpider();
+
+  const spiderCalls = app.calls.filter(x => x.url.startsWith('/api/benchmarks/spider'));
+  assert.equal(spiderCalls.length, 1);
+  const q = new URL('http://synthetic' + spiderCalls[0].url).searchParams;
+  assert.equal(q.get('series'), 'family');
+  assert.equal(q.get('series_values'), 'Qwen3,Llama3');
+  assert.equal(q.get('axes'), 'tepr,speed');
+  assert.equal(q.get('workload'), 'coding-agent');
+
+  assert.equal(app.nodes.get('spider-message').textContent, '');
+  assert.match(app.nodes.get('spider-caption').textContent, /TEPR = total quality_results\.generated_tokens/);
+  assert.match(app.nodes.get('spider-caption').textContent, /Minimum 3 qualifying runs per axis/);
+
+  const svg = app.nodes.get('spider-chart');
+  const lines = walk(svg).filter(x => x.tagName === 'LINE');
+  const rings = walk(svg).filter(x => x.tagName === 'POLYGON' && x.attributes.class === 'axis');
+  const dataPolygons = walk(svg).filter(x => x.tagName === 'POLYGON' && x.attributes.class !== 'axis');
+  const dots = walk(svg).filter(x => x.tagName === 'CIRCLE');
+  assert.equal(lines.length, 2, 'one spoke per axis');
+  assert.equal(rings.length, 4, 'four concentric grid rings');
+  assert.equal(dataPolygons.length, 2, 'one polygon per series');
+  assert.equal(dots.length, 4, 'one vertex per series per axis');
+  const greyDots = dots.filter(d => d.attributes.fill === '#66738a');
+  assert.equal(greyDots.length, 2, 'Llama3 is insufficient data on both axes');
+
+  const legendItems = walk(app.nodes.get('spider-legend')).filter(x => x.tagName === 'LI');
+  assert.equal(legendItems.length, 2);
+  assert.match(legendItems[1].textContent, /aggregated across models/);
+  assert.match(legendItems[1].textContent, /below minimum 3/);
+});
+
+test('drawRadar shows a placeholder instead of an empty chart when there is no series data', () => {
+  const app = browser();
+  app.sandbox.drawRadar('spider-chart', { axes: ['tepr', 'speed'], min_sample_size: 3, series: [] });
+  const svg = app.nodes.get('spider-chart');
+  assert.equal(walk(svg).filter(x => x.tagName === 'POLYGON').length, 0);
+  assert.equal(walk(svg).filter(x => x.tagName === 'CIRCLE').length, 0);
+  const text = walk(svg).find(x => x.tagName === 'TEXT');
+  assert.match(text.textContent, /Choose entities and axes/);
 });

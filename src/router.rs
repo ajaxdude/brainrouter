@@ -373,6 +373,8 @@ impl Router {
                 // (e.g. manifest ✗ → local ✓) instead of a single card.
                 let winner_stage = provider_to_stage(&info.effective_provider, bonsai_decision);
                 for f in info.failed_attempts.iter().filter(|f| f.stage != winner_stage) {
+                    let (toolbox_backend, compute_api) =
+                        crate::routing_events::derive_serving_identity(Some(f.provider.as_str()));
                     self.routing_events.emit(RouteEvent {
                         id: 0,
                         timestamp: String::new(),
@@ -392,8 +394,12 @@ impl Router {
                         conv_id: conv_id.clone(),
                         pp_tps: 0.0,
                         tg_tps: 0.0,
+                        toolbox_backend,
+                        compute_api,
                     });
                 }
+                let (toolbox_backend, compute_api) =
+                    crate::routing_events::derive_serving_identity(info.effective_provider.as_deref());
                 let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
@@ -413,6 +419,8 @@ impl Router {
                     conv_id: conv_id.clone(),
                     pp_tps: 0.0,
                     tg_tps: 0.0,
+                    toolbox_backend,
+                    compute_api,
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -426,6 +434,7 @@ impl Router {
             }
             Err(e) => {
                 tracker.clear();
+                let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(None);
                 self.routing_events.emit(RouteEvent {
                     id: 0,
                     timestamp: String::new(),
@@ -445,6 +454,8 @@ impl Router {
                     conv_id,
                     pp_tps: 0.0,
                     tg_tps: 0.0,
+                    toolbox_backend,
+                    compute_api,
                 });
                 return Err(e);
             }
@@ -1486,6 +1497,8 @@ mod tests {
             conv_id: "abc123".to_string(),
             pp_tps: 0.0,
             tg_tps: 0.0,
+            toolbox_backend: Some("llama_cpp".to_string()),
+            compute_api: Some("vulkan".to_string()),
         });
         // Matching conversation backfills.
         assert!(events.update_tps("abc123", 41.5, 77.0));
@@ -1516,6 +1529,8 @@ mod tests {
             conv_id: "same-conversation".to_string(),
             pp_tps: 0.0,
             tg_tps: 0.0,
+            toolbox_backend: Some("llama_cpp".to_string()),
+            compute_api: Some("vulkan".to_string()),
         }
     }
 

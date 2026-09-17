@@ -1,0 +1,799 @@
+{
+  "schema_version": 3,
+  "runtime_profiles": {
+    "amd-rocm": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--device",
+        "/dev/kfd",
+        "--group-add",
+        "video",
+        "--group-add",
+        "render",
+        "--security-opt",
+        "seccomp=unconfined"
+      ]
+    },
+    "amd-rocm-hipblaslt": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--device",
+        "/dev/kfd",
+        "--group-add",
+        "video",
+        "--group-add",
+        "render",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--env",
+        "ROCBLAS_USE_HIPBLASLT=1"
+      ]
+    },
+    "amd-rocm-keep-groups": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--device",
+        "/dev/kfd",
+        "--group-add",
+        "keep-groups",
+        "--security-opt",
+        "seccomp=unconfined"
+      ]
+    },
+    "vulkan": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "video",
+        "--security-opt",
+        "seccomp=unconfined"
+      ]
+    },
+    "intel-level-zero": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "video",
+        "--group-add",
+        "render",
+        "--security-opt",
+        "seccomp=unconfined"
+      ]
+    },
+    "nvidia-gb10": {
+      "engine_args": [
+        "--runtime",
+        "/usr/bin/nvidia-container-runtime",
+        "--env",
+        "NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=all"
+      ]
+    },
+    "halogen-strix-halo": {
+      "engine_args": [
+        "--pull=always",
+        "--device",
+        "/dev/kfd",
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "video",
+        "--group-add",
+        "render",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--ipc=host",
+        "--ulimit",
+        "memlock=-1:-1"
+      ]
+    }
+  },
+  "toolboxes": [
+    {
+      "id": "strix-halo-llama-rocm-10-0",
+      "backend": "llama_cpp",
+      "name": "llama-rocm-10.0",
+      "container_name": "llama-rocm-10.0",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Stable ROCm 10.0 backend (recommended)",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-hrx-staging",
+      "backend": "llama_cpp",
+      "name": "llama-hrx-staging",
+      "container_name": "llama-hrx-staging",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:hrx-staging",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "AMD HRX staging build for Strix Halo; Qwen3-30B-A3B-Instruct-2507 Q4_K_M is the initial RFC target. Other model coverage is evolving.",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "strix-halo",
+          "model_id": "llama-unsloth-qwen3-30b-a3b-instruct-2507-gguf",
+          "model_filename_pattern": "*Q4_K_M*.gguf",
+          "model_display_name": "Qwen3 30B A3B Instruct 2507 Q4_K_M",
+          "message": "The original HRX RFC targeted this exact model and quant on gfx1151. The staging build has broader but still evolving model coverage.",
+          "documentation_url": "https://github.com/ggml-org/llama.cpp/discussions/27219",
+          "notes": [
+            "The original draft PR only established Qwen3-30B-A3B-Instruct-2507 Q4_K_M as its supported target.",
+            "AMD's newer staging branch adds broader operator and model coverage, but other GGUFs are not validated for this toolbox.",
+            "Keep batch and microbatch equal for the initial Qwen test; the RFC notes that chunked prefill against a non-empty KV cache is unsupported."
+          ],
+          "server_defaults": {
+            "context_size": 8192,
+            "batch_size": 1024,
+            "ubatch_size": 1024,
+            "gpu_layers": 999,
+            "parallel_sequences": 1,
+            "load_mode": "none",
+            "flash_attention": true,
+            "mtp_enabled": false
+          }
+        }
+      }
+    },
+    {
+      "id": "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next",
+      "backend": "llama_cpp",
+      "name": "llama-rocm-10.0-qwen-3.8-flash-next",
+      "container_name": "llama-rocm-10.0-qwen-3.8-flash-next",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Purpose-built Qwen3.8 Flash Next fork with GPU TOP_K, native MTP, and ngram-mod (Strix Halo only)",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "strix-halo",
+          "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+          "model_filename_pattern": "*UD-IQ4_XS*.gguf",
+          "model_display_name": "Qwen 3.8 Flash Next UD-IQ4_XS",
+          "message": "Validated for Qwen 3.8 Flash Next UD-IQ4_XS on AMD Strix Halo / gfx1151 with drluoto's Q8_0 MTP sidecar.",
+          "documentation_url": "https://github.com/drluoto/flash-next-strix-halo",
+          "sidecar": {
+            "repo": "drluoto/Qwen3.8-Flash-Next-MTP-GGUF",
+            "filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
+          },
+          "server_defaults": {
+            "context_size": 262144,
+            "gpu_layers": 999,
+            "parallel_sequences": 1,
+            "load_mode": "dio",
+            "flash_attention": true,
+            "mtp": {
+              "default_draft_n": 3,
+              "default_np": 1,
+              "spec_types": [
+                "draft-mtp",
+                "ngram-mod"
+              ],
+              "ngram_mod_n_max": 64,
+              "ngram_mod_n_match": 24
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "strix-halo-llama-rocm-10-0-engramhalo",
+      "backend": "llama_cpp",
+      "name": "llama-rocm-10.0-engramhalo",
+      "container_name": "llama-rocm-10.0-engramhalo",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-engramhalo",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "EngramHalo Qwen3.8 Flash-Next ROCm/HIP fork with sparse QSA, SSD-backed engram loading, and MTP (Strix Halo only; experimental ROCm 10.0 port)",
+      "runtime_profile": "amd-rocm-hipblaslt",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "strix-halo",
+          "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+          "model_filename_patterns": [
+            "*UD-IQ3_XXS*.gguf",
+            "*UD-IQ4_XS*.gguf"
+          ],
+          "model_display_name": "Qwen 3.8 Flash Next UD-IQ3_XXS or UD-IQ4_XS",
+          "message": "EngramHalo SSD + MTP profile for Qwen 3.8 Flash Next on AMD Strix Halo / gfx1151.",
+          "documentation_url": "https://github.com/Aristo94/EngramHalo.cpp/blob/strix-halo-qwen4exp/docs/strix-halo/README.md",
+          "notes": [
+            "Validated main-model quants: UD-IQ3_XXS and UD-IQ4_XS.",
+            "SSD default: mmap with --lazy-mode on keeps the 26.8 GiB engram table SSD-backed, with about 1–1.5 GiB resident.",
+            "RAM option: select load mode none and replace --lazy-mode on with --lazy-mode off; budget another 26.8 GiB of RAM.",
+            "MTP is validated at 163840 context with one slot. Disable MTP for 262144 context or multiple parallel slots."
+          ],
+          "sidecar": {
+            "repo": "EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF",
+            "filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
+          },
+          "server_defaults": {
+            "context_size": 163840,
+            "batch_size": 8192,
+            "ubatch_size": 2048,
+            "gpu_layers": 999,
+            "parallel_sequences": 1,
+            "kv_cache_type": "q8_0",
+            "load_mode": "mmap",
+            "flash_attention": true,
+            "extra_args": "--lazy-mode on -t 4",
+            "mtp": {
+              "default_draft_n": 4,
+              "default_np": 1,
+              "spec_types": [
+                "draft-mtp",
+                "ngram-mod"
+              ],
+              "spec_draft_p_min": 0.75
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "strix-halo-llama-vulkan-radv",
+      "backend": "llama_cpp",
+      "name": "llama-vulkan-radv",
+      "container_name": "llama-vulkan-radv",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Mesa RADV Vulkan backend",
+      "runtime_profile": "vulkan",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-vulkan-radv-performance",
+      "backend": "llama_cpp",
+      "name": "llama-vulkan-radv-performance",
+      "container_name": "llama-vulkan-radv-performance",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv-performance",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Strix Halo Vulkan performance fork (Experimental)",
+      "runtime_profile": "vulkan",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-therock-nightly",
+      "backend": "llama_cpp",
+      "name": "llama-therock-nightly",
+      "container_name": "llama-therock-nightly",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:therock-nightly",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "TheRock nightly builds \u2014 bleeding edge, may contain bugs",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-rocm-7-2-4-turboquant",
+      "backend": "llama_cpp",
+      "name": "llama-rocm-7.2.4-turboquant",
+      "container_name": "llama-rocm-7.2.4-turboquant",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4-turboquant",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Experimental Turbo Quant build (ROCm 7.2.4)",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-rocm-10-0-rocmfpx",
+      "backend": "llama_cpp",
+      "name": "llama-rocm-10.0-rocmfpx",
+      "container_name": "llama-rocm-10.0-rocmfpx",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-rocmfpx",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "ROCmFPX build \u2014 ROCmFP3/FP4/FP6/FP8 weight formats with MTP (ROCm 10.0)",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-llama-vulkan-rocmfpx",
+      "backend": "llama_cpp",
+      "name": "llama-vulkan-rocmfpx",
+      "container_name": "llama-vulkan-rocmfpx",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-rocmfpx",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "ROCmFPX build \u2014 ROCmFP3/FP4/FP6/FP8 weight formats with MTP (Vulkan only)",
+      "runtime_profile": "vulkan",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "r9700-llama-rocm-10-0",
+      "backend": "llama_cpp",
+      "name": "r9700-llama-rocm-10.0",
+      "container_name": "r9700-llama-rocm-10.0",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:rocm-10.0",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Stable ROCm 10.0 Core SDK backend for gfx1201",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "r9700",
+          "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+          "model_filename_pattern": "*UD-Q2_K_XL*.gguf",
+          "model_display_name": "Qwen 3.8 Flash Next UD-Q2_K_XL",
+          "message": "Tested dual-R9700 mainline ROCm/HIP profile for Qwen 3.8 Flash Next UD-Q2_K_XL.",
+          "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+          "notes": [
+            "Requires two AMD Radeon AI PRO R9700 devices; HIP_VISIBLE_DEVICES=0,1 is preset when this profile is selected.",
+            "Validated on mainline llama.cpp build 10789 with ROCm 10.0/HIP at native 262144 context using q8_0 KV cache and lazy ngram loading.",
+            "ROCm/HIP is recommended over Vulkan for Qwen 3.8 Flash Next on R9700 for now.",
+            "MTP is intentionally disabled for this mainline profile."
+          ],
+          "server_defaults": {
+            "context_size": 262144,
+            "batch_size": 2048,
+            "ubatch_size": 1024,
+            "gpu_layers": null,
+            "parallel_sequences": 1,
+            "kv_cache_type": "q8_0",
+            "load_mode": "mmap",
+            "flash_attention": true,
+            "hip_devices": "0,1",
+            "mtp_enabled": false,
+            "extra_args": "--split-mode layer --fit on --fit-target 2048,2048 --lazy-mode on -t 4 --cache-ram 0"
+          }
+        }
+      }
+    },
+    {
+      "id": "r9700-r9v-rocm-10-0",
+      "backend": "r9v",
+      "name": "R9V Qwen3.8 Flash Next (ROCm 10)",
+      "container_name": "r9700-r9v-shell",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0",
+      "channel": "stable",
+      "maturity": "experimental",
+      "description": "Tested Qwen3.8 Flash Next IQ4_XS + FP8 MTP on 2× R9700 32 GB, 64 GB RAM and NVMe. Download the exact R9V package and prepare PLE in Models. Manual image releases.",
+      "runtime_profile": "amd-rocm",
+      "server_binary": "r9v-serve",
+      "toolbox_compatible": true,
+      "features": {
+        "interactive": "supported",
+        "models": "experimental",
+        "server": "experimental"
+      },
+      "backend_config": {
+        "model_id": "r9v-qwen38-flash-next-iq4-xs",
+        "required_gpus": 2,
+        "host_ram_gb": 64,
+        "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes/blob/main/docs/r9v-rocm-10.0.md"
+      }
+    },
+    {
+      "id": "r9700-llama-vulkan-radv",
+      "backend": "llama_cpp",
+      "name": "r9700-llama-vulkan-radv",
+      "container_name": "r9700-llama-vulkan-radv",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-radv",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Mesa RADV Vulkan backend (recommended for stability)",
+      "runtime_profile": "vulkan",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "r9700-llama-vulkan-rocmfpx",
+      "backend": "llama_cpp",
+      "name": "r9700-llama-vulkan-rocmfpx",
+      "container_name": "r9700-llama-vulkan-rocmfpx",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-rocmfpx",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "ROCmFPX build \u2014 ROCmFP3/FP4/FP6/FP8 weight formats with MTP (Vulkan only)",
+      "runtime_profile": "vulkan",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "r9700-llama-therock-nightly",
+      "backend": "llama_cpp",
+      "name": "r9700-llama-therock-nightly",
+      "container_name": "r9700-llama-therock-nightly",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:therock-nightly",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "TheRock multi-arch nightly backend for gfx1200/gfx1201",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "intel-b70-b70-llama-sycl",
+      "backend": "llama_cpp",
+      "name": "b70-llama-sycl",
+      "container_name": "b70-llama-sycl",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-ai-toolboxes:sycl",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "oneAPI SYCL backend (recommended)",
+      "runtime_profile": "intel-level-zero",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "intel-b70-b70-llama-vulkan",
+      "backend": "llama_cpp",
+      "name": "b70-llama-vulkan",
+      "container_name": "b70-llama-vulkan",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-ai-toolboxes:vulkan",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Vulkan backend",
+      "runtime_profile": "intel-level-zero",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-ds4-rocm-10-0",
+      "backend": "ds4",
+      "name": "ds4-rocm-10.0",
+      "container_name": "ds4-rocm-10.0",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/strix-halo-ds4-toolbox:rocm-10.0",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "ROCm 10.0 MMQ kernel lab \u2014 Recommended for most users",
+      "runtime_profile": "amd-rocm",
+      "server_binary": "ds4-server",
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-ds4-therock-nightly",
+      "backend": "ds4",
+      "name": "ds4-therock-nightly",
+      "container_name": "ds4-therock-nightly",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/strix-halo-ds4-toolbox:therock-nightly",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Latest TheRock multi-arch gfx1151 nightly",
+      "runtime_profile": "amd-rocm",
+      "server_binary": "ds4-server",
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "strix-vllm-latest",
+      "backend": "vllm",
+      "name": "vLLM TheRock",
+      "container_name": "vllm-therock-gfx1151",
+      "image": "docker.io/kyuz0/vllm-therock-gfx1151:latest",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Last verified vLLM build for gfx1151.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "group": "Official Toolboxes"
+    },
+    {
+      "id": "strix-vllm-dev",
+      "backend": "vllm",
+      "name": "vLLM TheRock Development",
+      "container_name": "vllm-therock-gfx1151-dev",
+      "image": "docker.io/kyuz0/vllm-therock-gfx1151:dev",
+      "channel": "development",
+      "maturity": "experimental",
+      "description": "Latest development vLLM image.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "group": "Development Toolboxes"
+    },
+    {
+      "id": "strix-comfyui-latest",
+      "backend": "comfyui",
+      "name": "ComfyUI Stable",
+      "container_name": "comfyui-strix-halo",
+      "image": "docker.io/kyuz0/amd-strix-halo-comfyui:latest",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "ComfyUI image and video toolbox for gfx1151.",
+      "runtime_profile": "amd-rocm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "group": "Official Toolboxes"
+    },
+    {
+      "id": "strix-comfyui-dev",
+      "backend": "comfyui",
+      "name": "ComfyUI Development",
+      "container_name": "comfyui-strix-halo-dev",
+      "image": "docker.io/kyuz0/amd-strix-halo-comfyui:dev",
+      "channel": "development",
+      "maturity": "experimental",
+      "description": "Development ComfyUI image.",
+      "runtime_profile": "amd-rocm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "group": "Development Toolboxes"
+    },
+    {
+      "id": "gb10-llama-cuda13",
+      "backend": "llama_cpp",
+      "name": "llama.cpp CUDA 13",
+      "container_name": "llama-cuda13-gb10",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/gb10-toolboxes:llama.cpp-cuda13",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "CUDA 13 llama.cpp build for NVIDIA GB10",
+      "runtime_profile": "nvidia-gb10",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "gb10-ds4-cuda13",
+      "backend": "ds4",
+      "name": "DS4 CUDA 13",
+      "container_name": "ds4-cuda13-gb10",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/gb10-toolboxes:ds4-cuda13",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "CUDA 13 DS4 build for NVIDIA GB10",
+      "runtime_profile": "nvidia-gb10",
+      "server_binary": "ds4-server",
+      "features": {
+        "interactive": "supported",
+        "server": "supported",
+        "models": "supported"
+      }
+    },
+    {
+      "id": "gb10-vllm-cu130",
+      "backend": "vllm",
+      "name": "vLLM CUDA 13 Nightly",
+      "container_name": "vllm-cu130-gb10",
+      "group": "Development Toolboxes",
+      "image": "docker.io/kyuz0/gb10-toolboxes:vllm-cu130",
+      "channel": "development",
+      "maturity": "experimental",
+      "description": "Official CUDA 13 vLLM nightly base for NVIDIA GB10",
+      "runtime_profile": "nvidia-gb10",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "policy_overrides": {
+          "valid_tp": [
+            1
+          ],
+          "attention_backend": null,
+          "attention_backend_label": "vLLM automatic selection",
+          "env": {}
+        }
+      }
+    },
+    {
+      "id": "strix-halo-halogen-flash",
+      "backend": "halogen",
+      "name": "Halogen Flash (latest)",
+      "container_name": "halogen-flash",
+      "group": "Server only",
+      "image": "ghcr.io/peonist-ai/halogen-flash-server:latest",
+      "channel": "stable",
+      "maturity": "experimental",
+      "description": "Qwen3.8-Flash-Next HGN server for Strix Halo (gfx1151). Pull the image here; start it in Server Mode. Not a Toolbx/Distrobox image.",
+      "runtime_profile": "halogen-strix-halo",
+      "toolbox_compatible": false,
+      "features": {
+        "interactive": "unavailable",
+        "models": "supported",
+        "server": "experimental"
+      }
+    }
+  ],
+  "platforms": [
+    {
+      "id": "strix-halo",
+      "name": "AMD Strix Halo",
+      "description": "Ryzen AI Max, gfx1151",
+      "toolbox_ids": [
+        "strix-halo-llama-rocm-10-0",
+        "strix-halo-llama-hrx-staging",
+        "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next",
+        "strix-halo-llama-rocm-10-0-engramhalo",
+        "strix-halo-llama-vulkan-radv",
+        "strix-halo-llama-vulkan-radv-performance",
+        "strix-halo-llama-therock-nightly",
+        "strix-halo-llama-rocm-7-2-4-turboquant",
+        "strix-halo-llama-rocm-10-0-rocmfpx",
+        "strix-halo-llama-vulkan-rocmfpx",
+        "strix-halo-ds4-rocm-10-0",
+        "strix-halo-ds4-therock-nightly",
+        "strix-vllm-latest",
+        "strix-vllm-dev",
+        "strix-comfyui-latest",
+        "strix-comfyui-dev",
+        "strix-halo-halogen-flash"
+      ],
+      "defaults": {
+        "llama_cpp": "strix-halo-llama-rocm-10-0",
+        "ds4": "strix-halo-ds4-rocm-10-0",
+        "vllm": "strix-vllm-latest",
+        "comfyui": "strix-comfyui-latest",
+        "halogen": "strix-halo-halogen-flash"
+      }
+    },
+    {
+      "id": "r9700",
+      "name": "AMD Radeon AI PRO R9700",
+      "description": "RDNA 4, gfx1201",
+      "toolbox_ids": [
+        "r9700-llama-rocm-10-0",
+        "r9700-llama-therock-nightly",
+        "r9700-llama-vulkan-radv",
+        "r9700-llama-vulkan-rocmfpx",
+        "r9700-r9v-rocm-10-0"
+      ],
+      "defaults": {
+        "llama_cpp": "r9700-llama-rocm-10-0",
+        "r9v": "r9700-r9v-rocm-10-0"
+      }
+    },
+    {
+      "id": "gb10",
+      "name": "NVIDIA GB10",
+      "description": "DGX Spark and other NVIDIA GB10 systems",
+      "toolbox_ids": [
+        "gb10-llama-cuda13",
+        "gb10-ds4-cuda13",
+        "gb10-vllm-cu130"
+      ],
+      "defaults": {
+        "llama_cpp": "gb10-llama-cuda13",
+        "ds4": "gb10-ds4-cuda13",
+        "vllm": "gb10-vllm-cu130"
+      }
+    },
+    {
+      "id": "intel-b70",
+      "name": "Intel Arc B70",
+      "description": "Battlemage / Level Zero",
+      "toolbox_ids": [
+        "intel-b70-b70-llama-sycl",
+        "intel-b70-b70-llama-vulkan"
+      ],
+      "defaults": {
+        "llama_cpp": "intel-b70-b70-llama-sycl"
+      }
+    }
+  ]
+}

@@ -104,6 +104,7 @@ impl BenchmarkStore {
             model,
             artifact,
             runtime,
+            serving_runtime: None,
             hardware,
             workload,
             experiment,

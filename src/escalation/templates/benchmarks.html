@@ -19,6 +19,8 @@ main{padding:22px;max-width:1700px;margin:auto}.notice{padding:12px 14px;border:
 details{border-top:1px solid var(--border);padding:12px 0}summary{cursor:pointer;font-weight:600;padding:4px 0}fieldset{border:0;padding:0;margin:0;min-width:0}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.workflow{margin:24px 0}.workflow>details{padding:16px 0}.workflow pre{max-height:360px}.inline-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.inline-label>input,.inline-label>select{width:auto}.wide{grid-column:1/-1}.lab{margin-bottom:28px}.lab-grid{display:grid;grid-template-columns:minmax(300px,1fr) minmax(0,2fr);gap:12px}.lab-card{padding:14px}.lab-card .fields{grid-template-columns:repeat(2,minmax(0,1fr))}.progress{width:120px;height:8px;border:0;background:var(--panel2);accent-color:var(--cyan)}
 dialog{width:min(1180px,94vw);max-height:90vh;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:0}dialog::backdrop{background:#000b}.dialog-head{display:flex;align-items:center;gap:12px;padding:14px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);z-index:1}.dialog-head h2{margin:0;overflow-wrap:anywhere;min-width:0}.dialog-body{padding:18px}.detail-section{border-top:1px solid var(--border);padding:16px 0}.detail-section:first-child{border-top:0}.detail-section h3{margin:0 0 12px}.definition{display:grid;grid-template-columns:minmax(130px,1fr) minmax(0,3fr);margin:0;gap:8px 18px}.definition dt{color:var(--dim)}.definition dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.definition .definition{grid-template-columns:minmax(100px,1fr) minmax(0,2fr)}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(--dim);font:12px ui-monospace,monospace;line-height:1.5;overflow:auto;background:var(--panel2)}.spark-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.spark{margin:0;padding:8px 0}.spark figcaption{font-size:13px}.spark svg{height:85px}.quality-table{min-width:1000px}.quality-table td{max-width:260px;overflow-wrap:anywhere}#preview-summary{font-weight:600}#success a{margin-left:8px}#selected-candidate{overflow-wrap:anywhere}
+.entity-picker{display:flex;flex-wrap:wrap;gap:6px 16px;margin:8px 0}.chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:4px 10px;font-size:13px}.chip button{background:none;border:0;color:var(--red);cursor:pointer;font:inherit;padding:0;line-height:1}
+#spider-legend{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--dim)}#spider-legend li{overflow-wrap:anywhere}#spider-chart{max-width:560px;margin:0 auto}
 @media(max-width:1050px){.filters{grid-template-columns:1fr 1fr}.charts,.lab-grid{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}.fields{grid-template-columns:1fr 1fr}}
 @media(max-width:650px){body{font-size:16px}main{padding:14px}header{padding:14px}.fields,.spark-grid{grid-template-columns:1fr}.definition,.definition .definition{grid-template-columns:1fr;gap:4px}.definition dd{margin-bottom:10px}input,select,textarea{font-size:16px}.dialog-body{padding:12px}.dialog-head{flex-wrap:wrap}.kpi-value{font-size:20px}.filters{grid-template-columns:1fr}}
 </style>
@@ -30,6 +32,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
   <div><h1>Benchmark Lab</h1><div class="subtitle">Native Riddllr and Plumebench execution with a shared evidence registry</div></div>
   <div class="spacer"></div>
   <a class="btn primary" href="#lab">Run benchmark</a>
+  <a class="btn primary" href="#spider">Compare on radar</a>
   <a class="btn primary" href="#workflows">Plan &amp; import</a>
   <button class="btn" id="export-jsonl">Export filtered JSONL</button>
   <button class="btn" id="export-csv">Export filtered CSV</button>
@@ -68,6 +71,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
       <label>Search<input id="q" placeholder="Model, runtime, workload, run ID" type="search"></label>
       <label>Family<select id="family"><option value="">All families</option></select></label>
       <label>Backend<select id="backend"><option value="">All backends</option></select></label>
+      <label>Toolbox backend<select id="toolbox_backend"><option value="">All toolbox backends</option></select></label>
+      <label>Compute API<select id="compute_api"><option value="">All compute APIs</option></select></label>
       <label>Workload<select id="workload"><option value="">All workloads</option></select></label>
       <label>Quantization<select id="quant_name"><option value="">All quantizations</option></select></label>
       <label>Status<select id="status"><option value="">All statuses</option></select></label>
@@ -102,6 +107,43 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
       </div>
       <div class="pager"><button class="btn" id="prev">Previous</button><span id="page-label"></span><button class="btn" id="next">Next</button><span class="spacer"></span><label class="inline-label">Sort<select id="sort"><option value="started_at:desc">Newest</option><option value="generation_tps:desc">Generation TPS</option><option value="prompt_tps:desc">Prompt TPS</option><option value="ttft_ms:asc">TTFT</option><option value="context_tokens:desc">Context</option></select></label></div>
     </section>
+  </section>
+  <section id="spider" aria-labelledby="spider-title">
+    <h2 id="spider-title">Compare dimensions on a radar chart</h2>
+    <p class="hint">Facets here narrow the underlying run population and are independent from the run filters above. Pick what to compare, then which axes to plot.</p>
+    <div class="filters" id="spider-facets">
+      <label>Engine (compute API)<select id="spider-compute-api"><option value="">All engines</option></select></label>
+      <label>Toolbox backend<select id="spider-toolbox-backend"><option value="">All toolbox backends</option></select></label>
+      <label>Toolbox<select id="spider-toolbox-id"><option value="">All toolboxes</option></select></label>
+      <label>Quantization<select id="spider-quant-name"><option value="">All quantizations</option></select></label>
+    </div>
+    <fieldset>
+      <legend>Compare by</legend>
+      <label>Compare<select id="spider-series"><option value="family">Models</option><option value="workload">Harnesses</option><option value="family_workload">Model × harness pairs</option></select></label>
+      <div id="spider-workload-pin-wrap">
+        <label>Workload/harness to pin (required when comparing models — token cost is workload-dependent)<select id="spider-workload-pin"><option value="">Choose a workload</option></select></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Entities to plot (2–5)</legend>
+      <div class="entity-picker" id="spider-entity-picker"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Axes (2 minimum)</legend>
+      <div class="toolbar">
+        <label class="inline-label"><input type="checkbox" id="spider-axis-tepr" checked> Token efficiency to positive result (TEPR)</label>
+        <label class="inline-label"><input type="checkbox" id="spider-axis-speed" checked> Speed (mean generation TPS)</label>
+      </div>
+      <p class="hint">TEPR: total <code>quality_results.generated_tokens</code> across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Treat it with the same page-only-sample caution as every other chart here.</p>
+    </fieldset>
+    <div class="toolbar"><button class="btn primary" id="spider-plot">Plot radar chart</button></div>
+    <p id="spider-message" class="message" role="status"></p>
+    <div class="chart">
+      <h3>Radar comparison</h3>
+      <svg id="spider-chart" viewBox="0 0 600 300" role="img" aria-label="Radar chart comparing selected entities across selected axes"></svg>
+      <ul id="spider-legend"></ul>
+      <p id="spider-caption" class="hint"></p>
+    </div>
   </section>
   <section id="workflows" class="workflow" aria-labelledby="workflow-title">
     <h2 id="workflow-title">Plan, prepare, then confirm</h2>
@@ -177,6 +219,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
 const state={page:1,perPage:25,totalPages:0,items:[]};
 const labState={suites:[],jobs:[],timer:null,generation:0};
 const colors=['#22d39a','#3ec5ff','#9d7bff','#f5b14a','#ff6b6b','#ff7ac6'];
+const SPIDER_PAIR_SEPARATOR='::'; // must match src/benchmark.rs's SPIDER_PAIR_SEPARATOR
 const byId=id=>document.getElementById(id);
 const finite=n=>typeof n==='number'&&Number.isFinite(n);
 const num=(n,d=1)=>finite(n)?n.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):'Not reported';
@@ -305,7 +348,7 @@ async function cancelLabJob(id){
 }
 function params(includePage=true){
   const p=new URLSearchParams();
-  for(const id of ['q','family','backend','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
+  for(const id of ['q','family','backend','toolbox_backend','compute_api','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
   const [sort,order]=byId('sort').value.split(':');p.set('sort',sort);p.set('order',order);
   if(includePage){p.set('page',state.page);p.set('per_page',state.perPage)}return p;
 }
@@ -314,7 +357,137 @@ function optionList(id,values){
   for(const value of values){const option=el('option',value);option.value=value;select.append(option)}
   if(values.includes(selected))select.value=selected;
 }
-async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');for(const [id,key] of [['family','families'],['backend','backends'],['workload','workloads'],['quant_name','quant_names'],['status','statuses']])optionList(id,f[key])}
+async function loadFilters(){
+  const f=await jsonFetch('/api/benchmarks/filters');
+  for(const [id,key] of [['family','families'],['backend','backends'],['toolbox_backend','toolbox_backends'],['compute_api','compute_apis'],['workload','workloads'],['quant_name','quant_names'],['status','statuses']])optionList(id,f[key]);
+  spiderState.filters=f;renderSpiderFacets(f);renderSpiderEntityPicker();
+}
+
+// -- Spider/radar chart (design doc §17). Facets/series/axes are independent
+// from the run-table filters above: they narrow a comparison cohort, not
+// "which rows are listed". series_values are always plain strings from
+// `/api/benchmarks/filters`; the `family_workload` series builds its own
+// `family::workload` keys client-side (matching SPIDER_PAIR_SEPARATOR).
+const spiderState={filters:null,pairs:[],entityChecks:[],pairChipsEl:null};
+function spiderSeriesKind(){return byId('spider-series').value}
+function spiderFacetParams(){
+  const p=new URLSearchParams();
+  for(const [id,key] of [['spider-compute-api','compute_api'],['spider-toolbox-backend','toolbox_backend'],['spider-toolbox-id','toolbox_id'],['spider-quant-name','quant_name']]){const value=byId(id).value.trim();if(value)p.set(key,value)}
+  return p;
+}
+function spiderEntityValues(kind){if(!spiderState.filters)return [];return kind==='workload'?spiderState.filters.workloads:spiderState.filters.families}
+function enforceSpiderEntityLimit(){
+  const checked=spiderState.entityChecks.filter(c=>c.checked);
+  for(const c of spiderState.entityChecks)if(!c.checked)c.disabled=checked.length>=5;
+}
+function renderSpiderPairChips(){
+  const chips=spiderState.pairChipsEl;if(!chips)return;chips.replaceChildren();
+  for(const key of spiderState.pairs){
+    const [family,workload]=key.split(SPIDER_PAIR_SEPARATOR),chip=el('span',family+' / '+workload,'chip');
+    const remove=button('×',()=>{spiderState.pairs=spiderState.pairs.filter(x=>x!==key);renderSpiderPairChips()});
+    remove.setAttribute('aria-label','Remove pair '+family+' / '+workload);chip.append(remove);chips.append(chip);
+  }
+}
+function renderSpiderPairBuilder(wrap){
+  const row=el('div',undefined,'inline-label');
+  const familySelect=el('select');familySelect.append(el('option','Choose a model'));familySelect.options[0].value='';
+  for(const value of spiderState.filters?.families||[]){const option=el('option',value);option.value=value;familySelect.append(option)}
+  const workloadSelect=el('select');workloadSelect.append(el('option','Choose a harness'));workloadSelect.options[0].value='';
+  for(const value of spiderState.filters?.workloads||[]){const option=el('option',value);option.value=value;workloadSelect.append(option)}
+  const add=button('Add pair',()=>{
+    const family=familySelect.value,workload=workloadSelect.value;
+    if(!family||!workload)return message('spider-message','Choose both a model and a harness before adding a pair.',true);
+    const key=family+SPIDER_PAIR_SEPARATOR+workload;
+    if(spiderState.pairs.includes(key))return message('spider-message','That pair is already added.',true);
+    if(spiderState.pairs.length>=5)return message('spider-message','A radar chart compares at most 5 entities.',true);
+    spiderState.pairs.push(key);renderSpiderPairChips();message('spider-message','');
+  });
+  row.append(familySelect,workloadSelect,add);wrap.append(row);
+  const chips=el('div',undefined,'chips');spiderState.pairChipsEl=chips;wrap.append(chips);renderSpiderPairChips();
+}
+function renderSpiderEntityPicker(){
+  const kind=spiderSeriesKind(),wrap=byId('spider-entity-picker');wrap.replaceChildren();spiderState.entityChecks=[];
+  byId('spider-workload-pin-wrap').hidden=kind!=='family';
+  if(kind==='family_workload'){spiderState.pairs=[];renderSpiderPairBuilder(wrap);return}
+  const values=spiderEntityValues(kind);
+  if(!values||!values.length){wrap.append(el('p','No '+(kind==='workload'?'workloads':'families')+' available yet.','hint'));return}
+  for(const value of values){
+    const label=el('label',undefined,'inline-label'),input=el('input');
+    input.type='checkbox';input.value=value;input.onchange=enforceSpiderEntityLimit;
+    label.append(input,el('span',value));wrap.append(label);spiderState.entityChecks.push(input);
+  }
+}
+function renderSpiderFacets(f){
+  for(const [id,key] of [['spider-compute-api','compute_apis'],['spider-toolbox-backend','toolbox_backends'],['spider-toolbox-id','toolbox_ids'],['spider-quant-name','quant_names']])optionList(id,f[key]);
+  optionList('spider-workload-pin',f.workloads);
+}
+function selectedSpiderEntities(){
+  const kind=spiderSeriesKind();
+  if(kind==='family_workload')return spiderState.pairs.slice();
+  return spiderState.entityChecks.filter(c=>c.checked).map(c=>c.value);
+}
+function selectedSpiderAxes(){const axes=[];if(byId('spider-axis-tepr').checked)axes.push('tepr');if(byId('spider-axis-speed').checked)axes.push('speed');return axes}
+function emptyRadar(svg){const text=svgEl('text',{x:300,y:150,class:'tick','text-anchor':'middle'});text.textContent='Choose entities and axes, then plot the radar chart';svg.append(text)}
+function drawRadar(id,response){
+  const svg=byId(id);svg.replaceChildren();
+  const axesList=response.axes,series=response.series,cx=300,cy=150,radius=110,n=axesList.length;
+  if(!n||!series.length){emptyRadar(svg);return}
+  const angleFor=i=>-Math.PI/2+i*2*Math.PI/n;
+  const ranges=new Map(axesList.map(axis=>{const values=series.map(s=>s.axis_values[axis]).filter(finite);return [axis,{min:values.length?Math.min(...values):0,max:values.length?Math.max(...values):1}]}));
+  const pointFor=(i,value)=>{
+    const axis=axesList[i],{min,max}=ranges.get(axis),span=max-min||1,ratio=finite(value)?(value-min)/span:0,clamped=Math.max(0,Math.min(1,ratio)),r=radius*clamped,angle=angleFor(i);
+    return [cx+r*Math.cos(angle),cy+r*Math.sin(angle)];
+  };
+  for(const fraction of [.25,.5,.75,1]){
+    const points=axesList.map((_,i)=>{const angle=angleFor(i),r=radius*fraction;return (cx+r*Math.cos(angle))+','+(cy+r*Math.sin(angle))}).join(' ');
+    svg.append(svgEl('polygon',{points,fill:'none',class:'axis'}));
+  }
+  axesList.forEach((axis,i)=>{
+    const angle=angleFor(i);
+    svg.append(svgEl('line',{x1:cx,y1:cy,x2:cx+radius*Math.cos(angle),y2:cy+radius*Math.sin(angle),class:'axis'}));
+    const label=svgEl('text',{x:cx+(radius+20)*Math.cos(angle),y:cy+(radius+20)*Math.sin(angle),class:'tick','text-anchor':'middle'});
+    label.textContent=axis.toUpperCase();svg.append(label);
+  });
+  series.forEach((s,si)=>{
+    const color=colors[si%colors.length],coords=axesList.map((axis,i)=>pointFor(i,s.axis_values[axis]));
+    const polygon=svgEl('polygon',{points:coords.map(p=>p.join(',')).join(' '),fill:color+'33',stroke:color,'stroke-width':2});
+    describeSVG(polygon,s.label+': '+axesList.map(axis=>axis+'='+(finite(s.axis_values[axis])?num(s.axis_values[axis],1):'no data')).join(', '));
+    svg.append(polygon);
+    coords.forEach((p,i)=>{
+      const axis=axesList[i],insufficient=s.insufficient_data[axis],value=s.axis_values[axis],dotColor=insufficient||!finite(value)?'#66738a':color;
+      const dot=svgEl('circle',{cx:p[0],cy:p[1],r:5,fill:dotColor,class:'point'});
+      describeSVG(dot,s.label+' '+axis+': '+(finite(value)?num(value,1):'no data')+(insufficient?' — insufficient data, n='+s.sample_n[axis]+', minimum '+response.min_sample_size:', n='+s.sample_n[axis]));
+      svg.append(dot);
+    });
+  });
+}
+function renderSpiderLegend(response){
+  const list=byId('spider-legend');list.replaceChildren();
+  response.series.forEach((s,si)=>{
+    const item=el('li'),swatch=el('span','⬤ ');swatch.setAttribute('style','color:'+colors[si%colors.length]);
+    const details=response.axes.map(axis=>{
+      const value=s.axis_values[axis],count=s.sample_n[axis],insufficient=s.insufficient_data[axis];
+      return axis+': '+(finite(value)?num(value,1):'no data')+' (n='+count+(insufficient?', below minimum '+response.min_sample_size:'')+')';
+    }).join(' · ');
+    const label=el('span',s.label+(s.aggregated_dimensions.length?' (aggregated across models)':'')+' — '+details);
+    item.append(swatch,label);list.append(item);
+  });
+}
+async function plotSpider(){
+  try{
+    const kind=spiderSeriesKind(),entities=selectedSpiderEntities(),axes=selectedSpiderAxes();
+    if(entities.length<2||entities.length>5)throw new Error('Choose between 2 and 5 entities to compare.');
+    if(axes.length<2)throw new Error('Choose at least 2 axes to plot.');
+    if(kind==='family'&&!byId('spider-workload-pin').value)throw new Error('Pin a single workload/harness before comparing by model — token cost is workload-dependent.');
+    const p=spiderFacetParams();p.set('series',kind);p.set('series_values',entities.join(','));p.set('axes',axes.join(','));
+    if(kind==='family'){const workload=byId('spider-workload-pin').value;if(workload)p.set('workload',workload)}
+    message('spider-message','Loading radar chart…');
+    const response=await jsonFetch('/api/benchmarks/spider?'+p);
+    drawRadar('spider-chart',response);renderSpiderLegend(response);
+    byId('spider-caption').textContent='TEPR = total quality_results.generated_tokens summed across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Minimum '+response.min_sample_size+' qualifying runs per axis; below that, a vertex is shown greyed out as insufficient data rather than omitted.';
+    message('spider-message','');
+  }catch(e){message('spider-message',e.message,true)}
+}
 async function load(){
   const generation=++loadGeneration;message('message','Loading runs…');byId('prev').disabled=true;byId('next').disabled=true;
   state.items=[];renderTable([]);renderAnalytics([],0);byId('kpi-runs').textContent='—';byId('page-label').textContent='';
@@ -667,11 +840,14 @@ byId('detail-retry').onclick=()=>showDetail(detailId);
 byId('detail-download').onclick=()=>{if(detailRawText!==null)downloadText(detailRawText,'benchmark-run-detail.json')};
 byId('memory-metric').onchange=()=>drawScatter(state.items);
 for(const format of ['jsonl','csv'])byId('export-'+format).onclick=()=>{const p=params(false);p.set('format',format);location.href='/api/benchmarks/export?'+p};
-for(const id of ['family','backend','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
+for(const id of ['family','backend','toolbox_backend','compute_api','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
 let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);loadGeneration++;searchTimer=setTimeout(()=>{state.page=1;load()},250)};
 byId('prev').onclick=()=>{if(state.page>1){state.page--;load()}};byId('next').onclick=()=>{if(state.page<state.totalPages){state.page++;load()}};
 byId('reload').onclick=load;
 byId('lab-suite').onchange=renderLabCases;byId('lab-start').onclick=startLabJob;byId('lab-refresh').onclick=refreshLabJobs;
+byId('spider-series').onchange=renderSpiderEntityPicker;
+byId('spider-plot').onclick=plotSpider;
+emptyRadar(byId('spider-chart'));
 window.addEventListener('hashchange',openHashRun);initializeExplorer();loadLab();
 </script>
 </body>

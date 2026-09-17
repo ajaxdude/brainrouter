@@ -226,6 +226,14 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⬢</span>
       <span>Models</span>
     </button>
+    <button class="nav-item" id="nav-toolbox-models" onclick="switchView('toolbox-models')">
+      <span class="nav-icon">⇩</span>
+      <span>Downloads</span>
+    </button>
+    <button class="nav-item" id="nav-server-mode" onclick="switchView('server-mode')">
+      <span class="nav-icon">▶</span>
+      <span>Server Mode</span>
+    </button>
     <a class="nav-item" href="/models">
       <span class="nav-icon">M</span>
       <span>Model activity</span>
@@ -289,6 +297,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
   </div>
 
   <!-- All toolboxes -->
+  <div id="cockpit-config-status" style="padding:0 12px 4px;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;display:none"></div>
   <div id="toolbox-list" style="padding:0 12px;display:flex;flex-direction:column;gap:2px"></div>
 
   <!-- Independent routing roles -->
@@ -442,7 +451,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
           </span>
         </div>
         <div id="sankey-container" style="width:100%;height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px">
-          <svg id="sankey-svg" viewBox="0 0 1232 418" width="1300" height="418" style="display:block"></svg>
+          <svg id="sankey-svg" viewBox="0 0 1460 418" width="1460" height="418" style="display:block"></svg>
         </div>
       </div>
       <!-- In-flight requests (llama-swap parity) -->
@@ -523,6 +532,347 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <div style="color:var(--textMute);font-size:12px">Loading...</div>
       </div>
     </div>
+
+    <!-- PR6: toolbox model catalog browsing + native download orchestration
+         (design doc §10). Distinct from #models-view above, which is the
+         unrelated OMP routing-model picker (llama-swap's already-loaded
+         models) — this view is about pulling catalog GGUF/HF assets onto
+         disk for the ds4/halogen/llama_cpp/r9v toolboxes to use. -->
+    <div id="toolbox-models-view" style="display:none;max-width:1100px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+        <div id="toolbox-models-backend-tabs" style="display:flex;gap:6px"></div>
+        <div style="margin-left:auto;display:flex;gap:8px">
+          <button onclick="loadToolboxModels()" style="font-size:11px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer">Refresh</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
+        Browse ai-toolbox-cockpit's model catalog and download models straight onto this host — no cockpit install required.
+        <code style="font-family:'JetBrains Mono',monospace">vllm</code> is excluded: it pulls from Hugging Face at server
+        start instead of a separate download step. Downloads run one at a time; progress is coarse (queued/downloading/
+        complete), not a byte percentage — see the design doc §10.
+      </div>
+      <div id="toolbox-models-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:22px">
+        <div style="color:var(--textMute);font-size:12px">Loading...</div>
+      </div>
+
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">Downloads</div>
+      <div id="toolbox-download-jobs" style="display:flex;flex-direction:column;gap:6px">
+        <div style="color:var(--textMute);font-size:12px">No downloads started yet.</div>
+      </div>
+    </div>
+
+    <!-- PR7/PR8/PR9: ds4 + halogen + vllm Server Mode (design doc §11/§12/§13/§14) —
+         headless detached `podman run` servers, structurally distinct from
+         the Toolboxes tab above (`toolbox create` dev-shells never receive
+         engine_args; only Server Mode's plain `podman run` does). Backend
+         tabs mirror the Downloads view's #toolbox-models-backend-tabs
+         pattern. ds4: single instance, standalone (single-node) launch —
+         multi-node/DSpark/SSD-streaming/MTP are reachable via the
+         custom-args escape hatch. halogen: bundle-based model resolution,
+         env-var-only launch shape, no custom_args (upstream has none).
+         vllm: HF-repo-based model resolution (catalog id or free-form
+         custom repo), policy-gated attention-backend override, separate
+         cache-paths save action (no auto-persist on start). -->
+    <div id="server-mode-view" style="display:none;max-width:900px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+        <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
+      </div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
+        Launch a headless inference server directly from an already-downloaded model — no cockpit install required.
+        v1 covers ds4, halogen, and vllm, one instance per backend at a time, standalone (single-node) mode. ds4's multi-node
+        roles, DSpark, SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args
+        field below — see the design doc §12/§13.
+      </div>
+
+      <div id="sm-panel-ds4" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">ds4 server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-ds4-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model (already downloaded)
+            <select id="sm-ds4-model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context
+              <input id="sm-ds4-ctx" type="number" value="126000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-ds4-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-ds4-port" type="number" value="8000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute)">Custom args (optional, shell-quoted)
+            <input id="sm-ds4-custom-args" type="text" placeholder="e.g. --n-gpu-layers 999" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startDs4Server()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopDs4Server()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-ds4-status" style="font-size:12px;color:var(--textMute)">Loading status…</div>
+
+      <!-- PR8: halogen Server Mode (§13). Bundle-based model resolution
+           (checkpoint + overlay + tokenizer_dir, optional vision_tower) and
+           an env-var-only in-container launch shape (no CLI args, no
+           custom_args escape hatch — upstream's own builder has none to
+           mirror), unlike ds4's CLI-flag/custom_args shape above. -->
+      <div id="sm-panel-halogen" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">halogen server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-halogen-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Bundle (already downloaded)
+            <select id="sm-halogen-bundle" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context size
+              <input id="sm-halogen-ctx" type="number" value="65536" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-halogen-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-halogen-port" type="number" value="8001" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV pool positions
+              <input id="sm-halogen-kv-pool" type="number" value="65536" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV slots
+              <input id="sm-halogen-kv-slots" type="number" value="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Prompt cache
+              <select id="sm-halogen-prompt-cache" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+                <option value="0">0 — off</option>
+                <option value="1">1 — exact-repeat reuse</option>
+                <option value="2" selected>2 — fast prefix reuse (default)</option>
+              </select>
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startHalogenServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopHalogenServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-halogen-status" style="display:none;font-size:12px;color:var(--textMute)">Loading status…</div>
+
+      <!-- PR9: vllm Server Mode (§14). HF-repo-based model resolution
+           (catalog `model_id` dropdown OR a free-form `custom_repo` text
+           field — mutually exclusive, mirroring upstream's own curated-
+           dropdown/free-text pair), a policy-gated attention-backend
+           override (rejected outright when the model locks it, §14 item
+           3), and a separate cache-paths save action distinct from
+           start/stop (upstream has no auto-persist-on-start for vllm,
+           unlike halogen). -->
+      <div id="sm-panel-vllm" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">vllm server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-vllm-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model (already downloaded)
+            <select id="sm-vllm-model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">…or a custom HF repo (bypasses the catalog entirely)
+            <input id="sm-vllm-custom-repo" type="text" placeholder="e.g. owner/model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-vllm-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-vllm-port" type="number" value="8000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Tensor parallel
+              <input id="sm-vllm-tp" type="number" value="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Max num seqs
+              <input id="sm-vllm-max-num-seqs" type="number" value="64" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Max model len
+              <input id="sm-vllm-max-model-len" type="text" value="auto" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">GPU memory util.
+              <input id="sm-vllm-gpu-mem-util" type="number" step="0.01" min="0" max="1" value="0.9" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Attention backend (optional override)
+              <input id="sm-vllm-attention-backend" type="text" placeholder="e.g. TRITON_ATTN" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Dtype
+              <input id="sm-vllm-dtype" type="text" value="auto" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">API key (optional)
+              <input id="sm-vllm-api-key" type="text" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute);display:flex;align-items:center;gap:6px">
+            <input id="sm-vllm-enforce-eager" type="checkbox" style="margin:0"> Enforce eager mode (overrides the model's default)
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Extra args (optional, shell-quoted)
+            <input id="sm-vllm-extra-args" type="text" placeholder="e.g. --enable-auto-tool-choice" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute);display:flex;align-items:center;gap:6px">
+            <input id="sm-vllm-reset-caches" type="checkbox" style="margin:0"> Wipe compiled vllm/triton/aiter caches before start
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startVllmServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopVllmServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-vllm-status" style="display:none;font-size:12px;color:var(--textMute);margin-bottom:16px">Loading status…</div>
+
+      <!-- PR9 §14 item 7: vllm's cache directories (huggingface/vllm/triton/
+           aiter) are saved as their own explicit action into cockpit's
+           shared config.json, distinct from starting a server — mirrors
+           upstream's separate "Save Cache Paths" button exactly. -->
+      <div id="sm-panel-vllm-caches" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">vllm cache paths</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Hugging Face cache
+            <input id="sm-vllm-cache-hf" type="text" placeholder="~/.cache/huggingface" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">vLLM cache
+            <input id="sm-vllm-cache-vllm" type="text" placeholder="~/.cache/vllm" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Triton cache
+            <input id="sm-vllm-cache-triton" type="text" placeholder="~/.cache/triton" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">AITER cache
+            <input id="sm-vllm-cache-aiter" type="text" placeholder="~/.aiter" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="saveVllmCachePaths()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Save cache paths</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PR11 §15/§15a: r9v Server Mode. Unlike ds4/halogen/vllm's toolbox
+           dropdowns, the r9v toolbox/model options below are deliberately
+           NOT filtered to CURRENT_PLATFORM_ID's allowedIds — r9v's only
+           vendored toolbox lives on the `r9700` platform, not the
+           hardcoded `strix-halo` default (design doc's Open question 1:
+           no real per-host platform detection yet), so that filter would
+           make this entire tab permanently empty on the very hosts it's
+           meant for. -->
+      <div id="sm-panel-r9v" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">r9v server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-r9v-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model package (already downloaded, PLE prepared in Downloads)
+            <select id="sm-r9v-package" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-r9v-host" type="text" placeholder="127.0.0.1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-r9v-port" type="number" placeholder="8004" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">GPU devices
+              <input id="sm-r9v-devices" type="text" placeholder="0,1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context
+              <input id="sm-r9v-context" type="number" placeholder="131072" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Batch
+              <input id="sm-r9v-batch" type="number" placeholder="1024" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Sequences
+              <input id="sm-r9v-sequences" type="number" placeholder="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV cache bytes
+              <input id="sm-r9v-kv-bytes" type="number" placeholder="2285670400" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Expert cache slots
+              <input id="sm-r9v-expert-cache-slots" type="number" placeholder="16" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">CPU offload GB
+              <input id="sm-r9v-offload" type="text" placeholder="112.5" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">CPU offload per device
+              <input id="sm-r9v-offload-devices" type="text" placeholder="112.5,112.5" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Served model name
+              <input id="sm-r9v-served-model" type="text" placeholder="qwen3.8-flash-next" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">API key (optional)
+              <input id="sm-r9v-api-key" type="text" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute)">Extra args (optional, shell-quoted)
+            <input id="sm-r9v-extra-args" type="text" placeholder="e.g. --enable-log-requests" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="font-size:10px;color:var(--textMute)">Every field above is optional — blank falls back to r9v's own defaults. TP2/MTP2/SSD-resident PLE are fixed, not configurable.</div>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startR9vServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopR9vServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-r9v-status" style="display:none;font-size:12px;color:var(--textMute);margin-bottom:16px">Loading status…</div>
+
+      <!-- PR11 §15a: r9v's three host directories (models_dir/ple_dir/
+           cache_dir) are saved as their own explicit action, mirroring
+           vllm's separate "Save Cache Paths" pattern above. -->
+      <div id="sm-panel-r9v-paths" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">r9v paths</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Models directory
+            <input id="sm-r9v-path-models" type="text" placeholder="~/models/R9V-Qwen3.8-IQ4_XS" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">PLE directory
+            <input id="sm-r9v-path-ple" type="text" placeholder="~/r9v-data" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Compilation cache directory
+            <input id="sm-r9v-path-cache" type="text" placeholder="~/r9v-data/cache-toolbox-rocm10" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="saveR9vPaths()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Save paths</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PR11a §16: read-only serving-identity registry. Bookkeeping only
+           — no start/stop controls here, and this data never affects
+           request routing (see `serving_identity` module docs / design
+           doc §16 before changing that). -->
+      <div id="sm-panel-serving-identities" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:900px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">Serving identities</div>
+        <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">Currently-registered Server Mode backends — read-only, informational (§16). Populated when a backend above is started, cleared when stopped.</div>
+        <div id="serving-identities-list" style="font-size:12px;color:var(--textMute)">Loading…</div>
+      </div>
+    </div>
+
 
   </div><!-- /content -->
 </div><!-- /main -->
@@ -712,19 +1062,23 @@ function switchView(view) {
   document.getElementById('stream-view').style.display   = view === 'stream'  ? 'flex'  : 'none';
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
   document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
+  document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
+  document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
 
-  ['stream','config','models'].forEach(v => {
+  ['stream','config','models','toolbox-models','server-mode'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  const titles = { stream: 'Routing', config: 'Config', models: 'Models' };
+  const titles = { stream: 'Routing', config: 'Config', models: 'Models', 'toolbox-models': 'Downloads', 'server-mode': 'Server Mode' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
     stream: 'Live routing events · newest first · polling every 3s',
     config: 'Edit configuration files',
     models: 'Pick a model, copy its OMP value, and paste it into OMP',
+    'toolbox-models': 'Catalog models for ds4 / halogen / llama.cpp / r9v — browse, download, verify',
+    'server-mode': 'Launch/stop headless inference servers — ds4 today, more backends in later PRs',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -733,6 +1087,8 @@ function switchView(view) {
 
   if (view === 'config') loadConfig();
   if (view === 'models') loadModels();
+  if (view === 'toolbox-models') loadToolboxModels();
+  if (view === 'server-mode') loadServerMode();
 }
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
@@ -1307,22 +1663,31 @@ function renderGroup(group, index) {
 </script>
 <script>
 // ─── Sankey SVG ───────────────────────────────────────────────────────────────
-// Four columns, built from raw routing events + review sessions:
-//   HARNESS → SESSION → ROUTING DECISION → MODEL
+// Six columns, built from raw routing events + review sessions:
+//   HARNESS → SESSION → ROUTING DECISION → BACKEND → ENGINE → MODEL
 // Clicking any bar filters the card list to requests that crossed that node.
-
+// BACKEND/ENGINE added in PR4 (design doc §6) — column x-positions are now
+// computed from each column's declared `width` (space reserved for its own
+// label text) rather than hardcoded per-column pixel literals, so adding a
+// 7th column later is a one-line addition, not a re-tuning of every x value.
 const SK_COLS = [
-  { name: 'harness', header: 'HARNESS', x: 16   },
-  { name: 'session', header: 'SESSION', x: 300  },
-  { name: 'routing', header: 'ROUTING', x: 720  },
-  { name: 'model',   header: 'MODEL',   x: 1040 },
+  { name: 'harness', header: 'HARNESS', width: 284 },
+  { name: 'session', header: 'SESSION', width: 420 },
+  { name: 'routing', header: 'ROUTING', width: 320 },
+  { name: 'backend', header: 'BACKEND', width: 190 },
+  { name: 'engine',  header: 'ENGINE',  width: 170 },
+  { name: 'model',   header: 'MODEL',   width: 60  }, // last column: trailing margin only
 ];
+(function layoutSankeyColumns() {
+  let x = 16;
+  SK_COLS.forEach(c => { c.x = x; x += c.width; });
+})();
 // SK_H is only the fallback drawing height; updateSankey() measures the
 // container — it stretches bars to fill it, or grows the SVG past it so the
 // container's overflow-y scrollbar takes over.
 const SK_W = 12, SK_H = 420, SK_TOP = 22, SK_PAD = 4;
 const SK_MIN_BAR = 14;  // legible floor: bar + its two label lines
-const SK_TOTAL_W = 1232;
+const SK_TOTAL_W = SK_COLS[SK_COLS.length - 1].x + SK_COLS[SK_COLS.length - 1].width;
 let sankeyFilter = { col: null, key: null };
 // Every link reachable forward and backward from the selected node (union of
 // all start-to-end paths through it).
@@ -1358,7 +1723,7 @@ function skComputePath(allLinks, NC) {
   return { links, nodes };
 }
 
-// Card click: highlight the path formed by a card's four column keys.
+// Card click: highlight the path formed by a card's per-column keys.
 function skPathFromCard(allLinks) {
   const cols = skCardHi;
   const nodes = new Set(), links = new Set();
@@ -1401,7 +1766,28 @@ function skRouting(e) {
   return e._route || deriveRoute(e);
 }
 
-// Col 3 — the model that served the request.
+// Cols 3/4 — which toolbox-family backend/compute-engine served the request
+// (PR4, design doc §6). `toolbox_backend`/`compute_api` are real values
+// (llama_cpp/vulkan today) only for requests the router actually served
+// through a registered serving identity; everything else falls back to an
+// explicit, distinct bucket rather than being silently merged with real
+// data — `cloud` (routed to Manifest), `unknown` (routing errored before
+// reaching any provider), `local_unmanaged` (served locally by something
+// other than a registered toolbox backend — not reachable from today's
+// router, reserved for when that becomes possible). `external`/`status_only`
+// (design doc §6 vocabulary) aren't derivable from `effective_provider`
+// alone and become reachable once later PRs register more serving
+// identities.
+function skServingBucket(e, field) {
+  if (e[field]) return e[field];
+  if (e.effective_provider === 'manifest') return 'cloud';
+  if (!e.effective_provider) return 'unknown';
+  return 'local_unmanaged';
+}
+function skBackend(e) { return skServingBucket(e, 'toolbox_backend'); }
+function skEngine(e) { return skServingBucket(e, 'compute_api'); }
+
+// Col 5 — the model that served the request.
 function skModel(e) {
   if (e.model_key) return e.model_key;
   if (e.effective_provider) return e.effective_provider.split('/').pop();
@@ -1410,7 +1796,8 @@ function skModel(e) {
 
 function skKeysOf(e) {
   return {
-    c0: skHarness(e), c1: skSession(e), c2: skRouting(e), c3: skModel(e),
+    c0: skHarness(e), c1: skSession(e), c2: skRouting(e),
+    c3: skBackend(e), c4: skEngine(e), c5: skModel(e),
   };
 }
 // Does this event match the active Sankey node filter?
@@ -1419,6 +1806,14 @@ function matchesSankey(t) {
   const k = skKeysOf(t);
   return k['c' + sankeyFilter.col] === sankeyFilter.key;
 }
+
+// Shared bucket palette for the backend/engine columns (PR4, §6) — muted for
+// "not really known" states, one flagged red for 'external' (a deliberate
+// manual override, worth visually distinguishing).
+const SK_SERVING_BUCKET_COLORS = {
+  cloud: '#9d7bff', local_unmanaged: '#5a6679', external: '#ff6b6b',
+  unknown: '#5a6679', status_only: '#5a6679',
+};
 
 function skColorFor(col, key) {
   const map = {
@@ -1430,7 +1825,21 @@ function skColorFor(col, key) {
       'hybrid · cloud → local': '#f5b14a', 'local · fallback': '#ff6b6b',
       'local · subs': '#22d39a', 'local · selected model': '#7dd3fc',
     },
-    3: {},
+    // PR4 (design doc §6): real backend ids get stable per-backend colors;
+    // the shared bucket vocabulary (cloud/local_unmanaged/external/unknown/
+    // status_only) gets one consistent muted/flagged palette reused across
+    // both the backend and engine columns, since the same buckets can
+    // appear in either.
+    3: {
+      'llama_cpp': '#3ec5ff', 'ds4': '#22d39a', 'halogen': '#ff7ac6',
+      'vllm': '#9d7bff', 'r9v': '#f5b14a',
+      ...SK_SERVING_BUCKET_COLORS,
+    },
+    4: {
+      'vulkan': '#3ec5ff', 'rocm': '#f5b14a',
+      ...SK_SERVING_BUCKET_COLORS,
+    },
+    5: {},
   };
   if (map[col] && map[col][key]) return map[col][key];
   const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
@@ -1494,7 +1903,7 @@ function updateSankey() {
   const SK_SEP = '\u0001';
   for (const e of enriched) {
     const k = skKeysOf(e);
-    const keys = [k.c0, k.c1, k.c2, k.c3];
+    const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5];
     for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
     for (let i = 0; i + 1 < NC; i++) {
       const lk = keys[i] + SK_SEP + keys[i + 1];
@@ -2334,33 +2743,886 @@ async function togglePromptRewrite() {
   } catch(e) { applyToggle('rewrite', currentlyOn); }
   rewriteBusy = false;
 }
-let toolboxesData = null;
+// Generalized, catalog-driven toolbox rendering (PR2 — covers every
+// supported backend: llama_cpp/ds4/halogen/vllm/r9v; comfyui is excluded by
+// the server's /api/toolbox-catalog response). `toolboxCatalogData` is the
+// declarative "what could exist" list; `toolboxContainersData` is "what
+// actually exists right now", correlated by container_name.
+let toolboxCatalogData = null;
+let toolboxContainersData = null;
+// PR3: cockpit's shared config.json, read-only snapshot (§4). `null` until
+// the first /api/cockpit-config fetch resolves; `config: null` inside it
+// means "file absent" (a normal state, not an error — see `.error` for that).
+let cockpitConfigData = null;
+
+const TOOLBOX_BACKEND_LABELS = {
+  llama_cpp: 'llama.cpp',
+  ds4: 'DS4',
+  halogen: 'Halogen',
+  vllm: 'vLLM',
+  r9v: 'R9V',
+};
+
+// The catalog spans several hardware platforms (strix-halo, r9700, gb10,
+// intel-b70) — 25 supported-backend toolboxes total. Showing all of them
+// would bury the handful actually relevant to this host under entries for
+// hardware it doesn't have. brainrouter has no real host/platform detection
+// yet (design doc Q1 is still open — e.g. distinguishing an R9700 box from
+// a Strix Halo one), so this narrows to the single platform brainrouter's
+// existing hardcoded defaults already assume (`docker.io/kyuz0/amd-strix-
+// halo-toolboxes:...`), matching current behavior rather than guessing new
+// behavior. Revisit once Q1 lands real detection.
+const CURRENT_PLATFORM_ID = 'strix-halo';
+
+// PR3 §4: cockpit's own per-backend override (`config.json`'s
+// `backends.<id>.default_toolboxes.<platform>`) takes precedence; the
+// catalog's `platform.defaults[backend]` is only a fallback recommendation
+// when cockpit has no override (or its config.json doesn't exist at all).
+function effectiveDefaultToolbox(backend) {
+  const cfg = cockpitConfigData && cockpitConfigData.config;
+  const override = cfg && cfg.backends && cfg.backends[backend] && cfg.backends[backend].default_toolboxes
+    && cfg.backends[backend].default_toolboxes[CURRENT_PLATFORM_ID];
+  if (override) return override;
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  return (platform && platform.defaults && platform.defaults[backend]) || null;
+}
+
+function renderCockpitConfigStatus() {
+  const el = document.getElementById('cockpit-config-status');
+  if (!el || !cockpitConfigData) return;
+  el.style.display = 'block';
+  if (cockpitConfigData.error) {
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--red)">read error</span>`;
+  } else if (!cockpitConfigData.exists) {
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--textMute)">not found (ai-toolbox-cockpit not installed on this host)</span>`;
+  } else {
+    const plat = (cockpitConfigData.config && cockpitConfigData.config.active_platform) || '—';
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--green)">linked</span> · active_platform=${escHtml(plat)}`;
+  }
+}
+
+async function setDefaultToolbox(backend, toolboxId) {
+  try {
+    await fetch('/api/cockpit-config/default-toolbox', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend_id: backend, platform_id: CURRENT_PLATFORM_ID, toolbox_id: toolboxId }),
+    });
+  } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 1000);
+}
 
 function renderToolboxes() {
   const el = document.getElementById('toolbox-list');
   if (!el) return;
-  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
-  if (boxes.length === 0) { el.innerHTML = ''; return; }
-  el.innerHTML = boxes.map(tb => {
-    const color = tb.running ? 'var(--green)' : 'var(--textMute)';
-    const sub = [tb.status, tb.created ? 'built ' + tb.created : ''].filter(Boolean).join(' · ');
-    const local = tb.local_created || '';
-    const latest = tb.latest_created || '';
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const toolboxes = allowedIds ? allToolboxes.filter(tb => allowedIds.has(tb.id)) : allToolboxes;
+  if (toolboxes.length === 0) { el.innerHTML = ''; return; }
+  const containers = (toolboxContainersData && toolboxContainersData.containers) || [];
+  const byName = {};
+  containers.forEach(c => { byName[c.container_name] = c; });
+
+  // Group catalog toolboxes by backend, preserving catalog order within each group.
+  const order = [];
+  const groups = {};
+  toolboxes.forEach(tb => {
+    if (!groups[tb.backend]) { groups[tb.backend] = []; order.push(tb.backend); }
+    groups[tb.backend].push(tb);
+  });
+
+  el.innerHTML = order.map(backend => {
+    const label = TOOLBOX_BACKEND_LABELS[backend] || backend;
+    const defaultId = effectiveDefaultToolbox(backend);
+    const rows = groups[backend].map(tb => renderToolboxRow(tb, byName[tb.container_name], backend, defaultId)).join('');
+    return `<div style="padding:6px 0 2px;font-size:9px;letter-spacing:1px;color:var(--textMute);text-transform:uppercase">${escHtml(label)}</div>${rows}`;
+  }).join('');
+}
+
+function renderToolboxRow(tb, c, backend, defaultId) {
+  const exists = !!c;
+  const color = exists ? (c.running ? 'var(--green)' : 'var(--textMute)') : 'var(--border)';
+  const name = tb.name || tb.id;
+  const isDefault = defaultId === tb.id;
+  // PR3: star marks the effective default toolbox for this backend+platform
+  // (cockpit config override, or catalog fallback — see effectiveDefaultToolbox);
+  // non-default rows get a click-to-set affordance instead.
+  const star = isDefault
+    ? `<span style="color:var(--amber);font-size:10px" title="Default toolbox for ${escHtml(backend)} on ${escHtml(CURRENT_PLATFORM_ID)}">★</span>`
+    : `<span onclick="event.stopPropagation();setDefaultToolbox(${JSON.stringify(backend)}, ${JSON.stringify(tb.id)})" style="color:var(--border);font-size:10px;cursor:pointer" title="Set as default toolbox for ${escHtml(backend)} on ${escHtml(CURRENT_PLATFORM_ID)}">☆</span>`;
+  let right;
+  if (!exists) {
+    right = `<button onclick="event.stopPropagation();createToolboxContainer(${JSON.stringify(tb.id)})" title="Create container for ${escHtml(name)}"
+      style="all:unset;cursor:pointer;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--bg3);color:var(--cyan);border:1px solid var(--border);font-family:'JetBrains Mono',monospace">+ create</button>`;
+  } else {
+    const local = c.local_created || '';
+    const latest = c.latest_created || '';
     // Version cell: if an update is available, show latest with a clickable ↑;
-    // otherwise show the installed date. Clicking the arrow upgrades just this box.
+    // otherwise show the installed date. Clicking the arrow updates just this box.
     let ver;
-    if (tb.update_available && latest) {
+    if (c.update_available && latest) {
       ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${escHtml(latest)}</span>` +
-            `<span onclick="event.stopPropagation();upgradeToolbox(${JSON.stringify(tb.name)})" style="font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:9px;cursor:pointer;padding:0 2px" title="Update available: ${escHtml(latest)}">↑</span>`;
+            `<span onclick="event.stopPropagation();updateToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:9px;cursor:pointer;padding:0 2px" title="Update available: ${escHtml(latest)}">↑</span>`;
     } else {
       ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${local ? escHtml(local) : '—'}</span>`;
     }
-    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.name)} — ${escHtml(sub)}${tb.update_available ? ' — update available ' + escHtml(latest) : ''}">
-      <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">${escHtml(tb.short_name || tb.name)}</span>
-      ${ver}
-    </div>`;
+    const adopt = !c.managed
+      ? `<span onclick="event.stopPropagation();adoptToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--violet);font-size:9px;cursor:pointer;padding:0 2px" title="Unmanaged — click to adopt (recreates in place to attach ownership labels)">adopt</span>`
+      : '';
+    const del = `<span onclick="event.stopPropagation();deleteToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--red);font-size:9px;cursor:pointer;padding:0 2px" title="Remove container">✕</span>`;
+    right = `${ver}${adopt}${del}`;
+  }
+  const sub = exists ? [c.status, c.local_created ? 'built ' + c.local_created : ''].filter(Boolean).join(' · ') : 'not created';
+  return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.container_name)} — ${escHtml(sub)}">
+    <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
+    ${star}
+    <span style="color:var(--textDim);flex:1">${escHtml(name)}</span>
+    ${right}
+  </div>`;
+}
+
+// ─── PR6: model-download orchestration (§10) ────────────────────────────────
+// toolboxModelsData holds the vendored model catalog (/api/toolbox-models);
+// toolboxModelPresence holds the read-only local-presence sweep
+// (/api/model-downloads/status); toolboxDownloadJobs holds the job
+// registry's current list (/api/model-downloads). vllm is excluded — see
+// module docs in src/model_downloads.rs.
+let toolboxModelsData = null;
+let toolboxModelPresence = null;
+let toolboxDownloadJobs = [];
+let toolboxModelsActiveBackend = 'llama_cpp';
+let toolboxModelsPollTimer = null;
+const DOWNLOAD_CAPABLE_BACKENDS = ['llama_cpp', 'ds4', 'halogen', 'r9v'];
+const DOWNLOAD_STATUS_COLORS = {
+  queued: 'var(--textMute)', downloading: 'var(--cyan)', running: 'var(--cyan)', verifying: 'var(--violet)',
+  complete: 'var(--green)', failed: 'var(--red)', cancelled: 'var(--textMute)',
+};
+
+async function loadToolboxModels() {
+  const [modelsRes, statusRes, jobsRes] = await Promise.all([
+    safeFetch('/api/toolbox-models'),
+    safeFetch('/api/model-downloads/status'),
+    safeFetch('/api/model-downloads'),
+  ]);
+  if (modelsRes) toolboxModelsData = modelsRes;
+  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (jobsRes) toolboxDownloadJobs = jobsRes.jobs || [];
+  renderToolboxModelsBackendTabs();
+  renderToolboxModelsList();
+  renderToolboxDownloadJobs();
+  scheduleToolboxModelsPoll();
+}
+
+function renderToolboxModelsBackendTabs() {
+  const el = document.getElementById('toolbox-models-backend-tabs');
+  if (!el) return;
+  el.innerHTML = DOWNLOAD_CAPABLE_BACKENDS.map(b => {
+    const active = b === toolboxModelsActiveBackend;
+    const label = TOOLBOX_BACKEND_LABELS[b] || b;
+    return `<button onclick="setToolboxModelsBackend(${JSON.stringify(b)})" style="font-size:11px;padding:5px 12px;border-radius:6px;border:1px solid var(--border);cursor:pointer;background:${active ? 'var(--bg3)' : 'var(--panel)'};color:${active ? 'var(--cyan)' : 'var(--textDim)'}">${escHtml(label)}</button>`;
   }).join('');
+}
+
+function setToolboxModelsBackend(backend) {
+  toolboxModelsActiveBackend = backend;
+  renderToolboxModelsBackendTabs();
+  renderToolboxModelsList();
+}
+
+function presenceFor(backend, modelId) {
+  return (toolboxModelPresence || []).find(p => p.backend === backend && p.model_id === modelId) || null;
+}
+
+function renderToolboxModelsList() {
+  const el = document.getElementById('toolbox-models-list');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === toolboxModelsActiveBackend);
+  const entries = (bc && bc.entries) || [];
+  if (!entries.length) { el.innerHTML = '<div style="color:var(--textMute);font-size:12px">No catalog entries for this backend.</div>'; return; }
+  el.innerHTML = entries.map(e => renderToolboxModelRow(e)).join('');
+}
+
+function renderToolboxModelRow(entry) {
+  const backend = toolboxModelsActiveBackend;
+  const payload = entry.payload || {};
+  const presence = presenceFor(backend, entry.id);
+  const kind = presence && presence.completeness && presence.completeness.kind;
+  const complete = kind === 'complete';
+  const notChecked = kind === 'not_checked';
+  const dot = complete ? 'var(--green)' : (notChecked ? 'var(--textMute)' : (presence ? 'var(--amber)' : 'var(--border)'));
+  let statusLabel = complete ? 'downloaded' : (notChecked ? 'unknown (no manifest check for this backend)' : (presence ? 'incomplete' : '—'));
+  // PR11 §15 item 8: r9v has a second readiness gate beyond file
+  // completeness — surfaced here so it's visible before the user ever
+  // tries (and fails) to start a server.
+  if (backend === 'r9v' && complete && presence && typeof presence.ple_ready === 'boolean') {
+    statusLabel += presence.ple_ready ? ' · PLE: ready' : ' · PLE: not prepared';
+  }
+
+  let sizeLabel = '';
+  if (typeof payload.size_gb === 'number') sizeLabel = payload.size_gb.toFixed(1) + ' GB';
+  else if (Array.isArray(payload.files)) {
+    const total = payload.files.reduce((sum, f) => sum + (f.size_bytes || 0), 0);
+    if (total > 0) sizeLabel = (total / 1e9).toFixed(1) + ' GB';
+  }
+
+  const runningJob = toolboxDownloadJobs.find(j => j.backend === backend && j.model_id === entry.id
+    && (j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying'));
+
+  let action;
+  if (runningJob) {
+    action = `<span style="font-size:10px;color:var(--cyan)">${escHtml(runningJob.status)}…</span>
+      <button onclick="cancelModelDownload(${JSON.stringify(runningJob.id)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Cancel</button>`;
+  } else if (backend === 'llama_cpp') {
+    // Upstream itself derives quant_pattern from a *live* HF repo file
+    // listing (llama_cpp_model_manager.py::get_hf_quants), not from the
+    // static catalog — the catalog has no quant/pattern field for
+    // llama_cpp at all. Replicating that live lookup is out of scope for
+    // this PR (design doc §10), so the operator types the pattern
+    // themselves, same info they'd see on the HF repo page.
+    const inputId = 'quant-input-' + entry.id;
+    action = `<input id="${inputId}" placeholder="quant pattern e.g. Q4_K_M.gguf or BF16" style="font-size:11px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);width:200px">
+      <button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, document.getElementById(${JSON.stringify(inputId)}).value)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
+  } else {
+    action = `<button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, null)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
+    if (complete && backend === 'r9v') {
+      action += `<button onclick="verifyModelChecksums(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)})" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--violet);cursor:pointer">Verify</button>`;
+      action += `<button onclick="prepareR9vPle(${JSON.stringify(entry.id)})" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--amber);cursor:pointer" title="Extract the per-layer-token-embedding file r9v needs before it can serve this package">Prepare PLE</button>`;
+    }
+  }
+
+  return `<div style="display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px;flex-wrap:wrap">
+    <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0"></span>
+    <div style="flex:1;min-width:220px">
+      <div style="font-size:12px;font-weight:600;color:var(--text)">${escHtml(entry.name || entry.id)}</div>
+      <div style="font-size:10px;color:var(--textMute)">${escHtml(payload.repo || '')}${sizeLabel ? ' · ' + sizeLabel : ''} · ${escHtml(statusLabel)}</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">${action}</div>
+  </div>`;
+}
+
+async function startModelDownload(backend, modelId, quantPattern) {
+  if (backend === 'llama_cpp' && !quantPattern) {
+    alert('Enter a quant pattern for this llama.cpp model first (e.g. Q4_K_M.gguf, or a folder name like BF16 — check the Hugging Face repo for available options).');
+    return;
+  }
+  try {
+    const r = await fetch('/api/model-downloads', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend, model_id: modelId, quant_pattern: quantPattern || undefined }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Download failed to start: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadToolboxModels();
+}
+
+async function cancelModelDownload(jobId) {
+  try { await fetch('/api/model-downloads/' + encodeURIComponent(jobId) + '/cancel', { method: 'POST' }); } catch (e) {}
+  loadToolboxModels();
+}
+
+async function verifyModelChecksums(backend, modelId) {
+  try {
+    const r = await fetch('/api/model-downloads/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend, model_id: modelId }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Verify failed: ' + (j.error || r.status)); return; }
+    const files = j.files || [];
+    const bad = files.filter(f => !f.matched);
+    alert(bad.length
+      ? ('Checksum mismatch on ' + bad.length + ' file(s): ' + bad.map(f => f.relative_path).join(', '))
+      : ('All ' + files.length + ' file(s) verified OK.'));
+  } catch (e) {}
+}
+
+function renderToolboxDownloadJobs() {
+  const el = document.getElementById('toolbox-download-jobs');
+  if (!el) return;
+  if (!toolboxDownloadJobs.length) { el.innerHTML = '<div style="color:var(--textMute);font-size:12px">No downloads started yet.</div>'; return; }
+  const sorted = [...toolboxDownloadJobs].sort((a, b) => new Date(b.queued_at) - new Date(a.queued_at));
+  el.innerHTML = sorted.map(renderToolboxDownloadJobRow).join('');
+}
+
+function renderToolboxDownloadJobRow(job) {
+  const color = DOWNLOAD_STATUS_COLORS[job.status] || 'var(--textMute)';
+  const terminal = job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled';
+  const cancelBtn = terminal ? '' : `<button onclick="cancelModelDownload(${JSON.stringify(job.id)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Cancel</button>`;
+  return `<div style="display:flex;flex-direction:column;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0"></span>
+      <span style="font-size:11px;font-weight:600;color:var(--text)">${escHtml(TOOLBOX_BACKEND_LABELS[job.backend] || job.backend)} · ${escHtml(job.model_id)}</span>
+      <span style="font-size:10px;color:${color}">${escHtml(job.status)}</span>
+      <span style="margin-left:auto">${cancelBtn}</span>
+    </div>
+    <div style="font-size:10px;color:var(--textMute);overflow-wrap:anywhere">${escHtml(job.message || '')}</div>
+  </div>`;
+}
+
+// Polls only while a job is in flight and this view is actually visible —
+// mirrors the coarse-progress design decision (§10): no byte percentage,
+// just periodically re-pulling the job's status string until terminal.
+function scheduleToolboxModelsPoll() {
+  if (toolboxModelsPollTimer) { clearTimeout(toolboxModelsPollTimer); toolboxModelsPollTimer = null; }
+  const active = toolboxDownloadJobs.some(j => j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying');
+  if (active && activeView === 'toolbox-models') {
+    toolboxModelsPollTimer = setTimeout(loadToolboxModels, 3000);
+  }
+}
+
+// ─── PR7/PR8/PR9: ds4 + halogen + vllm Server Mode (design doc §11/§12/§13/§14) ─
+// Headless detached `podman run` servers — structurally distinct from the
+// Toolboxes-tab dev-shells above. One instance per backend, standalone
+// launch. Lifecycle is synchronous request/response (no job registry like
+// the downloads above) — `status` always reflects live `podman inspect`
+// state, matching src/server_mode.rs's "no persisted state" design.
+const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm', 'r9v'];
+let serverModeActiveBackend = 'ds4';
+let serverModeStatus = null;
+let serverModeHalogenStatus = null;
+let serverModeVllmStatus = null;
+let serverModeR9vStatus = null;
+
+function renderServerModeBackendTabs() {
+  const el = document.getElementById('server-mode-backend-tabs');
+  if (!el) return;
+  el.innerHTML = SERVER_MODE_CAPABLE_BACKENDS.map(b => {
+    const active = b === serverModeActiveBackend;
+    const label = TOOLBOX_BACKEND_LABELS[b] || b;
+    return `<button onclick="setServerModeBackend(${JSON.stringify(b)})" style="font-size:11px;padding:5px 12px;border-radius:6px;border:1px solid var(--border);cursor:pointer;background:${active ? 'var(--bg3)' : 'var(--panel)'};color:${active ? 'var(--cyan)' : 'var(--textDim)'}">${escHtml(label)}</button>`;
+  }).join('');
+}
+
+function setServerModeBackend(backend) {
+  serverModeActiveBackend = backend;
+  renderServerModeBackendTabs();
+  document.getElementById('sm-panel-ds4').style.display = backend === 'ds4' ? 'block' : 'none';
+  document.getElementById('sm-ds4-status').style.display = backend === 'ds4' ? 'block' : 'none';
+  document.getElementById('sm-panel-halogen').style.display = backend === 'halogen' ? 'block' : 'none';
+  document.getElementById('sm-halogen-status').style.display = backend === 'halogen' ? 'block' : 'none';
+  document.getElementById('sm-panel-vllm').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-vllm-status').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-panel-vllm-caches').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-panel-r9v').style.display = backend === 'r9v' ? 'block' : 'none';
+  document.getElementById('sm-r9v-status').style.display = backend === 'r9v' ? 'block' : 'none';
+  document.getElementById('sm-panel-r9v-paths').style.display = backend === 'r9v' ? 'block' : 'none';
+}
+
+async function loadServerMode() {
+  // Reuses toolboxCatalogData (loaded by refreshSlow()) for the toolbox
+  // dropdowns, and fetches the model catalog + local-presence sweep fresh
+  // (same endpoints the Downloads view uses) to list only already-
+  // downloaded models per backend — starting a server needs a complete
+  // model/bundle on disk, not just a catalog entry.
+  renderServerModeBackendTabs();
+  setServerModeBackend(serverModeActiveBackend);
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes, servingIdentitiesRes] = await Promise.all([
+    safeFetch('/api/toolbox-models'),
+    safeFetch('/api/model-downloads/status'),
+    safeFetch('/api/server-mode/ds4/status'),
+    safeFetch('/api/server-mode/halogen/status'),
+    safeFetch('/api/server-mode/vllm/status'),
+    safeFetch('/api/server-mode/r9v/status'),
+    safeFetch('/api/serving-identities'),
+  ]);
+  if (modelsRes) toolboxModelsData = modelsRes;
+  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (ds4StatusRes) serverModeStatus = ds4StatusRes;
+  if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
+  if (vllmStatusRes) serverModeVllmStatus = vllmStatusRes;
+  if (r9vStatusRes) serverModeR9vStatus = r9vStatusRes;
+  renderServerModeToolboxOptions();
+  renderServerModeModelOptions();
+  renderServerModeStatus();
+  renderServerModeHalogenToolboxOptions();
+  renderServerModeHalogenBundleOptions();
+  renderServerModeHalogenStatus();
+  renderServerModeVllmToolboxOptions();
+  renderServerModeVllmModelOptions();
+  renderServerModeVllmStatus();
+  renderServerModeR9vToolboxOptions();
+  renderServerModeR9vPackageOptions();
+  renderServerModeR9vStatus();
+  renderServingIdentities(servingIdentitiesRes && servingIdentitiesRes.identities || []);
+}
+
+/// PR11a §16: renders the read-only serving-identity list. No start/stop
+/// controls — clicking through to actually manage a backend happens via
+/// the per-backend panels above, not here.
+function renderServingIdentities(identities) {
+  const el = document.getElementById('serving-identities-list');
+  if (!el) return;
+  if (!identities.length) {
+    el.innerHTML = '<span style="color:var(--textMute)">No server-mode backends currently registered.</span>';
+    return;
+  }
+  const rows = identities.map(v => {
+    const id = v.identity || {};
+    const runColor = v.container_running ? 'var(--green)' : 'var(--amber)';
+    const runLabel = v.container_running ? 'running' : 'container not found (stale entry)';
+    const compat = id.openai_compatible ? 'yes' : 'no (unverified)';
+    return `<tr>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.toolbox_backend || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.compute_api || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.runtime_profile_id || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(id.endpoint || '')}</td>
+      <td style="padding:4px 10px 4px 0">${escHtml(compat)}</td>
+      <td style="padding:4px 10px 4px 0"><span style="color:${runColor}">●</span> ${escHtml(runLabel)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table style="border-collapse:collapse;width:100%">
+    <thead><tr style="color:var(--textMute);text-align:left">
+      <th style="padding:4px 10px 4px 0">Backend</th>
+      <th style="padding:4px 10px 4px 0">Engine</th>
+      <th style="padding:4px 10px 4px 0">Toolbox</th>
+      <th style="padding:4px 10px 4px 0">Endpoint</th>
+      <th style="padding:4px 10px 4px 0">OpenAI-compatible</th>
+      <th style="padding:4px 10px 4px 0">Container</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+
+function renderServerModeToolboxOptions() {
+  const el = document.getElementById('sm-ds4-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const ds4Toolboxes = allToolboxes.filter(tb => tb.backend === 'ds4' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('ds4');
+  el.innerHTML = ds4Toolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (ds4Toolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeModelOptions() {
+  const el = document.getElementById('sm-ds4-model');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'ds4');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('ds4', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  if (!complete.length) {
+    el.innerHTML = '<option value="">No downloaded ds4 models — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeStatus() {
+  const el = document.getElementById('sm-ds4-status');
+  if (!el || !serverModeStatus) return;
+  if (!serverModeStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeStatus.model_id ? ' · model: ' + escHtml(serverModeStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeStatus.container_name)})</span>`;
+}
+
+async function startDs4Server() {
+  const toolboxId = document.getElementById('sm-ds4-toolbox').value;
+  const modelId = document.getElementById('sm-ds4-model').value;
+  const ctx = parseInt(document.getElementById('sm-ds4-ctx').value, 10);
+  const host = document.getElementById('sm-ds4-host').value;
+  const port = parseInt(document.getElementById('sm-ds4-port').value, 10);
+  const customArgs = document.getElementById('sm-ds4-custom-args').value;
+  if (!toolboxId || !modelId) { alert('Pick a toolbox and an already-downloaded model first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/ds4/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId, model_id: modelId, ctx, host, port, custom_args: customArgs || undefined }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeStatus = j;
+    renderServerModeStatus();
+  } catch (e) {}
+}
+
+async function stopDs4Server() {
+  try {
+    const r = await fetch('/api/server-mode/ds4/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+// PR8: halogen Server Mode (§13). Bundle-based model resolution instead of
+// ds4's single flat file, and no custom_args field — upstream's own
+// builder has nothing equivalent to mirror (every tunable is an env var
+// already exposed as its own form field above).
+function renderServerModeHalogenToolboxOptions() {
+  const el = document.getElementById('sm-halogen-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const halogenToolboxes = allToolboxes.filter(tb => tb.backend === 'halogen' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('halogen');
+  el.innerHTML = halogenToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (halogenToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeHalogenBundleOptions() {
+  const el = document.getElementById('sm-halogen-bundle');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'halogen');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('halogen', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  if (!complete.length) {
+    el.innerHTML = '<option value="">No downloaded halogen bundles — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeHalogenStatus() {
+  const el = document.getElementById('sm-halogen-status');
+  if (!el || !serverModeHalogenStatus) return;
+  if (!serverModeHalogenStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeHalogenStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeHalogenStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const bundleLabel = serverModeHalogenStatus.model_id ? ' · bundle: ' + escHtml(serverModeHalogenStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${bundleLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeHalogenStatus.container_name)})</span>`;
+}
+
+async function startHalogenServer() {
+  const toolboxId = document.getElementById('sm-halogen-toolbox').value;
+  const bundleId = document.getElementById('sm-halogen-bundle').value;
+  const host = document.getElementById('sm-halogen-host').value;
+  const port = parseInt(document.getElementById('sm-halogen-port').value, 10);
+  const contextSize = parseInt(document.getElementById('sm-halogen-ctx').value, 10);
+  const kvPoolPositions = parseInt(document.getElementById('sm-halogen-kv-pool').value, 10);
+  const kvSlots = parseInt(document.getElementById('sm-halogen-kv-slots').value, 10);
+  const promptCache = document.getElementById('sm-halogen-prompt-cache').value;
+  if (!toolboxId || !bundleId) { alert('Pick a toolbox and an already-downloaded bundle first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/halogen/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, bundle_id: bundleId, host, port,
+        context_size: contextSize, kv_pool_positions: kvPoolPositions,
+        kv_slots: kvSlots, prompt_cache: promptCache,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeHalogenStatus = j;
+    renderServerModeHalogenStatus();
+  } catch (e) {}
+}
+
+async function stopHalogenServer() {
+  try {
+    const r = await fetch('/api/server-mode/halogen/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+// PR9: vllm Server Mode (§14). HF-repo-based model resolution: a catalog
+// `model_id` dropdown (only already-downloaded entries, same
+// presenceFor()-gated pattern as ds4/halogen above) OR a free-form
+// `custom_repo` text field that bypasses the catalog entirely — exactly
+// one of the two must be set. Also exposes a separate "Save cache paths"
+// action, since upstream's own vllm UI never auto-persists settings on
+// server start (unlike halogen's `save_backend_settings()` call).
+function renderServerModeVllmToolboxOptions() {
+  const el = document.getElementById('sm-vllm-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const vllmToolboxes = allToolboxes.filter(tb => tb.backend === 'vllm' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('vllm');
+  el.innerHTML = vllmToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (vllmToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeVllmModelOptions() {
+  const el = document.getElementById('sm-vllm-model');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'vllm');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('vllm', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  const placeholder = '<option value="">(none — use the custom repo field below)</option>';
+  if (!complete.length) {
+    el.innerHTML = placeholder;
+    return;
+  }
+  el.innerHTML = placeholder + complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeVllmStatus() {
+  const el = document.getElementById('sm-vllm-status');
+  if (!el || !serverModeVllmStatus) return;
+  if (!serverModeVllmStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeVllmStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeVllmStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeVllmStatus.model_id ? ' · model: ' + escHtml(serverModeVllmStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeVllmStatus.container_name)})</span>`;
+}
+
+async function startVllmServer() {
+  const toolboxId = document.getElementById('sm-vllm-toolbox').value;
+  const modelId = document.getElementById('sm-vllm-model').value;
+  const customRepo = document.getElementById('sm-vllm-custom-repo').value.trim();
+  const host = document.getElementById('sm-vllm-host').value;
+  const port = parseInt(document.getElementById('sm-vllm-port').value, 10);
+  const tensorParallel = parseInt(document.getElementById('sm-vllm-tp').value, 10);
+  const maxNumSeqs = parseInt(document.getElementById('sm-vllm-max-num-seqs').value, 10);
+  const maxModelLen = document.getElementById('sm-vllm-max-model-len').value.trim() || 'auto';
+  const gpuMemoryUtilization = parseFloat(document.getElementById('sm-vllm-gpu-mem-util').value);
+  const attentionBackend = document.getElementById('sm-vllm-attention-backend').value.trim();
+  const enforceEager = document.getElementById('sm-vllm-enforce-eager').checked;
+  const dtype = document.getElementById('sm-vllm-dtype').value.trim() || 'auto';
+  const apiKey = document.getElementById('sm-vllm-api-key').value.trim();
+  const extraArgs = document.getElementById('sm-vllm-extra-args').value;
+  const resetCaches = document.getElementById('sm-vllm-reset-caches').checked;
+  if (!toolboxId || (!modelId && !customRepo)) { alert('Pick a toolbox and either an already-downloaded model or a custom repo.'); return; }
+  if (modelId && customRepo) { alert('Pick either a catalog model or a custom repo, not both.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/vllm/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, model_id: modelId || undefined, custom_repo: customRepo || undefined,
+        host, port, tensor_parallel: tensorParallel, max_num_seqs: maxNumSeqs,
+        max_model_len: maxModelLen, gpu_memory_utilization: gpuMemoryUtilization,
+        attention_backend: attentionBackend || undefined, enforce_eager: enforceEager || undefined,
+        dtype, api_key: apiKey || undefined, extra_args: extraArgs || undefined, reset_caches: resetCaches,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeVllmStatus = j;
+    renderServerModeVllmStatus();
+  } catch (e) {}
+}
+
+async function stopVllmServer() {
+  try {
+    const r = await fetch('/api/server-mode/vllm/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+async function saveVllmCachePaths() {
+  const hfCache = document.getElementById('sm-vllm-cache-hf').value.trim();
+  const vllmCache = document.getElementById('sm-vllm-cache-vllm').value.trim();
+  const tritonCache = document.getElementById('sm-vllm-cache-triton').value.trim();
+  const aiterCache = document.getElementById('sm-vllm-cache-aiter').value.trim();
+  if (!hfCache && !vllmCache && !tritonCache && !aiterCache) { alert('Enter at least one cache path first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/vllm/cache-paths', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hf_cache: hfCache || undefined, vllm_cache: vllmCache || undefined,
+        triton_cache: tritonCache || undefined, aiter_cache: aiterCache || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Save failed: ' + (j.error || r.status)); return; }
+    alert('Cache paths saved.');
+  } catch (e) {}
+}
+
+// PR11: r9v Server Mode (§15/§15a). Every tuning field the request accepts
+// is optional server-side (mirrors upstream's own DEFAULTS-merge design),
+// so blank inputs are sent as `undefined` and r9v's own defaults apply —
+// unlike vllm's start form, nothing here is client-side required except
+// picking a toolbox + an already-downloaded, PLE-prepared package.
+function firstR9vToolboxId() {
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const tb = allToolboxes.find(t => t.backend === 'r9v');
+  return tb ? tb.id : null;
+}
+
+function renderServerModeR9vToolboxOptions() {
+  const el = document.getElementById('sm-r9v-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  // Deliberately unfiltered by CURRENT_PLATFORM_ID — see the HTML comment
+  // above #sm-panel-r9v for why.
+  const r9vToolboxes = allToolboxes.filter(tb => tb.backend === 'r9v');
+  const previouslySelected = el.value;
+  el.innerHTML = r9vToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}</option>`).join('');
+  if (r9vToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeR9vPackageOptions() {
+  const el = document.getElementById('sm-r9v-package');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'r9v');
+  const entries = (bc && bc.entries) || [];
+  // PR11 §15 item 8: only offer packages that are both file-complete
+  // AND PLE-ready — this is the "disabling Start until both are true"
+  // gate, implemented by simply not listing an unready package rather
+  // than a separate enabled/disabled control.
+  const ready = entries.filter(e => {
+    const p = presenceFor('r9v', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete' && p.ple_ready === true;
+  });
+  const previouslySelected = el.value;
+  if (!ready.length) {
+    const anyIncompletePle = entries.some(e => {
+      const p = presenceFor('r9v', e.id);
+      return p && p.completeness && p.completeness.kind === 'complete' && p.ple_ready === false;
+    });
+    el.innerHTML = anyIncompletePle
+      ? '<option value="">Downloaded, but PLE not prepared yet — use the Downloads tab\'s "Prepare PLE" action first</option>'
+      : '<option value="">No downloaded r9v packages — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = ready.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (ready.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeR9vStatus() {
+  const el = document.getElementById('sm-r9v-status');
+  if (!el || !serverModeR9vStatus) return;
+  if (!serverModeR9vStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeR9vStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeR9vStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeR9vStatus.model_id ? ' · model: ' + escHtml(serverModeR9vStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeR9vStatus.container_name)})</span>`;
+}
+
+async function startR9vServer() {
+  const toolboxId = document.getElementById('sm-r9v-toolbox').value;
+  const packageId = document.getElementById('sm-r9v-package').value;
+  if (!toolboxId || !packageId) { alert('Pick a toolbox and an already-downloaded, PLE-prepared package.'); return; }
+  const host = document.getElementById('sm-r9v-host').value.trim();
+  const portRaw = document.getElementById('sm-r9v-port').value.trim();
+  const devices = document.getElementById('sm-r9v-devices').value.trim();
+  const contextRaw = document.getElementById('sm-r9v-context').value.trim();
+  const batchRaw = document.getElementById('sm-r9v-batch').value.trim();
+  const sequencesRaw = document.getElementById('sm-r9v-sequences').value.trim();
+  const kvBytesRaw = document.getElementById('sm-r9v-kv-bytes').value.trim();
+  const expertCacheSlotsRaw = document.getElementById('sm-r9v-expert-cache-slots').value.trim();
+  const offload = document.getElementById('sm-r9v-offload').value.trim();
+  const offloadDevices = document.getElementById('sm-r9v-offload-devices').value.trim();
+  const servedModel = document.getElementById('sm-r9v-served-model').value.trim();
+  const apiKey = document.getElementById('sm-r9v-api-key').value.trim();
+  const extraArgs = document.getElementById('sm-r9v-extra-args').value;
+  try {
+    const r = await fetch('/api/server-mode/r9v/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, package_id: packageId,
+        host: host || undefined, port: portRaw ? parseInt(portRaw, 10) : undefined,
+        devices: devices || undefined,
+        context: contextRaw ? parseInt(contextRaw, 10) : undefined,
+        batch: batchRaw ? parseInt(batchRaw, 10) : undefined,
+        sequences: sequencesRaw ? parseInt(sequencesRaw, 10) : undefined,
+        kv_bytes: kvBytesRaw ? parseInt(kvBytesRaw, 10) : undefined,
+        expert_cache_slots: expertCacheSlotsRaw ? parseInt(expertCacheSlotsRaw, 10) : undefined,
+        offload: offload || undefined, offload_devices: offloadDevices || undefined,
+        served_model: servedModel || undefined, api_key: apiKey || undefined,
+        extra_args: extraArgs || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeR9vStatus = j;
+    renderServerModeR9vStatus();
+  } catch (e) {}
+}
+
+async function stopR9vServer() {
+  try {
+    const r = await fetch('/api/server-mode/r9v/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+async function saveR9vPaths() {
+  const modelsDir = document.getElementById('sm-r9v-path-models').value.trim();
+  const pleDir = document.getElementById('sm-r9v-path-ple').value.trim();
+  const cacheDir = document.getElementById('sm-r9v-path-cache').value.trim();
+  if (!modelsDir && !pleDir && !cacheDir) { alert('Enter at least one path first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/r9v/paths', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        models_dir: modelsDir || undefined, ple_dir: pleDir || undefined, cache_dir: cacheDir || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Save failed: ' + (j.error || r.status)); return; }
+    alert('Paths saved.');
+  } catch (e) {}
+}
+
+// PR11: r9v's "Prepare PLE" is a Downloads-tab action (not Server Mode) —
+// it runs a one-shot podman job against an already-downloaded package,
+// through the same job registry as ordinary downloads, so it shares the
+// job list's status/cancel affordances (renderToolboxDownloadJobRow).
+async function prepareR9vPle(modelId) {
+  const toolboxId = firstR9vToolboxId();
+  if (!toolboxId) { alert('No r9v toolbox found in the catalog.'); return; }
+  try {
+    const r = await fetch('/api/model-downloads/r9v/prepare-ple', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId, package_id: modelId }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Prepare PLE failed to start: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadToolboxModels();
 }
 
 async function upgradeIfAvailable(svc) {
@@ -2371,20 +3633,50 @@ async function upgradeIfAvailable(svc) {
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
 }
 
+// "all ↑" in the sidebar header: update every container (any backend) that
+// currently has an update available, one /api/toolbox-containers/{name}/update
+// call per container (there is no single bulk-update route server-side).
 async function upgradeToolboxAll() {
-  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
-  if (boxes.length === 0) return;
-  if (!confirm('Upgrade ALL toolbox containers (' + boxes.length + ') to the latest images?\nThe local stack will restart. Takes a few minutes.')) return;
-  try { await fetch('/api/upgrade/toolbox', { method: 'POST' }); } catch (e) {}
+  const containers = (toolboxContainersData && toolboxContainersData.containers) || [];
+  const stale = containers.filter(c => c.update_available);
+  if (stale.length === 0) return;
+  if (!confirm('Update ' + stale.length + ' toolbox container(s) to the latest images?\nEach restarts individually. Takes a few minutes.')) return;
+  try {
+    await Promise.all(stale.map(c =>
+      fetch('/api/toolbox-containers/' + encodeURIComponent(c.container_name) + '/update', { method: 'POST' }).catch(() => {})
+    ));
+  } catch (e) {}
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 5000);
 }
 
-async function upgradeToolbox(name) {
-  if (!confirm('Upgrade toolbox "' + name + '" to the latest image?')) return;
+async function createToolboxContainer(toolboxId) {
+  if (!confirm('Create toolbox container for "' + toolboxId + '"? This pulls the image if needed.')) return;
   try {
-    await fetch('/api/upgrade/toolbox/' + encodeURIComponent(name), { method: 'POST' });
+    await fetch('/api/toolbox-containers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId }),
+    });
   } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 3000);
+}
+
+async function updateToolboxContainer(name) {
+  if (!confirm('Update toolbox container "' + name + '" to the latest image?')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/update', { method: 'POST' }); } catch (e) {}
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
+}
+
+async function adoptToolboxContainer(name) {
+  if (!confirm('Adopt toolbox container "' + name + '" as brainrouter-managed?\nThis recreates the container in place (same image, no pull) to attach ownership labels.')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/adopt', { method: 'POST' }); } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 3000);
+}
+
+async function deleteToolboxContainer(name) {
+  if (!confirm('Delete toolbox container "' + name + '"? This cannot be undone.')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/delete', { method: 'POST' }); } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 2000);
 }
 
 // ─── Action handlers ──────────────────────────────────────────────────────────
@@ -2600,18 +3892,23 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, tbRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
     safeFetch('/api/prompt-rewrite'),
-    safeFetch('/api/toolboxes'),
+    safeFetch('/api/toolbox-catalog'),
+    safeFetch('/api/toolbox-containers'),
+    safeFetch('/api/cockpit-config'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
   if (nudgeRes) { nudgeData = nudgeRes; applyNudgeUI(nudgeRes); }
   if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
-  if (tbRes) { toolboxesData = tbRes; renderToolboxes(); }
+  if (catalogRes) { toolboxCatalogData = catalogRes; }
+  if (containersRes) { toolboxContainersData = containersRes; }
+  if (cockpitConfigRes) { cockpitConfigData = cockpitConfigRes; renderCockpitConfigStatus(); }
+  if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
 }
 
 // ─── In-flight requests (llama-swap parity) ─────────────────────────────────
@@ -2738,7 +4035,7 @@ function ompTitleForCwd(cwd) {
     if (!g) return;
     const e = g.events[g.events.length - 1];
     const k = skKeysOf(e);
-    const cols = [k.c0, k.c1, k.c2, k.c3];
+    const cols = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5];
     const same = skCardHi && skCardHi.join('\u0001') === cols.join('\u0001');
     skCardHi = same ? null : cols;
     sankeyFilter = { col: null, key: null };

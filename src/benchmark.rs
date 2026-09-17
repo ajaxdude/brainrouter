@@ -22,12 +22,15 @@ use std::{
     sync::Arc,
 };
 
+use crate::toolbox_catalog;
+
 mod http;
 mod imports;
 pub use http::handle_request;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_benchmark_explorer.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_benchmark_lab.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_toolbox_serving_dimension.sql");
 const EXPLORER_HTML: &str = include_str!("escalation/templates/benchmarks.html");
 const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: u32 = 100;
@@ -425,6 +428,46 @@ impl RuntimeDefinition {
     }
 }
 
+/// "What toolbox/container actually served this run" — a container-image
+/// identity, distinct from [`RuntimeDefinition`]'s source-build identity
+/// (design doc §7: new table, not a widened `runtimes`, because
+/// `repository`/`fork_name`/`commit_sha`/`compiler` don't naturally fit
+/// non-llama.cpp-fork backends). Optional in an [`IngestBundle`]: a run with
+/// no catalog-toolbox involvement simply omits it, leaving
+/// `experiments.serving_runtime_id` NULL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingRuntimeDefinition {
+    pub id: String,
+    pub toolbox_backend: toolbox_catalog::SupportedServingBackend,
+    pub toolbox_id: String,
+    pub compute_api: Backend,
+    pub container_image: String,
+    pub catalog_snapshot_id: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl ServingRuntimeDefinition {
+    fn validate(&self) -> BenchmarkResult<()> {
+        for (name, value) in [
+            ("serving_runtime.id", self.id.as_str()),
+            ("serving_runtime.toolbox_id", self.toolbox_id.as_str()),
+            (
+                "serving_runtime.container_image",
+                self.container_image.as_str(),
+            ),
+            (
+                "serving_runtime.catalog_snapshot_id",
+                self.catalog_snapshot_id.as_str(),
+            ),
+        ] {
+            require_text(name, value)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuDevice {
@@ -700,6 +743,8 @@ pub struct ExperimentConfig {
     pub id: String,
     pub artifact_id: String,
     pub runtime_id: String,
+    #[serde(default)]
+    pub serving_runtime_id: Option<String>,
     pub hardware_id: String,
     pub workload_id: String,
     pub context_tokens: u64,
@@ -722,6 +767,7 @@ pub struct ExperimentConfig {
 struct CanonicalExperiment<'a> {
     artifact_id: &'a str,
     runtime_id: &'a str,
+    serving_runtime_id: Option<&'a str>,
     hardware_id: &'a str,
     workload_id: &'a str,
     context_tokens: u64,
@@ -749,6 +795,9 @@ impl ExperimentConfig {
             ),
         ] {
             require_text(name, value)?;
+        }
+        if let Some(serving_runtime_id) = &self.serving_runtime_id {
+            require_text("experiment.serving_runtime_id", serving_runtime_id)?;
         }
         if self.context_tokens == 0
             || self.batch_size == 0
@@ -983,6 +1032,7 @@ impl ExperimentMatrix {
                                             id: "pending".into(),
                                             artifact_id: artifact_id.clone(),
                                             runtime_id: runtime_id.clone(),
+                                            serving_runtime_id: None,
                                             hardware_id: hardware_id.clone(),
                                             workload_id: workload_id.clone(),
                                             context_tokens,
@@ -1028,6 +1078,7 @@ impl ExperimentConfig {
         CanonicalExperiment {
             artifact_id: &self.artifact_id,
             runtime_id: &self.runtime_id,
+            serving_runtime_id: self.serving_runtime_id.as_deref(),
             hardware_id: &self.hardware_id,
             workload_id: &self.workload_id,
             context_tokens: self.context_tokens,
@@ -1362,6 +1413,8 @@ pub struct IngestBundle {
     pub model: ModelDefinition,
     pub artifact: ArtifactDefinition,
     pub runtime: RuntimeDefinition,
+    #[serde(default)]
+    pub serving_runtime: Option<ServingRuntimeDefinition>,
     pub hardware: HardwareProfile,
     pub workload: WorkloadDefinition,
     pub experiment: ExperimentConfig,
@@ -1666,6 +1719,9 @@ impl IngestBundle {
         self.model.validate()?;
         self.artifact.validate()?;
         self.runtime.validate()?;
+        if let Some(serving_runtime) = &self.serving_runtime {
+            serving_runtime.validate()?;
+        }
         self.hardware.validate()?;
         self.workload.validate()?;
         self.experiment.validate()?;
@@ -1706,6 +1762,18 @@ impl IngestBundle {
                 return Err(BenchmarkError::Validation(format!(
                     "{name} must reference the matching object in this bundle"
                 )));
+            }
+        }
+        match (&self.serving_runtime, &self.experiment.serving_runtime_id) {
+            (Some(serving_runtime), Some(serving_runtime_id))
+                if serving_runtime.id == *serving_runtime_id => {}
+            (None, None) => {}
+            _ => {
+                return Err(BenchmarkError::Validation(
+                    "experiment.serving_runtime_id must reference bundle.serving_runtime.id \
+                     when either is present, and both must be absent otherwise"
+                        .into(),
+                ));
             }
         }
         if let Some(metrics) = &self.performance_metrics {
@@ -1755,6 +1823,9 @@ pub struct RunSummary {
     pub quant_name: String,
     pub fork_name: String,
     pub backend: String,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
     pub context_tokens: u64,
     pub workload: String,
     pub prompt_tps: Option<f64>,
@@ -1787,6 +1858,9 @@ pub struct RunQuery {
     pub status: Option<String>,
     pub family: Option<String>,
     pub backend: Option<String>,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
     pub workload: Option<String>,
     pub quant_name: Option<String>,
     pub speculator_type: Option<String>,
@@ -1820,6 +1894,9 @@ impl RunQuery {
                 "status" => result.status = non_empty_filter(value),
                 "family" => result.family = non_empty_filter(value),
                 "backend" => result.backend = non_empty_filter(value),
+                "toolbox_backend" => result.toolbox_backend = non_empty_filter(value),
+                "toolbox_id" => result.toolbox_id = non_empty_filter(value),
+                "compute_api" => result.compute_api = non_empty_filter(value),
                 "workload" => result.workload = non_empty_filter(value),
                 "quant_name" => result.quant_name = non_empty_filter(value),
                 "speculator_type" => result.speculator_type = non_empty_filter(value),
@@ -1870,6 +1947,237 @@ fn non_empty_filter(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+const SPIDER_MIN_SAMPLE_SIZE: u64 = 3;
+const SPIDER_MIN_SERIES_VALUES: usize = 2;
+const SPIDER_MAX_SERIES_VALUES: usize = 5;
+/// Separator joining `family`/`workload` into one grouping key for the
+/// `FamilyWorkload` series kind. Not expected to appear inside a real family
+/// or workload name; documented here rather than defended against, matching
+/// how the rest of this module treats catalog/import data as trusted-shape.
+const SPIDER_PAIR_SEPARATOR: &str = "::";
+
+/// Design doc §17: the entity dimension the user compares polygons by. Never
+/// itself a radar axis — see `SpiderAxis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiderSeriesKind {
+    Family,
+    Workload,
+    FamilyWorkload,
+}
+
+impl SpiderSeriesKind {
+    /// The `run_summary` grouping expression for this series kind. Used
+    /// identically as the `SELECT` key and as the target of the `IN (...)`
+    /// restriction to the caller's chosen `series_values` — one expression,
+    /// no separate filter-column mapping to keep in sync.
+    fn group_expr(self) -> &'static str {
+        match self {
+            Self::Family => "rs.family",
+            Self::Workload => "rs.workload",
+            Self::FamilyWorkload => "(rs.family || '::' || rs.workload)",
+        }
+    }
+
+    /// §17's cohort-pinning rule: a single `workload` facet value is required
+    /// unless the series itself already iterates over workload/harness (in
+    /// which case every produced entity is already single-workload by
+    /// construction).
+    fn requires_workload_pin(self) -> bool {
+        matches!(self, Self::Family)
+    }
+}
+
+/// Design doc §17: a continuous, plottable radar spoke. Categorical
+/// dimensions (engine/backend/toolbox/model/harness) are facet/series keys
+/// only and never appear here (§8's v3 resolution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiderAxis {
+    Tepr,
+    Speed,
+}
+
+impl SpiderAxis {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tepr => "tepr",
+            Self::Speed => "speed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpiderQuery {
+    pub backend: Option<String>,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
+    pub workload: Option<String>,
+    pub family: Option<String>,
+    pub quant_name: Option<String>,
+    pub series: SpiderSeriesKind,
+    pub series_values: Vec<String>,
+    pub axes: Vec<SpiderAxis>,
+}
+
+impl SpiderQuery {
+    pub fn parse(query: Option<&str>) -> BenchmarkResult<Self> {
+        let mut backend = None;
+        let mut toolbox_backend = None;
+        let mut toolbox_id = None;
+        let mut compute_api = None;
+        let mut workload = None;
+        let mut family = None;
+        let mut quant_name = None;
+        let mut series = None;
+        let mut series_values = None;
+        let mut axes = None;
+        for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            let value = value.into_owned();
+            match key.as_ref() {
+                "backend" => backend = non_empty_filter(value),
+                "toolbox_backend" => toolbox_backend = non_empty_filter(value),
+                "toolbox_id" => toolbox_id = non_empty_filter(value),
+                "compute_api" => compute_api = non_empty_filter(value),
+                "workload" => workload = non_empty_filter(value),
+                "family" => family = non_empty_filter(value),
+                "quant_name" => quant_name = non_empty_filter(value),
+                "series" => {
+                    series = Some(match value.as_str() {
+                        "family" => SpiderSeriesKind::Family,
+                        "workload" => SpiderSeriesKind::Workload,
+                        "family_workload" => SpiderSeriesKind::FamilyWorkload,
+                        other => {
+                            return Err(BenchmarkError::Validation(format!(
+                                "series must be one of family, workload, family_workload (got {other})"
+                            )))
+                        }
+                    });
+                }
+                "series_values" => {
+                    series_values = Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                "axes" => {
+                    let mut parsed = Vec::new();
+                    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                        parsed.push(match token {
+                            "tepr" => SpiderAxis::Tepr,
+                            "speed" => SpiderAxis::Speed,
+                            other => {
+                                return Err(BenchmarkError::Validation(format!(
+                                    "axes must be tepr and/or speed (got {other})"
+                                )))
+                            }
+                        });
+                    }
+                    axes = Some(parsed);
+                }
+                unknown => {
+                    return Err(BenchmarkError::Validation(format!(
+                        "unknown query parameter: {unknown}"
+                    )))
+                }
+            }
+        }
+        let series = series.ok_or_else(|| {
+            BenchmarkError::Validation(
+                "series is required: one of family, workload, family_workload".into(),
+            )
+        })?;
+        let series_values = series_values.unwrap_or_default();
+        if !(SPIDER_MIN_SERIES_VALUES..=SPIDER_MAX_SERIES_VALUES).contains(&series_values.len()) {
+            return Err(BenchmarkError::Validation(format!(
+                "series_values must list between {SPIDER_MIN_SERIES_VALUES} and {SPIDER_MAX_SERIES_VALUES} entities to compare"
+            )));
+        }
+        let mut deduped = series_values.clone();
+        deduped.sort();
+        deduped.dedup();
+        if deduped.len() != series_values.len() {
+            return Err(BenchmarkError::Validation(
+                "series_values must not repeat the same entity".into(),
+            ));
+        }
+        let axes = axes.unwrap_or_default();
+        if axes.len() < 2 {
+            return Err(BenchmarkError::Validation(
+                "axes must include at least 2 of: tepr, speed".into(),
+            ));
+        }
+        let mut deduped_axes = axes.clone();
+        deduped_axes.sort_by_key(|axis| axis.as_str());
+        deduped_axes.dedup();
+        if deduped_axes.len() != axes.len() {
+            return Err(BenchmarkError::Validation(
+                "axes must not repeat the same dimension".into(),
+            ));
+        }
+        if series.requires_workload_pin() && workload.is_none() {
+            return Err(BenchmarkError::Validation(
+                "pin a single workload/harness (the `workload` filter) when comparing by model; or switch to comparing by harness".into(),
+            ));
+        }
+        Ok(Self {
+            backend,
+            toolbox_backend,
+            toolbox_id,
+            compute_api,
+            workload,
+            family,
+            quant_name,
+            series,
+            series_values,
+            axes,
+        })
+    }
+
+    /// Adapts this query's facet subset into `RunQuery`'s shape so
+    /// `query_where()` can be reused verbatim rather than re-implemented —
+    /// only the facet fields are populated; paging/sort/search stay at their
+    /// (unused-by-`query_where`) defaults.
+    fn as_run_query(&self) -> RunQuery {
+        RunQuery {
+            backend: self.backend.clone(),
+            toolbox_backend: self.toolbox_backend.clone(),
+            toolbox_id: self.toolbox_id.clone(),
+            compute_api: self.compute_api.clone(),
+            workload: self.workload.clone(),
+            family: self.family.clone(),
+            quant_name: self.quant_name.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpiderSeriesResult {
+    pub key: String,
+    pub label: String,
+    pub axis_values: BTreeMap<String, Option<f64>>,
+    pub sample_n: BTreeMap<String, u64>,
+    pub insufficient_data: BTreeMap<String, bool>,
+    pub aggregated_dimensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpiderChartResponse {
+    pub axes: Vec<String>,
+    pub series: Vec<SpiderSeriesResult>,
+    pub min_sample_size: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpiderAxisPoint {
+    value: Option<f64>,
+    sample_n: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkStore {
     path: PathBuf,
@@ -1901,6 +2209,7 @@ impl BenchmarkStore {
         if !migrated {
             connection.execute_batch(MIGRATION_0001)?;
             connection.execute_batch(MIGRATION_0002)?;
+            connection.execute_batch(MIGRATION_0003)?;
         } else {
             let mut version = connection
                 .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
@@ -1922,7 +2231,7 @@ impl BenchmarkStore {
                 [],
                 |row| row.get::<_, u64>(0),
             )?;
-            if !(1..=2).contains(&version) || !expected_migration || required_v1_tables != 5 {
+            if !(1..=3).contains(&version) || !expected_migration || required_v1_tables != 5 {
                 return Err(BenchmarkError::Validation(format!(
                     "database is not a recognized benchmark explorer schema (found version {version})"
                 )));
@@ -1946,9 +2255,34 @@ impl BenchmarkStore {
                 [],
                 |row| row.get::<_, u64>(0),
             )?;
-            if version != 2 || !expected_lab_migration || required_tables != 6 {
+            if !(2..=3).contains(&version) || !expected_lab_migration || required_tables != 6 {
                 return Err(BenchmarkError::Validation(format!(
                     "database is not a complete benchmark explorer schema at version 2 (found version {version})"
+                )));
+            }
+            if version == 2 {
+                connection.execute_batch(MIGRATION_0003)?;
+                version = 3;
+            }
+            let expected_serving_migration = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM schema_migrations
+                    WHERE version=3 AND name='toolbox_serving_dimension'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let required_v3_tables = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='table'
+                    AND name IN ('models','artifacts','experiments','runs','entity_fingerprints',
+                                 'benchmark_jobs','toolbox_catalog_snapshot','serving_runtimes')",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if version != 3 || !expected_serving_migration || required_v3_tables != 8 {
+                return Err(BenchmarkError::Validation(format!(
+                    "database is not a complete benchmark explorer schema at version 3 (found version {version})"
                 )));
             }
         }
@@ -2176,6 +2510,14 @@ impl BenchmarkStore {
             &bundle.artifact,
         )?;
         ensure_fingerprint(&transaction, "runtime", &bundle.runtime.id, &bundle.runtime)?;
+        if let Some(serving_runtime) = &bundle.serving_runtime {
+            ensure_fingerprint(
+                &transaction,
+                "serving_runtime",
+                &serving_runtime.id,
+                serving_runtime,
+            )?;
+        }
         ensure_fingerprint(
             &transaction,
             "hardware",
@@ -2266,6 +2608,26 @@ impl BenchmarkStore {
             ],
         )?;
 
+        if let Some(serving_runtime) = &bundle.serving_runtime {
+            ensure_catalog_snapshot(&transaction, &serving_runtime.catalog_snapshot_id)?;
+            let serving_metadata = to_json(&serving_runtime.metadata)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO serving_runtimes(
+                    id,toolbox_backend,toolbox_id,compute_api,container_image,
+                    catalog_snapshot_id,metadata_json
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    serving_runtime.id,
+                    serving_runtime.toolbox_backend.as_str(),
+                    serving_runtime.toolbox_id,
+                    serving_runtime.compute_api.as_str(),
+                    serving_runtime.container_image,
+                    serving_runtime.catalog_snapshot_id,
+                    serving_metadata,
+                ],
+            )?;
+        }
+
         let gpus = to_json(&bundle.hardware.gpus)?;
         let driver_versions = to_json(&bundle.hardware.driver_versions)?;
         let hardware_metadata = to_json(&bundle.hardware.metadata)?;
@@ -2350,17 +2712,18 @@ impl BenchmarkStore {
         let sampling_json = to_json(&bundle.experiment.sampling)?;
         transaction.execute(
             "INSERT OR IGNORE INTO experiments(
-                id,experiment_hash,spec_id,artifact_id,runtime_id,hardware_id,workload_id,
-                context_tokens,prompt_tokens,generation_tokens,batch_size,micro_batch_size,
-                threads,gpu_layers,flash_attention,kv_cache_type_k,kv_cache_type_v,
-                optimization_json,sampling_json,command_template
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                id,experiment_hash,spec_id,artifact_id,runtime_id,serving_runtime_id,hardware_id,
+                workload_id,context_tokens,prompt_tokens,generation_tokens,batch_size,
+                micro_batch_size,threads,gpu_layers,flash_attention,kv_cache_type_k,
+                kv_cache_type_v,optimization_json,sampling_json,command_template
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 bundle.experiment.id,
                 experiment_hash,
                 spec_id,
                 bundle.experiment.artifact_id,
                 bundle.experiment.runtime_id,
+                bundle.experiment.serving_runtime_id,
                 bundle.experiment.hardware_id,
                 bundle.experiment.workload_id,
                 bundle.experiment.context_tokens,
@@ -2598,7 +2961,8 @@ impl BenchmarkStore {
         paged_values.push(SqlValue::Integer(offset as i64));
         let sql = format!(
             "SELECT rs.run_id,rs.status,rs.repetition,rs.experiment_hash,rs.family,
-                    rs.architecture,rs.quant_name,rs.fork_name,rs.backend,rs.context_tokens,
+                    rs.architecture,rs.quant_name,rs.fork_name,rs.backend,
+                    rs.toolbox_backend,rs.toolbox_id,rs.compute_api,rs.context_tokens,
                     rs.workload,rs.prompt_tps,rs.generation_tps,rs.ttft_ms,
                     rs.peak_rss_bytes,rs.peak_vram_bytes,rs.speculator_type,
                     rs.acceptance_rate,r.started_at,r.ended_at,r.failure_reason,
@@ -2652,7 +3016,8 @@ impl BenchmarkStore {
         let summary = connection
             .query_row(
                 "SELECT rs.run_id,rs.status,rs.repetition,rs.experiment_hash,rs.family,
-                        rs.architecture,rs.quant_name,rs.fork_name,rs.backend,rs.context_tokens,
+                        rs.architecture,rs.quant_name,rs.fork_name,rs.backend,
+                        rs.toolbox_backend,rs.toolbox_id,rs.compute_api,rs.context_tokens,
                         rs.workload,rs.prompt_tps,rs.generation_tps,rs.ttft_ms,
                         rs.peak_rss_bytes,rs.peak_vram_bytes,rs.speculator_type,
                         rs.acceptance_rate,r.started_at,r.ended_at,r.failure_reason,
@@ -2701,6 +3066,11 @@ impl BenchmarkStore {
                    'capabilities',json(rt.capabilities_json),
                    'executable_sha256',rt.executable_sha256,
                    'container_digest',rt.container_digest,'built_at',rt.built_at),
+                 'serving_runtime', CASE WHEN sr.id IS NULL THEN NULL ELSE json_object(
+                   'id',sr.id,'toolbox_backend',sr.toolbox_backend,'toolbox_id',sr.toolbox_id,
+                   'compute_api',sr.compute_api,'container_image',sr.container_image,
+                   'catalog_snapshot_id',sr.catalog_snapshot_id,
+                   'metadata',json(sr.metadata_json)) END,
                  'hardware', json_object(
                    'id',h.id,'hostname_hash',h.hostname_hash,'cpu_model',h.cpu_model,
                    'physical_cores',h.physical_cores,'logical_cores',h.logical_cores,
@@ -2759,6 +3129,7 @@ impl BenchmarkStore {
              JOIN runtimes rt ON rt.id=e.runtime_id
              JOIN hardware_profiles h ON h.id=e.hardware_id
              JOIN workloads w ON w.id=e.workload_id
+             LEFT JOIN serving_runtimes sr ON sr.id=e.serving_runtime_id
              LEFT JOIN performance_metrics pm ON pm.run_id=r.id
              LEFT JOIN speculative_metrics sm ON sm.run_id=r.id
              WHERE r.id=?1",
@@ -2838,10 +3209,103 @@ impl BenchmarkStore {
             "statuses": distinct_values(&connection, "SELECT DISTINCT status FROM runs ORDER BY status", self.http_limits)?,
             "families": distinct_values(&connection, "SELECT DISTINCT family FROM run_summary ORDER BY family", self.http_limits)?,
             "backends": distinct_values(&connection, "SELECT DISTINCT backend FROM run_summary ORDER BY backend", self.http_limits)?,
+            "toolbox_backends": distinct_values(&connection, "SELECT DISTINCT toolbox_backend FROM run_summary WHERE toolbox_backend IS NOT NULL ORDER BY toolbox_backend", self.http_limits)?,
+            "toolbox_ids": distinct_values(&connection, "SELECT DISTINCT toolbox_id FROM run_summary WHERE toolbox_id IS NOT NULL ORDER BY toolbox_id", self.http_limits)?,
+            "compute_apis": distinct_values(&connection, "SELECT DISTINCT compute_api FROM run_summary WHERE compute_api IS NOT NULL ORDER BY compute_api", self.http_limits)?,
             "workloads": distinct_values(&connection, "SELECT DISTINCT workload FROM run_summary ORDER BY workload", self.http_limits)?,
             "quant_names": distinct_values(&connection, "SELECT DISTINCT quant_name FROM run_summary ORDER BY quant_name", self.http_limits)?,
             "speculator_types": distinct_values(&connection, "SELECT DISTINCT speculator_type FROM run_summary WHERE speculator_type IS NOT NULL ORDER BY speculator_type", self.http_limits)?,
         }))
+    }
+
+    /// Design doc §17: computes the spider/radar chart's per-entity,
+    /// per-axis values. Facets narrow the run population exactly like
+    /// `query_runs()` (reusing the same `query_where()` builder); `series`
+    /// determines which column groups runs into the plotted entities;
+    /// `axes` selects which continuous metrics are computed. Every requested
+    /// `series_values` entry is always present in the response (even with
+    /// zero matching runs), so a caller can distinguish "no data" from
+    /// "server forgot this series."
+    pub fn spider_chart(&self, query: &SpiderQuery) -> BenchmarkResult<SpiderChartResponse> {
+        let connection = self.connect()?;
+        let (where_sql, base_values) = query_where(&query.as_run_query());
+        let group_expr = query.series.group_expr();
+
+        let speed_points = if query.axes.contains(&SpiderAxis::Speed) {
+            spider_speed_points(
+                &connection,
+                &where_sql,
+                &base_values,
+                group_expr,
+                &query.series_values,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        let tepr_points = if query.axes.contains(&SpiderAxis::Tepr) {
+            spider_tepr_points(
+                &connection,
+                &where_sql,
+                &base_values,
+                group_expr,
+                &query.series_values,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+
+        // `family` is only ever "aggregated" (as opposed to pinned or itself
+        // being the series) when it's neither: left as a free facet while
+        // some other dimension is the series.
+        let aggregated_dimensions = if !matches!(query.series, SpiderSeriesKind::Family)
+            && query.family.is_none()
+        {
+            vec!["family".to_string()]
+        } else {
+            Vec::new()
+        };
+
+        let series = query
+            .series_values
+            .iter()
+            .map(|key| {
+                let mut axis_values = BTreeMap::new();
+                let mut sample_n = BTreeMap::new();
+                let mut insufficient_data = BTreeMap::new();
+                for axis in &query.axes {
+                    let points = match axis {
+                        SpiderAxis::Speed => &speed_points,
+                        SpiderAxis::Tepr => &tepr_points,
+                    };
+                    let point = points.get(key).cloned().unwrap_or_default();
+                    let axis_name = axis.as_str().to_string();
+                    axis_values.insert(axis_name.clone(), point.value);
+                    sample_n.insert(axis_name.clone(), point.sample_n);
+                    insufficient_data.insert(axis_name, point.sample_n < SPIDER_MIN_SAMPLE_SIZE);
+                }
+                let label = if matches!(query.series, SpiderSeriesKind::FamilyWorkload) {
+                    key.splitn(2, SPIDER_PAIR_SEPARATOR)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                } else {
+                    key.clone()
+                };
+                SpiderSeriesResult {
+                    key: key.clone(),
+                    label,
+                    axis_values,
+                    sample_n,
+                    insufficient_data,
+                    aggregated_dimensions: aggregated_dimensions.clone(),
+                }
+            })
+            .collect();
+
+        Ok(SpiderChartResponse {
+            axes: query.axes.iter().map(|axis| axis.as_str().to_string()).collect(),
+            series,
+            min_sample_size: SPIDER_MIN_SAMPLE_SIZE,
+        })
     }
 
     pub fn export_runs(&self, mut query: RunQuery, format: &str) -> BenchmarkResult<String> {
@@ -2858,7 +3322,7 @@ impl BenchmarkStore {
         query.per_page = MAX_PAGE_SIZE;
         let mut output = BoundedBuffer::new(MAX_RESPONSE_BYTES);
         if format == "csv" {
-            output.append(b"run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n")?;
+            output.append(b"run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,toolbox_backend,toolbox_id,compute_api,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n")?;
         }
         loop {
             let page = bounded.query_runs_connection(&transaction, &query)?;
@@ -2882,6 +3346,9 @@ impl BenchmarkStore {
                         run.quant_name,
                         run.fork_name,
                         run.backend,
+                        run.toolbox_backend.unwrap_or_default(),
+                        run.toolbox_id.unwrap_or_default(),
+                        run.compute_api.unwrap_or_default(),
                         run.context_tokens.to_string(),
                         run.workload,
                         option_string(run.prompt_tps),
@@ -3028,6 +3495,36 @@ fn ensure_fingerprint<T: Serialize>(
     Ok(())
 }
 
+/// Ensures a `toolbox_catalog_snapshot` row exists for `snapshot_id` *only*
+/// when it matches the catalog embedded in this binary
+/// ([`toolbox_catalog::vendored_catalog_snapshot`]) — in that case the exact
+/// vendored content is known and safe to anchor. For any other id (an older
+/// or otherwise different snapshot), this deliberately does nothing: it does
+/// not fabricate unknown snapshot content. If the referenced row doesn't
+/// already exist, the subsequent `serving_runtimes` insert's foreign key
+/// constraint surfaces a clear `BenchmarkError::Conflict` instead of
+/// silently succeeding with invented data (design doc §7a).
+fn ensure_catalog_snapshot(
+    transaction: &Transaction<'_>,
+    snapshot_id: &str,
+) -> BenchmarkResult<()> {
+    let vendored = toolbox_catalog::vendored_catalog_snapshot();
+    if snapshot_id != vendored.id {
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO toolbox_catalog_snapshot(id,models_json,toolboxes_json,source_commit)
+         VALUES (?1,?2,?3,?4)",
+        params![
+            vendored.id,
+            vendored.models_json,
+            vendored.toolboxes_json,
+            vendored.source_commit,
+        ],
+    )?;
+    Ok(())
+}
+
 fn parse_json(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
 }
@@ -3119,20 +3616,23 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
         quant_name: row.get(6)?,
         fork_name: row.get(7)?,
         backend: row.get(8)?,
-        context_tokens: row.get(9)?,
-        workload: row.get(10)?,
-        prompt_tps: row.get(11)?,
-        generation_tps: row.get(12)?,
-        ttft_ms: row.get(13)?,
-        peak_rss_bytes: row.get(14)?,
-        peak_vram_bytes: row.get(15)?,
-        speculator_type: row.get(16)?,
-        acceptance_rate: row.get(17)?,
-        started_at: row.get(18)?,
-        ended_at: row.get(19)?,
-        failure_reason: row.get(20)?,
-        disk_bytes: row.get(21)?,
-        quality_score: row.get(22)?,
+        toolbox_backend: row.get(9)?,
+        toolbox_id: row.get(10)?,
+        compute_api: row.get(11)?,
+        context_tokens: row.get(12)?,
+        workload: row.get(13)?,
+        prompt_tps: row.get(14)?,
+        generation_tps: row.get(15)?,
+        ttft_ms: row.get(16)?,
+        peak_rss_bytes: row.get(17)?,
+        peak_vram_bytes: row.get(18)?,
+        speculator_type: row.get(19)?,
+        acceptance_rate: row.get(20)?,
+        started_at: row.get(21)?,
+        ended_at: row.get(22)?,
+        failure_reason: row.get(23)?,
+        disk_bytes: row.get(24)?,
+        quality_score: row.get(25)?,
     })
 }
 
@@ -3143,6 +3643,9 @@ fn query_where(query: &RunQuery) -> (String, Vec<SqlValue>) {
         ("rs.status", query.status.as_ref()),
         ("rs.family", query.family.as_ref()),
         ("rs.backend", query.backend.as_ref()),
+        ("rs.toolbox_backend", query.toolbox_backend.as_ref()),
+        ("rs.toolbox_id", query.toolbox_id.as_ref()),
+        ("rs.compute_api", query.compute_api.as_ref()),
         ("rs.workload", query.workload.as_ref()),
         ("rs.quant_name", query.quant_name.as_ref()),
         ("rs.speculator_type", query.speculator_type.as_ref()),
@@ -3177,6 +3680,133 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Appends `clause` to an existing `WHERE ...`/empty string produced by
+/// `query_where()`, without assuming which case it's in.
+fn append_and(where_sql: &str, clause: &str) -> String {
+    if where_sql.is_empty() {
+        format!("WHERE {clause}")
+    } else {
+        format!("{where_sql} AND {clause}")
+    }
+}
+
+/// Binds `series_values` as an `IN (...)` restriction on `group_expr`,
+/// appended to `base_values`/`where_sql`. Shared by the speed and TEPR
+/// per-entity queries so the placeholder numbering/parameter order logic
+/// exists in exactly one place.
+fn spider_series_filter(
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+    extra_clause: Option<&str>,
+) -> (String, Vec<SqlValue>) {
+    let mut values = base_values.to_vec();
+    let placeholder_start = values.len();
+    for value in series_values {
+        values.push(SqlValue::Text(value.clone()));
+    }
+    let in_list = (0..series_values.len())
+        .map(|index| format!("?{}", placeholder_start + index + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut clause = format!("{group_expr} IN ({in_list})");
+    if let Some(extra) = extra_clause {
+        clause = format!("{clause} AND {extra}");
+    }
+    (append_and(where_sql, &clause), values)
+}
+
+fn spider_speed_points(
+    connection: &Connection,
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+) -> BenchmarkResult<BTreeMap<String, SpiderAxisPoint>> {
+    let (where_sql, values) = spider_series_filter(
+        where_sql,
+        base_values,
+        group_expr,
+        series_values,
+        Some("rs.generation_tps IS NOT NULL"),
+    );
+    let sql = format!(
+        "SELECT {group_expr} AS entity_key, AVG(rs.generation_tps) AS avg_value, COUNT(*) AS n
+         FROM run_summary rs
+         {where_sql}
+         GROUP BY entity_key"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<f64>>(1)?,
+            row.get::<_, u64>(2)?,
+        ))
+    })?;
+    let mut points = BTreeMap::new();
+    for row in rows {
+        let (key, value, sample_n) = row?;
+        points.insert(key, SpiderAxisPoint { value, sample_n });
+    }
+    Ok(points)
+}
+
+/// `run_tokens` first collapses `quality_results` to one row per run (a run
+/// can have several tasks/metrics): `actual_tokens` sums every observed
+/// `generated_tokens` for the run (§17's `actual_tokens_consumed`);
+/// `any_failed` is nonzero iff at least one row explicitly recorded
+/// `passed = 0` — rows with `passed IS NULL` (continuous, non-verdict
+/// metrics such as `elegance.*`) are neutral and never veto an
+/// otherwise-passing run (§17's refinement of §8's "positive" rule).
+fn spider_tepr_points(
+    connection: &Connection,
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+) -> BenchmarkResult<BTreeMap<String, SpiderAxisPoint>> {
+    let (where_sql, values) =
+        spider_series_filter(where_sql, base_values, group_expr, series_values, None);
+    let sql = format!(
+        "WITH run_tokens AS (
+            SELECT run_id,
+                   SUM(generated_tokens) AS actual_tokens,
+                   SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS any_failed
+            FROM quality_results
+            GROUP BY run_id
+         )
+         SELECT {group_expr} AS entity_key,
+                SUM(rt.actual_tokens) AS total_tokens,
+                SUM(CASE WHEN rs.status = 'succeeded' AND rt.any_failed = 0 THEN 1 ELSE 0 END) AS positive_count,
+                COUNT(*) AS n
+         FROM run_summary rs
+         JOIN run_tokens rt ON rt.run_id = rs.run_id
+         {where_sql}
+         GROUP BY entity_key"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, u64>(3)?,
+        ))
+    })?;
+    let mut points = BTreeMap::new();
+    for row in rows {
+        let (key, total_tokens, positive_count, sample_n) = row?;
+        let value = match total_tokens {
+            Some(total) if positive_count > 0 => Some(total as f64 / positive_count as f64),
+            _ => None,
+        };
+        points.insert(key, SpiderAxisPoint { value, sample_n });
+    }
+    Ok(points)
 }
 
 fn distinct_values(
@@ -3354,6 +3984,7 @@ fn html_response(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolbox_catalog::SupportedServingBackend;
 
     pub(super) struct TestStore {
         pub(super) store: BenchmarkStore,
@@ -3428,6 +4059,7 @@ mod tests {
                 container_digest: None,
                 built_at: now,
             },
+            serving_runtime: None,
             hardware: HardwareProfile {
                 id: "hardware-1".into(),
                 hostname_hash: None,
@@ -3461,6 +4093,7 @@ mod tests {
                 id: "experiment-1".into(),
                 artifact_id: "artifact-1".into(),
                 runtime_id: "runtime-1".into(),
+                serving_runtime_id: None,
                 hardware_id: "hardware-1".into(),
                 workload_id: "workload-1".into(),
                 context_tokens: 131_072,
@@ -3514,6 +4147,186 @@ mod tests {
         }
     }
 
+    fn quality_result(
+        id: &str,
+        run_id: &str,
+        metric_name: &str,
+        passed: Option<bool>,
+        generated_tokens: Option<u64>,
+    ) -> QualityResult {
+        QualityResult {
+            id: id.into(),
+            run_id: run_id.into(),
+            task_id: "task-1".into(),
+            metric_name: metric_name.into(),
+            metric_value: Some(1.0),
+            passed,
+            compile_succeeded: Some(true),
+            tests_passed: Some(1),
+            tests_total: Some(1),
+            generated_tokens,
+            duration_ms: Some(1.0),
+            output_path: None,
+            log_path: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn spider_query_parse_rejects_family_series_without_a_pinned_workload() {
+        let error = SpiderQuery::parse(Some("series=family&series_values=A,B&axes=tepr,speed"))
+            .unwrap_err();
+        assert!(error.to_string().contains("pin a single workload"));
+    }
+
+    #[test]
+    fn spider_query_parse_allows_workload_series_without_a_pinned_workload() {
+        SpiderQuery::parse(Some("series=workload&series_values=A,B&axes=tepr,speed"))
+            .expect("workload series needs no workload pin");
+    }
+
+    #[test]
+    fn spider_query_parse_requires_two_to_five_series_values() {
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A&axes=tepr,speed"
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("between 2 and 5"));
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A,B,C,D,E,F&axes=tepr,speed"
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("between 2 and 5"));
+    }
+
+    #[test]
+    fn spider_query_parse_requires_at_least_two_axes() {
+        let error = SpiderQuery::parse(Some("series=workload&series_values=A,B&axes=tepr"))
+            .unwrap_err();
+        assert!(error.to_string().contains("at least 2"));
+    }
+
+    #[test]
+    fn spider_query_parse_rejects_unknown_axis_and_series() {
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A,B&axes=tepr,made_up"
+        ))
+        .is_err());
+        assert!(SpiderQuery::parse(Some(
+            "series=made_up&series_values=A,B&axes=tepr,speed"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn spider_chart_averages_tokens_across_attempts_but_counts_only_positive_runs() {
+        let test = test_store();
+
+        // Positive run: one clean pass@1 verdict, 100 actual tokens.
+        let mut pass_run = bundle("run-qwen-pass", 0, RunStatus::Succeeded);
+        pass_run.quality_results = vec![quality_result(
+            "q-pass",
+            "run-qwen-pass",
+            "pass@1",
+            Some(true),
+            Some(100),
+        )];
+        test.store.ingest(&pass_run).unwrap();
+
+        // Failed attempt: still costs tokens (200), must count in the numerator
+        // but not the denominator. Cloned from `pass_run` (not a fresh
+        // `bundle()` call) so the shared `runtime-1`/`hardware-1`/etc. rows
+        // stay byte-identical across ingests — those are immutable once
+        // written, and a fresh `bundle()` call's own `built_at: Utc::now()`
+        // would otherwise conflict with the first ingest's value.
+        let mut fail_run = pass_run.clone();
+        fail_run.run.id = "run-qwen-fail".into();
+        fail_run.run.repetition = 1;
+        fail_run.performance_metrics.as_mut().unwrap().run_id = "run-qwen-fail".into();
+        fail_run.quality_results = vec![quality_result(
+            "q-fail",
+            "run-qwen-fail",
+            "pass@1",
+            Some(false),
+            Some(200),
+        )];
+        test.store.ingest(&fail_run).unwrap();
+
+        // Positive run whose only *other* quality row is a non-verdict
+        // continuous metric (passed=NULL) — must not veto its own positivity.
+        let mut elegance_run = pass_run.clone();
+        elegance_run.run.id = "run-qwen-elegance".into();
+        elegance_run.run.repetition = 2;
+        elegance_run.performance_metrics.as_mut().unwrap().run_id = "run-qwen-elegance".into();
+        elegance_run.quality_results = vec![
+            quality_result(
+                "q-verdict",
+                "run-qwen-elegance",
+                "pass@1",
+                Some(true),
+                Some(90),
+            ),
+            quality_result(
+                "q-elegance",
+                "run-qwen-elegance",
+                "elegance.readability",
+                None,
+                None,
+            ),
+        ];
+        test.store.ingest(&elegance_run).unwrap();
+
+        let query = SpiderQuery::parse(Some(
+            "series=family&series_values=Qwen,Llama&axes=tepr,speed&workload=long-context",
+        ))
+        .unwrap();
+        let response = test.store.spider_chart(&query).unwrap();
+        assert_eq!(response.min_sample_size, SPIDER_MIN_SAMPLE_SIZE);
+        assert_eq!(response.axes, vec!["tepr".to_string(), "speed".to_string()]);
+
+        let qwen = response.series.iter().find(|s| s.key == "Qwen").unwrap();
+        // total tokens = 100 + 200 + 90 = 390; positive runs = 2 (pass + elegance).
+        assert_eq!(qwen.axis_values["tepr"], Some(390.0 / 2.0));
+        assert_eq!(qwen.sample_n["tepr"], 3);
+        assert!(!qwen.insufficient_data["tepr"]);
+        assert!(qwen.axis_values["speed"].is_some());
+        assert!(qwen.aggregated_dimensions.is_empty());
+
+        let llama = response.series.iter().find(|s| s.key == "Llama").unwrap();
+        assert_eq!(llama.axis_values["tepr"], None);
+        assert_eq!(llama.sample_n["tepr"], 0);
+        assert!(llama.insufficient_data["tepr"]);
+    }
+
+    #[test]
+    fn spider_chart_family_workload_pair_series_needs_no_workload_pin() {
+        let test = test_store();
+        let mut run = bundle("run-pair", 0, RunStatus::Succeeded);
+        run.quality_results = vec![quality_result(
+            "q-pair",
+            "run-pair",
+            "pass@1",
+            Some(true),
+            Some(50),
+        )];
+        test.store.ingest(&run).unwrap();
+
+        let query = SpiderQuery::parse(Some(
+            "series=family_workload&series_values=Qwen::long-context,Other::other&axes=tepr,speed",
+        ))
+        .unwrap();
+        let response = test.store.spider_chart(&query).unwrap();
+        let matched = response
+            .series
+            .iter()
+            .find(|s| s.key == "Qwen::long-context")
+            .unwrap();
+        assert_eq!(matched.label, "Qwen / long-context");
+        assert_eq!(matched.axis_values["tepr"], Some(50.0));
+    }
+
     #[test]
     fn migration_creates_contract_schema_and_enables_pragmas() {
         let test = test_store();
@@ -3533,6 +4346,8 @@ mod tests {
             "quality_results",
             "telemetry_samples",
             "benchmark_jobs",
+            "toolbox_catalog_snapshot",
+            "serving_runtimes",
         ] {
             assert!(tables.iter().any(|name| name == table), "missing {table}");
         }
@@ -3542,7 +4357,7 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            2
+            3
         );
         assert!(connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
@@ -3590,15 +4405,61 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            2
+            3
         );
-        assert!(connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_jobs')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap());
+        for table in [
+            "benchmark_jobs",
+            "toolbox_catalog_snapshot",
+            "serving_runtimes",
+        ] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        params![table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "missing {table} after upgrade from version 1"
+            );
+        }
+        drop(connection);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    #[test]
+    fn version_two_registry_is_upgraded_to_serving_dimension_schema() {
+        let path = std::env::temp_dir().join(format!("brainrouter-bench-v2-{}.sqlite3", new_id()));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_0001).unwrap();
+        connection.execute_batch(MIGRATION_0002).unwrap();
+        drop(connection);
+
+        let store = BenchmarkStore::open(&path).unwrap();
+        let connection = store.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            3
+        );
+        for table in ["toolbox_catalog_snapshot", "serving_runtimes"] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        params![table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "missing {table} after upgrade from version 2"
+            );
+        }
         drop(connection);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
@@ -3767,6 +4628,120 @@ mod tests {
             .unwrap();
         assert!(csv.contains("run-a"));
         assert!(csv.contains("run-b"));
+    }
+
+    #[test]
+    fn serving_runtime_ingest_populates_toolbox_dimensions_end_to_end() {
+        let test = test_store();
+        let mut run = bundle("run-ds4", 0, RunStatus::Succeeded);
+        let snapshot = toolbox_catalog::vendored_catalog_snapshot();
+        run.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-1".into(),
+            toolbox_backend: SupportedServingBackend::Ds4,
+            toolbox_id: "ds4-rocm".into(),
+            compute_api: Backend::Rocm,
+            container_image: "docker.io/kyuz0/amd-r9700-ai-toolboxes:ds4".into(),
+            catalog_snapshot_id: snapshot.id.clone(),
+            metadata: BTreeMap::new(),
+        });
+        run.experiment.serving_runtime_id = Some("serving-runtime-1".into());
+        test.store.ingest(&run).unwrap();
+
+        let page = test
+            .store
+            .query_runs(&RunQuery::parse(Some("toolbox_backend=ds4")).unwrap())
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].toolbox_backend.as_deref(), Some("ds4"));
+        assert_eq!(page.items[0].toolbox_id.as_deref(), Some("ds4-rocm"));
+        assert_eq!(page.items[0].compute_api.as_deref(), Some("rocm"));
+
+        let unrelated = test
+            .store
+            .query_runs(&RunQuery::parse(Some("toolbox_backend=vllm")).unwrap())
+            .unwrap();
+        assert_eq!(unrelated.total, 0);
+
+        let options = test.store.filter_options().unwrap();
+        assert_eq!(options["toolbox_backends"], json!(["ds4"]));
+        assert_eq!(options["toolbox_ids"], json!(["ds4-rocm"]));
+        assert_eq!(options["compute_apis"], json!(["rocm"]));
+
+        let detail = test.store.run_detail("run-ds4").unwrap();
+        assert_eq!(
+            detail["configuration"]["serving_runtime"]["toolbox_backend"],
+            "ds4"
+        );
+        assert_eq!(
+            detail["configuration"]["serving_runtime"]["container_image"],
+            "docker.io/kyuz0/amd-r9700-ai-toolboxes:ds4"
+        );
+
+        let csv = test
+            .store
+            .export_runs(RunQuery::parse(None).unwrap(), "csv")
+            .unwrap();
+        assert!(csv.contains("ds4,ds4-rocm,rocm"));
+    }
+
+    #[test]
+    fn run_without_serving_runtime_leaves_toolbox_dimensions_null() {
+        let test = test_store();
+        let run = bundle("run-plain", 0, RunStatus::Succeeded);
+        test.store.ingest(&run).unwrap();
+        let page = test
+            .store
+            .query_runs(&RunQuery::parse(None).unwrap())
+            .unwrap();
+        assert_eq!(page.items[0].toolbox_backend, None);
+        assert_eq!(page.items[0].toolbox_id, None);
+        assert_eq!(page.items[0].compute_api, None);
+    }
+
+    #[test]
+    fn experiment_serving_runtime_id_must_match_bundle_serving_runtime() {
+        let test = test_store();
+        let mut mismatched_id = bundle("run-mismatch", 0, RunStatus::Succeeded);
+        mismatched_id.experiment.serving_runtime_id = Some("nonexistent".into());
+        assert!(matches!(
+            test.store.ingest(&mismatched_id),
+            Err(BenchmarkError::Validation(_))
+        ));
+
+        let mut missing_id = bundle("run-missing-id", 0, RunStatus::Succeeded);
+        missing_id.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-2".into(),
+            toolbox_backend: SupportedServingBackend::Vllm,
+            toolbox_id: "vllm-toolbox".into(),
+            compute_api: Backend::Cuda,
+            container_image: "example/vllm:latest".into(),
+            catalog_snapshot_id: toolbox_catalog::vendored_catalog_snapshot().id,
+            metadata: BTreeMap::new(),
+        });
+        assert!(matches!(
+            test.store.ingest(&missing_id),
+            Err(BenchmarkError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn serving_runtime_referencing_unknown_catalog_snapshot_is_rejected() {
+        let test = test_store();
+        let mut run = bundle("run-bad-snapshot", 0, RunStatus::Succeeded);
+        run.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-3".into(),
+            toolbox_backend: SupportedServingBackend::Vllm,
+            toolbox_id: "vllm-toolbox".into(),
+            compute_api: Backend::Cuda,
+            container_image: "example/vllm:latest".into(),
+            catalog_snapshot_id: "not-the-embedded-snapshot".into(),
+            metadata: BTreeMap::new(),
+        });
+        run.experiment.serving_runtime_id = Some("serving-runtime-3".into());
+        assert!(matches!(
+            test.store.ingest(&run),
+            Err(BenchmarkError::Conflict(_)) | Err(BenchmarkError::Database(_))
+        ));
     }
 
     #[test]

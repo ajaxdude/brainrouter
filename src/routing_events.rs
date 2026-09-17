@@ -79,10 +79,44 @@ pub struct RouteEvent {
     /// Zero means unavailable; see CompletedStreamMeasurement for its definition.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub tg_tps: f64,
+    /// PR4 (design doc §6): which toolbox-family backend served this request
+    /// (`llama_cpp`/`ds4`/`halogen`/`vllm`/`r9v`), when derivable. `None` when
+    /// the request wasn't served by a registered toolbox backend at all (e.g.
+    /// routed to Manifest/cloud, or errored before reaching any provider) —
+    /// the dashboard's Sankey maps `None` to an explicit bucket rather than
+    /// treating it as "same as llama_cpp". See [`derive_serving_identity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolbox_backend: Option<String>,
+    /// PR4 (design doc §6): the compute API/engine (`vulkan`/`rocm`/...) the
+    /// serving backend above used, when derivable. Same `None` semantics as
+    /// `toolbox_backend`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_api: Option<String>,
 }
 
 fn is_zero_f64(f: &f64) -> bool {
     *f == 0.0
+}
+
+/// Derives the toolbox-family backend + compute-API/engine pair from
+/// `effective_provider`, for the two `RouteEvent` fields above.
+///
+/// Today the router only ever produces two `effective_provider` values —
+/// `"manifest"` (cloud, not a toolbox at all) and `"llama-swap"` (local,
+/// always backed by the one hardcoded `docker.io/kyuz0/amd-strix-halo-
+/// toolboxes:vulkan-radv` image — see `server.rs`'s toolbox defaults). This
+/// mapping is therefore an accurate description of what the router actually
+/// does today, not a guess or a placeholder for backends that aren't wired
+/// in yet. Once serving-identity registration (design doc §5b) lands for
+/// additional backends, this hardcoded match is replaced by a real lookup
+/// against the registered serving identity for whichever provider actually
+/// served the request — it is not meant to be extended by more hardcoded
+/// provider-string matches as new backends are added.
+pub fn derive_serving_identity(effective_provider: Option<&str>) -> (Option<String>, Option<String>) {
+    match effective_provider {
+        Some("llama-swap") => (Some("llama_cpp".to_string()), Some("vulkan".to_string())),
+        _ => (None, None),
+    }
 }
 
 /// Shared description for consumers displaying completed-stream trends.
@@ -342,6 +376,8 @@ mod tests {
             conv_id: "same-conversation".into(),
             pp_tps: 0.0,
             tg_tps: 0.0,
+            toolbox_backend: Some("llama_cpp".into()),
+            compute_api: Some("vulkan".into()),
         }
     }
 
@@ -357,6 +393,20 @@ mod tests {
             completion_tokens: Some(5),
             stream_duration_ms: 400.0,
         }
+    }
+
+    #[test]
+    fn derive_serving_identity_maps_llama_swap_to_llama_cpp_vulkan() {
+        assert_eq!(
+            derive_serving_identity(Some("llama-swap")),
+            (Some("llama_cpp".to_string()), Some("vulkan".to_string()))
+        );
+    }
+
+    #[test]
+    fn derive_serving_identity_is_none_for_manifest_and_absent_provider() {
+        assert_eq!(derive_serving_identity(Some("manifest")), (None, None));
+        assert_eq!(derive_serving_identity(None), (None, None));
     }
 
     #[test]

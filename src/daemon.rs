@@ -188,6 +188,27 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             error.to_string()
         });
 
+    // Defensive, log-only check that the vendored ai-toolbox-cockpit catalog
+    // (assets/cockpit-catalog/) still parses/validates. No behavior depends
+    // on this yet (that starts in PR2) — it exists purely so a corrupted or
+    // unexpectedly-edited vendored file is visible in the daemon's own logs,
+    // not just in CI. Never fatal.
+    let vendored_catalog = brainrouter::toolbox_catalog::load_vendored_catalog();
+    if vendored_catalog.report.is_ok() {
+        info!(
+            toolboxes = vendored_catalog.toolbox_count().unwrap_or(0),
+            model_backends = vendored_catalog.model_backend_count().unwrap_or(0),
+            warnings = vendored_catalog.report.warnings.len(),
+            "Vendored toolbox catalog loaded"
+        );
+    } else {
+        warn!(
+            errors = ?vendored_catalog.report.errors,
+            "Vendored toolbox catalog failed structural validation; toolbox-catalog features \
+             (none shipped yet) would be unavailable"
+        );
+    }
+
     let tcp_addr: std::net::SocketAddr = args
         .tcp_addr
         .parse()
@@ -405,6 +426,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         benchmark_store,
         benchmark_lab,
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
+        toolbox_container_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        model_downloads: Arc::new(brainrouter::model_downloads::ModelDownloadRegistry::new()),
+        serving_identities: Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new()),
     });
 
     brainrouter::observability::start(&state);

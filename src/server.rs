@@ -89,6 +89,9 @@ use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
 use crate::stream::{DeferredStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
 use crate::inflight::SniffStream;
+use crate::toolbox_catalog::{
+    self, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition,
+};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
@@ -148,6 +151,23 @@ pub struct AppState {
     pub benchmark_lab: Result<Arc<crate::benchmark_lab::BenchmarkLab>, String>,
     /// Read-only model observations and separately persisted operator settings.
     pub observability: Arc<crate::observability::Observability>,
+    /// Per-container-name mutation lock for toolbox create/update/delete/adopt,
+    /// so two concurrent requests for the same container name queue instead of
+    /// racing `podman`/`toolbox` invocations against each other. Different
+    /// container names never contend (see design doc §5c).
+    pub toolbox_container_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Model-download job registry (PR6, §10): single-flight `hf download`
+    /// orchestration for the download-capable catalog backends
+    /// (ds4/halogen/llama_cpp/r9v; vllm is out of scope, see
+    /// `model_downloads.rs` module docs).
+    pub model_downloads: Arc<crate::model_downloads::ModelDownloadRegistry>,
+    /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
+    /// of currently-running toolbox Server Mode containers'
+    /// `{toolbox_backend, compute_api, runtime_profile_id, endpoint}`.
+    /// **Does not make any backend a routable Router upstream** — see
+    /// `serving_identity` module docs and design doc §16 before extending
+    /// this to affect request routing.
+    pub serving_identities: Arc<crate::serving_identity::ServingIdentityRegistry>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -225,6 +245,20 @@ async fn handle_request(
     // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
     let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
     let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
+        // Generalized toolbox container management (create/update/delete/adopt,
+        // PR2 §5c) — prefix-gated like /api/upgrade/ so a future sub-path under
+        // this same prefix is never accidentally left ungated.
+        || (method == "POST" && path.starts_with("/api/toolbox-containers"))
+        // PR3: cockpit config.json explicit "apply" writes (§4) — these write
+        // to a file outside brainrouter's own state, so gate them the same way.
+        || (method == "POST" && path.starts_with("/api/cockpit-config/"))
+        // PR6: model-download orchestration (§10) — starting/cancelling a
+        // job spawns `hf download`/reads local files; prefix-gated like
+        // /api/toolbox-containers so any future sub-path stays covered.
+        || (method == "POST" && path.starts_with("/api/model-downloads"))
+        // PR7: server-mode start/stop (§12) — launches/removes a detached
+        // `podman run` container; prefix-gated the same way.
+        || (method == "POST" && path.starts_with("/api/server-mode/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -838,6 +872,198 @@ async fn handle_request(
         // ── Toolboxes API (all llama-* toolbox containers) ──────────────────
         ("GET", "/api/toolboxes") => {
             let resp = toolboxes_list().await;
+            into_unsync(resp)
+        }
+
+        // ── Generalized toolbox catalog/container API (PR2, all 5 supported
+        // backends: llama_cpp/ds4/halogen/vllm/r9v — see design doc §5c) ────
+        ("GET", "/api/toolbox-catalog") => {
+            let resp = toolbox_catalog_response().await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/toolbox-models") => {
+            let resp = toolbox_models_response().await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/toolbox-containers") => {
+            let resp = toolbox_containers_list().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/toolbox-containers") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let resp = match val.get("toolbox_id").and_then(|v| v.as_str()) {
+                Some(id) => create_toolbox_container(&state, id).await,
+                None => json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                    error: "Missing \"toolbox_id\" in request body".into(),
+                }),
+            };
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/update") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/update").trim_end_matches('/');
+            let resp = update_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/delete") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/delete").trim_end_matches('/');
+            let resp = delete_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/adopt") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/adopt").trim_end_matches('/');
+            let resp = adopt_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        // ── PR6: model-download orchestration (§10) ──────────────────────────
+        ("GET", "/api/model-downloads/status") => {
+            let resp = model_downloads_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads/verify") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_verify_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/model-downloads") => {
+            let resp = model_downloads_list_response(&state).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/model-downloads/") && p.ends_with("/cancel") => {
+            let id = p.trim_start_matches("/api/model-downloads/").trim_end_matches("/cancel").trim_end_matches('/');
+            let resp = model_downloads_cancel_response(&state, id).await;
+            into_unsync(resp)
+        }
+
+        ("GET", p) if p.starts_with("/api/model-downloads/") => {
+            let id = p.trim_start_matches("/api/model-downloads/").trim_end_matches('/');
+            let resp = model_downloads_get_response(&state, id).await;
+            into_unsync(resp)
+        }
+
+        // ── PR7: ds4 Server Mode (§11/§12) ────────────────────────────────────
+        ("GET", "/api/server-mode/ds4/status") => {
+            let resp = server_mode_ds4_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/ds4/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_ds4_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/ds4/stop") => {
+            let resp = server_mode_ds4_stop_response(&state).await;
+            into_unsync(resp)
+        }
+
+        // ── PR8: halogen Server Mode (§13) ────────────────────────────────────
+        ("GET", "/api/server-mode/halogen/status") => {
+            let resp = server_mode_halogen_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/halogen/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_halogen_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/halogen/stop") => {
+            let resp = server_mode_halogen_stop_response(&state).await;
+            into_unsync(resp)
+        }
+
+        // ── PR9: vllm Server Mode (§14) ────────────────────────────────────────
+        ("GET", "/api/server-mode/vllm/status") => {
+            let resp = server_mode_vllm_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_vllm_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/stop") => {
+            let resp = server_mode_vllm_stop_response(&state).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/cache-paths") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_vllm_cache_paths_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        // ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────
+        ("GET", "/api/server-mode/r9v/status") => {
+            let resp = server_mode_r9v_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_r9v_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/stop") => {
+            let resp = server_mode_r9v_stop_response(&state).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/paths") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_r9v_paths_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads/r9v/prepare-ple") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_prepare_ple_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        // ── PR11a: serving-identity registry (§16) ──────────────────────────
+        ("GET", "/api/serving-identities") => {
+            let resp = serving_identities_response(&state).await;
+            into_unsync(resp)
+        }
+
+        // ── PR3: cockpit config.json Phase-1 read + explicit apply (§4) ─────
+        ("GET", "/api/cockpit-config") => {
+            let resp = cockpit_config_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/cockpit-config/default-toolbox") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = apply_cockpit_default_toolbox(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/cockpit-config/active-platform") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = apply_cockpit_active_platform(&body_bytes).await;
             into_unsync(resp)
         }
 
@@ -1861,6 +2087,686 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
     map
 }
 
+// ─── Generalized toolbox-catalog-driven container management (PR2) ─────────
+//
+// Everything below generalizes `toolboxes_list()`/`upgrade_toolbox()` above
+// (kept, unmodified, for backward compatibility — see design doc §5c) from
+// one hardcoded llama_cpp/Vulkan image to every toolbox in the vendored
+// catalog, across all 5 supported backends. See
+// `docs/design/ai-toolbox-cockpit-integration.md` §5c for the API contract
+// and the decisions recorded while implementing this.
+
+/// Podman label brainrouter attaches to every toolbox container it creates,
+/// so it can tell "brainrouter made this" apart from "a container that
+/// happens to share a catalog `container_name` but was made some other way
+/// (e.g. by cockpit directly)". See §5c: attaching these via `toolbox
+/// create --label` is unverified in this environment (Open question 6) and
+/// deliberately allowed to fail loudly rather than being silently skipped.
+const LABEL_MANAGED: &str = "io.brainrouter.managed";
+const LABEL_CATALOG_ID: &str = "io.brainrouter.catalog_id";
+const LABEL_CATALOG_REVISION: &str = "io.brainrouter.catalog_revision";
+
+/// Loads and type-parses the vendored toolbox catalog, restricted to
+/// entries brainrouter can act on. Returns a human-readable error string
+/// (used directly in `ErrorResponse`s) rather than a custom error type,
+/// matching this file's existing preference for cheap, situational errors
+/// over a dedicated error enum for read paths that should essentially never
+/// fail (the catalog is embedded at compile time and covered by unit tests).
+fn load_typed_toolbox_catalog() -> Result<ToolboxCatalog, String> {
+    let vendored = toolbox_catalog::load_vendored_catalog();
+    if !vendored.report.is_ok() {
+        warn!(
+            errors = ?vendored.report.errors,
+            warnings = ?vendored.report.warnings,
+            "Vendored toolbox catalog has structural validation issues"
+        );
+    }
+    let (toolboxes, _models) = vendored
+        .typed()
+        .map_err(|e| format!("failed to parse vendored toolbox catalog: {e}"))?;
+    Ok(toolboxes)
+}
+
+/// Whether a podman container carries brainrouter's ownership label.
+/// Absence (including "no such container") is treated as unmanaged, not an
+/// error — callers already know whether the container exists from `podman
+/// ps`, this only answers the ownership question for ones that do.
+async fn toolbox_container_is_managed(name: &str) -> bool {
+    let out = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", &format!("{{{{ index .Config.Labels \"{LABEL_MANAGED}\" }}}}"), name])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+/// `Some(repo)` if `image` is hosted on Docker Hub in the implicit
+/// `docker.io/<namespace>/<name>` form — the only registry shape this
+/// freshness check knows how to query (§3, critic finding #12). Anything
+/// else (e.g. `ghcr.io/...`) gets an explicit "freshness unavailable"
+/// status downstream rather than a guessed Hub-only request that would
+/// just fail or, worse, hit the wrong repo on Hub.
+fn hub_repo_for_image(image: &str) -> Option<&str> {
+    let (repo, _tag) = split_repo_tag(image);
+    repo.strip_prefix("docker.io/")
+}
+
+/// How long a per-repository Docker Hub tag-listing is cached before being
+/// re-fetched. Looping over every vendored toolbox's image on every
+/// dashboard poll (today every 30s) without this would multiply outbound
+/// Hub requests by the number of distinct repos in the catalog, which is
+/// exactly the scaling problem §3/critic finding #12 flagged.
+const HUB_TAG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// repo -> (fetched_at, tag -> last-push-date).
+type HubTagCache = std::collections::HashMap<String, (std::time::Instant, std::collections::HashMap<String, String>)>;
+
+static HUB_TAG_CACHE: LazyLock<std::sync::Mutex<HubTagCache>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Docker Hub tag -> last-push-date map for one repo, generalizing
+/// `hub_toolbox_tag_dates()`'s single hardcoded repo to any repo, cached
+/// per-repo, and — unlike the original — with an explicit request timeout
+/// (the original had none; see §3, critic finding #12).
+async fn hub_repo_tag_dates(repo: &str) -> std::collections::HashMap<String, String> {
+    if let Ok(cache) = HUB_TAG_CACHE.lock() {
+        if let Some((fetched_at, dates)) = cache.get(repo) {
+            if fetched_at.elapsed() < HUB_TAG_CACHE_TTL {
+                return dates.clone();
+            }
+        }
+    }
+
+    let mut map = std::collections::HashMap::new();
+    let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100");
+    let resp = VERSION_CLIENT
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok();
+    if let Some(r) = resp {
+        if let Ok(data) = r.json::<serde_json::Value>().await {
+            for t in data.get("results").and_then(|v| v.as_array()).into_iter().flatten() {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let pushed = t
+                    .get("tag_last_pushed")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.get(..10))
+                    .unwrap_or("");
+                if !name.is_empty() && !pushed.is_empty() {
+                    map.insert(name.to_string(), pushed.to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(mut cache) = HUB_TAG_CACHE.lock() {
+        cache.insert(repo.to_string(), (std::time::Instant::now(), map.clone()));
+    }
+    map
+}
+
+/// Freshness (`local_created`, `latest_created`, `update_available`) for a
+/// set of distinct images, fetching each distinct Hub repo at most once
+/// (bounded concurrency, not one call per container) rather than once per
+/// image/container as a naive generalization of `toolboxes_list()` would.
+async fn image_freshness_map(
+    images: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, (String, String, bool)> {
+    let repos: std::collections::HashSet<&str> =
+        images.iter().filter_map(|i| hub_repo_for_image(i)).collect();
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut tasks = Vec::new();
+    for repo in repos {
+        let repo = repo.to_string();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let dates = hub_repo_tag_dates(&repo).await;
+            (repo, dates)
+        }));
+    }
+    let mut repo_tag_map: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    for task in tasks {
+        if let Ok((repo, dates)) = task.await {
+            repo_tag_map.insert(repo, dates);
+        }
+    }
+
+    let mut result = std::collections::HashMap::new();
+    for image in images {
+        let local = image_created_date(image).await.unwrap_or_default();
+        let (_repo, tag) = split_repo_tag(image);
+        let latest = hub_repo_for_image(image)
+            .and_then(|r| repo_tag_map.get(r))
+            .and_then(|m| m.get(tag))
+            .cloned()
+            .unwrap_or_default();
+        let update_available = !local.is_empty() && !latest.is_empty() && local < latest;
+        result.insert(image.clone(), (local, latest, update_available));
+    }
+    result
+}
+
+/// `GET /api/toolbox-catalog` — the vendored catalog, restricted to the 5
+/// supported backends (comfyui entries omitted entirely, not just flagged).
+pub async fn toolbox_catalog_response() -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e });
+        }
+    };
+    let toolboxes: Vec<&ToolboxDefinition> = catalog
+        .toolboxes
+        .iter()
+        .filter(|t| t.supported_backend().is_some())
+        .collect();
+    json_response(StatusCode::OK, &serde_json::json!({
+        "schema_version": catalog.schema_version,
+        "toolboxes": toolboxes,
+        "platforms": catalog.platforms,
+    }))
+}
+
+/// `GET /api/toolbox-models` — the vendored model catalog, restricted to
+/// the 5 supported backends.
+pub async fn toolbox_models_response() -> Response<Full<Bytes>> {
+    let vendored = toolbox_catalog::load_vendored_catalog();
+    let (_toolboxes, models) = match vendored.typed() {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox model catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("failed to parse vendored model catalog: {e}"),
+            });
+        }
+    };
+    let backends: Vec<_> = models
+        .backends
+        .iter()
+        .filter(|b| SupportedServingBackend::try_from(&b.backend).is_ok())
+        .collect();
+    json_response(StatusCode::OK, &serde_json::json!({
+        "schema_version": models.schema_version,
+        "backends": backends,
+    }))
+}
+
+/// `GET /api/toolbox-containers` — generalizes `toolboxes_list()` above
+/// from one hardcoded `llama-*` name prefix to every catalog toolbox across
+/// all 5 supported backends. A podman container whose name matches no
+/// catalog `container_name` is omitted, same effective behavior as the
+/// old prefix filter, now catalog-driven instead of hardcoded.
+pub async fn toolbox_containers_list() -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e });
+        }
+    };
+    let by_container_name: std::collections::HashMap<&str, &ToolboxDefinition> = catalog
+        .toolboxes
+        .iter()
+        .filter(|t| t.supported_backend().is_some())
+        .map(|t| (t.container_name.as_str(), t))
+        .collect();
+
+    let containers = tokio::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}|{{.Image}}|{{.Status}}|{{.CreatedAt}}"])
+        .output()
+        .await;
+
+    // (container_name, toolbox, image, status, created_at)
+    let mut matched: Vec<(String, &ToolboxDefinition, String, String, String)> = Vec::new();
+    if let Ok(o) = containers {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.splitn(4, '|');
+            let (Some(name), Some(image), Some(status), Some(created_at)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some(tb) = by_container_name.get(name) else {
+                continue;
+            };
+            matched.push((name.to_string(), tb, image.to_string(), status.to_string(), created_at.to_string()));
+        }
+    }
+    matched.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let images: std::collections::HashSet<String> = matched.iter().map(|m| m.2.clone()).collect();
+    let freshness = image_freshness_map(&images).await;
+
+    let mut list: Vec<serde_json::Value> = Vec::with_capacity(matched.len());
+    for (name, tb, image, status, created_at) in &matched {
+        let managed = toolbox_container_is_managed(name).await;
+        let (local_created, latest_created, update_available) =
+            freshness.get(image).cloned().unwrap_or_default();
+        list.push(serde_json::json!({
+            "container_name": name,
+            "toolbox_id": tb.id,
+            "backend": tb.backend.as_str(),
+            "image": image,
+            "running": status.starts_with("Up"),
+            "status": status,
+            "created_at": created_at,
+            "local_created": local_created,
+            "latest_created": latest_created,
+            "update_available": update_available,
+            "managed": managed,
+        }));
+    }
+
+    json_response(StatusCode::OK, &serde_json::json!({ "containers": list }))
+}
+
+/// Acquires the per-container-name mutation lock, creating one on first use.
+/// The outer `std::sync::Mutex` only ever guards inserting a new per-name
+/// entry (a fast, non-blocking operation); the actual create/update/delete/
+/// adopt work is done while holding the returned async guard, so a second
+/// concurrent request for the *same* name queues behind it, while different
+/// names never contend (§5c).
+async fn lock_toolbox_container(state: &AppState, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let entry = {
+        let mut locks = state.toolbox_container_locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(locks.entry(name.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+    };
+    entry.lock_owned().await
+}
+
+/// Shared create/update/adopt primitive: pulls (if `pull`) the toolbox's
+/// catalog image, force-removes any existing container of that name, then
+/// recreates it via `toolbox create` with brainrouter's ownership labels.
+/// Assumes the caller already holds the per-container-name lock.
+async fn recreate_toolbox_container(tb: &ToolboxDefinition, pull: bool) -> Response<Full<Bytes>> {
+    let container = &tb.container_name;
+    let image = &tb.image;
+
+    if pull {
+        let pull_out = tokio::process::Command::new("podman").args(["pull", image]).output().await;
+        match pull_out {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                error!(%stderr, %container, %image, "podman pull failed");
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                    error: format!("podman pull failed: {}", stderr.trim()),
+                });
+            }
+            Err(e) => {
+                error!(error = %e, %container, "Failed to exec podman pull");
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                    error: format!("Failed to exec podman: {}", e),
+                });
+            }
+        }
+    }
+
+    // Force-remove any existing container of this name (idempotent: fine if absent).
+    let _ = tokio::process::Command::new("toolbox").args(["rm", "--force", container]).output().await;
+
+    let revision = toolbox_catalog::vendored_catalog_revision();
+    let create = tokio::process::Command::new("toolbox")
+        .args([
+            "create",
+            "--image",
+            image,
+            "--label",
+            &format!("{LABEL_MANAGED}=true"),
+            "--label",
+            &format!("{LABEL_CATALOG_ID}={}", tb.id),
+            "--label",
+            &format!("{LABEL_CATALOG_REVISION}={revision}"),
+            container,
+        ])
+        .output()
+        .await;
+
+    match create {
+        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": format!("Toolbox container '{container}' created."),
+        })),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container, %image, "toolbox create failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!(
+                    "toolbox create failed: {} (if this mentions an unrecognized --label flag, \
+                     see design doc §5c / Open question 6 — toolbox's --label support is unverified)",
+                    stderr.trim()
+                ),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, %container, "Failed to exec toolbox create");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec toolbox: {}", e),
+            })
+        }
+    }
+}
+
+/// `POST /api/toolbox-containers` — create a new container for `toolbox_id`.
+pub async fn create_toolbox_container(state: &AppState, toolbox_id: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog.toolbox_by_id(toolbox_id).filter(|t| t.supported_backend().is_some()) else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No such supported toolbox catalog id: {toolbox_id}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, &tb.container_name).await;
+    if toolbox_container_image(&tb.container_name).await.is_some() {
+        return json_response(StatusCode::CONFLICT, &ErrorResponse {
+            error: format!(
+                "Container '{}' already exists — use update or adopt instead.",
+                tb.container_name
+            ),
+        });
+    }
+    recreate_toolbox_container(tb, false).await
+}
+
+/// `POST /api/toolbox-containers/{name}/update` — pull latest image + recreate.
+pub async fn update_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog
+        .toolboxes
+        .iter()
+        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
+    else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No catalog toolbox with container_name: {container_name}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, container_name).await;
+    recreate_toolbox_container(tb, true).await
+}
+
+/// `POST /api/toolbox-containers/{name}/adopt` — recreate-in-place (no
+/// pull) to attach ownership labels to a pre-existing unmanaged container.
+/// See §5c for why this can't be a label-only no-op.
+pub async fn adopt_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog
+        .toolboxes
+        .iter()
+        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
+    else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No catalog toolbox with container_name: {container_name}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, container_name).await;
+    if toolbox_container_image(container_name).await.is_none() {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No such container: {container_name}"),
+        });
+    }
+    if toolbox_container_is_managed(container_name).await {
+        return json_response(StatusCode::CONFLICT, &ErrorResponse {
+            error: format!("Container '{container_name}' is already brainrouter-managed."),
+        });
+    }
+    recreate_toolbox_container(tb, false).await
+}
+
+/// `POST /api/toolbox-containers/{name}/delete` — idempotent force-remove.
+pub async fn delete_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let _guard = lock_toolbox_container(state, container_name).await;
+    if toolbox_container_image(container_name).await.is_none() {
+        return json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "already removed",
+        }));
+    }
+    let remove = tokio::process::Command::new("toolbox").args(["rm", "--force", container_name]).output().await;
+    match remove {
+        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": format!("Toolbox container '{container_name}' removed."),
+        })),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container_name, "toolbox rm failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("toolbox rm failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, %container_name, "Failed to exec toolbox rm");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec toolbox: {}", e),
+            })
+        }
+    }
+}
+
+// ── PR6: model-download orchestration (§10) ──────────────────────────────
+
+/// `GET /api/model-downloads/status` — read-only local-presence sweep
+/// across every download-capable backend's catalog entries (ds4/halogen/
+/// r9v; llama_cpp and vllm are excluded — see `model_downloads.rs` docs).
+pub async fn model_downloads_status_response() -> Response<Full<Bytes>> {
+    match crate::model_downloads::local_presence_snapshot() {
+        Ok(presence) => json_response(StatusCode::OK, &serde_json::json!({ "models": presence })),
+        Err(e) => {
+            error!(error = %e, "Failed to compute model-download presence snapshot");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e })
+        }
+    }
+}
+
+/// `GET /api/model-downloads` — list all known jobs (most-recent-first,
+/// bounded by the registry's own `MAX_JOB_HISTORY`).
+pub async fn model_downloads_list_response(state: &AppState) -> Response<Full<Bytes>> {
+    let jobs = state.model_downloads.list(crate::model_downloads::MAX_JOB_HISTORY).await;
+    json_response(StatusCode::OK, &serde_json::json!({ "jobs": jobs }))
+}
+
+/// `GET /api/model-downloads/{id}` — poll a single job's current state.
+pub async fn model_downloads_get_response(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    match state.model_downloads.get(id).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads` — start a new download job. Body:
+/// `{"backend": "...", "model_id": "...", "quant_pattern": "..." (llama_cpp only)}`.
+pub async fn model_downloads_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::model_downloads::StartDownloadRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match state.model_downloads.start(request).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/{id}/cancel` — request cancellation of a
+/// running (or queued) job. Idempotent-ish: cancelling an already-terminal
+/// job returns a Conflict, not a silent no-op, so the caller's UI can
+/// surface it plainly.
+pub async fn model_downloads_cancel_response(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    match state.model_downloads.cancel(id).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/verify` — explicit SHA256 verification pass,
+/// only meaningful for backends whose catalog entries carry a `sha256`
+/// (today, only `r9v`). Body: `{"backend": "...", "model_id": "..."}`.
+pub async fn model_downloads_verify_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    let (Some(backend_raw), Some(model_id)) = (
+        val.get("backend").and_then(|v| v.as_str()),
+        val.get("model_id").and_then(|v| v.as_str()),
+    ) else {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: "Missing \"backend\" or \"model_id\" in request body".into(),
+        });
+    };
+    let catalog_id = crate::toolbox_catalog::types::CatalogBackendId::from_str(backend_raw);
+    let Ok(backend) = SupportedServingBackend::try_from(&catalog_id) else {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: format!("unsupported or unknown backend `{backend_raw}`"),
+        });
+    };
+    match crate::model_downloads::verify_checksums(backend, model_id).await {
+        Ok(results) => json_response(StatusCode::OK, &serde_json::json!({ "files": results })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR3: cockpit config.json Phase-1 read + explicit "apply" write (§4) ────
+
+/// `GET /api/cockpit-config` — read-only snapshot of cockpit's shared
+/// config.json, including the resolved path/owner so a HOME/config-path
+/// mismatch between brainrouter and an interactively-run cockpit is
+/// visible in the dashboard rather than silent.
+pub async fn cockpit_config_status_response() -> Response<Full<Bytes>> {
+    json_response(StatusCode::OK, &crate::cockpit_config::load())
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyDefaultToolboxRequest {
+    backend_id: String,
+    platform_id: String,
+    toolbox_id: String,
+}
+
+/// `POST /api/cockpit-config/default-toolbox` — the explicit, user-
+/// triggered single-write "apply" action for one backend's default toolbox
+/// on one platform. Only ever touches
+/// `backends.<backend_id>.default_toolboxes.<platform_id>`; every other key
+/// in the file round-trips untouched (§4).
+pub async fn apply_cockpit_default_toolbox(body: &[u8]) -> Response<Full<Bytes>> {
+    let req: ApplyDefaultToolboxRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::cockpit_config::apply_default_toolbox(&req.backend_id, &req.platform_id, &req.toolbox_id) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" })),
+        Err(crate::cockpit_config::ApplyError::NotAvailable) => {
+            json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: crate::cockpit_config::ApplyError::NotAvailable.to_string() })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to apply cockpit default-toolbox setting");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e.to_string() })
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyActivePlatformRequest {
+    platform_id: String,
+}
+
+/// `POST /api/cockpit-config/active-platform` — same contract as
+/// [`apply_cockpit_default_toolbox`], for the top-level `active_platform` key.
+pub async fn apply_cockpit_active_platform(body: &[u8]) -> Response<Full<Bytes>> {
+    let req: ApplyActivePlatformRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::cockpit_config::apply_active_platform(&req.platform_id) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" })),
+        Err(crate::cockpit_config::ApplyError::NotAvailable) => {
+            json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: crate::cockpit_config::ApplyError::NotAvailable.to_string() })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to apply cockpit active-platform setting");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e.to_string() })
+        }
+    }
+}
+
+
+/// Fixed name for the transient container used to probe the installed llama.cpp version.
+/// Combined with `--replace`, this lets a fresh check safely reuse (rather than collide with)
+/// any leftover container of the same name from a prior run whose cleanup failed, and gives
+/// operators a stable, greppable name instead of podman's randomly-assigned pet-names.
+const PODMAN_VERSION_CHECK_CONTAINER_NAME: &str = "brainrouter-llama-version-check";
+
+/// Outcome of [`run_with_timeout_and_cleanup`].
+enum TimedCommandOutcome {
+    Completed(std::process::Output),
+    Failed(std::io::Error),
+    TimedOut,
+}
+
+/// Runs `cmd` under `timeout`. `cmd` must already have `.kill_on_drop(true)` set by the caller.
+///
+/// `podman run --rm` only removes its own container when the podman client exits normally; if
+/// the client is killed first (as `kill_on_drop` does when this future is dropped on timeout),
+/// `--rm`'s cleanup never runs and the container is left running, orphaned, under whatever name
+/// podman assigned it. On timeout this function therefore also runs a best-effort `cleanup`
+/// command (e.g. `podman rm -f <name>`) to remove that container; the cleanup's own failure is
+/// logged but never propagated, since this is already a best-effort fallback path.
+async fn run_with_timeout_and_cleanup(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+    mut cleanup: tokio::process::Command,
+) -> TimedCommandOutcome {
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => TimedCommandOutcome::Completed(out),
+        Ok(Err(e)) => TimedCommandOutcome::Failed(e),
+        Err(_) => {
+            if let Err(e) = cleanup.output().await {
+                warn!(error = %e, "best-effort cleanup command failed after timeout");
+            }
+            TimedCommandOutcome::TimedOut
+        }
+    }
+}
+
 /// Compute local versions and "latest available" metadata for the /api/versions endpoint.
 /// Called periodically by a background task in daemon.rs.
 /// Cooperative lock checked before spawning any llama-server process for a
@@ -1902,13 +2808,22 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
     let toolbox_ver = if gpu_exclusive_lock_active() {
         "unknown".to_string()
     } else {
-        let child = Command::new("podman")
-            .args(["run", "--rm", "--name", "brainrouter-versioncheck", "--replace",
-                   "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS), child).await {
-            Ok(Ok(out)) => {
+        let mut child = Command::new("podman");
+        child
+            .args([
+                "run", "--rm", "--replace", "--name", PODMAN_VERSION_CHECK_CONTAINER_NAME,
+                "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version",
+            ])
+            .kill_on_drop(true);
+        let mut cleanup = Command::new("podman");
+        cleanup.args(["rm", "-f", PODMAN_VERSION_CHECK_CONTAINER_NAME]);
+
+        match run_with_timeout_and_cleanup(
+            child,
+            std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS),
+            cleanup,
+        ).await {
+            TimedCommandOutcome::Completed(out) => {
                 let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
                 if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
                     line.replace("version:", "").replace("built with", "").trim().to_string()
@@ -1918,12 +2833,16 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
                     "unknown".to_string()
                 }
             }
-            Ok(Err(e)) => {
+            TimedCommandOutcome::Failed(e) => {
                 error!(error = %e, "Failed to execute podman run for version check");
                 "unknown".to_string()
             }
-            Err(_) => {
-                warn!(timeout_secs = PODMAN_VERSION_TIMEOUT_SECS, "podman run timed out during llama.cpp version check");
+            TimedCommandOutcome::TimedOut => {
+                warn!(
+                    timeout_secs = PODMAN_VERSION_TIMEOUT_SECS,
+                    container = PODMAN_VERSION_CHECK_CONTAINER_NAME,
+                    "podman run timed out during llama.cpp version check; ran best-effort cleanup"
+                );
                 "unknown".to_string()
             }
         }
@@ -2255,6 +3174,375 @@ async fn upgrade_manifest() -> Response<Full<Bytes>> {
             })
         }
     }
+}
+
+// ── PR7: ds4 Server Mode (§11/§12) ────────────────────────────────────────
+
+/// Shared helper for the 4 backends' `start_*_response()` handlers
+/// (§16/PR11a): builds a [`crate::serving_identity::ServingIdentity`] from
+/// an already-resolved toolbox/runtime-profile pair and registers it.
+/// Called only after `start_*_server()` itself already succeeded — a
+/// failure here (e.g. an unexpected catalog-resolution error for a
+/// toolbox_id that just successfully started) is logged, not surfaced as
+/// an HTTP error, since the server itself is genuinely running either way
+/// (§16: registration is bookkeeping, never gates the start/stop action).
+async fn register_serving_identity(
+    state: &AppState,
+    backend: crate::toolbox_catalog::SupportedServingBackend,
+    container_name: &str,
+    toolbox_id: String,
+    profile: &crate::toolbox_catalog::RuntimeProfile,
+    endpoint: String,
+) {
+    let identity = crate::serving_identity::ServingIdentity {
+        toolbox_backend: backend.as_str(),
+        compute_api: crate::server_mode::compute_api_for_runtime_profile(profile).to_string(),
+        runtime_profile_id: toolbox_id,
+        endpoint,
+        openai_compatible: crate::serving_identity::openai_compatible_for_backend(backend),
+        registered_at: chrono::Utc::now(),
+    };
+    state.serving_identities.register(container_name, identity).await;
+}
+
+/// `"http://host:port"`, normalizing an all-interfaces bind address
+/// (`0.0.0.0`) to `127.0.0.1` — the dashboard/API reader needs a real
+/// destination to (eventually) reach, and `0.0.0.0` is never a valid one
+/// (§16).
+fn serving_identity_endpoint(host: &str, port: u16) -> String {
+    let host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    format!("http://{host}:{port}")
+}
+
+/// `GET /api/server-mode/ds4/status` — always reads live `podman inspect`
+/// state (§12 item 5: no persisted registry).
+pub async fn server_mode_ds4_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::ds4_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/ds4/start` — body:
+/// `{"toolbox_id": "...", "model_id": "...", "ctx": <n>, "host": "...", "port": <n>, "custom_args": "..."}`.
+pub async fn server_mode_ds4_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartDs4ServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_ds4_server(&request).await {
+        Ok(()) => {
+            if let Ok((_, profile)) = crate::server_mode::resolve_ds4_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Ds4,
+                    crate::server_mode::DS4_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
+            let status = crate::server_mode::ds4_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/ds4/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone (§12 item 5).
+pub async fn server_mode_ds4_stop_response(state: &AppState) -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_ds4_server().await {
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::DS4_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "ds4 server stopped.",
+            }))
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR8: halogen Server Mode (§13) ────────────────────────────────────────
+
+/// `GET /api/server-mode/halogen/status` — always reads live `podman
+/// inspect` state, same no-persisted-registry contract as ds4's status
+/// endpoint above.
+pub async fn server_mode_halogen_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::halogen_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/halogen/start` — body:
+/// `{"toolbox_id": "...", "bundle_id": "...", "host": "...", "port": <n>,
+/// "context_size": <n>, "kv_pool_positions": <n>, "kv_slots": <n>,
+/// "prompt_cache": "0"|"1"|"2"}`.
+pub async fn server_mode_halogen_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartHalogenServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_halogen_server(&request).await {
+        Ok(()) => {
+            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_halogen_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Halogen,
+                    crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
+            let status = crate::server_mode::halogen_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/halogen/stop` — graceful `podman stop` then
+/// `podman rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_halogen_stop_response(state: &AppState) -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_halogen_server().await {
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "halogen server stopped.",
+            }))
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR9: vllm Server Mode (§14) ────────────────────────────────────────────
+
+/// `GET /api/server-mode/vllm/status` — always reads live `podman inspect`
+/// state, same no-persisted-registry contract as ds4/halogen's status
+/// endpoints above.
+pub async fn server_mode_vllm_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::vllm_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/vllm/start` — body:
+/// `{"toolbox_id": "...", "model_id"|"custom_repo": "...", "host": "...",
+/// "port": <n>, "tensor_parallel": <n>, "max_num_seqs": <n>,
+/// "max_model_len": "auto"|"<n>", "gpu_memory_utilization": <f>,
+/// "attention_backend": "...", "enforce_eager": <bool>, "dtype": "...",
+/// "api_key": "...", "extra_args": "...", "reset_caches": <bool>}`.
+pub async fn server_mode_vllm_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartVllmServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_vllm_server(&request).await {
+        Ok(()) => {
+            if let Ok((_, profile)) = crate::server_mode::resolve_vllm_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Vllm,
+                    crate::server_mode::VLLM_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
+            let status = crate::server_mode::vllm_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/vllm/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_vllm_stop_response(state: &AppState) -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_vllm_server().await {
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::VLLM_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "vllm server stopped.",
+            }))
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/vllm/cache-paths` — body:
+/// `{"hf_cache"?, "vllm_cache"?, "triton_cache"?, "aiter_cache"?: "..."}`,
+/// the direct analogue of upstream's separate "Save Cache Paths" action
+/// (§14 item 7) — unlike ds4/halogen, vllm does not persist its settings
+/// as a side effect of `start`.
+pub async fn server_mode_vllm_cache_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::VllmCachePathsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::save_vllm_cache_paths(&request) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "vllm cache paths saved.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────────
+
+/// `GET /api/server-mode/r9v/status` — always reads live `podman inspect`
+/// state, same no-persisted-registry contract as the other three backends'
+/// status endpoints above.
+pub async fn server_mode_r9v_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::r9v_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/r9v/start` — body:
+/// `{"toolbox_id": "...", "package_id": "...", "host"?, "port"?,
+/// "devices"?, "context"?, "batch"?, "sequences"?, "kv_bytes"?,
+/// "expert_cache_slots"?, "offload"?, "offload_devices"?, "served_model"?,
+/// "api_key"?, "extra_args"?}` — every tuning field is optional, falling
+/// back to upstream's own literal defaults (§15a).
+pub async fn server_mode_r9v_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartR9vServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_r9v_server(&request).await {
+        Ok(()) => {
+            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_r9v_toolbox(&request.toolbox_id) {
+                let host = request.host.as_deref().unwrap_or(crate::server_mode::R9V_DEFAULT_HOST);
+                let port = request.port.unwrap_or(crate::server_mode::R9V_DEFAULT_PORT);
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::R9v,
+                    crate::server_mode::R9V_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(host, port),
+                )
+                .await;
+            }
+            let status = crate::server_mode::r9v_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/r9v/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_r9v_stop_response(state: &AppState) -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_r9v_server().await {
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::R9V_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "r9v server stopped.",
+            }))
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/r9v/paths` — body:
+/// `{"models_dir"?, "ple_dir"?, "cache_dir"?: "..."}`, the r9v analogue of
+/// vllm's `/cache-paths` action.
+pub async fn server_mode_r9v_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::R9vPathsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::save_r9v_paths(&request) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "r9v paths saved.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/r9v/prepare-ple` — body:
+/// `{"toolbox_id": "...", "package_id": "..."}`. Starts the "Prepare PLE"
+/// job (`podman run ... r9v-model prepare`) through the same
+/// [`crate::model_downloads::ModelDownloadRegistry`] job registry as
+/// ordinary downloads (§15's job-registry-widening decision) — the
+/// returned [`crate::model_downloads::ModelDownloadJob`] is polled the
+/// same way via the existing `GET /api/model-downloads/{id}` endpoint.
+pub async fn model_downloads_prepare_ple_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::model_downloads::StartPreparePleRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match state.model_downloads.start_prepare_ple(&request).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `GET /api/serving-identities` — read-only snapshot of every
+/// currently-registered server-mode backend's serving identity (§16/PR11a).
+/// Purely informational: the dashboard panel this feeds has no start/stop
+/// controls, and no request routing ever consults this endpoint's data
+/// (see `serving_identity` module docs).
+pub async fn serving_identities_response(state: &AppState) -> Response<Full<Bytes>> {
+    let identities = state.serving_identities.snapshot().await;
+    json_response(StatusCode::OK, &serde_json::json!({ "identities": identities }))
 }
 
 /// Look up the image a podman container is running from (full `docker.io/…`
@@ -2752,6 +4040,52 @@ mod tests {
     #[test]
     fn display_name_full_model_id() {
         assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-amdvlk"), "Qwen3.6 27B Q6 AMDVLK");
+    }
+
+    /// Regression test for the podman version-check leak (design doc
+    /// `docs/design/ai-toolbox-cockpit-integration.md` §5a): a normal completion within the
+    /// timeout must NOT trigger the best-effort cleanup command. This must actually exercise the
+    /// success path, not just assert the timeout path is correct in isolation, since either half
+    /// failing silently would defeat the fix.
+    #[tokio::test]
+    async fn timed_command_skips_cleanup_when_command_completes_in_time() {
+        let marker = std::env::temp_dir().join(format!("brainrouter-test-marker-{}", uuid::Uuid::new_v4()));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "true"]).kill_on_drop(true);
+        let mut cleanup = tokio::process::Command::new("sh");
+        cleanup.args(["-c", &format!("touch {}", marker.display())]);
+
+        let outcome = run_with_timeout_and_cleanup(
+            cmd,
+            std::time::Duration::from_secs(5),
+            cleanup,
+        ).await;
+
+        assert!(matches!(outcome, TimedCommandOutcome::Completed(_)));
+        assert!(!marker.exists(), "cleanup must not run when the command completes in time");
+    }
+
+    /// Regression test forcing the **timeout branch itself** (not just running the check twice
+    /// normally, which the Dory critic review found would pass even without the fix): a
+    /// deliberately slow command under an artificially short timeout must be killed and must
+    /// trigger the best-effort cleanup command exactly once.
+    #[tokio::test]
+    async fn timed_command_runs_cleanup_on_timeout() {
+        let marker = std::env::temp_dir().join(format!("brainrouter-test-marker-{}", uuid::Uuid::new_v4()));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 5"]).kill_on_drop(true);
+        let mut cleanup = tokio::process::Command::new("sh");
+        cleanup.args(["-c", &format!("touch {}", marker.display())]);
+
+        let outcome = run_with_timeout_and_cleanup(
+            cmd,
+            std::time::Duration::from_millis(50),
+            cleanup,
+        ).await;
+
+        assert!(matches!(outcome, TimedCommandOutcome::TimedOut));
+        assert!(marker.exists(), "best-effort cleanup must run on timeout");
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
