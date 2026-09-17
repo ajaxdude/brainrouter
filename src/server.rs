@@ -984,6 +984,29 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── PR9: vllm Server Mode (§14) ────────────────────────────────────────
+        ("GET", "/api/server-mode/vllm/status") => {
+            let resp = server_mode_vllm_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_vllm_start_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/stop") => {
+            let resp = server_mode_vllm_stop_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/vllm/cache-paths") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_vllm_cache_paths_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
         // ── PR3: cockpit config.json Phase-1 read + explicit apply (§4) ─────
         ("GET", "/api/cockpit-config") => {
             let resp = cockpit_config_status_response().await;
@@ -3180,6 +3203,81 @@ pub async fn server_mode_halogen_stop_response() -> Response<Full<Bytes>> {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
             "status": "ok",
             "message": "halogen server stopped.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR9: vllm Server Mode (§14) ────────────────────────────────────────────
+
+/// `GET /api/server-mode/vllm/status` — always reads live `podman inspect`
+/// state, same no-persisted-registry contract as ds4/halogen's status
+/// endpoints above.
+pub async fn server_mode_vllm_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::vllm_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/vllm/start` — body:
+/// `{"toolbox_id": "...", "model_id"|"custom_repo": "...", "host": "...",
+/// "port": <n>, "tensor_parallel": <n>, "max_num_seqs": <n>,
+/// "max_model_len": "auto"|"<n>", "gpu_memory_utilization": <f>,
+/// "attention_backend": "...", "enforce_eager": <bool>, "dtype": "...",
+/// "api_key": "...", "extra_args": "...", "reset_caches": <bool>}`.
+pub async fn server_mode_vllm_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartVllmServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_vllm_server(&request).await {
+        Ok(()) => {
+            let status = crate::server_mode::vllm_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/vllm/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_vllm_stop_response() -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_vllm_server().await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "vllm server stopped.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/vllm/cache-paths` — body:
+/// `{"hf_cache"?, "vllm_cache"?, "triton_cache"?, "aiter_cache"?: "..."}`,
+/// the direct analogue of upstream's separate "Save Cache Paths" action
+/// (§14 item 7) — unlike ds4/halogen, vllm does not persist its settings
+/// as a side effect of `start`.
+pub async fn server_mode_vllm_cache_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::VllmCachePathsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::save_vllm_cache_paths(&request) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "vllm cache paths saved.",
         })),
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),

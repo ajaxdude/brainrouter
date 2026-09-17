@@ -200,8 +200,10 @@ pub struct ModelPresence {
 
 /// Expands a leading `~` the same way cockpit's own `Path(...).expanduser()`
 /// does. `$HOME` falls back to `/root` if unset, matching
-/// `cockpit_config.rs::config_path()`'s existing convention.
-fn expand_tilde(raw: &str) -> PathBuf {
+/// `cockpit_config.rs::config_path()`'s existing convention. `pub(crate)`
+/// (PR9+) so `server_mode.rs`'s vllm cache-directory resolution reuses this
+/// exact expansion rather than duplicating it (§14).
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
     let home = || std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     if raw == "~" {
         return PathBuf::from(home());

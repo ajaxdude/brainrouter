@@ -561,7 +561,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
     </div>
 
-    <!-- PR7/PR8: ds4 + halogen Server Mode (design doc §11/§12/§13) —
+    <!-- PR7/PR8/PR9: ds4 + halogen + vllm Server Mode (design doc §11/§12/§13/§14) —
          headless detached `podman run` servers, structurally distinct from
          the Toolboxes tab above (`toolbox create` dev-shells never receive
          engine_args; only Server Mode's plain `podman run` does). Backend
@@ -569,14 +569,17 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
          pattern. ds4: single instance, standalone (single-node) launch —
          multi-node/DSpark/SSD-streaming/MTP are reachable via the
          custom-args escape hatch. halogen: bundle-based model resolution,
-         env-var-only launch shape, no custom_args (upstream has none). -->
+         env-var-only launch shape, no custom_args (upstream has none).
+         vllm: HF-repo-based model resolution (catalog id or free-form
+         custom repo), policy-gated attention-backend override, separate
+         cache-paths save action (no auto-persist on start). -->
     <div id="server-mode-view" style="display:none;max-width:900px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
       </div>
       <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
         Launch a headless inference server directly from an already-downloaded model — no cockpit install required.
-        v1 covers ds4 and halogen, one instance per backend at a time, standalone (single-node) mode. ds4's multi-node
+        v1 covers ds4, halogen, and vllm, one instance per backend at a time, standalone (single-node) mode. ds4's multi-node
         roles, DSpark, SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args
         field below — see the design doc §12/§13.
       </div>
@@ -663,6 +666,103 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
 
       <div id="sm-halogen-status" style="display:none;font-size:12px;color:var(--textMute)">Loading status…</div>
+
+      <!-- PR9: vllm Server Mode (§14). HF-repo-based model resolution
+           (catalog `model_id` dropdown OR a free-form `custom_repo` text
+           field — mutually exclusive, mirroring upstream's own curated-
+           dropdown/free-text pair), a policy-gated attention-backend
+           override (rejected outright when the model locks it, §14 item
+           3), and a separate cache-paths save action distinct from
+           start/stop (upstream has no auto-persist-on-start for vllm,
+           unlike halogen). -->
+      <div id="sm-panel-vllm" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">vllm server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-vllm-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model (already downloaded)
+            <select id="sm-vllm-model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">…or a custom HF repo (bypasses the catalog entirely)
+            <input id="sm-vllm-custom-repo" type="text" placeholder="e.g. owner/model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-vllm-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-vllm-port" type="number" value="8000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Tensor parallel
+              <input id="sm-vllm-tp" type="number" value="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Max num seqs
+              <input id="sm-vllm-max-num-seqs" type="number" value="64" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Max model len
+              <input id="sm-vllm-max-model-len" type="text" value="auto" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">GPU memory util.
+              <input id="sm-vllm-gpu-mem-util" type="number" step="0.01" min="0" max="1" value="0.9" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Attention backend (optional override)
+              <input id="sm-vllm-attention-backend" type="text" placeholder="e.g. TRITON_ATTN" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Dtype
+              <input id="sm-vllm-dtype" type="text" value="auto" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">API key (optional)
+              <input id="sm-vllm-api-key" type="text" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute);display:flex;align-items:center;gap:6px">
+            <input id="sm-vllm-enforce-eager" type="checkbox" style="margin:0"> Enforce eager mode (overrides the model's default)
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Extra args (optional, shell-quoted)
+            <input id="sm-vllm-extra-args" type="text" placeholder="e.g. --enable-auto-tool-choice" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute);display:flex;align-items:center;gap:6px">
+            <input id="sm-vllm-reset-caches" type="checkbox" style="margin:0"> Wipe compiled vllm/triton/aiter caches before start
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startVllmServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopVllmServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-vllm-status" style="display:none;font-size:12px;color:var(--textMute);margin-bottom:16px">Loading status…</div>
+
+      <!-- PR9 §14 item 7: vllm's cache directories (huggingface/vllm/triton/
+           aiter) are saved as their own explicit action into cockpit's
+           shared config.json, distinct from starting a server — mirrors
+           upstream's separate "Save Cache Paths" button exactly. -->
+      <div id="sm-panel-vllm-caches" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">vllm cache paths</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Hugging Face cache
+            <input id="sm-vllm-cache-hf" type="text" placeholder="~/.cache/huggingface" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">vLLM cache
+            <input id="sm-vllm-cache-vllm" type="text" placeholder="~/.cache/vllm" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Triton cache
+            <input id="sm-vllm-cache-triton" type="text" placeholder="~/.cache/triton" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">AITER cache
+            <input id="sm-vllm-cache-aiter" type="text" placeholder="~/.aiter" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="saveVllmCachePaths()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Save cache paths</button>
+          </div>
+        </div>
+      </div>
     </div>
 
 
@@ -2863,16 +2963,17 @@ function scheduleToolboxModelsPoll() {
   }
 }
 
-// ─── PR7/PR8: ds4 + halogen Server Mode (design doc §11/§12/§13) ───────────
+// ─── PR7/PR8/PR9: ds4 + halogen + vllm Server Mode (design doc §11/§12/§13/§14) ─
 // Headless detached `podman run` servers — structurally distinct from the
 // Toolboxes-tab dev-shells above. One instance per backend, standalone
 // launch. Lifecycle is synchronous request/response (no job registry like
 // the downloads above) — `status` always reflects live `podman inspect`
 // state, matching src/server_mode.rs's "no persisted state" design.
-const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen'];
+const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm'];
 let serverModeActiveBackend = 'ds4';
 let serverModeStatus = null;
 let serverModeHalogenStatus = null;
+let serverModeVllmStatus = null;
 
 function renderServerModeBackendTabs() {
   const el = document.getElementById('server-mode-backend-tabs');
@@ -2891,6 +2992,9 @@ function setServerModeBackend(backend) {
   document.getElementById('sm-ds4-status').style.display = backend === 'ds4' ? 'block' : 'none';
   document.getElementById('sm-panel-halogen').style.display = backend === 'halogen' ? 'block' : 'none';
   document.getElementById('sm-halogen-status').style.display = backend === 'halogen' ? 'block' : 'none';
+  document.getElementById('sm-panel-vllm').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-vllm-status').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-panel-vllm-caches').style.display = backend === 'vllm' ? 'block' : 'none';
 }
 
 async function loadServerMode() {
@@ -2901,22 +3005,27 @@ async function loadServerMode() {
   // model/bundle on disk, not just a catalog entry.
   renderServerModeBackendTabs();
   setServerModeBackend(serverModeActiveBackend);
-  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes] = await Promise.all([
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes] = await Promise.all([
     safeFetch('/api/toolbox-models'),
     safeFetch('/api/model-downloads/status'),
     safeFetch('/api/server-mode/ds4/status'),
     safeFetch('/api/server-mode/halogen/status'),
+    safeFetch('/api/server-mode/vllm/status'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
   if (statusRes) toolboxModelPresence = statusRes.models || [];
   if (ds4StatusRes) serverModeStatus = ds4StatusRes;
   if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
+  if (vllmStatusRes) serverModeVllmStatus = vllmStatusRes;
   renderServerModeToolboxOptions();
   renderServerModeModelOptions();
   renderServerModeStatus();
   renderServerModeHalogenToolboxOptions();
   renderServerModeHalogenBundleOptions();
   renderServerModeHalogenStatus();
+  renderServerModeVllmToolboxOptions();
+  renderServerModeVllmModelOptions();
+  renderServerModeVllmStatus();
 }
 
 function renderServerModeToolboxOptions() {
@@ -3079,6 +3188,126 @@ async function stopHalogenServer() {
     if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
   } catch (e) {}
   loadServerMode();
+}
+
+// PR9: vllm Server Mode (§14). HF-repo-based model resolution: a catalog
+// `model_id` dropdown (only already-downloaded entries, same
+// presenceFor()-gated pattern as ds4/halogen above) OR a free-form
+// `custom_repo` text field that bypasses the catalog entirely — exactly
+// one of the two must be set. Also exposes a separate "Save cache paths"
+// action, since upstream's own vllm UI never auto-persists settings on
+// server start (unlike halogen's `save_backend_settings()` call).
+function renderServerModeVllmToolboxOptions() {
+  const el = document.getElementById('sm-vllm-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const vllmToolboxes = allToolboxes.filter(tb => tb.backend === 'vllm' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('vllm');
+  el.innerHTML = vllmToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (vllmToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeVllmModelOptions() {
+  const el = document.getElementById('sm-vllm-model');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'vllm');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('vllm', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  const placeholder = '<option value="">(none — use the custom repo field below)</option>';
+  if (!complete.length) {
+    el.innerHTML = placeholder;
+    return;
+  }
+  el.innerHTML = placeholder + complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeVllmStatus() {
+  const el = document.getElementById('sm-vllm-status');
+  if (!el || !serverModeVllmStatus) return;
+  if (!serverModeVllmStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeVllmStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeVllmStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeVllmStatus.model_id ? ' · model: ' + escHtml(serverModeVllmStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeVllmStatus.container_name)})</span>`;
+}
+
+async function startVllmServer() {
+  const toolboxId = document.getElementById('sm-vllm-toolbox').value;
+  const modelId = document.getElementById('sm-vllm-model').value;
+  const customRepo = document.getElementById('sm-vllm-custom-repo').value.trim();
+  const host = document.getElementById('sm-vllm-host').value;
+  const port = parseInt(document.getElementById('sm-vllm-port').value, 10);
+  const tensorParallel = parseInt(document.getElementById('sm-vllm-tp').value, 10);
+  const maxNumSeqs = parseInt(document.getElementById('sm-vllm-max-num-seqs').value, 10);
+  const maxModelLen = document.getElementById('sm-vllm-max-model-len').value.trim() || 'auto';
+  const gpuMemoryUtilization = parseFloat(document.getElementById('sm-vllm-gpu-mem-util').value);
+  const attentionBackend = document.getElementById('sm-vllm-attention-backend').value.trim();
+  const enforceEager = document.getElementById('sm-vllm-enforce-eager').checked;
+  const dtype = document.getElementById('sm-vllm-dtype').value.trim() || 'auto';
+  const apiKey = document.getElementById('sm-vllm-api-key').value.trim();
+  const extraArgs = document.getElementById('sm-vllm-extra-args').value;
+  const resetCaches = document.getElementById('sm-vllm-reset-caches').checked;
+  if (!toolboxId || (!modelId && !customRepo)) { alert('Pick a toolbox and either an already-downloaded model or a custom repo.'); return; }
+  if (modelId && customRepo) { alert('Pick either a catalog model or a custom repo, not both.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/vllm/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, model_id: modelId || undefined, custom_repo: customRepo || undefined,
+        host, port, tensor_parallel: tensorParallel, max_num_seqs: maxNumSeqs,
+        max_model_len: maxModelLen, gpu_memory_utilization: gpuMemoryUtilization,
+        attention_backend: attentionBackend || undefined, enforce_eager: enforceEager || undefined,
+        dtype, api_key: apiKey || undefined, extra_args: extraArgs || undefined, reset_caches: resetCaches,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeVllmStatus = j;
+    renderServerModeVllmStatus();
+  } catch (e) {}
+}
+
+async function stopVllmServer() {
+  try {
+    const r = await fetch('/api/server-mode/vllm/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+async function saveVllmCachePaths() {
+  const hfCache = document.getElementById('sm-vllm-cache-hf').value.trim();
+  const vllmCache = document.getElementById('sm-vllm-cache-vllm').value.trim();
+  const tritonCache = document.getElementById('sm-vllm-cache-triton').value.trim();
+  const aiterCache = document.getElementById('sm-vllm-cache-aiter').value.trim();
+  if (!hfCache && !vllmCache && !tritonCache && !aiterCache) { alert('Enter at least one cache path first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/vllm/cache-paths', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hf_cache: hfCache || undefined, vllm_cache: vllmCache || undefined,
+        triton_cache: tritonCache || undefined, aiter_cache: aiterCache || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Save failed: ' + (j.error || r.status)); return; }
+    alert('Cache paths saved.');
+  } catch (e) {}
 }
 
 async function upgradeIfAvailable(svc) {

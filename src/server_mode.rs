@@ -1,16 +1,16 @@
-//! PR7/PR8: ds4 and halogen Server Mode — headless, detached `podman run`
-//! servers, distinct from the Toolboxes-tab dev-shell containers
-//! (`src/server.rs`'s `recreate_toolbox_container`/`toolbox create`
-//! family). Kept as one file across backends (not split into submodules),
-//! mirroring `src/model_downloads.rs`'s own single-file, per-backend-match
-//! organization rather than inventing a different convention mid-rollout
-//! (§13a).
+//! PR7/PR8/PR9: ds4, halogen, and vllm Server Mode — headless, detached
+//! `podman run` servers, distinct from the Toolboxes-tab dev-shell
+//! containers (`src/server.rs`'s `recreate_toolbox_container`/`toolbox
+//! create` family). Kept as one file across backends (not split into
+//! submodules), mirroring `src/model_downloads.rs`'s own single-file,
+//! per-backend-match organization rather than inventing a different
+//! convention mid-rollout (§13a).
 //!
 //! See `docs/design/ai-toolbox-cockpit-integration.md` §11 for why these
 //! are two structurally different code paths upstream (`toolbox create`
 //! never receives a `runtime_profile`'s `engine_args`; only Server Mode's
-//! plain `podman run` does), §12 for ds4's v1 scope-narrowing, and §13 for
-//! halogen's.
+//! plain `podman run` does), §12 for ds4's v1 scope-narrowing, §13 for
+//! halogen's, and §14 for vllm's.
 //!
 //! **ds4 v1 scope: standalone ("single-node") launch only.** Multi-node
 //! coordinator/worker roles, DSpark, SSD-streaming, and MTP/vision-projector
@@ -25,13 +25,26 @@
 //! it (§13: not a brainrouter invention to omit, upstream simply has
 //! nothing there to mirror).
 //!
+//! **vllm v1 scope: the full upstream `build_server_cmd()` surface, podman
+//! engine only.** vllm's own command builder supports both podman and
+//! docker (§14 item 4); brainrouter narrows to podman only, same standing
+//! decision as ds4/halogen ("no user-facing engine-selection concept").
+//! Everything else upstream's builder does is ported: HF-repo-based model
+//! identity (catalog or free-form custom repo), the per-model/per-toolbox
+//! policy-override merge, the 4 persistent cache-directory mounts (plus an
+//! opt-in `reset_caches` safety-gated wipe), and the `extra_args` escape
+//! hatch (vllm has one, unlike halogen — mirrors ds4's `custom_args`).
+//!
 //! Lifecycle is synchronous request/response for every backend (§12 item
 //! 5), not an async job registry like `model_downloads.rs` — starting/
 //! stopping a container is a sub-second podman operation, and `status`
 //! always reads live `podman inspect` state rather than persisting
 //! anything.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::model_downloads::{self, ResolvedDs4Model, ResolvedHalogenBundle};
 use crate::toolbox_catalog::{self, RuntimeProfile, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition};
@@ -49,6 +62,11 @@ pub const DS4_SERVER_CONTAINER_NAME: &str = "brainrouter-ds4-server";
 /// departure already established for ds4 above (avoids ownership confusion
 /// if cockpit itself is also installed and run on the same host).
 pub const HALOGEN_SERVER_CONTAINER_NAME: &str = "brainrouter-halogen-server";
+
+/// Fixed container name for the (single-instance, v1) vllm server-mode
+/// container. Same brainrouter-own naming departure as ds4/halogen above,
+/// not upstream's literal `ai-toolbox-cockpit-vllm-server`.
+pub const VLLM_SERVER_CONTAINER_NAME: &str = "brainrouter-vllm-server";
 
 /// Fallback binary name used when a toolbox's `backend_config` doesn't
 /// declare a `server_binary` override — every real vendored ds4 toolbox
@@ -153,6 +171,23 @@ impl From<model_downloads::DownloadError> for ServerModeError {
             model_downloads::DownloadError::Conflict(m) | model_downloads::DownloadError::Internal(m) => {
                 ServerModeError::Internal(m)
             }
+        }
+    }
+}
+
+/// PR9: lets `save_vllm_cache_paths()` (§14) use `?` directly against
+/// `cockpit_config::apply_backend_setting_values()`'s own error type,
+/// mirroring the `model_downloads::DownloadError` conversion above.
+/// `NotAvailable` (cockpit's config directory doesn't exist on this host)
+/// maps to `NotFound`/404 — the same status the existing
+/// `apply_cockpit_default_toolbox`/`apply_cockpit_active_platform` HTTP
+/// handlers already return for it (`src/server.rs`), just reached here via
+/// `From` instead of a duplicated match in the handler.
+impl From<crate::cockpit_config::ApplyError> for ServerModeError {
+    fn from(e: crate::cockpit_config::ApplyError) -> Self {
+        match e {
+            crate::cockpit_config::ApplyError::NotAvailable => ServerModeError::NotFound(e.to_string()),
+            other => ServerModeError::Internal(other.to_string()),
         }
     }
 }
@@ -718,6 +753,604 @@ pub async fn halogen_server_status() -> ServerStatus {
     container_server_status("halogen", HALOGEN_SERVER_CONTAINER_NAME, LABEL_SERVER_MODEL).await
 }
 
+// ── PR9: vllm Server Mode (§14) ───────────────────────────────────────────
+//
+// Structurally different from both ds4 and halogen, confirmed against
+// upstream's full `backends/vllm/{server,runner}.py`:
+//  1. Model identity is a raw Hugging Face repo string (catalog-sourced or
+//     free-form custom), not a downloaded local file/bundle — vLLM itself
+//     pulls from HF at container start, so there is no completeness gate.
+//  2. A catalog model entry *is* its own launch policy (`valid_tp`, `ctx`,
+//     `trust_remote`, `enforce_eager`, `attention_backend`, `env`,
+//     `extra_flags`), optionally shallow-merged with a toolbox's
+//     `backend_config.policy_overrides` — mirrored here as raw
+//     `serde_json::Map` merges (`dict.update()` semantics), exactly as
+//     upstream's `apply_toolbox_policy_overrides()` does.
+//  3. `attention_backend` distinguishes "key absent" (apply upstream's own
+//     `"TRITON_ATTN"` default, operator override wins) from "key present
+//     with JSON `null`" (model-specific, no flag emitted at all — an
+//     operator override in this case is a validation error here, a
+//     deliberate brainrouter-side stricter-than-upstream choice: upstream
+//     achieves this only by disabling the TUI selector, which has no
+//     headless-API equivalent to silently mirror — see §14a).
+//  4. Podman-only, same standing decision as ds4/halogen — upstream also
+//     supports docker with a different flag set and an NVIDIA-specific
+//     `adapt_nvidia_runtime_args()` rewrite, neither ported (§14 item 4).
+//  5. Four persistent, operator-configurable cache directories (HF/vllm/
+//     triton/aiter), not a read-only models directory — mounted on every
+//     start, and independently persistable via a *separate* endpoint
+//     mirroring upstream's own distinct "Save Cache Paths" action.
+//  6. `hf_token` never blocks a start: present -> `-e HF_TOKEN=<token>`,
+//     absent -> bare `-e HF_TOKEN` (ambient host-process passthrough),
+//     exactly mirroring upstream's own fallback.
+//  7. Unlike halogen, vllm's upstream `_start_confirmed()` does **not**
+//     call `save_backend_settings()` — only its own "Save Cache Paths"
+//     button does. `start_vllm_server()` below therefore does not persist
+//     run-time settings into config.json, a deliberate fidelity choice,
+//     not an omission (§14).
+
+/// A vllm model/toolbox's effective launch policy, resolved from raw JSON
+/// into named fields up front. `attention_backend` is the one field that
+/// genuinely needs Rust's `Option<Option<T>>` (not collapsible to a single
+/// `Option<String>`) to preserve upstream's own 3-way distinction: `None`
+/// (key absent from the merged policy map — apply the `"TRITON_ATTN"`
+/// default), `Some(None)` (key present, explicit JSON `null` — model-
+/// specific, no `--attention-backend` flag at all), `Some(Some(s))` (key
+/// present with a string default).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VllmEffectivePolicy {
+    valid_tp: Vec<u32>,
+    trust_remote: bool,
+    ctx: Option<String>,
+    enforce_eager: bool,
+    attention_backend: Option<Option<String>>,
+    env: Vec<(String, String)>,
+    extra_flags: Vec<String>,
+}
+
+/// Builds the raw policy map for a catalog-sourced vllm model: the subset
+/// of `VllmModel`'s fields upstream's `build_server_cmd()` actually reads
+/// (`valid_tp`, `trust_remote` from the typed fields; `ctx`/`enforce_eager`/
+/// `attention_backend`/`env`/`extra_flags` copied verbatim from `extra` if
+/// present — preserving JSON `null` vs. absent exactly, since `extra` is a
+/// raw `serde_json::Map`).
+fn vllm_model_policy_map(model: &toolbox_catalog::VllmModel) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "valid_tp".to_string(),
+        Value::Array(model.valid_tp.iter().map(|n| Value::from(*n)).collect()),
+    );
+    m.insert("trust_remote".to_string(), Value::Bool(model.trust_remote));
+    for key in ["ctx", "enforce_eager", "attention_backend", "env", "extra_flags"] {
+        if let Some(v) = model.extra.get(key) {
+            m.insert(key.to_string(), v.clone());
+        }
+    }
+    m
+}
+
+/// Upstream's own generic fallback policy for a custom (non-catalog) HF
+/// repo, verified against `_prepare_start()`'s literal
+/// `{"valid_tp": [1, 2], "attention_backend": "TRITON_ATTN", "extra_flags":
+/// [], "env": {}}`.
+fn vllm_generic_default_policy_map() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("valid_tp".to_string(), Value::Array(vec![Value::from(1u32), Value::from(2u32)]));
+    m.insert("attention_backend".to_string(), Value::String("TRITON_ATTN".to_string()));
+    m.insert("extra_flags".to_string(), Value::Array(Vec::new()));
+    m.insert("env".to_string(), Value::Object(Map::new()));
+    m
+}
+
+/// Mirrors `runner.py::apply_toolbox_policy_overrides()`: a shallow merge
+/// (`dict.update()` semantics — every overridden key is wholly replaced,
+/// never deep-merged) of `backend_config.policy_overrides` on top of the
+/// base policy map.
+fn apply_vllm_toolbox_policy_overrides(base: Map<String, Value>, backend_config: Option<&Value>) -> Map<String, Value> {
+    let mut result = base;
+    if let Some(overrides) = backend_config.and_then(|c| c.get("policy_overrides")).and_then(Value::as_object) {
+        for (k, v) in overrides {
+            result.insert(k.clone(), v.clone());
+        }
+    }
+    result
+}
+
+/// Resolves the final typed [`VllmEffectivePolicy`] from a merged raw
+/// policy map, applying the same last-resort defaults upstream's
+/// `build_server_cmd()` itself falls back to (`valid_tp` -> `[1]` if
+/// absent/empty; `enforce_eager` -> `false`; `attention_backend` absent ->
+/// `TRITON_ATTN` is applied at command-build time, not here, so this
+/// function's own `None` case is preserved for the builder to interpret).
+fn resolve_vllm_effective_policy(policy_map: &Map<String, Value>) -> VllmEffectivePolicy {
+    let valid_tp: Vec<u32> = policy_map
+        .get("valid_tp")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|n| n as u32).collect())
+        .filter(|v: &Vec<u32>| !v.is_empty())
+        .unwrap_or_else(|| vec![1]);
+    let trust_remote = policy_map.get("trust_remote").and_then(Value::as_bool).unwrap_or(false);
+    let ctx = policy_map.get("ctx").map(|v| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let enforce_eager = policy_map.get("enforce_eager").and_then(Value::as_bool).unwrap_or(false);
+    let attention_backend = match policy_map.get("attention_backend") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.clone())),
+        Some(other) => Some(Some(other.to_string())),
+    };
+    let env = policy_map
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }))
+                .collect()
+        })
+        .unwrap_or_default();
+    let extra_flags = policy_map
+        .get("extra_flags")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    VllmEffectivePolicy { valid_tp, trust_remote, ctx, enforce_eager, attention_backend, env, extra_flags }
+}
+
+/// Persistent host cache directories mounted into every vllm server
+/// container (§14 item 5) — read-write, operator-configurable, resolved
+/// the same override-then-catalog-default precedence as
+/// `model_downloads::effective_models_dir()`, but sourced from upstream's
+/// own hardcoded defaults (there is no catalog `storage.default` for these,
+/// since they're not "the models directory").
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VllmCacheDirs {
+    huggingface: PathBuf,
+    vllm: PathBuf,
+    triton: PathBuf,
+    aiter: PathBuf,
+}
+
+/// Resolves the effective cache directories for a vllm launch: a cockpit
+/// `backends.vllm.<key>` config.json override first, falling back to
+/// upstream's own defaults (`~/.cache/{huggingface,vllm,triton}`,
+/// `~/.aiter`) — mirrors `runner.py::default_cache_paths()` exactly.
+fn effective_vllm_cache_dirs() -> VllmCacheDirs {
+    let cockpit = crate::cockpit_config::load();
+    let settings = cockpit.config.as_ref().and_then(|c| c.backends.get("vllm"));
+    let get = |key: &str, default: &str| -> PathBuf {
+        settings
+            .and_then(|s| s.extra.get(key))
+            .and_then(Value::as_str)
+            .map(model_downloads::expand_tilde)
+            .unwrap_or_else(|| model_downloads::expand_tilde(default))
+    };
+    VllmCacheDirs {
+        huggingface: get("hf_cache", "~/.cache/huggingface"),
+        vllm: get("vllm_cache", "~/.cache/vllm"),
+        triton: get("triton_cache", "~/.cache/triton"),
+        aiter: get("aiter_cache", "~/.aiter"),
+    }
+}
+
+/// `POST /api/server-mode/vllm/start` request body. Exactly one of
+/// `model_id` (a vendored vllm catalog entry id) or `custom_repo` (a raw
+/// `owner/model` Hugging Face repo, bypassing the catalog entirely) must
+/// be given — mirrors upstream's own mutually-exclusive curated-dropdown/
+/// free-text-input pair.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartVllmServerRequest {
+    pub toolbox_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub custom_repo: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub tensor_parallel: u32,
+    pub max_num_seqs: u32,
+    /// `"auto"` (resolves to the effective policy's own `ctx`, or the
+    /// literal string `"auto"` if the policy has none — matching upstream
+    /// exactly, `--max-model-len` is always emitted) or a positive integer
+    /// string.
+    pub max_model_len: String,
+    pub gpu_memory_utilization: f64,
+    #[serde(default)]
+    pub attention_backend: Option<String>,
+    #[serde(default)]
+    pub enforce_eager: Option<bool>,
+    pub dtype: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub extra_args: Option<String>,
+    /// Wipes the vllm/triton/aiter (never huggingface) compiled-cache
+    /// directories immediately before launch — a real data-deletion
+    /// action, gated by [`validate_compiled_cache_root`]'s safety check
+    /// before any deletion, mirroring upstream's own
+    /// `validate_compiled_cache_roots()`/`_clear_compiled_caches()`.
+    #[serde(default)]
+    pub reset_caches: bool,
+}
+
+fn resolve_vllm_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
+    let catalog = load_typed_toolbox_catalog()?;
+    resolve_toolbox_for_server(&catalog, SupportedServingBackend::Vllm, toolbox_id)
+}
+
+/// Resolves `req`'s model reference into `(effective HF repo string, base
+/// policy map)` — either a vendored vllm catalog entry (`model_id`) or a
+/// custom free-form repo (`custom_repo`, generic default policy). Exactly
+/// one of the two request fields must be given.
+fn resolve_vllm_model_and_base_policy(req: &StartVllmServerRequest) -> Result<(String, Map<String, Value>), ServerModeError> {
+    let model_id = req.model_id.as_deref().filter(|s| !s.trim().is_empty());
+    let custom_repo = req.custom_repo.as_deref().filter(|s| !s.trim().is_empty());
+    match (model_id, custom_repo) {
+        (Some(_), Some(_)) => Err(ServerModeError::Validation(
+            "specify exactly one of model_id or custom_repo, not both".to_string(),
+        )),
+        (None, None) => Err(ServerModeError::Validation("either model_id or custom_repo is required".to_string())),
+        (None, Some(repo)) => Ok((repo.to_string(), vllm_generic_default_policy_map())),
+        (Some(id), None) => {
+            let vendored = toolbox_catalog::load_vendored_catalog();
+            let (_toolboxes, models) = vendored
+                .typed()
+                .map_err(|e| ServerModeError::Internal(format!("failed to parse vendored model catalog: {e}")))?;
+            let backend_catalog = models
+                .backends
+                .iter()
+                .find(|b| b.backend.as_str() == "vllm")
+                .ok_or_else(|| ServerModeError::Internal("catalog has no `vllm` backend section".to_string()))?;
+            let entry = backend_catalog
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| ServerModeError::NotFound(format!("no vllm catalog entry with id `{id}`")))?;
+            let model = match &entry.payload {
+                Some(toolbox_catalog::ModelPayload::Vllm(m)) => m,
+                _ => {
+                    return Err(ServerModeError::Internal(format!(
+                        "catalog entry `{id}` has no typed vllm payload"
+                    )));
+                }
+            };
+            Ok((model.repo.clone(), vllm_model_policy_map(model)))
+        }
+    }
+}
+
+/// Mirrors upstream's `validate_compiled_cache_roots()`: rejects `/`, the
+/// home directory, any path with fewer than 3 components, or any path
+/// missing `marker` as a (case-insensitive) substring of one of its own
+/// components — run before any deletion, not a mere warning.
+fn validate_compiled_cache_root(path: &std::path::Path, marker: &str) -> Result<PathBuf, ServerModeError> {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let has_marker = resolved
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().to_lowercase().contains(marker));
+    if resolved == std::path::Path::new("/")
+        || home.as_deref() == Some(resolved.as_path())
+        || resolved.components().count() < 3
+        || !has_marker
+    {
+        return Err(ServerModeError::Validation(format!(
+            "refusing unsafe cache root {}: must contain a `{marker}` path component and not be `/` or the home directory",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Wipes the contents (not the directory itself) of the vllm/triton/aiter
+/// cache roots — huggingface is deliberately excluded, matching upstream's
+/// own `_clear_compiled_caches()` exactly (it never touches the HF cache).
+fn reset_vllm_compiled_caches(cache_dirs: &VllmCacheDirs) -> Result<(), ServerModeError> {
+    for (path, marker) in [
+        (&cache_dirs.vllm, "vllm"),
+        (&cache_dirs.triton, "triton"),
+        (&cache_dirs.aiter, "aiter"),
+    ] {
+        let resolved = validate_compiled_cache_root(path, marker)?;
+        if !resolved.exists() {
+            std::fs::create_dir_all(&resolved)
+                .map_err(|e| ServerModeError::Internal(format!("failed to create {}: {e}", resolved.display())))?;
+            continue;
+        }
+        let entries = std::fs::read_dir(&resolved)
+            .map_err(|e| ServerModeError::Internal(format!("failed to read {}: {e}", resolved.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| ServerModeError::Internal(format!("failed to read cache entry: {e}")))?;
+            let p = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false);
+            let result = if is_dir { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+            result.map_err(|e| ServerModeError::Internal(format!("failed to remove {}: {e}", p.display())))?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds the podman argument list for `podman <args>` (no leading
+/// `"podman"` binary name), mirroring `runner.py::build_server_cmd()`'s
+/// podman branch exactly — see the module-level PR9 note above for the
+/// six structural differences from ds4/halogen this reflects.
+pub(crate) fn build_vllm_server_command(
+    toolbox_image: &str,
+    runtime_profile: &RuntimeProfile,
+    model_repo: &str,
+    policy: &VllmEffectivePolicy,
+    cache_dirs: &VllmCacheDirs,
+    hf_token: Option<&str>,
+    req: &StartVllmServerRequest,
+) -> Result<Vec<String>, ServerModeError> {
+    if model_repo.trim().is_empty() {
+        return Err(ServerModeError::Validation("a model repository is required".to_string()));
+    }
+    if !policy.valid_tp.contains(&req.tensor_parallel) {
+        return Err(ServerModeError::Validation(format!(
+            "tensor_parallel {} is not permitted for this model (valid: {:?})",
+            req.tensor_parallel, policy.valid_tp
+        )));
+    }
+    if req.port == 0 {
+        return Err(ServerModeError::Validation("port must be nonzero".to_string()));
+    }
+    if req.max_num_seqs == 0 {
+        return Err(ServerModeError::Validation("max_num_seqs must be at least 1".to_string()));
+    }
+    if !(req.gpu_memory_utilization > 0.0 && req.gpu_memory_utilization <= 1.0) {
+        return Err(ServerModeError::Validation(
+            "gpu_memory_utilization must be greater than 0 and at most 1".to_string(),
+        ));
+    }
+    if req.max_model_len != "auto" && req.max_model_len.parse::<u64>().is_err() {
+        return Err(ServerModeError::Validation(
+            "max_model_len must be \"auto\" or a positive integer".to_string(),
+        ));
+    }
+    let requested_attention = req.attention_backend.as_deref().filter(|s| !s.is_empty());
+    if requested_attention.is_some() && matches!(policy.attention_backend, Some(None)) {
+        return Err(ServerModeError::Validation(
+            "this model requires a specific attention backend and does not accept an override".to_string(),
+        ));
+    }
+
+    let engine_args = upgrade_groups_for_podman(&clean_engine_args_for_server(&runtime_profile.engine_args));
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        VLLM_SERVER_CONTAINER_NAME.to_string(),
+    ];
+    args.extend(engine_args);
+    args.push("--ipc=host".to_string());
+    args.push("--cap-add=SYS_PTRACE".to_string());
+    // Podman-specific (brainrouter is podman-only, §14 item 4) — upstream's
+    // `elif engine == "docker"` branch is not ported, same reasoning
+    // already established for ds4's builder.
+    args.extend(["--security-opt".to_string(), "label=disable".to_string()]);
+    args.push("--userns=keep-id".to_string());
+
+    args.extend(["--label".to_string(), format!("{LABEL_MANAGED}=true")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_BACKEND}=vllm")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_MODEL}={model_repo}")]);
+
+    let bind_host = if req.host == "localhost" { "127.0.0.1" } else { req.host.as_str() };
+    let mapping = if bind_host == "0.0.0.0" {
+        format!("{}:{}", req.port, req.port)
+    } else {
+        format!("{bind_host}:{}:{}", req.port, req.port)
+    };
+    args.extend(["-p".to_string(), mapping]);
+
+    for (key, value) in [
+        ("HOME", "/workspace".to_string()),
+        ("VLLM_CONFIG_ROOT", "/workspace/.cache/vllm/config".to_string()),
+        ("TRITON_CACHE_DIR", "/workspace/.cache/triton".to_string()),
+        ("TILELANG_CACHE_DIR", "/workspace/.cache/triton/tilelang".to_string()),
+        ("VLLM_NO_USAGE_STATS", "1".to_string()),
+    ] {
+        args.extend(["-e".to_string(), format!("{key}={value}")]);
+    }
+    let hf_token_env = match hf_token.filter(|t| !t.is_empty()) {
+        Some(t) => format!("HF_TOKEN={t}"),
+        None => "HF_TOKEN".to_string(),
+    };
+    args.extend(["-e".to_string(), hf_token_env]);
+
+    for (host_path, container_path) in [
+        (&cache_dirs.huggingface, "/workspace/.cache/huggingface"),
+        (&cache_dirs.vllm, "/workspace/.cache/vllm"),
+        (&cache_dirs.triton, "/workspace/.cache/triton"),
+        (&cache_dirs.aiter, "/workspace/.aiter"),
+    ] {
+        args.extend(["-v".to_string(), format!("{}:{container_path}", host_path.display())]);
+    }
+    for (key, value) in &policy.env {
+        args.extend(["-e".to_string(), format!("{key}={value}")]);
+    }
+
+    args.push(toolbox_image.to_string());
+    args.extend(["vllm".to_string(), "serve".to_string(), model_repo.to_string()]);
+
+    let resolved_max_model_len = if req.max_model_len == "auto" {
+        policy.ctx.clone().unwrap_or_else(|| "auto".to_string())
+    } else {
+        req.max_model_len.clone()
+    };
+    args.extend(["--host".to_string(), "0.0.0.0".to_string()]);
+    args.extend(["--port".to_string(), req.port.to_string()]);
+    args.extend(["--tensor-parallel-size".to_string(), req.tensor_parallel.to_string()]);
+    args.extend(["--max-num-seqs".to_string(), req.max_num_seqs.to_string()]);
+    args.extend(["--max-model-len".to_string(), resolved_max_model_len]);
+    args.extend(["--gpu-memory-utilization".to_string(), req.gpu_memory_utilization.to_string()]);
+    args.extend(["--dtype".to_string(), req.dtype.clone()]);
+
+    if policy.trust_remote {
+        args.push("--trust-remote-code".to_string());
+    }
+    let eager = req.enforce_eager.unwrap_or(policy.enforce_eager);
+    if eager {
+        args.push("--enforce-eager".to_string());
+    }
+    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+        args.extend(["--api-key".to_string(), key.to_string()]);
+    }
+    match &policy.attention_backend {
+        None => {
+            let backend = requested_attention.unwrap_or("TRITON_ATTN");
+            args.extend(["--attention-backend".to_string(), backend.to_string()]);
+        }
+        Some(Some(default_backend)) => {
+            let backend = requested_attention.unwrap_or(default_backend.as_str());
+            args.extend(["--attention-backend".to_string(), backend.to_string()]);
+        }
+        Some(None) => {
+            // Model-specific: no flag at all, no override allowed (validated above).
+        }
+    }
+    args.extend(policy.extra_flags.clone());
+
+    if let Some(extra) = req.extra_args.as_deref().filter(|s| !s.trim().is_empty()) {
+        let parsed = shlex::split(extra)
+            .ok_or_else(|| ServerModeError::Validation("extra_args is not valid shell-quoted text".to_string()))?;
+        args.extend(parsed);
+    }
+
+    Ok(args)
+}
+
+/// The hf_token source for the vllm container's `HF_TOKEN` env var: the
+/// daemon process's own `HF_TOKEN` env var first, falling back to
+/// cockpit's saved top-level `hf_token` config.json setting — the same
+/// precedence `model_downloads::hf_subprocess_env()` already established
+/// for the `hf download` subprocess, reused here for consistency rather
+/// than inventing a second resolution order.
+fn resolve_vllm_hf_token() -> Option<String> {
+    std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| crate::cockpit_config::load().config.and_then(|c| c.hf_token))
+}
+
+/// `POST /api/server-mode/vllm/start`: resolves the toolbox + model/policy,
+/// creates the (possibly overridden) cache directories, optionally wipes
+/// the compiled ones first, force-removes any pre-existing container of
+/// the fixed name, then runs the built command. **Does not** persist
+/// run-time settings into cockpit's config.json (§14 item 7) — unlike
+/// halogen, upstream's own vllm `_start_confirmed()` has no
+/// `save_backend_settings()` call; only the separate
+/// [`save_vllm_cache_paths`] does.
+pub async fn start_vllm_server(req: &StartVllmServerRequest) -> Result<(), ServerModeError> {
+    let (tb, profile) = resolve_vllm_toolbox(&req.toolbox_id)?;
+    let (model_repo, base_policy) = resolve_vllm_model_and_base_policy(req)?;
+    let merged_policy = apply_vllm_toolbox_policy_overrides(base_policy, tb.backend_config.as_ref());
+    let policy = resolve_vllm_effective_policy(&merged_policy);
+
+    let cache_dirs = effective_vllm_cache_dirs();
+    for dir in [&cache_dirs.huggingface, &cache_dirs.vllm, &cache_dirs.triton, &cache_dirs.aiter] {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ServerModeError::Internal(format!("failed to create cache directory {}: {e}", dir.display())))?;
+    }
+    if req.reset_caches {
+        reset_vllm_compiled_caches(&cache_dirs)?;
+    }
+
+    let hf_token = resolve_vllm_hf_token();
+    let args = build_vllm_server_command(&tb.image, &profile, &model_repo, &policy, &cache_dirs, hf_token.as_deref(), req)?;
+
+    let _ = tokio::process::Command::new("podman")
+        .args(["rm", "-f", VLLM_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+
+    let out = tokio::process::Command::new("podman")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman run failed: {}", stderr.trim())))
+    }
+}
+
+/// `POST /api/server-mode/vllm/stop` — same graceful-stop-then-rm contract
+/// as [`stop_ds4_server`]/[`stop_halogen_server`].
+pub async fn stop_vllm_server() -> Result<(), ServerModeError> {
+    let _ = tokio::process::Command::new("podman")
+        .args(["stop", "--time", "10", VLLM_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+    let out = tokio::process::Command::new("podman")
+        .args(["rm", "-f", VLLM_SERVER_CONTAINER_NAME])
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman rm failed: {}", stderr.trim())))
+    }
+}
+
+pub async fn vllm_server_status() -> ServerStatus {
+    container_server_status("vllm", VLLM_SERVER_CONTAINER_NAME, LABEL_SERVER_MODEL).await
+}
+
+/// `POST /api/server-mode/vllm/cache-paths` request body — the direct
+/// analogue of upstream's own separate "Save Cache Paths" button (§14 item
+/// 7): every field is optional, only the ones supplied are persisted/
+/// `mkdir -p`'d, mirroring `save_caches_pressed()`'s all-four-at-once shape
+/// loosely (brainrouter allows a partial update; upstream's UI always
+/// submits all four since they're all always-visible form fields, but nothing
+/// about `apply_backend_setting_values()` requires that).
+#[derive(Debug, Clone, Deserialize)]
+pub struct VllmCachePathsRequest {
+    #[serde(default)]
+    pub hf_cache: Option<String>,
+    #[serde(default)]
+    pub vllm_cache: Option<String>,
+    #[serde(default)]
+    pub triton_cache: Option<String>,
+    #[serde(default)]
+    pub aiter_cache: Option<String>,
+}
+
+/// Creates each supplied cache directory, then persists it into cockpit's
+/// shared config.json via the generic [`crate::cockpit_config::apply_backend_setting_values`]
+/// helper built during PR8 (§13a) — its first reuse by a second backend, as
+/// designed.
+pub fn save_vllm_cache_paths(req: &VllmCachePathsRequest) -> Result<(), ServerModeError> {
+    let provided: Vec<(&str, &str)> = [
+        ("hf_cache", req.hf_cache.as_deref()),
+        ("vllm_cache", req.vllm_cache.as_deref()),
+        ("triton_cache", req.triton_cache.as_deref()),
+        ("aiter_cache", req.aiter_cache.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
+    if provided.is_empty() {
+        return Err(ServerModeError::Validation("at least one cache path must be provided".to_string()));
+    }
+    for (_, raw) in &provided {
+        let expanded = model_downloads::expand_tilde(raw);
+        std::fs::create_dir_all(&expanded)
+            .map_err(|e| ServerModeError::Internal(format!("failed to create cache directory {}: {e}", expanded.display())))?;
+    }
+    let updates: Vec<(&str, Value)> = provided.into_iter().map(|(k, v)| (k, Value::String(v.to_string()))).collect();
+    crate::cockpit_config::apply_backend_setting_values("vllm", updates)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1725,373 @@ mod tests {
         let err =
             build_halogen_server_command("img", &halogen_strix_halo_profile(), "strix-halo", &bundle, &halogen_req())
                 .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    // ── PR9: vllm Server Mode (§14) ───────────────────────────────────────
+
+    fn vllm_req() -> StartVllmServerRequest {
+        StartVllmServerRequest {
+            toolbox_id: "strix-vllm-latest".to_string(),
+            model_id: Some("vllm-meta-llama-meta-llama-3-1-8b-instruct".to_string()),
+            custom_repo: None,
+            host: "localhost".to_string(),
+            port: 8000,
+            tensor_parallel: 1,
+            max_num_seqs: 64,
+            max_model_len: "auto".to_string(),
+            gpu_memory_utilization: 0.9,
+            attention_backend: None,
+            enforce_eager: None,
+            dtype: "auto".to_string(),
+            api_key: None,
+            extra_args: None,
+            reset_caches: false,
+        }
+    }
+
+    fn vllm_cache_dirs() -> VllmCacheDirs {
+        VllmCacheDirs {
+            huggingface: PathBuf::from("/data/cache/huggingface"),
+            vllm: PathBuf::from("/data/cache/vllm"),
+            triton: PathBuf::from("/data/cache/triton"),
+            aiter: PathBuf::from("/data/cache/aiter"),
+        }
+    }
+
+    fn plain_policy() -> VllmEffectivePolicy {
+        VllmEffectivePolicy {
+            valid_tp: vec![1, 2],
+            trust_remote: false,
+            ctx: None,
+            enforce_eager: false,
+            attention_backend: None,
+            env: Vec::new(),
+            extra_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_vllm_toolbox_finds_the_real_vendored_entry_and_its_runtime_profile() {
+        let (tb, profile) = resolve_vllm_toolbox("strix-vllm-latest").expect("must resolve");
+        assert_eq!(tb.id, "strix-vllm-latest");
+        assert_eq!(profile.id, "amd-rocm-keep-groups");
+    }
+
+    #[test]
+    fn resolve_vllm_toolbox_rejects_non_vllm_backend() {
+        let err = resolve_vllm_toolbox("strix-halo-ds4-rocm-10-0").unwrap_err();
+        assert_eq!(err.status(), 404);
+    }
+
+    #[test]
+    fn resolve_vllm_model_and_base_policy_rejects_both_and_neither() {
+        let mut r = vllm_req();
+        r.custom_repo = Some("owner/model".to_string());
+        let err = resolve_vllm_model_and_base_policy(&r).unwrap_err();
+        assert_eq!(err.status(), 400);
+
+        r.model_id = None;
+        r.custom_repo = None;
+        let err = resolve_vllm_model_and_base_policy(&r).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn resolve_vllm_model_and_base_policy_resolves_real_catalog_entry_with_explicit_null_attention_backend() {
+        let mut r = vllm_req();
+        r.model_id = Some("vllm-deepseek-ai-deepseek-v4-flash-0731".to_string());
+        let (repo, policy_map) = resolve_vllm_model_and_base_policy(&r).expect("must resolve");
+        assert_eq!(repo, "deepseek-ai/DeepSeek-V4-Flash-0731");
+        // Real vendored entry has `"attention_backend": null` — present but
+        // explicitly null, distinct from absent (§14 item 2/3).
+        assert_eq!(policy_map.get("attention_backend"), Some(&Value::Null));
+        assert_eq!(policy_map.get("ctx"), Some(&Value::String("262144".to_string())));
+        assert_eq!(policy_map.get("enforce_eager"), Some(&Value::Bool(true)));
+        assert!(policy_map.get("env").is_some());
+    }
+
+    #[test]
+    fn resolve_vllm_model_and_base_policy_rejects_unknown_id() {
+        let mut r = vllm_req();
+        r.model_id = Some("no-such-model".to_string());
+        let err = resolve_vllm_model_and_base_policy(&r).unwrap_err();
+        assert_eq!(err.status(), 404);
+    }
+
+    #[test]
+    fn resolve_vllm_model_and_base_policy_uses_generic_default_for_custom_repo() {
+        let mut r = vllm_req();
+        r.model_id = None;
+        r.custom_repo = Some("acme/custom-model".to_string());
+        let (repo, policy_map) = resolve_vllm_model_and_base_policy(&r).expect("must resolve");
+        assert_eq!(repo, "acme/custom-model");
+        assert_eq!(policy_map.get("valid_tp"), Some(&serde_json::json!([1, 2])));
+        assert_eq!(policy_map.get("attention_backend"), Some(&Value::String("TRITON_ATTN".to_string())));
+    }
+
+    #[test]
+    fn apply_vllm_toolbox_policy_overrides_shallow_merges_and_replaces_whole_keys() {
+        let mut base = Map::new();
+        base.insert("valid_tp".to_string(), serde_json::json!([1, 2]));
+        base.insert("attention_backend".to_string(), Value::String("TRITON_ATTN".to_string()));
+        base.insert("trust_remote".to_string(), Value::Bool(false));
+
+        let backend_config = serde_json::json!({
+            "policy_overrides": {
+                "valid_tp": [1],
+                "attention_backend": Value::Null,
+            }
+        });
+        let merged = apply_vllm_toolbox_policy_overrides(base, Some(&backend_config));
+        assert_eq!(merged.get("valid_tp"), Some(&serde_json::json!([1])));
+        assert_eq!(merged.get("attention_backend"), Some(&Value::Null));
+        // Untouched key round-trips.
+        assert_eq!(merged.get("trust_remote"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn resolve_vllm_effective_policy_distinguishes_absent_vs_null_vs_string_attention_backend() {
+        let mut m = Map::new();
+        assert_eq!(resolve_vllm_effective_policy(&m).attention_backend, None);
+
+        m.insert("attention_backend".to_string(), Value::Null);
+        assert_eq!(resolve_vllm_effective_policy(&m).attention_backend, Some(None));
+
+        m.insert("attention_backend".to_string(), Value::String("ROCM_ATTN".to_string()));
+        assert_eq!(resolve_vllm_effective_policy(&m).attention_backend, Some(Some("ROCM_ATTN".to_string())));
+    }
+
+    #[test]
+    fn resolve_vllm_effective_policy_falls_back_to_valid_tp_one_when_absent_or_empty() {
+        let m = Map::new();
+        assert_eq!(resolve_vllm_effective_policy(&m).valid_tp, vec![1]);
+
+        let mut m2 = Map::new();
+        m2.insert("valid_tp".to_string(), serde_json::json!([]));
+        assert_eq!(resolve_vllm_effective_policy(&m2).valid_tp, vec![1]);
+    }
+
+    #[test]
+    fn build_vllm_server_command_matches_upstream_shape() {
+        let cmd = build_vllm_server_command(
+            "docker.io/kyuz0/vllm-therock-gfx1151:latest",
+            &amd_rocm_profile(),
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            &plain_policy(),
+            &vllm_cache_dirs(),
+            Some("hf_abc123"),
+            &vllm_req(),
+        )
+        .expect("must build");
+
+        assert_eq!(cmd[0..4], ["run", "-d", "--name", VLLM_SERVER_CONTAINER_NAME]);
+        assert_eq!(cmd[4..10], ["--device", "/dev/dri", "--device", "/dev/kfd", "--group-add", "keep-groups"]);
+        assert!(cmd.windows(2).any(|w| w == ["--ipc=host", "--cap-add=SYS_PTRACE"]));
+        assert!(cmd.windows(2).any(|w| w == ["--security-opt", "label=disable"]));
+        assert!(cmd.contains(&"--userns=keep-id".to_string()));
+        assert!(cmd.windows(2).any(|w| w == [
+            "--label",
+            "io.brainrouter.server_model=meta-llama/Meta-Llama-3.1-8B-Instruct"
+        ]));
+        assert!(cmd.windows(2).any(|w| w == ["-p", "127.0.0.1:8000:8000"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "HOME=/workspace"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "VLLM_CONFIG_ROOT=/workspace/.cache/vllm/config"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "TRITON_CACHE_DIR=/workspace/.cache/triton"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "TILELANG_CACHE_DIR=/workspace/.cache/triton/tilelang"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "VLLM_NO_USAGE_STATS=1"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "HF_TOKEN=hf_abc123"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/cache/huggingface:/workspace/.cache/huggingface"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/cache/vllm:/workspace/.cache/vllm"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/cache/triton:/workspace/.cache/triton"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/cache/aiter:/workspace/.aiter"]));
+        assert!(cmd.windows(4).any(|w| w == [
+            "docker.io/kyuz0/vllm-therock-gfx1151:latest",
+            "vllm",
+            "serve",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        ]));
+        assert!(cmd.windows(2).any(|w| w == ["--tensor-parallel-size", "1"]));
+        assert!(cmd.windows(2).any(|w| w == ["--max-num-seqs", "64"]));
+        // policy.ctx is None and max_model_len is "auto" -> resolves to the
+        // literal string "auto", matching upstream exactly (never omitted).
+        assert!(cmd.windows(2).any(|w| w == ["--max-model-len", "auto"]));
+        assert!(cmd.windows(2).any(|w| w == ["--gpu-memory-utilization", "0.9"]));
+        assert!(cmd.windows(2).any(|w| w == ["--dtype", "auto"]));
+        assert!(cmd.windows(2).any(|w| w == ["--attention-backend", "TRITON_ATTN"]));
+        assert!(!cmd.contains(&"--trust-remote-code".to_string()));
+        assert!(!cmd.contains(&"--enforce-eager".to_string()));
+    }
+
+    #[test]
+    fn build_vllm_server_command_uses_bare_hf_token_when_absent() {
+        let cmd =
+            build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &vllm_req())
+                .expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["-e", "HF_TOKEN"]));
+        assert!(!cmd.iter().any(|a| a.starts_with("HF_TOKEN=")));
+    }
+
+    #[test]
+    fn build_vllm_server_command_resolves_max_model_len_from_policy_ctx_when_auto() {
+        let mut policy = plain_policy();
+        policy.ctx = Some("262144".to_string());
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &vllm_req())
+            .expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["--max-model-len", "262144"]));
+    }
+
+    #[test]
+    fn build_vllm_server_command_explicit_max_model_len_overrides_policy_ctx() {
+        let mut policy = plain_policy();
+        policy.ctx = Some("262144".to_string());
+        let mut r = vllm_req();
+        r.max_model_len = "16384".to_string();
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &r)
+            .expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["--max-model-len", "16384"]));
+    }
+
+    #[test]
+    fn build_vllm_server_command_rejects_invalid_max_model_len() {
+        let mut r = vllm_req();
+        r.max_model_len = "not-a-number".to_string();
+        let err = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+            .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_vllm_server_command_emits_trust_remote_code_and_enforce_eager_and_env_and_extra_flags() {
+        let policy = VllmEffectivePolicy {
+            valid_tp: vec![1],
+            trust_remote: true,
+            ctx: None,
+            enforce_eager: true,
+            attention_backend: Some(Some("ROCM_ATTN".to_string())),
+            env: vec![("VLLM_ROCM_USE_AITER".to_string(), "1".to_string())],
+            extra_flags: vec!["--enable-auto-tool-choice".to_string(), "--tool-call-parser".to_string(), "llama3_json".to_string()],
+        };
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &vllm_req())
+            .expect("must build");
+        assert!(cmd.contains(&"--trust-remote-code".to_string()));
+        assert!(cmd.contains(&"--enforce-eager".to_string()));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "VLLM_ROCM_USE_AITER=1"]));
+        assert!(cmd.windows(2).any(|w| w == ["--attention-backend", "ROCM_ATTN"]));
+        assert!(cmd.windows(3).any(|w| w == ["--enable-auto-tool-choice", "--tool-call-parser", "llama3_json"]));
+    }
+
+    #[test]
+    fn build_vllm_server_command_operator_attention_backend_override_wins_over_policy_default() {
+        let mut policy = plain_policy();
+        policy.attention_backend = Some(Some("TRITON_ATTN".to_string()));
+        let mut r = vllm_req();
+        r.attention_backend = Some("ROCM_AITER_UNIFIED_ATTN".to_string());
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &r)
+            .expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["--attention-backend", "ROCM_AITER_UNIFIED_ATTN"]));
+    }
+
+    #[test]
+    fn build_vllm_server_command_omits_attention_backend_flag_when_model_specific() {
+        let mut policy = plain_policy();
+        policy.attention_backend = Some(None);
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &vllm_req())
+            .expect("must build");
+        assert!(!cmd.contains(&"--attention-backend".to_string()));
+    }
+
+    #[test]
+    fn build_vllm_server_command_rejects_attention_backend_override_when_model_specific() {
+        let mut policy = plain_policy();
+        policy.attention_backend = Some(None);
+        let mut r = vllm_req();
+        r.attention_backend = Some("TRITON_ATTN".to_string());
+        let err = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &policy, &vllm_cache_dirs(), None, &r)
+            .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_vllm_server_command_rejects_tensor_parallel_not_in_valid_tp() {
+        let mut r = vllm_req();
+        r.tensor_parallel = 4;
+        let err = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+            .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_vllm_server_command_rejects_zero_port_and_zero_max_num_seqs_and_bad_gpu_util() {
+        let mut r = vllm_req();
+        r.port = 0;
+        assert_eq!(
+            build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+                .unwrap_err()
+                .status(),
+            400
+        );
+
+        let mut r = vllm_req();
+        r.max_num_seqs = 0;
+        assert_eq!(
+            build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+                .unwrap_err()
+                .status(),
+            400
+        );
+
+        let mut r = vllm_req();
+        r.gpu_memory_utilization = 1.5;
+        assert_eq!(
+            build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+                .unwrap_err()
+                .status(),
+            400
+        );
+
+        let mut r = vllm_req();
+        r.gpu_memory_utilization = 0.0;
+        assert_eq!(
+            build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+                .unwrap_err()
+                .status(),
+            400
+        );
+    }
+
+    #[test]
+    fn build_vllm_server_command_appends_shlex_split_extra_args() {
+        let mut r = vllm_req();
+        r.extra_args = Some("--speculative-config '{}'".to_string());
+        let cmd = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+            .expect("must build");
+        let tail = &cmd[cmd.len() - 2..];
+        assert_eq!(tail, &["--speculative-config", "{}"]);
+    }
+
+    #[test]
+    fn build_vllm_server_command_rejects_unterminated_quote_in_extra_args() {
+        let mut r = vllm_req();
+        r.extra_args = Some("--flag \"unterminated".to_string());
+        let err = build_vllm_server_command("img", &amd_rocm_profile(), "owner/model", &plain_policy(), &vllm_cache_dirs(), None, &r)
+            .unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn validate_compiled_cache_root_rejects_root_home_and_missing_marker() {
+        assert!(validate_compiled_cache_root(std::path::Path::new("/"), "vllm").is_err());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        assert!(validate_compiled_cache_root(std::path::Path::new(&home), "vllm").is_err());
+        assert!(validate_compiled_cache_root(std::path::Path::new("/data/cache/other"), "vllm").is_err());
+        assert!(validate_compiled_cache_root(std::path::Path::new("/data/cache/vllm"), "vllm").is_ok());
+    }
+
+    #[test]
+    fn save_vllm_cache_paths_rejects_when_nothing_provided() {
+        let req = VllmCachePathsRequest { hf_cache: None, vllm_cache: None, triton_cache: None, aiter_cache: None };
+        let err = save_vllm_cache_paths(&req).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 }
