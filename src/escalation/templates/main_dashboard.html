@@ -443,7 +443,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
           </span>
         </div>
         <div id="sankey-container" style="width:100%;height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px">
-          <svg id="sankey-svg" viewBox="0 0 1232 418" width="1300" height="418" style="display:block"></svg>
+          <svg id="sankey-svg" viewBox="0 0 1460 418" width="1460" height="418" style="display:block"></svg>
         </div>
       </div>
       <!-- In-flight requests (llama-swap parity) -->
@@ -1308,22 +1308,31 @@ function renderGroup(group, index) {
 </script>
 <script>
 // ─── Sankey SVG ───────────────────────────────────────────────────────────────
-// Four columns, built from raw routing events + review sessions:
-//   HARNESS → SESSION → ROUTING DECISION → MODEL
+// Six columns, built from raw routing events + review sessions:
+//   HARNESS → SESSION → ROUTING DECISION → BACKEND → ENGINE → MODEL
 // Clicking any bar filters the card list to requests that crossed that node.
-
+// BACKEND/ENGINE added in PR4 (design doc §6) — column x-positions are now
+// computed from each column's declared `width` (space reserved for its own
+// label text) rather than hardcoded per-column pixel literals, so adding a
+// 7th column later is a one-line addition, not a re-tuning of every x value.
 const SK_COLS = [
-  { name: 'harness', header: 'HARNESS', x: 16   },
-  { name: 'session', header: 'SESSION', x: 300  },
-  { name: 'routing', header: 'ROUTING', x: 720  },
-  { name: 'model',   header: 'MODEL',   x: 1040 },
+  { name: 'harness', header: 'HARNESS', width: 284 },
+  { name: 'session', header: 'SESSION', width: 420 },
+  { name: 'routing', header: 'ROUTING', width: 320 },
+  { name: 'backend', header: 'BACKEND', width: 190 },
+  { name: 'engine',  header: 'ENGINE',  width: 170 },
+  { name: 'model',   header: 'MODEL',   width: 60  }, // last column: trailing margin only
 ];
+(function layoutSankeyColumns() {
+  let x = 16;
+  SK_COLS.forEach(c => { c.x = x; x += c.width; });
+})();
 // SK_H is only the fallback drawing height; updateSankey() measures the
 // container — it stretches bars to fill it, or grows the SVG past it so the
 // container's overflow-y scrollbar takes over.
 const SK_W = 12, SK_H = 420, SK_TOP = 22, SK_PAD = 4;
 const SK_MIN_BAR = 14;  // legible floor: bar + its two label lines
-const SK_TOTAL_W = 1232;
+const SK_TOTAL_W = SK_COLS[SK_COLS.length - 1].x + SK_COLS[SK_COLS.length - 1].width;
 let sankeyFilter = { col: null, key: null };
 // Every link reachable forward and backward from the selected node (union of
 // all start-to-end paths through it).
@@ -1359,7 +1368,7 @@ function skComputePath(allLinks, NC) {
   return { links, nodes };
 }
 
-// Card click: highlight the path formed by a card's four column keys.
+// Card click: highlight the path formed by a card's per-column keys.
 function skPathFromCard(allLinks) {
   const cols = skCardHi;
   const nodes = new Set(), links = new Set();
@@ -1402,7 +1411,28 @@ function skRouting(e) {
   return e._route || deriveRoute(e);
 }
 
-// Col 3 — the model that served the request.
+// Cols 3/4 — which toolbox-family backend/compute-engine served the request
+// (PR4, design doc §6). `toolbox_backend`/`compute_api` are real values
+// (llama_cpp/vulkan today) only for requests the router actually served
+// through a registered serving identity; everything else falls back to an
+// explicit, distinct bucket rather than being silently merged with real
+// data — `cloud` (routed to Manifest), `unknown` (routing errored before
+// reaching any provider), `local_unmanaged` (served locally by something
+// other than a registered toolbox backend — not reachable from today's
+// router, reserved for when that becomes possible). `external`/`status_only`
+// (design doc §6 vocabulary) aren't derivable from `effective_provider`
+// alone and become reachable once later PRs register more serving
+// identities.
+function skServingBucket(e, field) {
+  if (e[field]) return e[field];
+  if (e.effective_provider === 'manifest') return 'cloud';
+  if (!e.effective_provider) return 'unknown';
+  return 'local_unmanaged';
+}
+function skBackend(e) { return skServingBucket(e, 'toolbox_backend'); }
+function skEngine(e) { return skServingBucket(e, 'compute_api'); }
+
+// Col 5 — the model that served the request.
 function skModel(e) {
   if (e.model_key) return e.model_key;
   if (e.effective_provider) return e.effective_provider.split('/').pop();
@@ -1411,7 +1441,8 @@ function skModel(e) {
 
 function skKeysOf(e) {
   return {
-    c0: skHarness(e), c1: skSession(e), c2: skRouting(e), c3: skModel(e),
+    c0: skHarness(e), c1: skSession(e), c2: skRouting(e),
+    c3: skBackend(e), c4: skEngine(e), c5: skModel(e),
   };
 }
 // Does this event match the active Sankey node filter?
@@ -1420,6 +1451,14 @@ function matchesSankey(t) {
   const k = skKeysOf(t);
   return k['c' + sankeyFilter.col] === sankeyFilter.key;
 }
+
+// Shared bucket palette for the backend/engine columns (PR4, §6) — muted for
+// "not really known" states, one flagged red for 'external' (a deliberate
+// manual override, worth visually distinguishing).
+const SK_SERVING_BUCKET_COLORS = {
+  cloud: '#9d7bff', local_unmanaged: '#5a6679', external: '#ff6b6b',
+  unknown: '#5a6679', status_only: '#5a6679',
+};
 
 function skColorFor(col, key) {
   const map = {
@@ -1431,7 +1470,21 @@ function skColorFor(col, key) {
       'hybrid · cloud → local': '#f5b14a', 'local · fallback': '#ff6b6b',
       'local · subs': '#22d39a', 'local · selected model': '#7dd3fc',
     },
-    3: {},
+    // PR4 (design doc §6): real backend ids get stable per-backend colors;
+    // the shared bucket vocabulary (cloud/local_unmanaged/external/unknown/
+    // status_only) gets one consistent muted/flagged palette reused across
+    // both the backend and engine columns, since the same buckets can
+    // appear in either.
+    3: {
+      'llama_cpp': '#3ec5ff', 'ds4': '#22d39a', 'halogen': '#ff7ac6',
+      'vllm': '#9d7bff', 'r9v': '#f5b14a',
+      ...SK_SERVING_BUCKET_COLORS,
+    },
+    4: {
+      'vulkan': '#3ec5ff', 'rocm': '#f5b14a',
+      ...SK_SERVING_BUCKET_COLORS,
+    },
+    5: {},
   };
   if (map[col] && map[col][key]) return map[col][key];
   const palette = ['#3ec5ff', '#22d39a', '#9d7bff', '#ff7ac6', '#f5b14a', '#ff6b6b', '#7dd3fc', '#a3e635'];
@@ -1495,7 +1548,7 @@ function updateSankey() {
   const SK_SEP = '\u0001';
   for (const e of enriched) {
     const k = skKeysOf(e);
-    const keys = [k.c0, k.c1, k.c2, k.c3];
+    const keys = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5];
     for (let i = 0; i < NC; i++) counts[i].set(keys[i], (counts[i].get(keys[i]) || 0) + 1);
     for (let i = 0; i + 1 < NC; i++) {
       const lk = keys[i] + SK_SEP + keys[i + 1];
@@ -2890,7 +2943,7 @@ function ompTitleForCwd(cwd) {
     if (!g) return;
     const e = g.events[g.events.length - 1];
     const k = skKeysOf(e);
-    const cols = [k.c0, k.c1, k.c2, k.c3];
+    const cols = [k.c0, k.c1, k.c2, k.c3, k.c4, k.c5];
     const same = skCardHi && skCardHi.join('\u0001') === cols.join('\u0001');
     skCardHi = same ? null : cols;
     sankeyFilter = { col: null, key: null };

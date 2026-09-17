@@ -1330,6 +1330,8 @@ mod tests {
             conv_id: "same-conversation".into(),
             pp_tps: 0.0,
             tg_tps: 0.0,
+            toolbox_backend: Some("llama_cpp".into()),
+            compute_api: Some("vulkan".into()),
         }
     }
 
