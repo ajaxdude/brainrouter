@@ -426,6 +426,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         benchmark_store,
         benchmark_lab,
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
+        toolbox_container_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     brainrouter::observability::start(&state);

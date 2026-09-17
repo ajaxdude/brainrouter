@@ -89,6 +89,9 @@ use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
 use crate::stream::{DeferredStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
 use crate::inflight::SniffStream;
+use crate::toolbox_catalog::{
+    self, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition,
+};
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
@@ -148,6 +151,11 @@ pub struct AppState {
     pub benchmark_lab: Result<Arc<crate::benchmark_lab::BenchmarkLab>, String>,
     /// Read-only model observations and separately persisted operator settings.
     pub observability: Arc<crate::observability::Observability>,
+    /// Per-container-name mutation lock for toolbox create/update/delete/adopt,
+    /// so two concurrent requests for the same container name queue instead of
+    /// racing `podman`/`toolbox` invocations against each other. Different
+    /// container names never contend (see design doc §5c).
+    pub toolbox_container_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 #[derive(Serialize)]
 struct HealthResponse {
@@ -225,6 +233,10 @@ async fn handle_request(
     // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
     let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
     let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
+        // Generalized toolbox container management (create/update/delete/adopt,
+        // PR2 §5c) — prefix-gated like /api/upgrade/ so a future sub-path under
+        // this same prefix is never accidentally left ungated.
+        || (method == "POST" && path.starts_with("/api/toolbox-containers"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -838,6 +850,53 @@ async fn handle_request(
         // ── Toolboxes API (all llama-* toolbox containers) ──────────────────
         ("GET", "/api/toolboxes") => {
             let resp = toolboxes_list().await;
+            into_unsync(resp)
+        }
+
+        // ── Generalized toolbox catalog/container API (PR2, all 5 supported
+        // backends: llama_cpp/ds4/halogen/vllm/r9v — see design doc §5c) ────
+        ("GET", "/api/toolbox-catalog") => {
+            let resp = toolbox_catalog_response().await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/toolbox-models") => {
+            let resp = toolbox_models_response().await;
+            into_unsync(resp)
+        }
+
+        ("GET", "/api/toolbox-containers") => {
+            let resp = toolbox_containers_list().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/toolbox-containers") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let resp = match val.get("toolbox_id").and_then(|v| v.as_str()) {
+                Some(id) => create_toolbox_container(&state, id).await,
+                None => json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                    error: "Missing \"toolbox_id\" in request body".into(),
+                }),
+            };
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/update") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/update").trim_end_matches('/');
+            let resp = update_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/delete") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/delete").trim_end_matches('/');
+            let resp = delete_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/adopt") => {
+            let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/adopt").trim_end_matches('/');
+            let resp = adopt_toolbox_container(&state, name).await;
             into_unsync(resp)
         }
 
@@ -1860,6 +1919,479 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
     }
     map
 }
+
+// ─── Generalized toolbox-catalog-driven container management (PR2) ─────────
+//
+// Everything below generalizes `toolboxes_list()`/`upgrade_toolbox()` above
+// (kept, unmodified, for backward compatibility — see design doc §5c) from
+// one hardcoded llama_cpp/Vulkan image to every toolbox in the vendored
+// catalog, across all 5 supported backends. See
+// `docs/design/ai-toolbox-cockpit-integration.md` §5c for the API contract
+// and the decisions recorded while implementing this.
+
+/// Podman label brainrouter attaches to every toolbox container it creates,
+/// so it can tell "brainrouter made this" apart from "a container that
+/// happens to share a catalog `container_name` but was made some other way
+/// (e.g. by cockpit directly)". See §5c: attaching these via `toolbox
+/// create --label` is unverified in this environment (Open question 6) and
+/// deliberately allowed to fail loudly rather than being silently skipped.
+const LABEL_MANAGED: &str = "io.brainrouter.managed";
+const LABEL_CATALOG_ID: &str = "io.brainrouter.catalog_id";
+const LABEL_CATALOG_REVISION: &str = "io.brainrouter.catalog_revision";
+
+/// Loads and type-parses the vendored toolbox catalog, restricted to
+/// entries brainrouter can act on. Returns a human-readable error string
+/// (used directly in `ErrorResponse`s) rather than a custom error type,
+/// matching this file's existing preference for cheap, situational errors
+/// over a dedicated error enum for read paths that should essentially never
+/// fail (the catalog is embedded at compile time and covered by unit tests).
+fn load_typed_toolbox_catalog() -> Result<ToolboxCatalog, String> {
+    let vendored = toolbox_catalog::load_vendored_catalog();
+    if !vendored.report.is_ok() {
+        warn!(
+            errors = ?vendored.report.errors,
+            warnings = ?vendored.report.warnings,
+            "Vendored toolbox catalog has structural validation issues"
+        );
+    }
+    let (toolboxes, _models) = vendored
+        .typed()
+        .map_err(|e| format!("failed to parse vendored toolbox catalog: {e}"))?;
+    Ok(toolboxes)
+}
+
+/// Whether a podman container carries brainrouter's ownership label.
+/// Absence (including "no such container") is treated as unmanaged, not an
+/// error — callers already know whether the container exists from `podman
+/// ps`, this only answers the ownership question for ones that do.
+async fn toolbox_container_is_managed(name: &str) -> bool {
+    let out = tokio::process::Command::new("podman")
+        .args(["inspect", "--format", &format!("{{{{ index .Config.Labels \"{LABEL_MANAGED}\" }}}}"), name])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+/// `Some(repo)` if `image` is hosted on Docker Hub in the implicit
+/// `docker.io/<namespace>/<name>` form — the only registry shape this
+/// freshness check knows how to query (§3, critic finding #12). Anything
+/// else (e.g. `ghcr.io/...`) gets an explicit "freshness unavailable"
+/// status downstream rather than a guessed Hub-only request that would
+/// just fail or, worse, hit the wrong repo on Hub.
+fn hub_repo_for_image(image: &str) -> Option<&str> {
+    let (repo, _tag) = split_repo_tag(image);
+    repo.strip_prefix("docker.io/")
+}
+
+/// How long a per-repository Docker Hub tag-listing is cached before being
+/// re-fetched. Looping over every vendored toolbox's image on every
+/// dashboard poll (today every 30s) without this would multiply outbound
+/// Hub requests by the number of distinct repos in the catalog, which is
+/// exactly the scaling problem §3/critic finding #12 flagged.
+const HUB_TAG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// repo -> (fetched_at, tag -> last-push-date).
+type HubTagCache = std::collections::HashMap<String, (std::time::Instant, std::collections::HashMap<String, String>)>;
+
+static HUB_TAG_CACHE: LazyLock<std::sync::Mutex<HubTagCache>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Docker Hub tag -> last-push-date map for one repo, generalizing
+/// `hub_toolbox_tag_dates()`'s single hardcoded repo to any repo, cached
+/// per-repo, and — unlike the original — with an explicit request timeout
+/// (the original had none; see §3, critic finding #12).
+async fn hub_repo_tag_dates(repo: &str) -> std::collections::HashMap<String, String> {
+    if let Ok(cache) = HUB_TAG_CACHE.lock() {
+        if let Some((fetched_at, dates)) = cache.get(repo) {
+            if fetched_at.elapsed() < HUB_TAG_CACHE_TTL {
+                return dates.clone();
+            }
+        }
+    }
+
+    let mut map = std::collections::HashMap::new();
+    let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100");
+    let resp = VERSION_CLIENT
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok();
+    if let Some(r) = resp {
+        if let Ok(data) = r.json::<serde_json::Value>().await {
+            for t in data.get("results").and_then(|v| v.as_array()).into_iter().flatten() {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let pushed = t
+                    .get("tag_last_pushed")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.get(..10))
+                    .unwrap_or("");
+                if !name.is_empty() && !pushed.is_empty() {
+                    map.insert(name.to_string(), pushed.to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(mut cache) = HUB_TAG_CACHE.lock() {
+        cache.insert(repo.to_string(), (std::time::Instant::now(), map.clone()));
+    }
+    map
+}
+
+/// Freshness (`local_created`, `latest_created`, `update_available`) for a
+/// set of distinct images, fetching each distinct Hub repo at most once
+/// (bounded concurrency, not one call per container) rather than once per
+/// image/container as a naive generalization of `toolboxes_list()` would.
+async fn image_freshness_map(
+    images: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, (String, String, bool)> {
+    let repos: std::collections::HashSet<&str> =
+        images.iter().filter_map(|i| hub_repo_for_image(i)).collect();
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut tasks = Vec::new();
+    for repo in repos {
+        let repo = repo.to_string();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let dates = hub_repo_tag_dates(&repo).await;
+            (repo, dates)
+        }));
+    }
+    let mut repo_tag_map: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    for task in tasks {
+        if let Ok((repo, dates)) = task.await {
+            repo_tag_map.insert(repo, dates);
+        }
+    }
+
+    let mut result = std::collections::HashMap::new();
+    for image in images {
+        let local = image_created_date(image).await.unwrap_or_default();
+        let (_repo, tag) = split_repo_tag(image);
+        let latest = hub_repo_for_image(image)
+            .and_then(|r| repo_tag_map.get(r))
+            .and_then(|m| m.get(tag))
+            .cloned()
+            .unwrap_or_default();
+        let update_available = !local.is_empty() && !latest.is_empty() && local < latest;
+        result.insert(image.clone(), (local, latest, update_available));
+    }
+    result
+}
+
+/// `GET /api/toolbox-catalog` — the vendored catalog, restricted to the 5
+/// supported backends (comfyui entries omitted entirely, not just flagged).
+pub async fn toolbox_catalog_response() -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e });
+        }
+    };
+    let toolboxes: Vec<&ToolboxDefinition> = catalog
+        .toolboxes
+        .iter()
+        .filter(|t| t.supported_backend().is_some())
+        .collect();
+    json_response(StatusCode::OK, &serde_json::json!({
+        "schema_version": catalog.schema_version,
+        "toolboxes": toolboxes,
+        "platforms": catalog.platforms,
+    }))
+}
+
+/// `GET /api/toolbox-models` — the vendored model catalog, restricted to
+/// the 5 supported backends.
+pub async fn toolbox_models_response() -> Response<Full<Bytes>> {
+    let vendored = toolbox_catalog::load_vendored_catalog();
+    let (_toolboxes, models) = match vendored.typed() {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox model catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("failed to parse vendored model catalog: {e}"),
+            });
+        }
+    };
+    let backends: Vec<_> = models
+        .backends
+        .iter()
+        .filter(|b| SupportedServingBackend::try_from(&b.backend).is_ok())
+        .collect();
+    json_response(StatusCode::OK, &serde_json::json!({
+        "schema_version": models.schema_version,
+        "backends": backends,
+    }))
+}
+
+/// `GET /api/toolbox-containers` — generalizes `toolboxes_list()` above
+/// from one hardcoded `llama-*` name prefix to every catalog toolbox across
+/// all 5 supported backends. A podman container whose name matches no
+/// catalog `container_name` is omitted, same effective behavior as the
+/// old prefix filter, now catalog-driven instead of hardcoded.
+pub async fn toolbox_containers_list() -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to load toolbox catalog");
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e });
+        }
+    };
+    let by_container_name: std::collections::HashMap<&str, &ToolboxDefinition> = catalog
+        .toolboxes
+        .iter()
+        .filter(|t| t.supported_backend().is_some())
+        .map(|t| (t.container_name.as_str(), t))
+        .collect();
+
+    let containers = tokio::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}|{{.Image}}|{{.Status}}|{{.CreatedAt}}"])
+        .output()
+        .await;
+
+    // (container_name, toolbox, image, status, created_at)
+    let mut matched: Vec<(String, &ToolboxDefinition, String, String, String)> = Vec::new();
+    if let Ok(o) = containers {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.splitn(4, '|');
+            let (Some(name), Some(image), Some(status), Some(created_at)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some(tb) = by_container_name.get(name) else {
+                continue;
+            };
+            matched.push((name.to_string(), tb, image.to_string(), status.to_string(), created_at.to_string()));
+        }
+    }
+    matched.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let images: std::collections::HashSet<String> = matched.iter().map(|m| m.2.clone()).collect();
+    let freshness = image_freshness_map(&images).await;
+
+    let mut list: Vec<serde_json::Value> = Vec::with_capacity(matched.len());
+    for (name, tb, image, status, created_at) in &matched {
+        let managed = toolbox_container_is_managed(name).await;
+        let (local_created, latest_created, update_available) =
+            freshness.get(image).cloned().unwrap_or_default();
+        list.push(serde_json::json!({
+            "container_name": name,
+            "toolbox_id": tb.id,
+            "backend": tb.backend.as_str(),
+            "image": image,
+            "running": status.starts_with("Up"),
+            "status": status,
+            "created_at": created_at,
+            "local_created": local_created,
+            "latest_created": latest_created,
+            "update_available": update_available,
+            "managed": managed,
+        }));
+    }
+
+    json_response(StatusCode::OK, &serde_json::json!({ "containers": list }))
+}
+
+/// Acquires the per-container-name mutation lock, creating one on first use.
+/// The outer `std::sync::Mutex` only ever guards inserting a new per-name
+/// entry (a fast, non-blocking operation); the actual create/update/delete/
+/// adopt work is done while holding the returned async guard, so a second
+/// concurrent request for the *same* name queues behind it, while different
+/// names never contend (§5c).
+async fn lock_toolbox_container(state: &AppState, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let entry = {
+        let mut locks = state.toolbox_container_locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(locks.entry(name.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+    };
+    entry.lock_owned().await
+}
+
+/// Shared create/update/adopt primitive: pulls (if `pull`) the toolbox's
+/// catalog image, force-removes any existing container of that name, then
+/// recreates it via `toolbox create` with brainrouter's ownership labels.
+/// Assumes the caller already holds the per-container-name lock.
+async fn recreate_toolbox_container(tb: &ToolboxDefinition, pull: bool) -> Response<Full<Bytes>> {
+    let container = &tb.container_name;
+    let image = &tb.image;
+
+    if pull {
+        let pull_out = tokio::process::Command::new("podman").args(["pull", image]).output().await;
+        match pull_out {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                error!(%stderr, %container, %image, "podman pull failed");
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                    error: format!("podman pull failed: {}", stderr.trim()),
+                });
+            }
+            Err(e) => {
+                error!(error = %e, %container, "Failed to exec podman pull");
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                    error: format!("Failed to exec podman: {}", e),
+                });
+            }
+        }
+    }
+
+    // Force-remove any existing container of this name (idempotent: fine if absent).
+    let _ = tokio::process::Command::new("toolbox").args(["rm", "--force", container]).output().await;
+
+    let revision = toolbox_catalog::vendored_catalog_revision();
+    let create = tokio::process::Command::new("toolbox")
+        .args([
+            "create",
+            "--image",
+            image,
+            "--label",
+            &format!("{LABEL_MANAGED}=true"),
+            "--label",
+            &format!("{LABEL_CATALOG_ID}={}", tb.id),
+            "--label",
+            &format!("{LABEL_CATALOG_REVISION}={revision}"),
+            container,
+        ])
+        .output()
+        .await;
+
+    match create {
+        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": format!("Toolbox container '{container}' created."),
+        })),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container, %image, "toolbox create failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!(
+                    "toolbox create failed: {} (if this mentions an unrecognized --label flag, \
+                     see design doc §5c / Open question 6 — toolbox's --label support is unverified)",
+                    stderr.trim()
+                ),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, %container, "Failed to exec toolbox create");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec toolbox: {}", e),
+            })
+        }
+    }
+}
+
+/// `POST /api/toolbox-containers` — create a new container for `toolbox_id`.
+pub async fn create_toolbox_container(state: &AppState, toolbox_id: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog.toolbox_by_id(toolbox_id).filter(|t| t.supported_backend().is_some()) else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No such supported toolbox catalog id: {toolbox_id}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, &tb.container_name).await;
+    if toolbox_container_image(&tb.container_name).await.is_some() {
+        return json_response(StatusCode::CONFLICT, &ErrorResponse {
+            error: format!(
+                "Container '{}' already exists — use update or adopt instead.",
+                tb.container_name
+            ),
+        });
+    }
+    recreate_toolbox_container(tb, false).await
+}
+
+/// `POST /api/toolbox-containers/{name}/update` — pull latest image + recreate.
+pub async fn update_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog
+        .toolboxes
+        .iter()
+        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
+    else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No catalog toolbox with container_name: {container_name}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, container_name).await;
+    recreate_toolbox_container(tb, true).await
+}
+
+/// `POST /api/toolbox-containers/{name}/adopt` — recreate-in-place (no
+/// pull) to attach ownership labels to a pre-existing unmanaged container.
+/// See §5c for why this can't be a label-only no-op.
+pub async fn adopt_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let catalog = match load_typed_toolbox_catalog() {
+        Ok(c) => c,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    };
+    let Some(tb) = catalog
+        .toolboxes
+        .iter()
+        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
+    else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No catalog toolbox with container_name: {container_name}"),
+        });
+    };
+    let _guard = lock_toolbox_container(state, container_name).await;
+    if toolbox_container_image(container_name).await.is_none() {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
+            error: format!("No such container: {container_name}"),
+        });
+    }
+    if toolbox_container_is_managed(container_name).await {
+        return json_response(StatusCode::CONFLICT, &ErrorResponse {
+            error: format!("Container '{container_name}' is already brainrouter-managed."),
+        });
+    }
+    recreate_toolbox_container(tb, false).await
+}
+
+/// `POST /api/toolbox-containers/{name}/delete` — idempotent force-remove.
+pub async fn delete_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
+    let _guard = lock_toolbox_container(state, container_name).await;
+    if toolbox_container_image(container_name).await.is_none() {
+        return json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "already removed",
+        }));
+    }
+    let remove = tokio::process::Command::new("toolbox").args(["rm", "--force", container_name]).output().await;
+    match remove {
+        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": format!("Toolbox container '{container_name}' removed."),
+        })),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container_name, "toolbox rm failed");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("toolbox rm failed: {}", stderr.trim()),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, %container_name, "Failed to exec toolbox rm");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec toolbox: {}", e),
+            })
+        }
+    }
+}
+
 
 /// Fixed name for the transient container used to probe the installed llama.cpp version.
 /// Combined with `--replace`, this lets a fresh check safely reuse (rather than collide with)

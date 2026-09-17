@@ -2334,33 +2334,93 @@ async function togglePromptRewrite() {
   } catch(e) { applyToggle('rewrite', currentlyOn); }
   rewriteBusy = false;
 }
-let toolboxesData = null;
+// Generalized, catalog-driven toolbox rendering (PR2 — covers every
+// supported backend: llama_cpp/ds4/halogen/vllm/r9v; comfyui is excluded by
+// the server's /api/toolbox-catalog response). `toolboxCatalogData` is the
+// declarative "what could exist" list; `toolboxContainersData` is "what
+// actually exists right now", correlated by container_name.
+let toolboxCatalogData = null;
+let toolboxContainersData = null;
+
+const TOOLBOX_BACKEND_LABELS = {
+  llama_cpp: 'llama.cpp',
+  ds4: 'DS4',
+  halogen: 'Halogen',
+  vllm: 'vLLM',
+  r9v: 'R9V',
+};
+
+// The catalog spans several hardware platforms (strix-halo, r9700, gb10,
+// intel-b70) — 25 supported-backend toolboxes total. Showing all of them
+// would bury the handful actually relevant to this host under entries for
+// hardware it doesn't have. brainrouter has no real host/platform detection
+// yet (design doc Q1 is still open — e.g. distinguishing an R9700 box from
+// a Strix Halo one), so this narrows to the single platform brainrouter's
+// existing hardcoded defaults already assume (`docker.io/kyuz0/amd-strix-
+// halo-toolboxes:...`), matching current behavior rather than guessing new
+// behavior. Revisit once Q1 lands real detection.
+const CURRENT_PLATFORM_ID = 'strix-halo';
 
 function renderToolboxes() {
   const el = document.getElementById('toolbox-list');
   if (!el) return;
-  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
-  if (boxes.length === 0) { el.innerHTML = ''; return; }
-  el.innerHTML = boxes.map(tb => {
-    const color = tb.running ? 'var(--green)' : 'var(--textMute)';
-    const sub = [tb.status, tb.created ? 'built ' + tb.created : ''].filter(Boolean).join(' · ');
-    const local = tb.local_created || '';
-    const latest = tb.latest_created || '';
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const toolboxes = allowedIds ? allToolboxes.filter(tb => allowedIds.has(tb.id)) : allToolboxes;
+  if (toolboxes.length === 0) { el.innerHTML = ''; return; }
+  const containers = (toolboxContainersData && toolboxContainersData.containers) || [];
+  const byName = {};
+  containers.forEach(c => { byName[c.container_name] = c; });
+
+  // Group catalog toolboxes by backend, preserving catalog order within each group.
+  const order = [];
+  const groups = {};
+  toolboxes.forEach(tb => {
+    if (!groups[tb.backend]) { groups[tb.backend] = []; order.push(tb.backend); }
+    groups[tb.backend].push(tb);
+  });
+
+  el.innerHTML = order.map(backend => {
+    const label = TOOLBOX_BACKEND_LABELS[backend] || backend;
+    const rows = groups[backend].map(tb => renderToolboxRow(tb, byName[tb.container_name])).join('');
+    return `<div style="padding:6px 0 2px;font-size:9px;letter-spacing:1px;color:var(--textMute);text-transform:uppercase">${escHtml(label)}</div>${rows}`;
+  }).join('');
+}
+
+function renderToolboxRow(tb, c) {
+  const exists = !!c;
+  const color = exists ? (c.running ? 'var(--green)' : 'var(--textMute)') : 'var(--border)';
+  const name = tb.name || tb.id;
+  let right;
+  if (!exists) {
+    right = `<button onclick="event.stopPropagation();createToolboxContainer(${JSON.stringify(tb.id)})" title="Create container for ${escHtml(name)}"
+      style="all:unset;cursor:pointer;font-size:9px;padding:1px 6px;border-radius:99px;background:var(--bg3);color:var(--cyan);border:1px solid var(--border);font-family:'JetBrains Mono',monospace">+ create</button>`;
+  } else {
+    const local = c.local_created || '';
+    const latest = c.latest_created || '';
     // Version cell: if an update is available, show latest with a clickable ↑;
-    // otherwise show the installed date. Clicking the arrow upgrades just this box.
+    // otherwise show the installed date. Clicking the arrow updates just this box.
     let ver;
-    if (tb.update_available && latest) {
+    if (c.update_available && latest) {
       ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${escHtml(latest)}</span>` +
-            `<span onclick="event.stopPropagation();upgradeToolbox(${JSON.stringify(tb.name)})" style="font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:9px;cursor:pointer;padding:0 2px" title="Update available: ${escHtml(latest)}">↑</span>`;
+            `<span onclick="event.stopPropagation();updateToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--amber);font-size:9px;cursor:pointer;padding:0 2px" title="Update available: ${escHtml(latest)}">↑</span>`;
     } else {
       ver = `<span style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:9px">${local ? escHtml(local) : '—'}</span>`;
     }
-    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.name)} — ${escHtml(sub)}${tb.update_available ? ' — update available ' + escHtml(latest) : ''}">
-      <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">${escHtml(tb.short_name || tb.name)}</span>
-      ${ver}
-    </div>`;
-  }).join('');
+    const adopt = !c.managed
+      ? `<span onclick="event.stopPropagation();adoptToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--violet);font-size:9px;cursor:pointer;padding:0 2px" title="Unmanaged — click to adopt (recreates in place to attach ownership labels)">adopt</span>`
+      : '';
+    const del = `<span onclick="event.stopPropagation();deleteToolboxContainer(${JSON.stringify(c.container_name)})" style="font-family:'JetBrains Mono',monospace;color:var(--red);font-size:9px;cursor:pointer;padding:0 2px" title="Remove container">✕</span>`;
+    right = `${ver}${adopt}${del}`;
+  }
+  const sub = exists ? [c.status, c.local_created ? 'built ' + c.local_created : ''].filter(Boolean).join(' · ') : 'not created';
+  return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.container_name)} — ${escHtml(sub)}">
+    <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
+    <span style="color:var(--textDim);flex:1">${escHtml(name)}</span>
+    ${right}
+  </div>`;
 }
 
 async function upgradeIfAvailable(svc) {
@@ -2371,20 +2431,50 @@ async function upgradeIfAvailable(svc) {
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
 }
 
+// "all ↑" in the sidebar header: update every container (any backend) that
+// currently has an update available, one /api/toolbox-containers/{name}/update
+// call per container (there is no single bulk-update route server-side).
 async function upgradeToolboxAll() {
-  const boxes = (toolboxesData && toolboxesData.toolboxes) || [];
-  if (boxes.length === 0) return;
-  if (!confirm('Upgrade ALL toolbox containers (' + boxes.length + ') to the latest images?\nThe local stack will restart. Takes a few minutes.')) return;
-  try { await fetch('/api/upgrade/toolbox', { method: 'POST' }); } catch (e) {}
+  const containers = (toolboxContainersData && toolboxContainersData.containers) || [];
+  const stale = containers.filter(c => c.update_available);
+  if (stale.length === 0) return;
+  if (!confirm('Update ' + stale.length + ' toolbox container(s) to the latest images?\nEach restarts individually. Takes a few minutes.')) return;
+  try {
+    await Promise.all(stale.map(c =>
+      fetch('/api/toolbox-containers/' + encodeURIComponent(c.container_name) + '/update', { method: 'POST' }).catch(() => {})
+    ));
+  } catch (e) {}
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 5000);
 }
 
-async function upgradeToolbox(name) {
-  if (!confirm('Upgrade toolbox "' + name + '" to the latest image?')) return;
+async function createToolboxContainer(toolboxId) {
+  if (!confirm('Create toolbox container for "' + toolboxId + '"? This pulls the image if needed.')) return;
   try {
-    await fetch('/api/upgrade/toolbox/' + encodeURIComponent(name), { method: 'POST' });
+    await fetch('/api/toolbox-containers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId }),
+    });
   } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 3000);
+}
+
+async function updateToolboxContainer(name) {
+  if (!confirm('Update toolbox container "' + name + '" to the latest image?')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/update', { method: 'POST' }); } catch (e) {}
   setTimeout(() => { refreshSlow(); refreshHealth(); }, 3000);
+}
+
+async function adoptToolboxContainer(name) {
+  if (!confirm('Adopt toolbox container "' + name + '" as brainrouter-managed?\nThis recreates the container in place (same image, no pull) to attach ownership labels.')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/adopt', { method: 'POST' }); } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 3000);
+}
+
+async function deleteToolboxContainer(name) {
+  if (!confirm('Delete toolbox container "' + name + '"? This cannot be undone.')) return;
+  try { await fetch('/api/toolbox-containers/' + encodeURIComponent(name) + '/delete', { method: 'POST' }); } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 2000);
 }
 
 // ─── Action handlers ──────────────────────────────────────────────────────────
@@ -2600,18 +2690,21 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, tbRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
     safeFetch('/api/prompt-rewrite'),
-    safeFetch('/api/toolboxes'),
+    safeFetch('/api/toolbox-catalog'),
+    safeFetch('/api/toolbox-containers'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
   if (nudgeRes) { nudgeData = nudgeRes; applyNudgeUI(nudgeRes); }
   if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
-  if (tbRes) { toolboxesData = tbRes; renderToolboxes(); }
+  if (catalogRes) { toolboxCatalogData = catalogRes; }
+  if (containersRes) { toolboxContainersData = containersRes; }
+  if (catalogRes || containersRes) { renderToolboxes(); }
 }
 
 // ─── In-flight requests (llama-swap parity) ─────────────────────────────────
