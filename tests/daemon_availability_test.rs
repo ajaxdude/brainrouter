@@ -562,7 +562,7 @@ async fn forward_benchmark_schema_does_not_stop_core_routing() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO schema_migrations(version,name) VALUES(3,'future_schema')",
+            "INSERT INTO schema_migrations(version,name) VALUES(4,'future_schema')",
             [],
         )
         .unwrap();
@@ -580,7 +580,7 @@ async fn forward_benchmark_schema_does_not_stop_core_routing() {
         })
         .unwrap();
     assert_eq!(
-        version, 3,
+        version, 4,
         "startup must not downgrade an unsupported database"
     );
 }
