@@ -1861,6 +1861,44 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Fixed name for the transient container used to probe the installed llama.cpp version.
+/// Combined with `--replace`, this lets a fresh check safely reuse (rather than collide with)
+/// any leftover container of the same name from a prior run whose cleanup failed, and gives
+/// operators a stable, greppable name instead of podman's randomly-assigned pet-names.
+const PODMAN_VERSION_CHECK_CONTAINER_NAME: &str = "brainrouter-llama-version-check";
+
+/// Outcome of [`run_with_timeout_and_cleanup`].
+enum TimedCommandOutcome {
+    Completed(std::process::Output),
+    Failed(std::io::Error),
+    TimedOut,
+}
+
+/// Runs `cmd` under `timeout`. `cmd` must already have `.kill_on_drop(true)` set by the caller.
+///
+/// `podman run --rm` only removes its own container when the podman client exits normally; if
+/// the client is killed first (as `kill_on_drop` does when this future is dropped on timeout),
+/// `--rm`'s cleanup never runs and the container is left running, orphaned, under whatever name
+/// podman assigned it. On timeout this function therefore also runs a best-effort `cleanup`
+/// command (e.g. `podman rm -f <name>`) to remove that container; the cleanup's own failure is
+/// logged but never propagated, since this is already a best-effort fallback path.
+async fn run_with_timeout_and_cleanup(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+    mut cleanup: tokio::process::Command,
+) -> TimedCommandOutcome {
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => TimedCommandOutcome::Completed(out),
+        Ok(Err(e)) => TimedCommandOutcome::Failed(e),
+        Err(_) => {
+            if let Err(e) = cleanup.output().await {
+                warn!(error = %e, "best-effort cleanup command failed after timeout");
+            }
+            TimedCommandOutcome::TimedOut
+        }
+    }
+}
+
 /// Compute local versions and "latest available" metadata for the /api/versions endpoint.
 /// Called periodically by a background task in daemon.rs.
 pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
@@ -1885,12 +1923,22 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
     // 2. llama.cpp version from toolbox container image.
     const PODMAN_VERSION_TIMEOUT_SECS: u64 = 15;
     let toolbox_ver = {
-        let child = Command::new("podman")
-            .args(["run", "--rm", "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version"])
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS), child).await {
-            Ok(Ok(out)) => {
+        let mut child = Command::new("podman");
+        child
+            .args([
+                "run", "--rm", "--replace", "--name", PODMAN_VERSION_CHECK_CONTAINER_NAME,
+                "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv", "llama-server", "--version",
+            ])
+            .kill_on_drop(true);
+        let mut cleanup = Command::new("podman");
+        cleanup.args(["rm", "-f", PODMAN_VERSION_CHECK_CONTAINER_NAME]);
+
+        match run_with_timeout_and_cleanup(
+            child,
+            std::time::Duration::from_secs(PODMAN_VERSION_TIMEOUT_SECS),
+            cleanup,
+        ).await {
+            TimedCommandOutcome::Completed(out) => {
                 let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
                 if let Some(line) = combined.lines().find(|l| l.contains("version:")) {
                     line.replace("version:", "").replace("built with", "").trim().to_string()
@@ -1900,12 +1948,16 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
                     "unknown".to_string()
                 }
             }
-            Ok(Err(e)) => {
+            TimedCommandOutcome::Failed(e) => {
                 error!(error = %e, "Failed to execute podman run for version check");
                 "unknown".to_string()
             }
-            Err(_) => {
-                warn!(timeout_secs = PODMAN_VERSION_TIMEOUT_SECS, "podman run timed out during llama.cpp version check");
+            TimedCommandOutcome::TimedOut => {
+                warn!(
+                    timeout_secs = PODMAN_VERSION_TIMEOUT_SECS,
+                    container = PODMAN_VERSION_CHECK_CONTAINER_NAME,
+                    "podman run timed out during llama.cpp version check; ran best-effort cleanup"
+                );
                 "unknown".to_string()
             }
         }
@@ -2734,6 +2786,52 @@ mod tests {
     #[test]
     fn display_name_full_model_id() {
         assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-amdvlk"), "Qwen3.6 27B Q6 AMDVLK");
+    }
+
+    /// Regression test for the podman version-check leak (design doc
+    /// `docs/design/ai-toolbox-cockpit-integration.md` §5a): a normal completion within the
+    /// timeout must NOT trigger the best-effort cleanup command. This must actually exercise the
+    /// success path, not just assert the timeout path is correct in isolation, since either half
+    /// failing silently would defeat the fix.
+    #[tokio::test]
+    async fn timed_command_skips_cleanup_when_command_completes_in_time() {
+        let marker = std::env::temp_dir().join(format!("brainrouter-test-marker-{}", uuid::Uuid::new_v4()));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "true"]).kill_on_drop(true);
+        let mut cleanup = tokio::process::Command::new("sh");
+        cleanup.args(["-c", &format!("touch {}", marker.display())]);
+
+        let outcome = run_with_timeout_and_cleanup(
+            cmd,
+            std::time::Duration::from_secs(5),
+            cleanup,
+        ).await;
+
+        assert!(matches!(outcome, TimedCommandOutcome::Completed(_)));
+        assert!(!marker.exists(), "cleanup must not run when the command completes in time");
+    }
+
+    /// Regression test forcing the **timeout branch itself** (not just running the check twice
+    /// normally, which the Dory critic review found would pass even without the fix): a
+    /// deliberately slow command under an artificially short timeout must be killed and must
+    /// trigger the best-effort cleanup command exactly once.
+    #[tokio::test]
+    async fn timed_command_runs_cleanup_on_timeout() {
+        let marker = std::env::temp_dir().join(format!("brainrouter-test-marker-{}", uuid::Uuid::new_v4()));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 5"]).kill_on_drop(true);
+        let mut cleanup = tokio::process::Command::new("sh");
+        cleanup.args(["-c", &format!("touch {}", marker.display())]);
+
+        let outcome = run_with_timeout_and_cleanup(
+            cmd,
+            std::time::Duration::from_millis(50),
+            cleanup,
+        ).await;
+
+        assert!(matches!(outcome, TimedCommandOutcome::TimedOut));
+        assert!(marker.exists(), "best-effort cleanup must run on timeout");
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
