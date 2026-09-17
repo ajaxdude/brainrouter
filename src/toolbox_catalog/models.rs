@@ -108,11 +108,28 @@ pub struct VllmModel {
     pub extra: serde_json::Map<String, Value>,
 }
 
+/// The single large extracted file R9V's "Prepare PLE" step produces
+/// (`per_layer_token_embd.iq4_nl.bin`, ~26.8 GiB in the vendored fixture),
+/// typed for PR11's Server Mode readiness gate (design doc §15 item 1;
+/// previously left in [`R9vModel::extra`] as "not characterized beyond the
+/// single sample"). Readiness is checked by `size_bytes` only, mirroring
+/// upstream's own `model_manager.py::ple_ready()` exactly — `sha256` is
+/// carried here for a possible future stronger check but is **not**
+/// verified today (§15's flagged open item, not silently upgraded).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct R9vPleFile {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
 /// `r9v` model entry. Only 1 entry exists in the vendored fixture as of the
 /// pin, so "common across all entries" is weak evidence here — every field
-/// below except `id`/`name`/`repo`/`files` is deliberately `#[serde(default)]`
-/// as a safety margin against a second entry omitting one. `ple` is kept in
-/// `extra` (its shape wasn't characterized beyond the single sample).
+/// below except `id`/`name`/`repo`/`files`/`ple` is deliberately
+/// `#[serde(default)]` as a safety margin against a second entry omitting
+/// one. `ple` is `Option` (not required) for the same reason, even though
+/// it's semantically required for the one entry that exists today — a
+/// future no-PLE r9v variant shouldn't fail catalog parsing entirely.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R9vModel {
     pub id: String,
@@ -132,6 +149,8 @@ pub struct R9vModel {
     pub recommended: bool,
     #[serde(default)]
     pub files: Vec<CatalogModelFile>,
+    #[serde(default)]
+    pub ple: Option<R9vPleFile>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -387,7 +406,7 @@ mod tests {
         let r9v = catalog.backend(SupportedServingBackend::R9v).unwrap();
         assert!(r9v.entries.iter().all(|e| matches!(
             &e.payload,
-            Some(ModelPayload::R9v(m)) if !m.files.is_empty()
+            Some(ModelPayload::R9v(m)) if !m.files.is_empty() && m.ple.is_some()
         )));
     }
 

@@ -763,6 +763,104 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
           </div>
         </div>
       </div>
+
+      <!-- PR11 §15/§15a: r9v Server Mode. Unlike ds4/halogen/vllm's toolbox
+           dropdowns, the r9v toolbox/model options below are deliberately
+           NOT filtered to CURRENT_PLATFORM_ID's allowedIds — r9v's only
+           vendored toolbox lives on the `r9700` platform, not the
+           hardcoded `strix-halo` default (design doc's Open question 1:
+           no real per-host platform detection yet), so that filter would
+           make this entire tab permanently empty on the very hosts it's
+           meant for. -->
+      <div id="sm-panel-r9v" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">r9v server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-r9v-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model package (already downloaded, PLE prepared in Downloads)
+            <select id="sm-r9v-package" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-r9v-host" type="text" placeholder="127.0.0.1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-r9v-port" type="number" placeholder="8004" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">GPU devices
+              <input id="sm-r9v-devices" type="text" placeholder="0,1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context
+              <input id="sm-r9v-context" type="number" placeholder="131072" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Batch
+              <input id="sm-r9v-batch" type="number" placeholder="1024" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Sequences
+              <input id="sm-r9v-sequences" type="number" placeholder="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV cache bytes
+              <input id="sm-r9v-kv-bytes" type="number" placeholder="2285670400" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Expert cache slots
+              <input id="sm-r9v-expert-cache-slots" type="number" placeholder="16" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">CPU offload GB
+              <input id="sm-r9v-offload" type="text" placeholder="112.5" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">CPU offload per device
+              <input id="sm-r9v-offload-devices" type="text" placeholder="112.5,112.5" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Served model name
+              <input id="sm-r9v-served-model" type="text" placeholder="qwen3.8-flash-next" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">API key (optional)
+              <input id="sm-r9v-api-key" type="text" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute)">Extra args (optional, shell-quoted)
+            <input id="sm-r9v-extra-args" type="text" placeholder="e.g. --enable-log-requests" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="font-size:10px;color:var(--textMute)">Every field above is optional — blank falls back to r9v's own defaults. TP2/MTP2/SSD-resident PLE are fixed, not configurable.</div>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startR9vServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopR9vServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-r9v-status" style="display:none;font-size:12px;color:var(--textMute);margin-bottom:16px">Loading status…</div>
+
+      <!-- PR11 §15a: r9v's three host directories (models_dir/ple_dir/
+           cache_dir) are saved as their own explicit action, mirroring
+           vllm's separate "Save Cache Paths" pattern above. -->
+      <div id="sm-panel-r9v-paths" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">r9v paths</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Models directory
+            <input id="sm-r9v-path-models" type="text" placeholder="~/models/R9V-Qwen3.8-IQ4_XS" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">PLE directory
+            <input id="sm-r9v-path-ple" type="text" placeholder="~/r9v-data" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Compilation cache directory
+            <input id="sm-r9v-path-cache" type="text" placeholder="~/r9v-data/cache-toolbox-rocm10" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="saveR9vPaths()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Save paths</button>
+          </div>
+        </div>
+      </div>
     </div>
 
 
@@ -2792,7 +2890,7 @@ let toolboxModelsActiveBackend = 'llama_cpp';
 let toolboxModelsPollTimer = null;
 const DOWNLOAD_CAPABLE_BACKENDS = ['llama_cpp', 'ds4', 'halogen', 'r9v'];
 const DOWNLOAD_STATUS_COLORS = {
-  queued: 'var(--textMute)', downloading: 'var(--cyan)', verifying: 'var(--violet)',
+  queued: 'var(--textMute)', downloading: 'var(--cyan)', running: 'var(--cyan)', verifying: 'var(--violet)',
   complete: 'var(--green)', failed: 'var(--red)', cancelled: 'var(--textMute)',
 };
 
@@ -2849,7 +2947,13 @@ function renderToolboxModelRow(entry) {
   const complete = kind === 'complete';
   const notChecked = kind === 'not_checked';
   const dot = complete ? 'var(--green)' : (notChecked ? 'var(--textMute)' : (presence ? 'var(--amber)' : 'var(--border)'));
-  const statusLabel = complete ? 'downloaded' : (notChecked ? 'unknown (no manifest check for this backend)' : (presence ? 'incomplete' : '—'));
+  let statusLabel = complete ? 'downloaded' : (notChecked ? 'unknown (no manifest check for this backend)' : (presence ? 'incomplete' : '—'));
+  // PR11 §15 item 8: r9v has a second readiness gate beyond file
+  // completeness — surfaced here so it's visible before the user ever
+  // tries (and fails) to start a server.
+  if (backend === 'r9v' && complete && presence && typeof presence.ple_ready === 'boolean') {
+    statusLabel += presence.ple_ready ? ' · PLE: ready' : ' · PLE: not prepared';
+  }
 
   let sizeLabel = '';
   if (typeof payload.size_gb === 'number') sizeLabel = payload.size_gb.toFixed(1) + ' GB';
@@ -2859,7 +2963,7 @@ function renderToolboxModelRow(entry) {
   }
 
   const runningJob = toolboxDownloadJobs.find(j => j.backend === backend && j.model_id === entry.id
-    && (j.status === 'queued' || j.status === 'downloading' || j.status === 'verifying'));
+    && (j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying'));
 
   let action;
   if (runningJob) {
@@ -2879,6 +2983,7 @@ function renderToolboxModelRow(entry) {
     action = `<button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, null)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
     if (complete && backend === 'r9v') {
       action += `<button onclick="verifyModelChecksums(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)})" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--violet);cursor:pointer">Verify</button>`;
+      action += `<button onclick="prepareR9vPle(${JSON.stringify(entry.id)})" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--amber);cursor:pointer" title="Extract the per-layer-token-embedding file r9v needs before it can serve this package">Prepare PLE</button>`;
     }
   }
 
@@ -2957,7 +3062,7 @@ function renderToolboxDownloadJobRow(job) {
 // just periodically re-pulling the job's status string until terminal.
 function scheduleToolboxModelsPoll() {
   if (toolboxModelsPollTimer) { clearTimeout(toolboxModelsPollTimer); toolboxModelsPollTimer = null; }
-  const active = toolboxDownloadJobs.some(j => j.status === 'queued' || j.status === 'downloading' || j.status === 'verifying');
+  const active = toolboxDownloadJobs.some(j => j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying');
   if (active && activeView === 'toolbox-models') {
     toolboxModelsPollTimer = setTimeout(loadToolboxModels, 3000);
   }
@@ -2969,11 +3074,12 @@ function scheduleToolboxModelsPoll() {
 // launch. Lifecycle is synchronous request/response (no job registry like
 // the downloads above) — `status` always reflects live `podman inspect`
 // state, matching src/server_mode.rs's "no persisted state" design.
-const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm'];
+const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm', 'r9v'];
 let serverModeActiveBackend = 'ds4';
 let serverModeStatus = null;
 let serverModeHalogenStatus = null;
 let serverModeVllmStatus = null;
+let serverModeR9vStatus = null;
 
 function renderServerModeBackendTabs() {
   const el = document.getElementById('server-mode-backend-tabs');
@@ -2995,6 +3101,9 @@ function setServerModeBackend(backend) {
   document.getElementById('sm-panel-vllm').style.display = backend === 'vllm' ? 'block' : 'none';
   document.getElementById('sm-vllm-status').style.display = backend === 'vllm' ? 'block' : 'none';
   document.getElementById('sm-panel-vllm-caches').style.display = backend === 'vllm' ? 'block' : 'none';
+  document.getElementById('sm-panel-r9v').style.display = backend === 'r9v' ? 'block' : 'none';
+  document.getElementById('sm-r9v-status').style.display = backend === 'r9v' ? 'block' : 'none';
+  document.getElementById('sm-panel-r9v-paths').style.display = backend === 'r9v' ? 'block' : 'none';
 }
 
 async function loadServerMode() {
@@ -3005,18 +3114,20 @@ async function loadServerMode() {
   // model/bundle on disk, not just a catalog entry.
   renderServerModeBackendTabs();
   setServerModeBackend(serverModeActiveBackend);
-  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes] = await Promise.all([
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes] = await Promise.all([
     safeFetch('/api/toolbox-models'),
     safeFetch('/api/model-downloads/status'),
     safeFetch('/api/server-mode/ds4/status'),
     safeFetch('/api/server-mode/halogen/status'),
     safeFetch('/api/server-mode/vllm/status'),
+    safeFetch('/api/server-mode/r9v/status'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
   if (statusRes) toolboxModelPresence = statusRes.models || [];
   if (ds4StatusRes) serverModeStatus = ds4StatusRes;
   if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
   if (vllmStatusRes) serverModeVllmStatus = vllmStatusRes;
+  if (r9vStatusRes) serverModeR9vStatus = r9vStatusRes;
   renderServerModeToolboxOptions();
   renderServerModeModelOptions();
   renderServerModeStatus();
@@ -3026,6 +3137,9 @@ async function loadServerMode() {
   renderServerModeVllmToolboxOptions();
   renderServerModeVllmModelOptions();
   renderServerModeVllmStatus();
+  renderServerModeR9vToolboxOptions();
+  renderServerModeR9vPackageOptions();
+  renderServerModeR9vStatus();
 }
 
 function renderServerModeToolboxOptions() {
@@ -3308,6 +3422,157 @@ async function saveVllmCachePaths() {
     if (!r.ok) { alert('Save failed: ' + (j.error || r.status)); return; }
     alert('Cache paths saved.');
   } catch (e) {}
+}
+
+// PR11: r9v Server Mode (§15/§15a). Every tuning field the request accepts
+// is optional server-side (mirrors upstream's own DEFAULTS-merge design),
+// so blank inputs are sent as `undefined` and r9v's own defaults apply —
+// unlike vllm's start form, nothing here is client-side required except
+// picking a toolbox + an already-downloaded, PLE-prepared package.
+function firstR9vToolboxId() {
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const tb = allToolboxes.find(t => t.backend === 'r9v');
+  return tb ? tb.id : null;
+}
+
+function renderServerModeR9vToolboxOptions() {
+  const el = document.getElementById('sm-r9v-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  // Deliberately unfiltered by CURRENT_PLATFORM_ID — see the HTML comment
+  // above #sm-panel-r9v for why.
+  const r9vToolboxes = allToolboxes.filter(tb => tb.backend === 'r9v');
+  const previouslySelected = el.value;
+  el.innerHTML = r9vToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}</option>`).join('');
+  if (r9vToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeR9vPackageOptions() {
+  const el = document.getElementById('sm-r9v-package');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'r9v');
+  const entries = (bc && bc.entries) || [];
+  // PR11 §15 item 8: only offer packages that are both file-complete
+  // AND PLE-ready — this is the "disabling Start until both are true"
+  // gate, implemented by simply not listing an unready package rather
+  // than a separate enabled/disabled control.
+  const ready = entries.filter(e => {
+    const p = presenceFor('r9v', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete' && p.ple_ready === true;
+  });
+  const previouslySelected = el.value;
+  if (!ready.length) {
+    const anyIncompletePle = entries.some(e => {
+      const p = presenceFor('r9v', e.id);
+      return p && p.completeness && p.completeness.kind === 'complete' && p.ple_ready === false;
+    });
+    el.innerHTML = anyIncompletePle
+      ? '<option value="">Downloaded, but PLE not prepared yet — use the Downloads tab\'s "Prepare PLE" action first</option>'
+      : '<option value="">No downloaded r9v packages — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = ready.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (ready.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeR9vStatus() {
+  const el = document.getElementById('sm-r9v-status');
+  if (!el || !serverModeR9vStatus) return;
+  if (!serverModeR9vStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeR9vStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeR9vStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeR9vStatus.model_id ? ' · model: ' + escHtml(serverModeR9vStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeR9vStatus.container_name)})</span>`;
+}
+
+async function startR9vServer() {
+  const toolboxId = document.getElementById('sm-r9v-toolbox').value;
+  const packageId = document.getElementById('sm-r9v-package').value;
+  if (!toolboxId || !packageId) { alert('Pick a toolbox and an already-downloaded, PLE-prepared package.'); return; }
+  const host = document.getElementById('sm-r9v-host').value.trim();
+  const portRaw = document.getElementById('sm-r9v-port').value.trim();
+  const devices = document.getElementById('sm-r9v-devices').value.trim();
+  const contextRaw = document.getElementById('sm-r9v-context').value.trim();
+  const batchRaw = document.getElementById('sm-r9v-batch').value.trim();
+  const sequencesRaw = document.getElementById('sm-r9v-sequences').value.trim();
+  const kvBytesRaw = document.getElementById('sm-r9v-kv-bytes').value.trim();
+  const expertCacheSlotsRaw = document.getElementById('sm-r9v-expert-cache-slots').value.trim();
+  const offload = document.getElementById('sm-r9v-offload').value.trim();
+  const offloadDevices = document.getElementById('sm-r9v-offload-devices').value.trim();
+  const servedModel = document.getElementById('sm-r9v-served-model').value.trim();
+  const apiKey = document.getElementById('sm-r9v-api-key').value.trim();
+  const extraArgs = document.getElementById('sm-r9v-extra-args').value;
+  try {
+    const r = await fetch('/api/server-mode/r9v/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, package_id: packageId,
+        host: host || undefined, port: portRaw ? parseInt(portRaw, 10) : undefined,
+        devices: devices || undefined,
+        context: contextRaw ? parseInt(contextRaw, 10) : undefined,
+        batch: batchRaw ? parseInt(batchRaw, 10) : undefined,
+        sequences: sequencesRaw ? parseInt(sequencesRaw, 10) : undefined,
+        kv_bytes: kvBytesRaw ? parseInt(kvBytesRaw, 10) : undefined,
+        expert_cache_slots: expertCacheSlotsRaw ? parseInt(expertCacheSlotsRaw, 10) : undefined,
+        offload: offload || undefined, offload_devices: offloadDevices || undefined,
+        served_model: servedModel || undefined, api_key: apiKey || undefined,
+        extra_args: extraArgs || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeR9vStatus = j;
+    renderServerModeR9vStatus();
+  } catch (e) {}
+}
+
+async function stopR9vServer() {
+  try {
+    const r = await fetch('/api/server-mode/r9v/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+async function saveR9vPaths() {
+  const modelsDir = document.getElementById('sm-r9v-path-models').value.trim();
+  const pleDir = document.getElementById('sm-r9v-path-ple').value.trim();
+  const cacheDir = document.getElementById('sm-r9v-path-cache').value.trim();
+  if (!modelsDir && !pleDir && !cacheDir) { alert('Enter at least one path first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/r9v/paths', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        models_dir: modelsDir || undefined, ple_dir: pleDir || undefined, cache_dir: cacheDir || undefined,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Save failed: ' + (j.error || r.status)); return; }
+    alert('Paths saved.');
+  } catch (e) {}
+}
+
+// PR11: r9v's "Prepare PLE" is a Downloads-tab action (not Server Mode) —
+// it runs a one-shot podman job against an already-downloaded package,
+// through the same job registry as ordinary downloads, so it shares the
+// job list's status/cancel affordances (renderToolboxDownloadJobRow).
+async function prepareR9vPle(modelId) {
+  const toolboxId = firstR9vToolboxId();
+  if (!toolboxId) { alert('No r9v toolbox found in the catalog.'); return; }
+  try {
+    const r = await fetch('/api/model-downloads/r9v/prepare-ple', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId, package_id: modelId }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Prepare PLE failed to start: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadToolboxModels();
 }
 
 async function upgradeIfAvailable(svc) {

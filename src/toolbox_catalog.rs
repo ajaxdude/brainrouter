@@ -22,7 +22,7 @@ use schema_validate::ValidationReport;
 
 pub use models::{
     CatalogModelEntry, CatalogModelFile, Ds4Model, HalogenModel, LlamaCppModel,
-    ModelBackendCatalog, ModelCatalog, ModelPayload, R9vModel, VllmModel,
+    ModelBackendCatalog, ModelCatalog, ModelPayload, R9vModel, R9vPleFile, VllmModel,
 };
 pub use types::{
     CatalogBackendId, CatalogParseError, Channel, FeatureState, Maturity, Platform,

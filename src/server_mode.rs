@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::model_downloads::{self, ResolvedDs4Model, ResolvedHalogenBundle};
+use crate::model_downloads::{self, ResolvedDs4Model, ResolvedHalogenBundle, ResolvedR9vPackage};
 use crate::toolbox_catalog::{self, RuntimeProfile, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition};
 
 /// Fixed container name for the (single-instance, v1) ds4 server-mode
@@ -67,6 +67,11 @@ pub const HALOGEN_SERVER_CONTAINER_NAME: &str = "brainrouter-halogen-server";
 /// container. Same brainrouter-own naming departure as ds4/halogen above,
 /// not upstream's literal `ai-toolbox-cockpit-vllm-server`.
 pub const VLLM_SERVER_CONTAINER_NAME: &str = "brainrouter-vllm-server";
+
+/// Fixed container name for the (single-instance, v1) r9v server-mode
+/// container. Same brainrouter-own naming departure as the other three
+/// backends, not upstream's literal `ai-toolbox-cockpit-r9v-server`.
+pub const R9V_SERVER_CONTAINER_NAME: &str = "brainrouter-r9v-server";
 
 /// Fallback binary name used when a toolbox's `backend_config` doesn't
 /// declare a `server_binary` override — every real vendored ds4 toolbox
@@ -1351,6 +1356,421 @@ pub fn save_vllm_cache_paths(req: &VllmCachePathsRequest) -> Result<(), ServerMo
     Ok(())
 }
 
+// ── PR11: r9v Server Mode (§15/§15a) ──────────────────────────────────────
+//
+// Structurally the most different backend of the four: upstream's own
+// `runner.py::DEFAULTS` dict makes *every* tuning field optional (merged
+// via `{**DEFAULTS, **(values or {})}`), so unlike ds4/halogen/vllm's
+// mostly-required request shapes, `StartR9vServerRequest` mirrors that
+// shape — only `toolbox_id`/`package_id` are required, everything else
+// falls back to upstream's own literal defaults below. r9v also uses
+// `--user 0:0` (root inside the container) rather than the
+// `--userns=keep-id` every other backend's builder uses — confirmed by
+// reading `runner.py::build_server_cmd()` in full, not assumed by
+// analogy — and has its own cache-directory separation safety check
+// (`model == cache` / `model` an ancestor of `cache` / `ple == cache`)
+// with no equivalent in any other backend.
+
+/// Every one of upstream's `DEFAULTS` dict values (`runner.py`), applied
+/// whenever the corresponding [`StartR9vServerRequest`] field is omitted.
+const R9V_DEFAULT_HOST: &str = "127.0.0.1";
+const R9V_DEFAULT_PORT: u16 = 8004;
+const R9V_DEFAULT_DEVICES: &str = "0,1";
+const R9V_DEFAULT_CONTEXT: u32 = 131072;
+const R9V_DEFAULT_BATCH: u32 = 1024;
+const R9V_DEFAULT_SEQUENCES: u32 = 1;
+const R9V_DEFAULT_KV_BYTES: u64 = 2_285_670_400;
+const R9V_DEFAULT_EXPERT_CACHE_SLOTS: u32 = 16;
+const R9V_DEFAULT_OFFLOAD: &str = "112.5";
+const R9V_DEFAULT_OFFLOAD_DEVICES: &str = "112.5,112.5";
+const R9V_DEFAULT_SERVED_MODEL: &str = "qwen3.8-flash-next";
+
+/// Upstream's own `RESERVED_ARGS` set (`runner.py`) — `extra_args` tokens
+/// (shlex-split, `--flag=value` and bare `--flag` both checked via the
+/// substring before the first `=`) may not override any of these, since
+/// they're already controlled by r9v's own dedicated form fields or the
+/// fixed TP2/MTP2/SSD-residency profile.
+const R9V_RESERVED_ARGS: &[&str] = &[
+    "--model",
+    "--tokenizer",
+    "--speculative-config",
+    "--load-format",
+    "--quantization",
+    "--tensor-parallel-size",
+    "-tp",
+    "--pipeline-parallel-size",
+    "-pp",
+    "--max-model-len",
+    "--max-num-seqs",
+    "--max-num-batched-tokens",
+    "--kv-cache-memory-bytes",
+    "--cpu-offload-gb",
+    "--cpu-offload-params",
+    "--host",
+    "--port",
+    "--served-model-name",
+    "--async-scheduling",
+    "--no-async-scheduling",
+    "--compilation-config",
+    "--api-key",
+];
+
+/// `POST /api/server-mode/r9v/start` request body. Every tuning field is
+/// optional (see the `R9V_DEFAULT_*` constants above) — a genuine
+/// divergence from ds4/halogen/vllm's mostly-required shapes, driven by
+/// upstream's own `DEFAULTS` dict, not a brainrouter simplification.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartR9vServerRequest {
+    /// The single vendored r9v toolbox (`r9700-r9v-rocm-10-0` today).
+    pub toolbox_id: String,
+    /// Which already-downloaded r9v catalog package to serve.
+    pub package_id: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Two distinct GPU device indices, e.g. `"0,1"`.
+    #[serde(default)]
+    pub devices: Option<String>,
+    #[serde(default)]
+    pub context: Option<u32>,
+    #[serde(default)]
+    pub batch: Option<u32>,
+    #[serde(default)]
+    pub sequences: Option<u32>,
+    #[serde(default)]
+    pub kv_bytes: Option<u64>,
+    #[serde(default)]
+    pub expert_cache_slots: Option<u32>,
+    /// Logical CPU-offload budget in GB, kept as a string (not parsed into
+    /// a float and reformatted) because the original text is what's
+    /// written verbatim into the `R9V_CPU_OFFLOAD_GB` env var — matching
+    /// upstream, which validates-then-preserves rather than round-trips
+    /// through `float`.
+    #[serde(default)]
+    pub offload: Option<String>,
+    /// Two comma-separated per-device offload budgets, e.g. `"112.5,112.5"`
+    /// — same preserve-the-string rationale as `offload`.
+    #[serde(default)]
+    pub offload_devices: Option<String>,
+    /// The `served-model-name` reported by the OpenAI-compatible API.
+    #[serde(default)]
+    pub served_model: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub extra_args: Option<String>,
+}
+
+/// Same as [`resolve_halogen_toolbox`]/[`resolve_ds4_toolbox`], plus the
+/// owning platform id — [`build_r9v_server_command`]'s upstream-mirrored
+/// `platform_id != "r9700"` check needs it, same rationale as halogen's.
+fn resolve_r9v_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinition, RuntimeProfile, String), ServerModeError> {
+    let catalog = load_typed_toolbox_catalog()?;
+    let (tb, profile) = resolve_toolbox_for_server(&catalog, SupportedServingBackend::R9v, toolbox_id)?;
+    let platform_id = catalog
+        .platform_id_for_toolbox(toolbox_id)
+        .ok_or_else(|| {
+            ServerModeError::Internal(format!("toolbox `{toolbox_id}` is not listed under any catalog platform"))
+        })?
+        .to_string();
+    Ok((tb, profile, platform_id))
+}
+
+/// Builds the podman argument list for `podman <args>` (no leading
+/// `"podman"` binary name), mirroring `runner.py::build_server_cmd()`'s
+/// full validation battery and command shape byte-for-byte, with `-d
+/// --name brainrouter-r9v-server` replacing `--rm -it --name
+/// <cockpit-name>` (same detached-not-foreground departure as the other
+/// three backends) and brainrouter's own ownership `--label`s inserted
+/// after `--security-opt label=disable` (mirroring vllm's label
+/// placement, since r9v's own `--user 0:0` sits where vllm's
+/// `--userns=keep-id` does).
+///
+/// Applies [`clean_engine_args_for_server`] before [`upgrade_groups_for_podman`]
+/// even though upstream's own `build_server_cmd()` does not call an
+/// equivalent of the former — a deliberate, minor non-literal-port choice
+/// (§15a): the cleaning step is idempotent/safe and consistent with
+/// brainrouter's own established headless-server invariant used by every
+/// other backend's builder. It is a no-op in practice today regardless,
+/// since the vendored `amd-rocm` runtime profile's `engine_args` carries
+/// no `--group-add sudo`.
+pub fn build_r9v_server_command(
+    toolbox_image: &str,
+    runtime_profile: &RuntimeProfile,
+    platform_id: &str,
+    package: &ResolvedR9vPackage,
+    req: &StartR9vServerRequest,
+) -> Result<Vec<String>, ServerModeError> {
+    if platform_id != "r9700" {
+        return Err(ServerModeError::Validation(
+            "r9v is tested only on the AMD Radeon AI PRO R9700 platform (platform_id must be `r9700`)".to_string(),
+        ));
+    }
+    if !package.ple_ready {
+        return Err(ServerModeError::Validation(
+            "the per-layer-embedding (PLE) file has not been prepared for this package yet — use \
+             the Models tab's \"Prepare PLE\" action first"
+                .to_string(),
+        ));
+    }
+
+    // Mirrors upstream's `re.fullmatch(r"\d+,\d+", devices)` (exactly two
+    // all-digit groups, nothing else) plus the follow-up "must parse to
+    // two distinct integers" check.
+    let devices = req.devices.as_deref().unwrap_or(R9V_DEFAULT_DEVICES).trim().to_string();
+    let device_parts: Vec<&str> = devices.split(',').collect();
+    let is_digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let devices_valid = device_parts.len() == 2
+        && device_parts.iter().all(|p| is_digits(p))
+        && device_parts[0].parse::<u64>().ok() != device_parts[1].parse::<u64>().ok();
+    if !devices_valid {
+        return Err(ServerModeError::Validation(
+            "devices must be two distinct non-negative integers, e.g. \"0,1\"".to_string(),
+        ));
+    }
+
+    let port = req.port.unwrap_or(R9V_DEFAULT_PORT);
+    if port == 0 {
+        return Err(ServerModeError::Validation("port must be nonzero".to_string()));
+    }
+    let context = req.context.unwrap_or(R9V_DEFAULT_CONTEXT);
+    if context == 0 || context > 262_144 {
+        return Err(ServerModeError::Validation("context must be between 1 and 262144".to_string()));
+    }
+    let batch = req.batch.unwrap_or(R9V_DEFAULT_BATCH);
+    if batch == 0 || batch > 131_072 {
+        return Err(ServerModeError::Validation("batch must be between 1 and 131072".to_string()));
+    }
+    let sequences = req.sequences.unwrap_or(R9V_DEFAULT_SEQUENCES);
+    if sequences == 0 || sequences > 16 {
+        return Err(ServerModeError::Validation("sequences must be between 1 and 16".to_string()));
+    }
+    if batch < sequences {
+        return Err(ServerModeError::Validation("batch must be at least sequences".to_string()));
+    }
+    let kv_bytes = req.kv_bytes.unwrap_or(R9V_DEFAULT_KV_BYTES);
+    if kv_bytes == 0 || kv_bytes > 32 * 1024 * 1024 * 1024 {
+        return Err(ServerModeError::Validation("kv_bytes must be between 1 and 34359738368 (32 GiB)".to_string()));
+    }
+    let expert_cache_slots = req.expert_cache_slots.unwrap_or(R9V_DEFAULT_EXPERT_CACHE_SLOTS);
+    if expert_cache_slots > 16 {
+        return Err(ServerModeError::Validation("expert_cache_slots must be between 0 and 16".to_string()));
+    }
+
+    let offload = req.offload.as_deref().unwrap_or(R9V_DEFAULT_OFFLOAD).trim().to_string();
+    let offload_devices = req.offload_devices.as_deref().unwrap_or(R9V_DEFAULT_OFFLOAD_DEVICES).trim().to_string();
+    let offload_device_parts: Vec<&str> = offload_devices.split(',').collect();
+    if offload_device_parts.len() != 2 {
+        return Err(ServerModeError::Validation(
+            "offload_devices must be two comma-separated values, e.g. \"112.5,112.5\"".to_string(),
+        ));
+    }
+    for value in std::iter::once(offload.as_str()).chain(offload_device_parts.iter().copied()) {
+        match value.parse::<f64>() {
+            Ok(f) if f.is_finite() && f >= 0.0 => {}
+            _ => {
+                return Err(ServerModeError::Validation(
+                    "offload and offload_devices must be non-negative finite numbers".to_string(),
+                ));
+            }
+        }
+    }
+
+    let host_raw = req.host.as_deref().unwrap_or(R9V_DEFAULT_HOST).trim().to_string();
+    let host_for_parse = if host_raw.eq_ignore_ascii_case("localhost") { "127.0.0.1".to_string() } else { host_raw };
+    let addr: std::net::IpAddr = host_for_parse
+        .parse()
+        .map_err(|_| ServerModeError::Validation("host must be an IP address or \"localhost\"".to_string()))?;
+    let binding = match addr {
+        std::net::IpAddr::V6(_) => format!("[{addr}]"),
+        std::net::IpAddr::V4(_) => addr.to_string(),
+    };
+
+    let served_model = req.served_model.as_deref().unwrap_or(R9V_DEFAULT_SERVED_MODEL).trim().to_string();
+    if served_model.is_empty() || served_model.chars().any(char::is_whitespace) {
+        return Err(ServerModeError::Validation(
+            "served_model must be non-empty and contain no whitespace".to_string(),
+        ));
+    }
+
+    let extra_args: Vec<String> = match req.extra_args.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(s) => shlex::split(s)
+            .ok_or_else(|| ServerModeError::Validation("extra_args is not valid shell-quoted text".to_string()))?,
+        None => Vec::new(),
+    };
+    if let Some(bad) = extra_args
+        .iter()
+        .find(|a| R9V_RESERVED_ARGS.contains(&a.split('=').next().unwrap_or(a.as_str())))
+    {
+        return Err(ServerModeError::Validation(format!(
+            "extra_args cannot override `{bad}` — it is controlled by a dedicated form field or the fixed r9v profile"
+        )));
+    }
+
+    // Upstream's own cache-directory separation safety check
+    // (`runner.py::build_server_cmd`): `model == cache or model in
+    // cache.parents or ple == cache` → reject. `starts_with` covers both
+    // the equality and ancestor cases in one comparison.
+    if package.cache_dir.starts_with(&package.models_dir) || package.ple_dir == package.cache_dir {
+        return Err(ServerModeError::Validation(
+            "cache_dir must be a separate directory outside of models_dir and distinct from ple_dir".to_string(),
+        ));
+    }
+
+    let engine_args = upgrade_groups_for_podman(&clean_engine_args_for_server(&runtime_profile.engine_args));
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        R9V_SERVER_CONTAINER_NAME.to_string(),
+        "--runtime".to_string(),
+        "crun".to_string(),
+    ];
+    args.extend(engine_args);
+    // r9v runs the container as root, unlike ds4/halogen/vllm's
+    // `--userns=keep-id` — confirmed against upstream's own
+    // `build_server_cmd()`, not an oversight.
+    args.extend(["--user".to_string(), "0:0".to_string()]);
+    args.push("--ipc=host".to_string());
+    args.extend(["--security-opt".to_string(), "label=disable".to_string()]);
+
+    args.extend(["--label".to_string(), format!("{LABEL_MANAGED}=true")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_BACKEND}=r9v")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_MODEL}={}", req.package_id)]);
+
+    args.extend(["-p".to_string(), format!("{binding}:{port}:8000")]);
+    args.extend(["-v".to_string(), format!("{}:/models:ro", package.models_dir.display())]);
+    args.extend([
+        "-v".to_string(),
+        format!(
+            "{}:/ple/{}:ro",
+            package.ple_dir.join(&package.ple_filename).display(),
+            package.ple_filename
+        ),
+    ]);
+    args.extend(["-v".to_string(), format!("{}:/cache", package.cache_dir.display())]);
+
+    for (key, value) in [
+        ("R9V_VISIBLE_DEVICES", devices.clone()),
+        ("R9V_MAX_MODEL_LEN", context.to_string()),
+        ("R9V_MAX_NUM_BATCHED_TOKENS", batch.to_string()),
+        ("R9V_MAX_NUM_SEQS", sequences.to_string()),
+        ("R9V_KV_CACHE_MEMORY_BYTES", kv_bytes.to_string()),
+        ("R9V_CPU_OFFLOAD_GB", offload),
+        ("R9V_CPU_OFFLOAD_GB_BY_DEVICE", offload_devices),
+        ("R9V_SERVED_MODEL_NAME", served_model),
+        ("R9V_TENSOR_PARALLEL_SIZE", "2".to_string()),
+        ("R9V_MTP_SPEC_TOKENS", "2".to_string()),
+        ("R9V_PLE_RESIDENCY_MODE", "ssd".to_string()),
+        ("R9V_PLE_WORKER_TIMING", "1".to_string()),
+        ("R9V_SERIALIZE_EXPERT_LOAD", "1".to_string()),
+        ("R9V_TIERED_EXPERT_CACHE_SLOTS", expert_cache_slots.to_string()),
+    ] {
+        args.extend(["-e".to_string(), format!("{key}={value}")]);
+    }
+    args.push(toolbox_image.to_string());
+    args.push("r9v-serve".to_string());
+    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+        args.extend(["--api-key".to_string(), key.to_string()]);
+    }
+    args.extend(extra_args);
+
+    Ok(args)
+}
+
+/// `POST /api/server-mode/r9v/start`: resolves the toolbox + already-
+/// downloaded (and PLE-prepared) package, force-removes any pre-existing
+/// container of the fixed name, then runs the built command. Does not
+/// persist run-time settings into cockpit's config.json — same rationale
+/// as vllm's `start_vllm_server`, only [`save_r9v_paths`] does.
+pub async fn start_r9v_server(req: &StartR9vServerRequest) -> Result<(), ServerModeError> {
+    let (tb, profile, platform_id) = resolve_r9v_toolbox(&req.toolbox_id)?;
+    let package = model_downloads::resolve_downloaded_r9v_package(&req.package_id)?;
+    let args = build_r9v_server_command(&tb.image, &profile, &platform_id, &package, req)?;
+
+    let _ = tokio::process::Command::new("podman")
+        .args(["rm", "-f", R9V_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+
+    let out = tokio::process::Command::new("podman")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman run failed: {}", stderr.trim())))
+    }
+}
+
+/// `POST /api/server-mode/r9v/stop` — same graceful-stop-then-rm contract
+/// as the other three backends.
+pub async fn stop_r9v_server() -> Result<(), ServerModeError> {
+    let _ = tokio::process::Command::new("podman")
+        .args(["stop", "--time", "10", R9V_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+    let out = tokio::process::Command::new("podman")
+        .args(["rm", "-f", R9V_SERVER_CONTAINER_NAME])
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman rm failed: {}", stderr.trim())))
+    }
+}
+
+pub async fn r9v_server_status() -> ServerStatus {
+    container_server_status("r9v", R9V_SERVER_CONTAINER_NAME, LABEL_SERVER_MODEL).await
+}
+
+/// `POST /api/server-mode/r9v/paths` request body — the r9v analogue of
+/// [`VllmCachePathsRequest`], three keys matching
+/// `model_downloads::R9vPaths`/`effective_r9v_paths()` exactly:
+/// `models_dir`/`ple_dir`/`cache_dir`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct R9vPathsRequest {
+    #[serde(default)]
+    pub models_dir: Option<String>,
+    #[serde(default)]
+    pub ple_dir: Option<String>,
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+}
+
+/// Creates each supplied path, then persists it into cockpit's shared
+/// config.json via [`crate::cockpit_config::apply_backend_setting_values`]
+/// — same pattern as [`save_vllm_cache_paths`].
+pub fn save_r9v_paths(req: &R9vPathsRequest) -> Result<(), ServerModeError> {
+    let provided: Vec<(&str, &str)> = [
+        ("models_dir", req.models_dir.as_deref()),
+        ("ple_dir", req.ple_dir.as_deref()),
+        ("cache_dir", req.cache_dir.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
+    if provided.is_empty() {
+        return Err(ServerModeError::Validation("at least one path must be provided".to_string()));
+    }
+    for (_, raw) in &provided {
+        let expanded = model_downloads::expand_tilde(raw);
+        std::fs::create_dir_all(&expanded)
+            .map_err(|e| ServerModeError::Internal(format!("failed to create directory {}: {e}", expanded.display())))?;
+    }
+    let updates: Vec<(&str, Value)> = provided.into_iter().map(|(k, v)| (k, Value::String(v.to_string()))).collect();
+    crate::cockpit_config::apply_backend_setting_values("r9v", updates)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2092,6 +2512,316 @@ mod tests {
     fn save_vllm_cache_paths_rejects_when_nothing_provided() {
         let req = VllmCachePathsRequest { hf_cache: None, vllm_cache: None, triton_cache: None, aiter_cache: None };
         let err = save_vllm_cache_paths(&req).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    fn amd_rocm_r9v_profile() -> RuntimeProfile {
+        // Exact vendored `amd-rocm` runtime_profile used by the real r9v
+        // toolbox entry (`assets/cockpit-catalog/toolboxes.json`) — no
+        // `--group-add sudo` present, so `clean_engine_args_for_server` is
+        // a no-op here; `upgrade_groups_for_podman` still collapses
+        // video/render into keep-groups.
+        RuntimeProfile {
+            id: "amd-rocm".to_string(),
+            engine_args: vec![
+                "--device".to_string(),
+                "/dev/dri".to_string(),
+                "--device".to_string(),
+                "/dev/kfd".to_string(),
+                "--group-add".to_string(),
+                "video".to_string(),
+                "--group-add".to_string(),
+                "render".to_string(),
+                "--security-opt".to_string(),
+                "seccomp=unconfined".to_string(),
+            ],
+        }
+    }
+
+    fn r9v_package() -> ResolvedR9vPackage {
+        ResolvedR9vPackage {
+            models_dir: std::path::PathBuf::from("/data/r9v-models"),
+            ple_dir: std::path::PathBuf::from("/data/r9v-ple"),
+            cache_dir: std::path::PathBuf::from("/data/r9v-cache"),
+            ple_filename: "per_layer_token_embd.iq4_nl.bin".to_string(),
+            ple_size_bytes: 28_800_138_240,
+            ple_ready: true,
+        }
+    }
+
+    fn r9v_req() -> StartR9vServerRequest {
+        StartR9vServerRequest {
+            toolbox_id: "r9700-r9v-rocm-10-0".to_string(),
+            package_id: "r9v-qwen38-flash-next-iq4-xs".to_string(),
+            host: None,
+            port: None,
+            devices: None,
+            context: None,
+            batch: None,
+            sequences: None,
+            kv_bytes: None,
+            expert_cache_slots: None,
+            offload: None,
+            offload_devices: None,
+            served_model: None,
+            api_key: None,
+            extra_args: None,
+        }
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_finds_the_real_vendored_entry_and_platform() {
+        let (tb, profile, platform_id) = resolve_r9v_toolbox("r9700-r9v-rocm-10-0").expect("must resolve");
+        assert_eq!(tb.id, "r9700-r9v-rocm-10-0");
+        assert_eq!(profile.id, "amd-rocm");
+        assert_eq!(platform_id, "r9700");
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_rejects_unknown_id() {
+        let err = resolve_r9v_toolbox("no-such-toolbox").unwrap_err();
+        assert_eq!(err.status(), 404);
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_rejects_non_r9v_backend() {
+        let err = resolve_r9v_toolbox("strix-halo-llama-rocm-10-0").unwrap_err();
+        assert_eq!(err.status(), 404);
+    }
+
+    #[test]
+    fn build_r9v_server_command_matches_upstream_default_shape() {
+        let cmd = build_r9v_server_command(
+            "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0",
+            &amd_rocm_r9v_profile(),
+            "r9700",
+            &r9v_package(),
+            &r9v_req(),
+        )
+        .expect("must build");
+
+        assert_eq!(cmd[0..4], ["run", "-d", "--name", R9V_SERVER_CONTAINER_NAME]);
+        assert!(cmd.windows(2).any(|w| w == ["--runtime", "crun"]));
+        // engine_args (post group-upgrade) come right after --runtime crun.
+        assert!(cmd.windows(6).any(|w| w == ["--device", "/dev/dri", "--device", "/dev/kfd", "--group-add", "keep-groups"]));
+        assert!(cmd.windows(2).any(|w| w == ["--user", "0:0"]));
+        assert!(!cmd.contains(&"--userns=keep-id".to_string()));
+        assert!(cmd.contains(&"--ipc=host".to_string()));
+        assert!(cmd.windows(2).any(|w| w == ["--security-opt", "label=disable"]));
+        assert!(cmd.windows(2).any(|w| w == ["--label", "io.brainrouter.server_backend=r9v"]));
+        assert!(cmd.windows(2).any(|w| w == ["--label", "io.brainrouter.server_model=r9v-qwen38-flash-next-iq4-xs"]));
+        // Defaults: host 127.0.0.1, port 8004.
+        assert!(cmd.windows(2).any(|w| w == ["-p", "127.0.0.1:8004:8000"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/r9v-models:/models:ro"]));
+        assert!(cmd.windows(2).any(|w| w == [
+            "-v",
+            "/data/r9v-ple/per_layer_token_embd.iq4_nl.bin:/ple/per_layer_token_embd.iq4_nl.bin:ro"
+        ]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/data/r9v-cache:/cache"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_VISIBLE_DEVICES=0,1"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_MAX_MODEL_LEN=131072"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_MAX_NUM_BATCHED_TOKENS=1024"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_MAX_NUM_SEQS=1"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_KV_CACHE_MEMORY_BYTES=2285670400"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_CPU_OFFLOAD_GB=112.5"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_CPU_OFFLOAD_GB_BY_DEVICE=112.5,112.5"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_SERVED_MODEL_NAME=qwen3.8-flash-next"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_TENSOR_PARALLEL_SIZE=2"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_MTP_SPEC_TOKENS=2"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_PLE_RESIDENCY_MODE=ssd"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_PLE_WORKER_TIMING=1"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_SERIALIZE_EXPERT_LOAD=1"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_TIERED_EXPERT_CACHE_SLOTS=16"]));
+        assert!(cmd.contains(&"docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0".to_string()));
+        assert!(cmd.windows(2).any(|w| w == ["docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0", "r9v-serve"]));
+        assert_eq!(cmd.last().unwrap(), "r9v-serve");
+        assert!(!cmd.contains(&"--api-key".to_string()));
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_non_r9700_platform() {
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "strix-halo", &r9v_package(), &r9v_req()).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_when_ple_not_ready() {
+        let mut pkg = r9v_package();
+        pkg.ple_ready = false;
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &pkg, &r9v_req()).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_non_distinct_devices() {
+        let mut r = r9v_req();
+        r.devices = Some("0,0".to_string());
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_malformed_devices() {
+        for bad in ["0", "0,1,2", "a,b", "0, 1", ""] {
+            let mut r = r9v_req();
+            r.devices = Some(bad.to_string());
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "expected `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_out_of_range_numerics() {
+        type MutateCase = (fn(&mut StartR9vServerRequest), &'static str);
+        let cases: Vec<MutateCase> = vec![
+            (|r| r.port = Some(0), "port"),
+            (|r| r.context = Some(0), "context zero"),
+            (|r| r.context = Some(262_145), "context too large"),
+            (|r| r.batch = Some(0), "batch zero"),
+            (|r| r.batch = Some(131_073), "batch too large"),
+            (|r| r.sequences = Some(0), "sequences zero"),
+            (|r| r.sequences = Some(17), "sequences too large"),
+            (|r| r.kv_bytes = Some(0), "kv_bytes zero"),
+            (|r| r.kv_bytes = Some(32 * 1024 * 1024 * 1024 + 1), "kv_bytes too large"),
+            (|r| r.expert_cache_slots = Some(17), "expert_cache_slots too large"),
+        ];
+        for (mutate, label) in cases {
+            let mut r = r9v_req();
+            mutate(&mut r);
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "case `{label}` should have been rejected");
+        }
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_batch_below_sequences() {
+        let mut r = r9v_req();
+        r.batch = Some(1);
+        r.sequences = Some(2);
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_non_finite_or_negative_offload() {
+        for bad in ["-1", "nan", "inf", "not-a-number"] {
+            let mut r = r9v_req();
+            r.offload = Some(bad.to_string());
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "expected offload `{bad}` to be rejected");
+        }
+        for bad in ["112.5", "112.5,-1", "112.5,112.5,112.5"] {
+            let mut r = r9v_req();
+            r.offload_devices = Some(bad.to_string());
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "expected offload_devices `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn build_r9v_server_command_preserves_original_offload_strings_verbatim() {
+        let mut r = r9v_req();
+        r.offload = Some("50".to_string());
+        r.offload_devices = Some("25,25".to_string());
+        let cmd = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_CPU_OFFLOAD_GB=50"]));
+        assert!(cmd.windows(2).any(|w| w == ["-e", "R9V_CPU_OFFLOAD_GB_BY_DEVICE=25,25"]));
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_bad_host() {
+        let mut r = r9v_req();
+        r.host = Some("not-an-ip".to_string());
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_normalizes_localhost_and_brackets_ipv6() {
+        let mut r = r9v_req();
+        r.host = Some("localhost".to_string());
+        let cmd = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["-p", "127.0.0.1:8004:8000"]));
+
+        let mut r = r9v_req();
+        r.host = Some("::1".to_string());
+        let cmd = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["-p", "[::1]:8004:8000"]));
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_empty_or_whitespace_served_model() {
+        for bad in ["", "  ", "has space", "tab\tchar"] {
+            let mut r = r9v_req();
+            r.served_model = Some(bad.to_string());
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "expected served_model `{bad:?}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_reserved_extra_args() {
+        for bad in ["--host 0.0.0.0", "--port=9000", "--tensor-parallel-size 4", "-tp 4", "--api-key abc"] {
+            let mut r = r9v_req();
+            r.extra_args = Some(bad.to_string());
+            let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+            assert_eq!(err.status(), 400, "expected extra_args `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn build_r9v_server_command_appends_shlex_split_extra_args() {
+        let mut r = r9v_req();
+        r.extra_args = Some("--enable-log-requests --foo bar".to_string());
+        let cmd = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).expect("must build");
+        let tail = &cmd[cmd.len() - 3..];
+        assert_eq!(tail, &["--enable-log-requests", "--foo", "bar"]);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_unterminated_quote_in_extra_args() {
+        let mut r = r9v_req();
+        r.extra_args = Some("--foo \"unterminated".to_string());
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_includes_api_key_when_given() {
+        let mut r = r9v_req();
+        r.api_key = Some("secret-key".to_string());
+        let cmd = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &r9v_package(), &r).expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["--api-key", "secret-key"]));
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_cache_dir_nested_in_models_dir() {
+        let mut pkg = r9v_package();
+        pkg.cache_dir = pkg.models_dir.join("cache");
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &pkg, &r9v_req()).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_cache_dir_equal_to_models_dir() {
+        let mut pkg = r9v_package();
+        pkg.cache_dir = pkg.models_dir.clone();
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &pkg, &r9v_req()).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn build_r9v_server_command_rejects_cache_dir_equal_to_ple_dir() {
+        let mut pkg = r9v_package();
+        pkg.cache_dir = pkg.ple_dir.clone();
+        let err = build_r9v_server_command("img", &amd_rocm_r9v_profile(), "r9700", &pkg, &r9v_req()).unwrap_err();
+        assert_eq!(err.status(), 400);
+    }
+
+    #[test]
+    fn save_r9v_paths_rejects_when_nothing_provided() {
+        let req = R9vPathsRequest { models_dir: None, ple_dir: None, cache_dir: None };
+        let err = save_r9v_paths(&req).unwrap_err();
         assert_eq!(err.status(), 400);
     }
 }

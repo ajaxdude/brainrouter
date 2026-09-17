@@ -1007,6 +1007,35 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────
+        ("GET", "/api/server-mode/r9v/status") => {
+            let resp = server_mode_r9v_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_r9v_start_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/stop") => {
+            let resp = server_mode_r9v_stop_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/r9v/paths") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_r9v_paths_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/model-downloads/r9v/prepare-ple") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = model_downloads_prepare_ple_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
         // ── PR3: cockpit config.json Phase-1 read + explicit apply (§4) ─────
         ("GET", "/api/cockpit-config") => {
             let resp = cockpit_config_status_response().await;
@@ -3279,6 +3308,103 @@ pub async fn server_mode_vllm_cache_paths_response(body: &Bytes) -> Response<Ful
             "status": "ok",
             "message": "vllm cache paths saved.",
         })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────────
+
+/// `GET /api/server-mode/r9v/status` — always reads live `podman inspect`
+/// state, same no-persisted-registry contract as the other three backends'
+/// status endpoints above.
+pub async fn server_mode_r9v_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::r9v_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/r9v/start` — body:
+/// `{"toolbox_id": "...", "package_id": "...", "host"?, "port"?,
+/// "devices"?, "context"?, "batch"?, "sequences"?, "kv_bytes"?,
+/// "expert_cache_slots"?, "offload"?, "offload_devices"?, "served_model"?,
+/// "api_key"?, "extra_args"?}` — every tuning field is optional, falling
+/// back to upstream's own literal defaults (§15a).
+pub async fn server_mode_r9v_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartR9vServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_r9v_server(&request).await {
+        Ok(()) => {
+            let status = crate::server_mode::r9v_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/r9v/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_r9v_stop_response() -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_r9v_server().await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "r9v server stopped.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/r9v/paths` — body:
+/// `{"models_dir"?, "ple_dir"?, "cache_dir"?: "..."}`, the r9v analogue of
+/// vllm's `/cache-paths` action.
+pub async fn server_mode_r9v_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::R9vPathsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::save_r9v_paths(&request) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "r9v paths saved.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/model-downloads/r9v/prepare-ple` — body:
+/// `{"toolbox_id": "...", "package_id": "..."}`. Starts the "Prepare PLE"
+/// job (`podman run ... r9v-model prepare`) through the same
+/// [`crate::model_downloads::ModelDownloadRegistry`] job registry as
+/// ordinary downloads (§15's job-registry-widening decision) — the
+/// returned [`crate::model_downloads::ModelDownloadJob`] is polled the
+/// same way via the existing `GET /api/model-downloads/{id}` endpoint.
+pub async fn model_downloads_prepare_ple_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::model_downloads::StartPreparePleRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match state.model_downloads.start_prepare_ple(&request).await {
+        Ok(job) => json_response(StatusCode::OK, &job),
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),

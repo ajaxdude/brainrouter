@@ -56,27 +56,57 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 /// and only atomically renames into the destination on success (confirmed
 /// via upstream maintainer statements during PR6's design pass), so no
 /// partial-byte progress is observable by polling the destination directory.
+///
+/// `Running` (PR11, §15 item 3) is the generic in-progress state for job
+/// kinds that aren't an `hf download` — today, only r9v's "Prepare PLE"
+/// job (see [`JobKind`]) — kept distinct from `Downloading` so the
+/// dashboard never shows a misleading "downloading" badge for a podman
+/// extraction job. `Verifying` stays shared: both an `hf download`'s
+/// post-transfer file check and a prepare-PLE job's post-run size check
+/// are the same kind of "confirm the output looks right" step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadStatus {
     Queued,
     Downloading,
+    Running,
     Verifying,
     Complete,
     Failed,
     Cancelled,
 }
 
-/// A single model-download job's externally-visible state.
+/// Which real-world action a [`ModelDownloadJob`] record represents (PR11,
+/// §15 item 3). The registry was widened to carry both kinds rather than
+/// standing up a second, parallel job registry for r9v's one "Prepare PLE"
+/// action — see the module-level design note referenced above for the
+/// explicit tradeoff (~150 lines of proven registry/cancellation/history
+/// code reused, at the cost of `ModelDownloadJob` no longer being *only*
+/// downloads despite its name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Download,
+    PreparePle,
+}
+
+/// A single job's externally-visible state — despite the name (kept for
+/// minimal diff/history, PR6-8), this now also represents r9v's "Prepare
+/// PLE" job (PR11, [`JobKind::PreparePle`]), disambiguated by `kind`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelDownloadJob {
     pub id: String,
+    pub kind: JobKind,
     pub backend: SupportedServingBackend,
+    /// The catalog entry this job concerns — a model id for `Download`
+    /// jobs, r9v's package id for `PreparePle` jobs.
     pub model_id: String,
+    /// Where the job's output lands — the model's destination directory
+    /// for `Download` jobs, r9v's `ple_dir` for `PreparePle` jobs.
     pub destination: String,
     pub status: DownloadStatus,
     pub message: String,
-    /// The exact `hf` invocation, for transparency/debugging — not a
+    /// The exact subprocess invocation, for transparency/debugging — not a
     /// secret (the destination path and repo id are already visible
     /// elsewhere; no token is ever included here, see `hf_token_env`).
     pub command_display: String,
@@ -87,6 +117,7 @@ pub struct ModelDownloadJob {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
 }
+
 
 struct JobControl {
     record: RwLock<ModelDownloadJob>,
@@ -196,6 +227,14 @@ pub struct ModelPresence {
     pub model_id: String,
     pub destination: String,
     pub completeness: CompletenessResult,
+    /// R9V's second readiness gate (design doc §15 item 8): `Some(true)`/
+    /// `Some(false)` for r9v entries that carry a typed `ple` manifest
+    /// field, `None` for every other backend (and for an r9v entry that
+    /// somehow lacks one) — lets the dashboard show "PLE: ready/not
+    /// prepared" and gate the Server Mode Start button without a second
+    /// round-trip per package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ple_ready: Option<bool>,
 }
 
 /// Expands a leading `~` the same way cockpit's own `Path(...).expanduser()`
@@ -447,11 +486,19 @@ pub fn local_presence_snapshot() -> Result<Vec<ModelPresence>, String> {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            let ple_ready = match payload {
+                ModelPayload::R9v(m) if backend == SupportedServingBackend::R9v => m
+                    .ple
+                    .as_ref()
+                    .map(|ple| r9v_ple_ready(&effective_r9v_paths(&backend_catalog.storage).ple_dir, ple)),
+                _ => None,
+            };
             out.push(ModelPresence {
                 backend,
                 model_id: entry.id.clone(),
                 destination: built.destination.display().to_string(),
                 completeness: check_completeness(&built.expected_files, &built.destination),
+                ple_ready,
             });
         }
     }
@@ -546,6 +593,140 @@ pub fn resolve_downloaded_halogen_bundle(bundle_id: &str) -> Result<ResolvedHalo
     })
 }
 
+/// R9V's three named host directories (design doc §15 item 6 — not one or
+/// four): `models_dir` (the downloaded package, resolved the same
+/// override-then-catalog-default precedence as every other backend via
+/// [`effective_models_dir`]), `ple_dir` (where the prepared PLE file
+/// lives) and `cache_dir` (compilation/runtime cache, mounted read-write).
+/// `ple_dir`/`cache_dir` have no catalog `storage.default` — same as
+/// vllm's cache directories — so they fall back to upstream's own
+/// hardcoded defaults (`runner.py::default_paths()`) rather than a
+/// catalog-driven one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct R9vPaths {
+    pub models_dir: PathBuf,
+    pub ple_dir: PathBuf,
+    pub cache_dir: PathBuf,
+}
+
+/// Resolves R9V's effective paths: a cockpit `backends.r9v.<key>`
+/// config.json override first, falling back to upstream's own defaults —
+/// mirrors `server_mode.rs::effective_vllm_cache_dirs()`'s exact
+/// precedence and reuses this module's own [`effective_models_dir`] for
+/// `models_dir` (it *does* have a catalog `storage.default`, verified
+/// against the vendored fixture's r9v entry).
+pub fn effective_r9v_paths(storage: &serde_json::Value) -> R9vPaths {
+    let models_dir = effective_models_dir(SupportedServingBackend::R9v, storage);
+    let cockpit = crate::cockpit_config::load();
+    let settings = cockpit.config.as_ref().and_then(|c| c.backends.get("r9v"));
+    let get = |key: &str, default: &str| -> PathBuf {
+        settings
+            .and_then(|s| s.extra.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(expand_tilde)
+            .unwrap_or_else(|| expand_tilde(default))
+    };
+    R9vPaths {
+        models_dir,
+        ple_dir: get("ple_dir", "~/r9v-data"),
+        cache_dir: get("cache_dir", "~/r9v-data/cache-toolbox-rocm10"),
+    }
+}
+
+/// The single large file R9V's "Prepare PLE" job extracts into `ple_dir`
+/// (`per_layer_token_embd.iq4_nl.bin` in the vendored fixture). Mirrors
+/// upstream's own `model_manager.py::ple_ready()`: existence + exact
+/// `size_bytes` match, never a hash check (design doc §15's flagged open
+/// item — `sha256` is carried on [`toolbox_catalog::R9vPleFile`] but not
+/// verified here, a possible future strengthening, not silently added).
+fn r9v_ple_ready(ple_dir: &Path, ple: &toolbox_catalog::R9vPleFile) -> bool {
+    let expected = [ExpectedFile {
+        relative_path: ple.filename.clone(),
+        expected_size_bytes: Some(ple.size_bytes),
+        sha256: None,
+    }];
+    matches!(check_completeness(&expected, ple_dir), CompletenessResult::Complete)
+}
+
+/// An already-downloaded R9V package's on-disk location plus its PLE
+/// (per-layer token embedding) preparation readiness — resolved for PR11's
+/// Server Mode (design doc §15) and for the Downloads tab's own
+/// "package: complete/incomplete, PLE: ready/not prepared" status display.
+/// Two independent gates, mirrored from upstream's own
+/// `incomplete_files()` + `ple_ready()` checks in `model_manager.py`.
+pub struct ResolvedR9vPackage {
+    pub models_dir: PathBuf,
+    pub ple_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub ple_filename: String,
+    pub ple_size_bytes: u64,
+    pub ple_ready: bool,
+}
+
+/// Resolves `package_id` (an r9v catalog entry id) to its on-disk package
+/// location and PLE readiness, rejecting the request if the package itself
+/// isn't fully downloaded yet — but **not** if the PLE isn't prepared yet;
+/// that's a distinct, actionable state the caller (Server Mode) surfaces
+/// separately, so a user blocked on "prepare PLE first" isn't told the
+/// misleading "download it first" message instead (§15 item 2).
+pub fn resolve_downloaded_r9v_package(package_id: &str) -> Result<ResolvedR9vPackage, DownloadError> {
+    let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::R9v, package_id)?;
+    let ModelPayload::R9v(m) = &payload else {
+        return Err(DownloadError::Internal("r9v catalog entry did not carry an R9v payload".to_string()));
+    };
+    let ple = m.ple.as_ref().ok_or_else(|| {
+        DownloadError::Internal(format!("r9v catalog entry `{package_id}` has no `ple` metadata"))
+    })?;
+    let paths = effective_r9v_paths(&storage);
+    let built = build_download(SupportedServingBackend::R9v, &payload, &paths.models_dir, None)?;
+    match check_completeness(&built.expected_files, &built.destination) {
+        CompletenessResult::Complete => {}
+        other => {
+            return Err(DownloadError::Validation(format!(
+                "r9v package `{package_id}` is not fully downloaded yet ({other:?}) — download it \
+                 first via the Models tab before preparing PLE or starting a server for it"
+            )));
+        }
+    }
+    let ple_ready = r9v_ple_ready(&paths.ple_dir, ple);
+    Ok(ResolvedR9vPackage {
+        models_dir: paths.models_dir,
+        ple_dir: paths.ple_dir,
+        cache_dir: paths.cache_dir,
+        ple_filename: ple.filename.clone(),
+        ple_size_bytes: ple.size_bytes,
+        ple_ready,
+    })
+}
+
+/// Looks up an r9v catalog toolbox's image by id, for the "Prepare PLE"
+/// job's `podman run <image> r9v-model prepare` invocation — a plain
+/// catalog lookup, not [`crate::server_mode::resolve_toolbox_for_server`]'s
+/// `features.server`-gated one, since preparing the PLE has nothing to do
+/// with Server Mode's own feature gate.
+fn resolve_r9v_toolbox_image(toolbox_id: &str) -> Result<String, DownloadError> {
+    let vendored = toolbox_catalog::load_vendored_catalog();
+    let (catalog, _models) = vendored
+        .typed()
+        .map_err(|e| DownloadError::Internal(format!("failed to parse vendored toolbox catalog: {e}")))?;
+    let tb = catalog
+        .toolbox_by_id(toolbox_id)
+        .filter(|t| t.supported_backend() == Some(SupportedServingBackend::R9v))
+        .ok_or_else(|| DownloadError::NotFound(format!("no r9v catalog toolbox with id `{toolbox_id}`")))?;
+    Ok(tb.image.clone())
+}
+
+/// `POST /api/model-downloads/r9v/prepare-ple` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartPreparePleRequest {
+    /// Which vendored r9v toolbox to source the image from (same id space
+    /// as [`crate::server_mode::StartR9vServerRequest::toolbox_id`]).
+    pub toolbox_id: String,
+    /// Which already-downloaded r9v catalog package to prepare the PLE
+    /// for (same id space as [`StartDownloadRequest::model_id`]).
+    pub package_id: String,
+}
+
 /// Streaming SHA256 verification for a backend's catalog entry (only
 /// meaningful when its files carry `sha256` — today, only `r9v`; mirrors
 /// upstream's explicit, expensive, not-run-automatically `verify_package()`).
@@ -627,7 +808,8 @@ impl ModelDownloadRegistry {
         let command_display = format!("{} {}", hf_binary(), built.args.join(" "));
         let now = Utc::now();
         let record = ModelDownloadJob {
-            id: id.clone(),
+            id,
+            kind: JobKind::Download,
             backend,
             model_id: request.model_id.clone(),
             destination: built.destination.display().to_string(),
@@ -640,17 +822,7 @@ impl ModelDownloadRegistry {
             ended_at: None,
         };
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let control = Arc::new(JobControl { record: RwLock::new(record.clone()), cancel: cancel_tx });
-        {
-            let mut jobs = self.jobs.lock().await;
-            jobs.insert(id.clone(), Arc::clone(&control));
-        }
-        {
-            let mut history = self.history.lock().await;
-            history.push_back(id.clone());
-        }
-        self.evict_old_jobs().await;
+        let (control, cancel_rx) = self.register_job(record.clone()).await;
 
         let registry = Arc::clone(self);
         let expected_files = built.expected_files;
@@ -661,6 +833,89 @@ impl ModelDownloadRegistry {
         });
 
         Ok(record)
+    }
+
+    /// `POST /api/model-downloads/r9v/prepare-ple`: runs r9v's one-shot
+    /// `podman run --network=none ... r9v-model prepare` job, sharing this
+    /// registry's execution slot/history/cancellation with `hf download`
+    /// jobs (PR11, §15 item 3 — see [`JobKind`]'s doc comment for the
+    /// explicit tradeoff). Rejects the request if the package itself isn't
+    /// fully downloaded yet (mirrors [`resolve_downloaded_r9v_package`]'s
+    /// own gate) — the same "download it first" message a Server Mode
+    /// start attempt would get.
+    pub async fn start_prepare_ple(self: &Arc<Self>, req: &StartPreparePleRequest) -> Result<ModelDownloadJob, DownloadError> {
+        let image = resolve_r9v_toolbox_image(&req.toolbox_id)?;
+        let resolved = resolve_downloaded_r9v_package(&req.package_id)?;
+
+        let args: Vec<String> = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network=none".to_string(),
+            "--user".to_string(),
+            "0:0".to_string(),
+            "--security-opt".to_string(),
+            "label=disable".to_string(),
+            "-v".to_string(),
+            format!("{}:/models:ro", resolved.models_dir.display()),
+            "-v".to_string(),
+            format!("{}:/ple", resolved.ple_dir.display()),
+            image,
+            "r9v-model".to_string(),
+            "prepare".to_string(),
+        ];
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let command_display = format!("podman {}", args.join(" "));
+        let now = Utc::now();
+        let record = ModelDownloadJob {
+            id,
+            kind: JobKind::PreparePle,
+            backend: SupportedServingBackend::R9v,
+            model_id: req.package_id.clone(),
+            destination: resolved.ple_dir.display().to_string(),
+            status: DownloadStatus::Queued,
+            message: "Waiting for the job execution slot".to_string(),
+            command_display,
+            output_tail: String::new(),
+            queued_at: now,
+            started_at: None,
+            ended_at: None,
+        };
+
+        let (control, cancel_rx) = self.register_job(record.clone()).await;
+
+        let registry = Arc::clone(self);
+        let ple_dir = resolved.ple_dir;
+        let expected_files = vec![ExpectedFile {
+            relative_path: resolved.ple_filename,
+            expected_size_bytes: Some(resolved.ple_size_bytes),
+            sha256: None,
+        }];
+        tokio::spawn(async move {
+            registry.execute_prepare_ple(control, args, ple_dir, expected_files, cancel_rx).await;
+        });
+
+        Ok(record)
+    }
+
+    /// Inserts a freshly-built job record into the registry (job map,
+    /// history, and eviction) and opens its cancellation channel — shared
+    /// by [`Self::start`] and [`Self::start_prepare_ple`]; everything from
+    /// here on is identical regardless of which subprocess the job runs.
+    async fn register_job(self: &Arc<Self>, record: ModelDownloadJob) -> (Arc<JobControl>, watch::Receiver<bool>) {
+        let id = record.id.clone();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let control = Arc::new(JobControl { record: RwLock::new(record), cancel: cancel_tx });
+        {
+            let mut jobs = self.jobs.lock().await;
+            jobs.insert(id.clone(), Arc::clone(&control));
+        }
+        {
+            let mut history = self.history.lock().await;
+            history.push_back(id);
+        }
+        self.evict_old_jobs().await;
+        (control, cancel_rx)
     }
 
     async fn evict_old_jobs(&self) {
@@ -805,6 +1060,131 @@ impl ModelDownloadRegistry {
             }
             Outcome::Exited(Err(e)) => {
                 error!(error = %e, "Failed to wait on model-download subprocess");
+                self.finish(&control, DownloadStatus::Failed, format!("failed to wait on subprocess: {e}")).await;
+            }
+        }
+    }
+
+    /// The r9v "Prepare PLE" counterpart to [`Self::execute`] — same
+    /// slot/cancel/tail/history-registry shape, but runs `podman` (not
+    /// `hf`) with no special env, and reports `Running`/"Preparing PLE"
+    /// instead of `Downloading`/"Downloading" so the dashboard never shows
+    /// a misleading download badge for this job (PR11, §15 item 3). Kept
+    /// as its own method rather than further-parametrizing [`Self::execute`]
+    /// — the two subprocess shapes (binary, env, in-progress wording) differ
+    /// enough that threading yet more parameters through the existing,
+    /// well-tested download path was judged a worse tradeoff than this
+    /// small amount of duplication.
+    async fn execute_prepare_ple(
+        self: Arc<Self>,
+        control: Arc<JobControl>,
+        args: Vec<String>,
+        destination: PathBuf,
+        expected_files: Vec<ExpectedFile>,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) {
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.execution_slot).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.finish(&control, DownloadStatus::Failed, "execution slot closed".to_string()).await;
+                    return;
+                }
+            },
+            _ = cancel_rx.changed() => {
+                self.finish(&control, DownloadStatus::Cancelled, "cancelled while queued".to_string()).await;
+                return;
+            }
+        };
+
+        if let Err(e) = tokio::fs::create_dir_all(&destination).await {
+            drop(permit);
+            self.finish(&control, DownloadStatus::Failed, format!("failed to create ple_dir: {e}")).await;
+            return;
+        }
+
+        {
+            let mut record = control.record.write().await;
+            record.status = DownloadStatus::Running;
+            record.message = "Preparing PLE".to_string();
+            record.started_at = Some(Utc::now());
+        }
+
+        let mut command = Command::new("podman");
+        command.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                drop(permit);
+                self.finish(
+                    &control,
+                    DownloadStatus::Failed,
+                    format!("failed to exec `podman`: {e} (is podman installed and on PATH?)"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(drain_into_tail(stdout, Arc::clone(&tail)));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(drain_into_tail(stderr, Arc::clone(&tail)));
+        }
+
+        let outcome = tokio::select! {
+            status = child.wait() => Outcome::Exited(status),
+            _ = cancel_rx.changed() => {
+                if let Err(e) = child.start_kill() {
+                    warn!(error = %e, "Failed to send kill to prepare-ple subprocess");
+                }
+                let _ = child.wait().await;
+                Outcome::Cancelled
+            }
+        };
+        drop(permit);
+
+        let final_tail = tail.lock().await.clone();
+        {
+            let mut record = control.record.write().await;
+            record.output_tail = final_tail;
+        }
+
+        match outcome {
+            Outcome::Cancelled => {
+                self.finish(&control, DownloadStatus::Cancelled, "cancelled by request".to_string()).await;
+            }
+            Outcome::Exited(Ok(status)) if status.success() => {
+                {
+                    let mut record = control.record.write().await;
+                    record.status = DownloadStatus::Verifying;
+                    record.message = "Checking PLE readiness".to_string();
+                }
+                match check_completeness(&expected_files, &destination) {
+                    CompletenessResult::Incomplete { missing_or_mismatched } => {
+                        self.finish(
+                            &control,
+                            DownloadStatus::Failed,
+                            format!(
+                                "r9v-model prepare exited successfully but the PLE file is missing/wrong size: {}",
+                                missing_or_mismatched.join(", ")
+                            ),
+                        )
+                        .await;
+                    }
+                    CompletenessResult::Complete | CompletenessResult::NotChecked { .. } => {
+                        self.finish(&control, DownloadStatus::Complete, "PLE prepared".to_string()).await;
+                    }
+                }
+            }
+            Outcome::Exited(Ok(status)) => {
+                self.finish(&control, DownloadStatus::Failed, format!("r9v-model prepare exited with {status}")).await;
+            }
+            Outcome::Exited(Err(e)) => {
+                error!(error = %e, "Failed to wait on prepare-ple subprocess");
                 self.finish(&control, DownloadStatus::Failed, format!("failed to wait on subprocess: {e}")).await;
             }
         }
@@ -1000,6 +1380,49 @@ mod tests {
     fn completeness_check_empty_manifest_is_not_checked() {
         let result = check_completeness(&[], Path::new("/tmp"));
         assert!(matches!(result, CompletenessResult::NotChecked { .. }));
+    }
+
+    #[test]
+    fn r9v_ple_ready_checks_existence_and_exact_size_only() {
+        let dir = std::env::temp_dir().join(format!("brainrouter-r9v-ple-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let ple = toolbox_catalog::R9vPleFile {
+            filename: "per_layer_token_embd.iq4_nl.bin".to_string(),
+            size_bytes: 5,
+            sha256: "deadbeef".to_string(),
+        };
+
+        // Not present yet.
+        assert!(!r9v_ple_ready(&dir, &ple));
+
+        // Present but wrong size.
+        std::fs::write(dir.join(&ple.filename), b"1234").expect("write short file");
+        assert!(!r9v_ple_ready(&dir, &ple));
+
+        // Present with the exact expected size — sha256 is deliberately
+        // never checked (§15's flagged v1 scope decision).
+        std::fs::write(dir.join(&ple.filename), b"12345").expect("write exact-size file");
+        assert!(r9v_ple_ready(&dir, &ple));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_image_finds_the_real_vendored_entry() {
+        let image = resolve_r9v_toolbox_image("r9700-r9v-rocm-10-0").expect("must resolve");
+        assert_eq!(image, "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0");
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_image_rejects_unknown_id() {
+        let err = resolve_r9v_toolbox_image("no-such-toolbox").unwrap_err();
+        assert!(matches!(err, DownloadError::NotFound(_)));
+    }
+
+    #[test]
+    fn resolve_r9v_toolbox_image_rejects_non_r9v_backend() {
+        let err = resolve_r9v_toolbox_image("strix-halo-llama-rocm-10-0").unwrap_err();
+        assert!(matches!(err, DownloadError::NotFound(_)));
     }
 
     #[tokio::test]
