@@ -175,6 +175,7 @@ dependencies = [
  "serde_yml",
  "serenity",
  "sha2",
+ "shlex",
  "tar",
  "tokio",
  "tokio-stream",

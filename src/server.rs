@@ -249,6 +249,9 @@ async fn handle_request(
         // job spawns `hf download`/reads local files; prefix-gated like
         // /api/toolbox-containers so any future sub-path stays covered.
         || (method == "POST" && path.starts_with("/api/model-downloads"))
+        // PR7: server-mode start/stop (§12) — launches/removes a detached
+        // `podman run` container; prefix-gated the same way.
+        || (method == "POST" && path.starts_with("/api/server-mode/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -944,6 +947,23 @@ async fn handle_request(
         ("GET", p) if p.starts_with("/api/model-downloads/") => {
             let id = p.trim_start_matches("/api/model-downloads/").trim_end_matches('/');
             let resp = model_downloads_get_response(&state, id).await;
+            into_unsync(resp)
+        }
+
+        // ── PR7: ds4 Server Mode (§11/§12) ────────────────────────────────────
+        ("GET", "/api/server-mode/ds4/status") => {
+            let resp = server_mode_ds4_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/ds4/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_ds4_start_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/ds4/stop") => {
+            let resp = server_mode_ds4_stop_response().await;
             into_unsync(resp)
         }
 
@@ -3054,6 +3074,51 @@ async fn upgrade_manifest() -> Response<Full<Bytes>> {
                 error: format!("Failed to exec docker: {}", e),
             })
         }
+    }
+}
+
+// ── PR7: ds4 Server Mode (§11/§12) ────────────────────────────────────────
+
+/// `GET /api/server-mode/ds4/status` — always reads live `podman inspect`
+/// state (§12 item 5: no persisted registry).
+pub async fn server_mode_ds4_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::ds4_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/ds4/start` — body:
+/// `{"toolbox_id": "...", "model_id": "...", "ctx": <n>, "host": "...", "port": <n>, "custom_args": "..."}`.
+pub async fn server_mode_ds4_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_ds4_server(&request).await {
+        Ok(()) => {
+            let status = crate::server_mode::ds4_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/ds4/stop` — graceful `podman stop` then `podman
+/// rm -f`, idempotent if the container is already gone (§12 item 5).
+pub async fn server_mode_ds4_stop_response() -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_ds4_server().await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "ds4 server stopped.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
     }
 }
 

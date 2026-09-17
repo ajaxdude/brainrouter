@@ -230,6 +230,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⇩</span>
       <span>Downloads</span>
     </button>
+    <button class="nav-item" id="nav-server-mode" onclick="switchView('server-mode')">
+      <span class="nav-icon">▶</span>
+      <span>Server Mode</span>
+    </button>
     <a class="nav-item" href="/models">
       <span class="nav-icon">M</span>
       <span>Model activity</span>
@@ -557,6 +561,54 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
     </div>
 
+    <!-- PR7: ds4 Server Mode (design doc §11/§12) — headless detached
+         `podman run` servers, structurally distinct from the Toolboxes tab
+         above (`toolbox create` dev-shells never receive engine_args; only
+         Server Mode's plain `podman run` does). v1 scope: ds4 only, single
+         instance, standalone (single-node) launch — multi-node/DSpark/
+         SSD-streaming/MTP are reachable via the custom-args escape hatch. -->
+    <div id="server-mode-view" style="display:none;max-width:900px">
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
+        Launch a headless ds4 inference server directly from an already-downloaded model — no cockpit install required.
+        v1 covers ds4 only, one instance at a time, standalone (single-node) mode. Multi-node roles, DSpark,
+        SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args field below —
+        see the design doc §12.
+      </div>
+
+      <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">ds4 server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-ds4-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model (already downloaded)
+            <select id="sm-ds4-model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context
+              <input id="sm-ds4-ctx" type="number" value="126000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-ds4-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-ds4-port" type="number" value="8000" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute)">Custom args (optional, shell-quoted)
+            <input id="sm-ds4-custom-args" type="text" placeholder="e.g. --n-gpu-layers 999" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startDs4Server()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopDs4Server()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-ds4-status" style="font-size:12px;color:var(--textMute)">Loading status…</div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 </div><!-- /app -->
@@ -746,13 +798,14 @@ function switchView(view) {
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
   document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
   document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
+  document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
 
-  ['stream','config','models','toolbox-models'].forEach(v => {
+  ['stream','config','models','toolbox-models','server-mode'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (btn) btn.classList.toggle('active', v === view);
   });
 
-  const titles = { stream: 'Routing', config: 'Config', models: 'Models', 'toolbox-models': 'Downloads' };
+  const titles = { stream: 'Routing', config: 'Config', models: 'Models', 'toolbox-models': 'Downloads', 'server-mode': 'Server Mode' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
@@ -760,6 +813,7 @@ function switchView(view) {
     config: 'Edit configuration files',
     models: 'Pick a model, copy its OMP value, and paste it into OMP',
     'toolbox-models': 'Catalog models for ds4 / halogen / llama.cpp / r9v — browse, download, verify',
+    'server-mode': 'Launch/stop headless inference servers — ds4 today, more backends in later PRs',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -769,6 +823,7 @@ function switchView(view) {
   if (view === 'config') loadConfig();
   if (view === 'models') loadModels();
   if (view === 'toolbox-models') loadToolboxModels();
+  if (view === 'server-mode') loadServerMode();
 }
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
@@ -2751,6 +2806,108 @@ function scheduleToolboxModelsPoll() {
   }
 }
 
+// ─── PR7: ds4 Server Mode (design doc §11/§12) ──────────────────────────────
+// Headless detached `podman run` servers — structurally distinct from the
+// Toolboxes-tab dev-shells above. v1: ds4 only, single instance, standalone
+// launch. Lifecycle is synchronous request/response (no job registry like
+// the downloads above) — `status` always reflects live `podman inspect`
+// state, matching src/server_mode.rs's "no persisted state" design.
+let serverModeStatus = null;
+
+async function loadServerMode() {
+  // Reuses toolboxCatalogData (loaded by refreshSlow()) for the toolbox
+  // dropdown, and fetches the model catalog + local-presence sweep fresh
+  // (same endpoints the Downloads view uses) to list only already-
+  // downloaded ds4 models — starting a server needs a complete model on
+  // disk, not just a catalog entry.
+  const [modelsRes, statusRes, serverStatusRes] = await Promise.all([
+    safeFetch('/api/toolbox-models'),
+    safeFetch('/api/model-downloads/status'),
+    safeFetch('/api/server-mode/ds4/status'),
+  ]);
+  if (modelsRes) toolboxModelsData = modelsRes;
+  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (serverStatusRes) serverModeStatus = serverStatusRes;
+  renderServerModeToolboxOptions();
+  renderServerModeModelOptions();
+  renderServerModeStatus();
+}
+
+function renderServerModeToolboxOptions() {
+  const el = document.getElementById('sm-ds4-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const ds4Toolboxes = allToolboxes.filter(tb => tb.backend === 'ds4' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('ds4');
+  el.innerHTML = ds4Toolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (ds4Toolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeModelOptions() {
+  const el = document.getElementById('sm-ds4-model');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'ds4');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('ds4', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  if (!complete.length) {
+    el.innerHTML = '<option value="">No downloaded ds4 models — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeStatus() {
+  const el = document.getElementById('sm-ds4-status');
+  if (!el || !serverModeStatus) return;
+  if (!serverModeStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeStatus.model_id ? ' · model: ' + escHtml(serverModeStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeStatus.container_name)})</span>`;
+}
+
+async function startDs4Server() {
+  const toolboxId = document.getElementById('sm-ds4-toolbox').value;
+  const modelId = document.getElementById('sm-ds4-model').value;
+  const ctx = parseInt(document.getElementById('sm-ds4-ctx').value, 10);
+  const host = document.getElementById('sm-ds4-host').value;
+  const port = parseInt(document.getElementById('sm-ds4-port').value, 10);
+  const customArgs = document.getElementById('sm-ds4-custom-args').value;
+  if (!toolboxId || !modelId) { alert('Pick a toolbox and an already-downloaded model first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/ds4/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId, model_id: modelId, ctx, host, port, custom_args: customArgs || undefined }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeStatus = j;
+    renderServerModeStatus();
+  } catch (e) {}
+}
+
+async function stopDs4Server() {
+  try {
+    const r = await fetch('/api/server-mode/ds4/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
 
 async function upgradeIfAvailable(svc) {
   const btn = event && event.target;

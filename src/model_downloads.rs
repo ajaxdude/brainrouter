@@ -456,6 +456,45 @@ pub fn local_presence_snapshot() -> Result<Vec<ModelPresence>, String> {
     Ok(out)
 }
 
+/// An already-downloaded ds4 catalog model's on-disk location, resolved for
+/// PR7's Server Mode (`src/server_mode.rs`) — analogous to what `-m
+/// /models/<rel_path>` needs in upstream's `build_server_cmd()`, but
+/// computed from the catalog + local completeness check rather than
+/// accepting a raw filesystem path from the request body (§12 item 3).
+pub struct ResolvedDs4Model {
+    pub models_dir: PathBuf,
+    pub filename: String,
+}
+
+/// Resolves `model_id` (a ds4 catalog entry id, same id space as
+/// [`StartDownloadRequest::model_id`]) to its on-disk location, rejecting
+/// the request if the model is unknown or not yet fully downloaded — Server
+/// Mode must never be pointed at a partial/missing download. Mirrors
+/// [`local_presence_snapshot`]'s own completeness check for a single entry
+/// instead of every entry.
+pub fn resolve_downloaded_ds4_model(model_id: &str) -> Result<ResolvedDs4Model, DownloadError> {
+    let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::Ds4, model_id)?;
+    let ModelPayload::Ds4(m) = &payload else {
+        return Err(DownloadError::Internal(
+            "ds4 catalog entry did not carry a Ds4 payload".to_string(),
+        ));
+    };
+    let models_dir = effective_models_dir(SupportedServingBackend::Ds4, &storage);
+    let built = build_download(SupportedServingBackend::Ds4, &payload, &models_dir, None)?;
+    match check_completeness(&built.expected_files, &built.destination) {
+        CompletenessResult::Complete => {}
+        other => {
+            return Err(DownloadError::Validation(format!(
+                "ds4 model `{model_id}` is not fully downloaded yet ({other:?}) — download it \
+                 first via the Models tab before starting a server for it"
+            )));
+        }
+    }
+    Ok(ResolvedDs4Model { models_dir, filename: m.filename.clone() })
+}
+
+
+
 /// Streaming SHA256 verification for a backend's catalog entry (only
 /// meaningful when its files carry `sha256` — today, only `r9v`; mirrors
 /// upstream's explicit, expensive, not-run-automatically `verify_package()`).
