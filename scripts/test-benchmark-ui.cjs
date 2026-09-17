@@ -814,7 +814,7 @@ test('plotSpider rejects incomplete selections client-side and never calls the A
   assert.equal(callsBefore(), 0);
 });
 
-test('plotSpider issues the correct request, draws the radar chart, and captions TEPR as a proposal', async () => {
+test('plotSpider issues the correct request, draws the radar chart, and captions the TEPR formula', async () => {
   const fixture = spiderFixtureResponse();
   const app = browser(
     async address => (address.startsWith('/api/benchmarks/spider') ? response(fixture) : response(spiderFilters)),
@@ -837,7 +837,7 @@ test('plotSpider issues the correct request, draws the radar chart, and captions
   assert.equal(q.get('workload'), 'coding-agent');
 
   assert.equal(app.nodes.get('spider-message').textContent, '');
-  assert.match(app.nodes.get('spider-caption').textContent, /Proposed metric pending sign-off/);
+  assert.match(app.nodes.get('spider-caption').textContent, /TEPR = total quality_results\.generated_tokens/);
   assert.match(app.nodes.get('spider-caption').textContent, /Minimum 3 qualifying runs per axis/);
 
   const svg = app.nodes.get('spider-chart');

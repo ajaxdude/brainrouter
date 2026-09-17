@@ -852,15 +852,14 @@ family/workload/family×workload picker, an entity picker capped at 5 series,
 and an SVG radar renderer with min-max normalization and greyed-out vertices
 for insufficient data.
 
-> **TEPR is a proposed metric, not an established one — flagged in both the
-> API response and the UI, pending the user's explicit sign-off on the
-> formula.** As implemented: `SUM(quality_results.generated_tokens)` across
-> every attempt in the cohort, divided by the count of *positive* runs
-> (`status='succeeded'` and no associated `quality_results` row with
-> `passed=0`); runs with zero `quality_results` rows are excluded entirely.
-> Comparing **by model** requires a single pinned workload (token cost is
-> workload-dependent); comparing by harness, or by model×harness pairs, needs
-> no pin. Treat this formula as a starting proposal until confirmed.
+> **TEPR is the confirmed metric definition (signed off by the user).** As
+> implemented: `SUM(quality_results.generated_tokens)` across every attempt in
+> the cohort, divided by the count of *positive* runs (`status='succeeded'`
+> and no associated `quality_results` row with `passed=0`); runs with zero
+> `quality_results` rows are excluded entirely. Comparing **by model** requires
+> a single pinned workload (token cost is workload-dependent); comparing by
+> harness, or by model×harness pairs, needs no pin.
+
 
 ## Model Observability and Regression Alerts
 
@@ -1377,7 +1376,6 @@ These are ideas requiring separate approval, not acceptance claims for this rele
 - **Router integration for Server Mode backends ("PR 11b").** Server Mode containers are not dispatchable as real request traffic; `Router`/`route()` still only knows Manifest + llama-swap. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
 - **R9V functional validation on real 2×AMD R9700 hardware.** ROCm/HSA device-passthrough (`--device /dev/kfd`/`/dev/dri`, `--group-add render`/`video`, `--ipc=host`, `--runtime crun`) has not been exercised end-to-end; ships behind an "unverified" badge.
 - **Bidirectional/continuous config.json sync with ai-toolbox-cockpit.** Only an explicit, user-triggered single-write "apply" path exists; no locking/conflict protocol is defined for concurrent brainrouter+cockpit writes.
-- **TEPR ("token efficiency to positive result") sign-off.** The shipped formula (`SUM(quality_results.generated_tokens)` over positive runs) is a proposal, not a confirmed metric — needs explicit user sign-off before being treated as authoritative.
 - **ROCm/AMD-GPU auto-detection.** brainrouter has no `rocminfo`/sysfs-based hardware detection; R9V is offered as a selectable option and fails loudly on unsupported hardware rather than being auto-hidden.
 
 The notes motivating Quant Lab/Model Compare are not fully implemented by the

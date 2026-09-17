@@ -134,7 +134,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
         <label class="inline-label"><input type="checkbox" id="spider-axis-tepr" checked> Token efficiency to positive result (TEPR)</label>
         <label class="inline-label"><input type="checkbox" id="spider-axis-speed" checked> Speed (mean generation TPS)</label>
       </div>
-      <p class="hint">TEPR is a <strong>proposed</strong> metric pending explicit sign-off, not an established industry term: total <code>quality_results.generated_tokens</code> across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Treat it with the same page-only-sample caution as every other chart here.</p>
+      <p class="hint">TEPR: total <code>quality_results.generated_tokens</code> across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Treat it with the same page-only-sample caution as every other chart here.</p>
     </fieldset>
     <div class="toolbar"><button class="btn primary" id="spider-plot">Plot radar chart</button></div>
     <p id="spider-message" class="message" role="status"></p>
@@ -484,7 +484,7 @@ async function plotSpider(){
     message('spider-message','Loading radar chart…');
     const response=await jsonFetch('/api/benchmarks/spider?'+p);
     drawRadar('spider-chart',response);renderSpiderLegend(response);
-    byId('spider-caption').textContent='TEPR = total quality_results.generated_tokens summed across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Proposed metric pending sign-off, not an established term. Minimum '+response.min_sample_size+' qualifying runs per axis; below that, a vertex is shown greyed out as insufficient data rather than omitted.';
+    byId('spider-caption').textContent='TEPR = total quality_results.generated_tokens summed across every attempt in the cohort ÷ the count of positive runs (status succeeded, no failing quality verdict). Minimum '+response.min_sample_size+' qualifying runs per axis; below that, a vertex is shown greyed out as insufficient data rather than omitted.';
     message('spider-message','');
   }catch(e){message('spider-message',e.message,true)}
 }

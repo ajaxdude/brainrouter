@@ -627,14 +627,13 @@ harnesses, engine, backend, toolbox, speed, and TEPR** and plot one polygon
 per selected series (e.g. compare `r9v` vs. `llama_cpp` across three models).
 Backed by `GET /api/benchmarks/spider`.
 
-> **TEPR ("token efficiency to positive result") is a proposed metric, not an
-> established one** — flagged here for explicit sign-off, not a silent
-> assumption: `TEPR = total_tokens_consumed / count(runs where the task's
-> quality outcome is a pass)` for the selected axis bucket, expressed as
-> tokens-per-successful-task. A bucket with zero passing runs has undefined
-> TEPR (reported as `null`, not `Infinity` or `0`) — do not read `null` as
-> "perfectly efficient." See `docs/design/ai-toolbox-cockpit-integration.md`
-> for the full rationale before relying on this number.
+> **TEPR ("token efficiency to positive result")**: `TEPR =
+> total_tokens_consumed / count(runs where the task's quality outcome is a
+> pass)` for the selected axis bucket, expressed as tokens-per-successful-task.
+> A bucket with zero passing runs has undefined TEPR (reported as `null`, not
+> `Infinity` or `0`) — do not read `null` as "perfectly efficient." See
+> `docs/design/ai-toolbox-cockpit-integration.md` for the full rationale.
+
 
 ### Native Benchmark Lab
 
@@ -1440,8 +1439,6 @@ not imply that these execution or verification pipelines exist.
   hardware.
 - config.json sharing is single-write "apply," not continuous bidirectional
   sync — concurrent edits from cockpit and brainrouter are not merged live.
-- TEPR ("token efficiency to positive result") is a **proposed** benchmark
-  metric pending explicit user sign-off, not an established one.
 - No automatic ROCm/ROCm-vs-Vulkan hardware detection; engine selection is
   driven by the catalog and user choice, not host GPU introspection.
 
