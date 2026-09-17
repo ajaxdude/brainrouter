@@ -57,6 +57,43 @@ pub fn vendored_catalog_revision() -> String {
     format!("{:x}", digest).chars().take(12).collect()
 }
 
+/// `assets/cockpit-catalog/SOURCE`, embedded so the pinned upstream commit
+/// can be read back at runtime without a filesystem access.
+const VENDORED_SOURCE: &str = include_str!("../assets/cockpit-catalog/SOURCE");
+
+/// Everything needed to persist a `toolbox_catalog_snapshot` row (design doc
+/// §2/§7) anchoring a historical record (e.g. a benchmark run's
+/// `serving_runtimes` entry) to the exact vendored catalog content that was
+/// embedded in this binary when the record was made.
+pub struct VendoredCatalogSnapshot {
+    pub id: String,
+    pub models_json: &'static str,
+    pub toolboxes_json: &'static str,
+    pub source_commit: Option<String>,
+}
+
+/// Snapshot of the catalog embedded in *this* binary, suitable for an
+/// `INSERT OR IGNORE` anchor row. `id` is [`vendored_catalog_revision`];
+/// `source_commit` is parsed from `SOURCE`'s own `- Pinned commit: \`<sha>\``
+/// line (a format this crate's own sync script writes, so parsing it here is
+/// reading our own convention back, not scraping an unowned format) and is
+/// `None` — not a panic — if that line is ever missing or reformatted.
+pub fn vendored_catalog_snapshot() -> VendoredCatalogSnapshot {
+    VendoredCatalogSnapshot {
+        id: vendored_catalog_revision(),
+        models_json: VENDORED_MODELS_JSON,
+        toolboxes_json: VENDORED_TOOLBOXES_JSON,
+        source_commit: vendored_source_commit(),
+    }
+}
+
+fn vendored_source_commit() -> Option<String> {
+    VENDORED_SOURCE.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("- Pinned commit: `")?;
+        rest.strip_suffix('`').map(str::to_string)
+    })
+}
+
 /// Result of loading the vendored catalog at runtime: the parsed JSON for
 /// each file plus the structural validation report. Parsing the vendored
 /// files themselves is not expected to ever fail (they're checked in CI and
@@ -183,5 +220,21 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 12);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn vendored_catalog_snapshot_matches_source_and_revision() {
+        let snapshot = vendored_catalog_snapshot();
+        assert_eq!(snapshot.id, vendored_catalog_revision());
+        assert_eq!(snapshot.models_json, VENDORED_MODELS_JSON);
+        assert_eq!(snapshot.toolboxes_json, VENDORED_TOOLBOXES_JSON);
+        // SOURCE currently has a real pinned commit line; if the sync script
+        // ever changes that format this should fail loudly here rather than
+        // silently persisting `None` into every future snapshot row.
+        let commit = snapshot
+            .source_commit
+            .expect("SOURCE must have a parseable pinned commit line");
+        assert_eq!(commit.len(), 40, "expected a full git SHA: {commit}");
+        assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

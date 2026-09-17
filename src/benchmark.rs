@@ -22,12 +22,15 @@ use std::{
     sync::Arc,
 };
 
+use crate::toolbox_catalog;
+
 mod http;
 mod imports;
 pub use http::handle_request;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_benchmark_explorer.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_benchmark_lab.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_toolbox_serving_dimension.sql");
 const EXPLORER_HTML: &str = include_str!("escalation/templates/benchmarks.html");
 const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: u32 = 100;
@@ -425,6 +428,46 @@ impl RuntimeDefinition {
     }
 }
 
+/// "What toolbox/container actually served this run" — a container-image
+/// identity, distinct from [`RuntimeDefinition`]'s source-build identity
+/// (design doc §7: new table, not a widened `runtimes`, because
+/// `repository`/`fork_name`/`commit_sha`/`compiler` don't naturally fit
+/// non-llama.cpp-fork backends). Optional in an [`IngestBundle`]: a run with
+/// no catalog-toolbox involvement simply omits it, leaving
+/// `experiments.serving_runtime_id` NULL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingRuntimeDefinition {
+    pub id: String,
+    pub toolbox_backend: toolbox_catalog::SupportedServingBackend,
+    pub toolbox_id: String,
+    pub compute_api: Backend,
+    pub container_image: String,
+    pub catalog_snapshot_id: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl ServingRuntimeDefinition {
+    fn validate(&self) -> BenchmarkResult<()> {
+        for (name, value) in [
+            ("serving_runtime.id", self.id.as_str()),
+            ("serving_runtime.toolbox_id", self.toolbox_id.as_str()),
+            (
+                "serving_runtime.container_image",
+                self.container_image.as_str(),
+            ),
+            (
+                "serving_runtime.catalog_snapshot_id",
+                self.catalog_snapshot_id.as_str(),
+            ),
+        ] {
+            require_text(name, value)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuDevice {
@@ -700,6 +743,8 @@ pub struct ExperimentConfig {
     pub id: String,
     pub artifact_id: String,
     pub runtime_id: String,
+    #[serde(default)]
+    pub serving_runtime_id: Option<String>,
     pub hardware_id: String,
     pub workload_id: String,
     pub context_tokens: u64,
@@ -722,6 +767,7 @@ pub struct ExperimentConfig {
 struct CanonicalExperiment<'a> {
     artifact_id: &'a str,
     runtime_id: &'a str,
+    serving_runtime_id: Option<&'a str>,
     hardware_id: &'a str,
     workload_id: &'a str,
     context_tokens: u64,
@@ -749,6 +795,9 @@ impl ExperimentConfig {
             ),
         ] {
             require_text(name, value)?;
+        }
+        if let Some(serving_runtime_id) = &self.serving_runtime_id {
+            require_text("experiment.serving_runtime_id", serving_runtime_id)?;
         }
         if self.context_tokens == 0
             || self.batch_size == 0
@@ -983,6 +1032,7 @@ impl ExperimentMatrix {
                                             id: "pending".into(),
                                             artifact_id: artifact_id.clone(),
                                             runtime_id: runtime_id.clone(),
+                                            serving_runtime_id: None,
                                             hardware_id: hardware_id.clone(),
                                             workload_id: workload_id.clone(),
                                             context_tokens,
@@ -1028,6 +1078,7 @@ impl ExperimentConfig {
         CanonicalExperiment {
             artifact_id: &self.artifact_id,
             runtime_id: &self.runtime_id,
+            serving_runtime_id: self.serving_runtime_id.as_deref(),
             hardware_id: &self.hardware_id,
             workload_id: &self.workload_id,
             context_tokens: self.context_tokens,
@@ -1362,6 +1413,8 @@ pub struct IngestBundle {
     pub model: ModelDefinition,
     pub artifact: ArtifactDefinition,
     pub runtime: RuntimeDefinition,
+    #[serde(default)]
+    pub serving_runtime: Option<ServingRuntimeDefinition>,
     pub hardware: HardwareProfile,
     pub workload: WorkloadDefinition,
     pub experiment: ExperimentConfig,
@@ -1666,6 +1719,9 @@ impl IngestBundle {
         self.model.validate()?;
         self.artifact.validate()?;
         self.runtime.validate()?;
+        if let Some(serving_runtime) = &self.serving_runtime {
+            serving_runtime.validate()?;
+        }
         self.hardware.validate()?;
         self.workload.validate()?;
         self.experiment.validate()?;
@@ -1706,6 +1762,18 @@ impl IngestBundle {
                 return Err(BenchmarkError::Validation(format!(
                     "{name} must reference the matching object in this bundle"
                 )));
+            }
+        }
+        match (&self.serving_runtime, &self.experiment.serving_runtime_id) {
+            (Some(serving_runtime), Some(serving_runtime_id))
+                if serving_runtime.id == *serving_runtime_id => {}
+            (None, None) => {}
+            _ => {
+                return Err(BenchmarkError::Validation(
+                    "experiment.serving_runtime_id must reference bundle.serving_runtime.id \
+                     when either is present, and both must be absent otherwise"
+                        .into(),
+                ));
             }
         }
         if let Some(metrics) = &self.performance_metrics {
@@ -1755,6 +1823,9 @@ pub struct RunSummary {
     pub quant_name: String,
     pub fork_name: String,
     pub backend: String,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
     pub context_tokens: u64,
     pub workload: String,
     pub prompt_tps: Option<f64>,
@@ -1787,6 +1858,9 @@ pub struct RunQuery {
     pub status: Option<String>,
     pub family: Option<String>,
     pub backend: Option<String>,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
     pub workload: Option<String>,
     pub quant_name: Option<String>,
     pub speculator_type: Option<String>,
@@ -1820,6 +1894,9 @@ impl RunQuery {
                 "status" => result.status = non_empty_filter(value),
                 "family" => result.family = non_empty_filter(value),
                 "backend" => result.backend = non_empty_filter(value),
+                "toolbox_backend" => result.toolbox_backend = non_empty_filter(value),
+                "toolbox_id" => result.toolbox_id = non_empty_filter(value),
+                "compute_api" => result.compute_api = non_empty_filter(value),
                 "workload" => result.workload = non_empty_filter(value),
                 "quant_name" => result.quant_name = non_empty_filter(value),
                 "speculator_type" => result.speculator_type = non_empty_filter(value),
@@ -1901,6 +1978,7 @@ impl BenchmarkStore {
         if !migrated {
             connection.execute_batch(MIGRATION_0001)?;
             connection.execute_batch(MIGRATION_0002)?;
+            connection.execute_batch(MIGRATION_0003)?;
         } else {
             let mut version = connection
                 .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
@@ -1922,7 +2000,7 @@ impl BenchmarkStore {
                 [],
                 |row| row.get::<_, u64>(0),
             )?;
-            if !(1..=2).contains(&version) || !expected_migration || required_v1_tables != 5 {
+            if !(1..=3).contains(&version) || !expected_migration || required_v1_tables != 5 {
                 return Err(BenchmarkError::Validation(format!(
                     "database is not a recognized benchmark explorer schema (found version {version})"
                 )));
@@ -1946,9 +2024,34 @@ impl BenchmarkStore {
                 [],
                 |row| row.get::<_, u64>(0),
             )?;
-            if version != 2 || !expected_lab_migration || required_tables != 6 {
+            if !(2..=3).contains(&version) || !expected_lab_migration || required_tables != 6 {
                 return Err(BenchmarkError::Validation(format!(
                     "database is not a complete benchmark explorer schema at version 2 (found version {version})"
+                )));
+            }
+            if version == 2 {
+                connection.execute_batch(MIGRATION_0003)?;
+                version = 3;
+            }
+            let expected_serving_migration = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM schema_migrations
+                    WHERE version=3 AND name='toolbox_serving_dimension'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let required_v3_tables = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='table'
+                    AND name IN ('models','artifacts','experiments','runs','entity_fingerprints',
+                                 'benchmark_jobs','toolbox_catalog_snapshot','serving_runtimes')",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if version != 3 || !expected_serving_migration || required_v3_tables != 8 {
+                return Err(BenchmarkError::Validation(format!(
+                    "database is not a complete benchmark explorer schema at version 3 (found version {version})"
                 )));
             }
         }
@@ -2176,6 +2279,14 @@ impl BenchmarkStore {
             &bundle.artifact,
         )?;
         ensure_fingerprint(&transaction, "runtime", &bundle.runtime.id, &bundle.runtime)?;
+        if let Some(serving_runtime) = &bundle.serving_runtime {
+            ensure_fingerprint(
+                &transaction,
+                "serving_runtime",
+                &serving_runtime.id,
+                serving_runtime,
+            )?;
+        }
         ensure_fingerprint(
             &transaction,
             "hardware",
@@ -2266,6 +2377,26 @@ impl BenchmarkStore {
             ],
         )?;
 
+        if let Some(serving_runtime) = &bundle.serving_runtime {
+            ensure_catalog_snapshot(&transaction, &serving_runtime.catalog_snapshot_id)?;
+            let serving_metadata = to_json(&serving_runtime.metadata)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO serving_runtimes(
+                    id,toolbox_backend,toolbox_id,compute_api,container_image,
+                    catalog_snapshot_id,metadata_json
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    serving_runtime.id,
+                    serving_runtime.toolbox_backend.as_str(),
+                    serving_runtime.toolbox_id,
+                    serving_runtime.compute_api.as_str(),
+                    serving_runtime.container_image,
+                    serving_runtime.catalog_snapshot_id,
+                    serving_metadata,
+                ],
+            )?;
+        }
+
         let gpus = to_json(&bundle.hardware.gpus)?;
         let driver_versions = to_json(&bundle.hardware.driver_versions)?;
         let hardware_metadata = to_json(&bundle.hardware.metadata)?;
@@ -2350,17 +2481,18 @@ impl BenchmarkStore {
         let sampling_json = to_json(&bundle.experiment.sampling)?;
         transaction.execute(
             "INSERT OR IGNORE INTO experiments(
-                id,experiment_hash,spec_id,artifact_id,runtime_id,hardware_id,workload_id,
-                context_tokens,prompt_tokens,generation_tokens,batch_size,micro_batch_size,
-                threads,gpu_layers,flash_attention,kv_cache_type_k,kv_cache_type_v,
-                optimization_json,sampling_json,command_template
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                id,experiment_hash,spec_id,artifact_id,runtime_id,serving_runtime_id,hardware_id,
+                workload_id,context_tokens,prompt_tokens,generation_tokens,batch_size,
+                micro_batch_size,threads,gpu_layers,flash_attention,kv_cache_type_k,
+                kv_cache_type_v,optimization_json,sampling_json,command_template
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 bundle.experiment.id,
                 experiment_hash,
                 spec_id,
                 bundle.experiment.artifact_id,
                 bundle.experiment.runtime_id,
+                bundle.experiment.serving_runtime_id,
                 bundle.experiment.hardware_id,
                 bundle.experiment.workload_id,
                 bundle.experiment.context_tokens,
@@ -2598,7 +2730,8 @@ impl BenchmarkStore {
         paged_values.push(SqlValue::Integer(offset as i64));
         let sql = format!(
             "SELECT rs.run_id,rs.status,rs.repetition,rs.experiment_hash,rs.family,
-                    rs.architecture,rs.quant_name,rs.fork_name,rs.backend,rs.context_tokens,
+                    rs.architecture,rs.quant_name,rs.fork_name,rs.backend,
+                    rs.toolbox_backend,rs.toolbox_id,rs.compute_api,rs.context_tokens,
                     rs.workload,rs.prompt_tps,rs.generation_tps,rs.ttft_ms,
                     rs.peak_rss_bytes,rs.peak_vram_bytes,rs.speculator_type,
                     rs.acceptance_rate,r.started_at,r.ended_at,r.failure_reason,
@@ -2652,7 +2785,8 @@ impl BenchmarkStore {
         let summary = connection
             .query_row(
                 "SELECT rs.run_id,rs.status,rs.repetition,rs.experiment_hash,rs.family,
-                        rs.architecture,rs.quant_name,rs.fork_name,rs.backend,rs.context_tokens,
+                        rs.architecture,rs.quant_name,rs.fork_name,rs.backend,
+                        rs.toolbox_backend,rs.toolbox_id,rs.compute_api,rs.context_tokens,
                         rs.workload,rs.prompt_tps,rs.generation_tps,rs.ttft_ms,
                         rs.peak_rss_bytes,rs.peak_vram_bytes,rs.speculator_type,
                         rs.acceptance_rate,r.started_at,r.ended_at,r.failure_reason,
@@ -2701,6 +2835,11 @@ impl BenchmarkStore {
                    'capabilities',json(rt.capabilities_json),
                    'executable_sha256',rt.executable_sha256,
                    'container_digest',rt.container_digest,'built_at',rt.built_at),
+                 'serving_runtime', CASE WHEN sr.id IS NULL THEN NULL ELSE json_object(
+                   'id',sr.id,'toolbox_backend',sr.toolbox_backend,'toolbox_id',sr.toolbox_id,
+                   'compute_api',sr.compute_api,'container_image',sr.container_image,
+                   'catalog_snapshot_id',sr.catalog_snapshot_id,
+                   'metadata',json(sr.metadata_json)) END,
                  'hardware', json_object(
                    'id',h.id,'hostname_hash',h.hostname_hash,'cpu_model',h.cpu_model,
                    'physical_cores',h.physical_cores,'logical_cores',h.logical_cores,
@@ -2759,6 +2898,7 @@ impl BenchmarkStore {
              JOIN runtimes rt ON rt.id=e.runtime_id
              JOIN hardware_profiles h ON h.id=e.hardware_id
              JOIN workloads w ON w.id=e.workload_id
+             LEFT JOIN serving_runtimes sr ON sr.id=e.serving_runtime_id
              LEFT JOIN performance_metrics pm ON pm.run_id=r.id
              LEFT JOIN speculative_metrics sm ON sm.run_id=r.id
              WHERE r.id=?1",
@@ -2838,6 +2978,9 @@ impl BenchmarkStore {
             "statuses": distinct_values(&connection, "SELECT DISTINCT status FROM runs ORDER BY status", self.http_limits)?,
             "families": distinct_values(&connection, "SELECT DISTINCT family FROM run_summary ORDER BY family", self.http_limits)?,
             "backends": distinct_values(&connection, "SELECT DISTINCT backend FROM run_summary ORDER BY backend", self.http_limits)?,
+            "toolbox_backends": distinct_values(&connection, "SELECT DISTINCT toolbox_backend FROM run_summary WHERE toolbox_backend IS NOT NULL ORDER BY toolbox_backend", self.http_limits)?,
+            "toolbox_ids": distinct_values(&connection, "SELECT DISTINCT toolbox_id FROM run_summary WHERE toolbox_id IS NOT NULL ORDER BY toolbox_id", self.http_limits)?,
+            "compute_apis": distinct_values(&connection, "SELECT DISTINCT compute_api FROM run_summary WHERE compute_api IS NOT NULL ORDER BY compute_api", self.http_limits)?,
             "workloads": distinct_values(&connection, "SELECT DISTINCT workload FROM run_summary ORDER BY workload", self.http_limits)?,
             "quant_names": distinct_values(&connection, "SELECT DISTINCT quant_name FROM run_summary ORDER BY quant_name", self.http_limits)?,
             "speculator_types": distinct_values(&connection, "SELECT DISTINCT speculator_type FROM run_summary WHERE speculator_type IS NOT NULL ORDER BY speculator_type", self.http_limits)?,
@@ -2858,7 +3001,7 @@ impl BenchmarkStore {
         query.per_page = MAX_PAGE_SIZE;
         let mut output = BoundedBuffer::new(MAX_RESPONSE_BYTES);
         if format == "csv" {
-            output.append(b"run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n")?;
+            output.append(b"run_id,status,repetition,experiment_hash,family,architecture,quant_name,fork_name,backend,toolbox_backend,toolbox_id,compute_api,context_tokens,workload,prompt_tps,generation_tps,ttft_ms,peak_rss_bytes,peak_vram_bytes,speculator_type,acceptance_rate,started_at,ended_at,failure_reason,disk_bytes,quality_score\n")?;
         }
         loop {
             let page = bounded.query_runs_connection(&transaction, &query)?;
@@ -2882,6 +3025,9 @@ impl BenchmarkStore {
                         run.quant_name,
                         run.fork_name,
                         run.backend,
+                        run.toolbox_backend.unwrap_or_default(),
+                        run.toolbox_id.unwrap_or_default(),
+                        run.compute_api.unwrap_or_default(),
                         run.context_tokens.to_string(),
                         run.workload,
                         option_string(run.prompt_tps),
@@ -3028,6 +3174,36 @@ fn ensure_fingerprint<T: Serialize>(
     Ok(())
 }
 
+/// Ensures a `toolbox_catalog_snapshot` row exists for `snapshot_id` *only*
+/// when it matches the catalog embedded in this binary
+/// ([`toolbox_catalog::vendored_catalog_snapshot`]) — in that case the exact
+/// vendored content is known and safe to anchor. For any other id (an older
+/// or otherwise different snapshot), this deliberately does nothing: it does
+/// not fabricate unknown snapshot content. If the referenced row doesn't
+/// already exist, the subsequent `serving_runtimes` insert's foreign key
+/// constraint surfaces a clear `BenchmarkError::Conflict` instead of
+/// silently succeeding with invented data (design doc §7a).
+fn ensure_catalog_snapshot(
+    transaction: &Transaction<'_>,
+    snapshot_id: &str,
+) -> BenchmarkResult<()> {
+    let vendored = toolbox_catalog::vendored_catalog_snapshot();
+    if snapshot_id != vendored.id {
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO toolbox_catalog_snapshot(id,models_json,toolboxes_json,source_commit)
+         VALUES (?1,?2,?3,?4)",
+        params![
+            vendored.id,
+            vendored.models_json,
+            vendored.toolboxes_json,
+            vendored.source_commit,
+        ],
+    )?;
+    Ok(())
+}
+
 fn parse_json(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
 }
@@ -3119,20 +3295,23 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
         quant_name: row.get(6)?,
         fork_name: row.get(7)?,
         backend: row.get(8)?,
-        context_tokens: row.get(9)?,
-        workload: row.get(10)?,
-        prompt_tps: row.get(11)?,
-        generation_tps: row.get(12)?,
-        ttft_ms: row.get(13)?,
-        peak_rss_bytes: row.get(14)?,
-        peak_vram_bytes: row.get(15)?,
-        speculator_type: row.get(16)?,
-        acceptance_rate: row.get(17)?,
-        started_at: row.get(18)?,
-        ended_at: row.get(19)?,
-        failure_reason: row.get(20)?,
-        disk_bytes: row.get(21)?,
-        quality_score: row.get(22)?,
+        toolbox_backend: row.get(9)?,
+        toolbox_id: row.get(10)?,
+        compute_api: row.get(11)?,
+        context_tokens: row.get(12)?,
+        workload: row.get(13)?,
+        prompt_tps: row.get(14)?,
+        generation_tps: row.get(15)?,
+        ttft_ms: row.get(16)?,
+        peak_rss_bytes: row.get(17)?,
+        peak_vram_bytes: row.get(18)?,
+        speculator_type: row.get(19)?,
+        acceptance_rate: row.get(20)?,
+        started_at: row.get(21)?,
+        ended_at: row.get(22)?,
+        failure_reason: row.get(23)?,
+        disk_bytes: row.get(24)?,
+        quality_score: row.get(25)?,
     })
 }
 
@@ -3143,6 +3322,9 @@ fn query_where(query: &RunQuery) -> (String, Vec<SqlValue>) {
         ("rs.status", query.status.as_ref()),
         ("rs.family", query.family.as_ref()),
         ("rs.backend", query.backend.as_ref()),
+        ("rs.toolbox_backend", query.toolbox_backend.as_ref()),
+        ("rs.toolbox_id", query.toolbox_id.as_ref()),
+        ("rs.compute_api", query.compute_api.as_ref()),
         ("rs.workload", query.workload.as_ref()),
         ("rs.quant_name", query.quant_name.as_ref()),
         ("rs.speculator_type", query.speculator_type.as_ref()),
@@ -3354,6 +3536,7 @@ fn html_response(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolbox_catalog::SupportedServingBackend;
 
     pub(super) struct TestStore {
         pub(super) store: BenchmarkStore,
@@ -3428,6 +3611,7 @@ mod tests {
                 container_digest: None,
                 built_at: now,
             },
+            serving_runtime: None,
             hardware: HardwareProfile {
                 id: "hardware-1".into(),
                 hostname_hash: None,
@@ -3461,6 +3645,7 @@ mod tests {
                 id: "experiment-1".into(),
                 artifact_id: "artifact-1".into(),
                 runtime_id: "runtime-1".into(),
+                serving_runtime_id: None,
                 hardware_id: "hardware-1".into(),
                 workload_id: "workload-1".into(),
                 context_tokens: 131_072,
@@ -3533,6 +3718,8 @@ mod tests {
             "quality_results",
             "telemetry_samples",
             "benchmark_jobs",
+            "toolbox_catalog_snapshot",
+            "serving_runtimes",
         ] {
             assert!(tables.iter().any(|name| name == table), "missing {table}");
         }
@@ -3542,7 +3729,7 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            2
+            3
         );
         assert!(connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
@@ -3590,15 +3777,61 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            2
+            3
         );
-        assert!(connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_jobs')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap());
+        for table in [
+            "benchmark_jobs",
+            "toolbox_catalog_snapshot",
+            "serving_runtimes",
+        ] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        params![table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "missing {table} after upgrade from version 1"
+            );
+        }
+        drop(connection);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    #[test]
+    fn version_two_registry_is_upgraded_to_serving_dimension_schema() {
+        let path = std::env::temp_dir().join(format!("brainrouter-bench-v2-{}.sqlite3", new_id()));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_0001).unwrap();
+        connection.execute_batch(MIGRATION_0002).unwrap();
+        drop(connection);
+
+        let store = BenchmarkStore::open(&path).unwrap();
+        let connection = store.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            3
+        );
+        for table in ["toolbox_catalog_snapshot", "serving_runtimes"] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        params![table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "missing {table} after upgrade from version 2"
+            );
+        }
         drop(connection);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
@@ -3767,6 +4000,120 @@ mod tests {
             .unwrap();
         assert!(csv.contains("run-a"));
         assert!(csv.contains("run-b"));
+    }
+
+    #[test]
+    fn serving_runtime_ingest_populates_toolbox_dimensions_end_to_end() {
+        let test = test_store();
+        let mut run = bundle("run-ds4", 0, RunStatus::Succeeded);
+        let snapshot = toolbox_catalog::vendored_catalog_snapshot();
+        run.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-1".into(),
+            toolbox_backend: SupportedServingBackend::Ds4,
+            toolbox_id: "ds4-rocm".into(),
+            compute_api: Backend::Rocm,
+            container_image: "docker.io/kyuz0/amd-r9700-ai-toolboxes:ds4".into(),
+            catalog_snapshot_id: snapshot.id.clone(),
+            metadata: BTreeMap::new(),
+        });
+        run.experiment.serving_runtime_id = Some("serving-runtime-1".into());
+        test.store.ingest(&run).unwrap();
+
+        let page = test
+            .store
+            .query_runs(&RunQuery::parse(Some("toolbox_backend=ds4")).unwrap())
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].toolbox_backend.as_deref(), Some("ds4"));
+        assert_eq!(page.items[0].toolbox_id.as_deref(), Some("ds4-rocm"));
+        assert_eq!(page.items[0].compute_api.as_deref(), Some("rocm"));
+
+        let unrelated = test
+            .store
+            .query_runs(&RunQuery::parse(Some("toolbox_backend=vllm")).unwrap())
+            .unwrap();
+        assert_eq!(unrelated.total, 0);
+
+        let options = test.store.filter_options().unwrap();
+        assert_eq!(options["toolbox_backends"], json!(["ds4"]));
+        assert_eq!(options["toolbox_ids"], json!(["ds4-rocm"]));
+        assert_eq!(options["compute_apis"], json!(["rocm"]));
+
+        let detail = test.store.run_detail("run-ds4").unwrap();
+        assert_eq!(
+            detail["configuration"]["serving_runtime"]["toolbox_backend"],
+            "ds4"
+        );
+        assert_eq!(
+            detail["configuration"]["serving_runtime"]["container_image"],
+            "docker.io/kyuz0/amd-r9700-ai-toolboxes:ds4"
+        );
+
+        let csv = test
+            .store
+            .export_runs(RunQuery::parse(None).unwrap(), "csv")
+            .unwrap();
+        assert!(csv.contains("ds4,ds4-rocm,rocm"));
+    }
+
+    #[test]
+    fn run_without_serving_runtime_leaves_toolbox_dimensions_null() {
+        let test = test_store();
+        let run = bundle("run-plain", 0, RunStatus::Succeeded);
+        test.store.ingest(&run).unwrap();
+        let page = test
+            .store
+            .query_runs(&RunQuery::parse(None).unwrap())
+            .unwrap();
+        assert_eq!(page.items[0].toolbox_backend, None);
+        assert_eq!(page.items[0].toolbox_id, None);
+        assert_eq!(page.items[0].compute_api, None);
+    }
+
+    #[test]
+    fn experiment_serving_runtime_id_must_match_bundle_serving_runtime() {
+        let test = test_store();
+        let mut mismatched_id = bundle("run-mismatch", 0, RunStatus::Succeeded);
+        mismatched_id.experiment.serving_runtime_id = Some("nonexistent".into());
+        assert!(matches!(
+            test.store.ingest(&mismatched_id),
+            Err(BenchmarkError::Validation(_))
+        ));
+
+        let mut missing_id = bundle("run-missing-id", 0, RunStatus::Succeeded);
+        missing_id.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-2".into(),
+            toolbox_backend: SupportedServingBackend::Vllm,
+            toolbox_id: "vllm-toolbox".into(),
+            compute_api: Backend::Cuda,
+            container_image: "example/vllm:latest".into(),
+            catalog_snapshot_id: toolbox_catalog::vendored_catalog_snapshot().id,
+            metadata: BTreeMap::new(),
+        });
+        assert!(matches!(
+            test.store.ingest(&missing_id),
+            Err(BenchmarkError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn serving_runtime_referencing_unknown_catalog_snapshot_is_rejected() {
+        let test = test_store();
+        let mut run = bundle("run-bad-snapshot", 0, RunStatus::Succeeded);
+        run.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-3".into(),
+            toolbox_backend: SupportedServingBackend::Vllm,
+            toolbox_id: "vllm-toolbox".into(),
+            compute_api: Backend::Cuda,
+            container_image: "example/vllm:latest".into(),
+            catalog_snapshot_id: "not-the-embedded-snapshot".into(),
+            metadata: BTreeMap::new(),
+        });
+        run.experiment.serving_runtime_id = Some("serving-runtime-3".into());
+        assert!(matches!(
+            test.store.ingest(&run),
+            Err(BenchmarkError::Conflict(_)) | Err(BenchmarkError::Database(_))
+        ));
     }
 
     #[test]

@@ -68,6 +68,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:0;color:var(
       <label>Search<input id="q" placeholder="Model, runtime, workload, run ID" type="search"></label>
       <label>Family<select id="family"><option value="">All families</option></select></label>
       <label>Backend<select id="backend"><option value="">All backends</option></select></label>
+      <label>Toolbox backend<select id="toolbox_backend"><option value="">All toolbox backends</option></select></label>
+      <label>Compute API<select id="compute_api"><option value="">All compute APIs</option></select></label>
       <label>Workload<select id="workload"><option value="">All workloads</option></select></label>
       <label>Quantization<select id="quant_name"><option value="">All quantizations</option></select></label>
       <label>Status<select id="status"><option value="">All statuses</option></select></label>
@@ -305,7 +307,7 @@ async function cancelLabJob(id){
 }
 function params(includePage=true){
   const p=new URLSearchParams();
-  for(const id of ['q','family','backend','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
+  for(const id of ['q','family','backend','toolbox_backend','compute_api','workload','quant_name','status']){const value=byId(id).value.trim();if(value)p.set(id,value)}
   const [sort,order]=byId('sort').value.split(':');p.set('sort',sort);p.set('order',order);
   if(includePage){p.set('page',state.page);p.set('per_page',state.perPage)}return p;
 }
@@ -314,7 +316,7 @@ function optionList(id,values){
   for(const value of values){const option=el('option',value);option.value=value;select.append(option)}
   if(values.includes(selected))select.value=selected;
 }
-async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');for(const [id,key] of [['family','families'],['backend','backends'],['workload','workloads'],['quant_name','quant_names'],['status','statuses']])optionList(id,f[key])}
+async function loadFilters(){const f=await jsonFetch('/api/benchmarks/filters');for(const [id,key] of [['family','families'],['backend','backends'],['toolbox_backend','toolbox_backends'],['compute_api','compute_apis'],['workload','workloads'],['quant_name','quant_names'],['status','statuses']])optionList(id,f[key])}
 async function load(){
   const generation=++loadGeneration;message('message','Loading runs…');byId('prev').disabled=true;byId('next').disabled=true;
   state.items=[];renderTable([]);renderAnalytics([],0);byId('kpi-runs').textContent='—';byId('page-label').textContent='';
@@ -667,7 +669,7 @@ byId('detail-retry').onclick=()=>showDetail(detailId);
 byId('detail-download').onclick=()=>{if(detailRawText!==null)downloadText(detailRawText,'benchmark-run-detail.json')};
 byId('memory-metric').onchange=()=>drawScatter(state.items);
 for(const format of ['jsonl','csv'])byId('export-'+format).onclick=()=>{const p=params(false);p.set('format',format);location.href='/api/benchmarks/export?'+p};
-for(const id of ['family','backend','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
+for(const id of ['family','backend','toolbox_backend','compute_api','workload','quant_name','status','sort'])byId(id).onchange=()=>{state.page=1;load()};
 let searchTimer;byId('q').oninput=()=>{clearTimeout(searchTimer);loadGeneration++;searchTimer=setTimeout(()=>{state.page=1;load()},250)};
 byId('prev').onclick=()=>{if(state.page>1){state.page--;load()}};byId('next').onclick=()=>{if(state.page<state.totalPages){state.page++;load()}};
 byId('reload').onclick=load;

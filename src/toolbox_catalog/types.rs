@@ -189,6 +189,32 @@ impl From<SupportedServingBackend> for CatalogBackendId {
     }
 }
 
+/// Hand-written (not derived) so that an unsupported id — `comfyui` or any
+/// unrecognized future backend — is rejected at deserialize time with a
+/// clear error, rather than silently landing in a generic `Other` variant
+/// (`SupportedServingBackend`, unlike `CatalogBackendId`, has none). Used by
+/// [`crate::benchmark::ServingRuntimeDefinition`] so that out-of-scope
+/// backend ids can never enter a benchmark ingest bundle.
+impl Serialize for SupportedServingBackend {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SupportedServingBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let catalog_id = CatalogBackendId::from_str(&raw);
+        SupportedServingBackend::try_from(&catalog_id).map_err(serde::de::Error::custom)
+    }
+}
+
 /// `toolboxes.json`'s lifecycle-maturity vocabulary. Closed sets (unlike
 /// backend ids) because these are brainrouter/cockpit's own UI vocabulary,
 /// not upstream identity that needs future-proofing.
