@@ -967,6 +967,23 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── PR8: halogen Server Mode (§13) ────────────────────────────────────
+        ("GET", "/api/server-mode/halogen/status") => {
+            let resp = server_mode_halogen_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/halogen/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_halogen_start_response(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/halogen/stop") => {
+            let resp = server_mode_halogen_stop_response().await;
+            into_unsync(resp)
+        }
+
         // ── PR3: cockpit config.json Phase-1 read + explicit apply (§4) ─────
         ("GET", "/api/cockpit-config") => {
             let resp = cockpit_config_status_response().await;
@@ -3089,7 +3106,7 @@ pub async fn server_mode_ds4_status_response() -> Response<Full<Bytes>> {
 /// `POST /api/server-mode/ds4/start` — body:
 /// `{"toolbox_id": "...", "model_id": "...", "ctx": <n>, "host": "...", "port": <n>, "custom_args": "..."}`.
 pub async fn server_mode_ds4_start_response(body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::StartServerRequest = match serde_json::from_slice(body) {
+    let request: crate::server_mode::StartDs4ServerRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
             return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
@@ -3115,6 +3132,54 @@ pub async fn server_mode_ds4_stop_response() -> Response<Full<Bytes>> {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
             "status": "ok",
             "message": "ds4 server stopped.",
+        })),
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+// ── PR8: halogen Server Mode (§13) ────────────────────────────────────────
+
+/// `GET /api/server-mode/halogen/status` — always reads live `podman
+/// inspect` state, same no-persisted-registry contract as ds4's status
+/// endpoint above.
+pub async fn server_mode_halogen_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::halogen_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/halogen/start` — body:
+/// `{"toolbox_id": "...", "bundle_id": "...", "host": "...", "port": <n>,
+/// "context_size": <n>, "kv_pool_positions": <n>, "kv_slots": <n>,
+/// "prompt_cache": "0"|"1"|"2"}`.
+pub async fn server_mode_halogen_start_response(body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartHalogenServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_halogen_server(&request).await {
+        Ok(()) => {
+            let status = crate::server_mode::halogen_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/halogen/stop` — graceful `podman stop` then
+/// `podman rm -f`, idempotent if the container is already gone.
+pub async fn server_mode_halogen_stop_response() -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_halogen_server().await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "message": "halogen server stopped.",
         })),
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),

@@ -437,6 +437,21 @@ impl ToolboxCatalog {
     pub fn platform_by_id(&self, id: &str) -> Option<&Platform> {
         self.platforms.iter().find(|p| p.id == id)
     }
+
+    /// Which platform, if any, lists `toolbox_id` in its `toolbox_ids` —
+    /// needed by backends whose own upstream command builder validates a
+    /// `platform_id` directly (e.g. halogen's `runner.py::build_server_cmd`,
+    /// which only accepts `"strix-halo"` and has no other way to learn the
+    /// caller's platform). Every vendored platform's `toolbox_ids` is
+    /// disjoint today, so the first match is the only match in practice;
+    /// this returns the first match regardless, rather than asserting
+    /// uniqueness.
+    pub fn platform_id_for_toolbox(&self, toolbox_id: &str) -> Option<&str> {
+        self.platforms
+            .iter()
+            .find(|p| p.toolbox_ids.iter().any(|id| id == toolbox_id))
+            .map(|p| p.id.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +571,12 @@ mod tests {
             platform.defaults.get("llama_cpp").map(String::as_str),
             Some("strix-halo-llama-rocm-10-0")
         );
+    }
+
+    #[test]
+    fn platform_id_for_toolbox_finds_the_owning_platform() {
+        let catalog = ToolboxCatalog::parse(&vendored_toolboxes()).unwrap();
+        assert_eq!(catalog.platform_id_for_toolbox("strix-halo-llama-rocm-10-0"), Some("strix-halo"));
+        assert_eq!(catalog.platform_id_for_toolbox("no-such-toolbox"), None);
     }
 }

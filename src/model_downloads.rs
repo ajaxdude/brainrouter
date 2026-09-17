@@ -493,7 +493,56 @@ pub fn resolve_downloaded_ds4_model(model_id: &str) -> Result<ResolvedDs4Model, 
     Ok(ResolvedDs4Model { models_dir, filename: m.filename.clone() })
 }
 
+/// An already-downloaded halogen catalog bundle's on-disk location,
+/// resolved for PR8's Server Mode — analogous to [`ResolvedDs4Model`] but
+/// shaped for halogen's multi-file "HGN bundle" (a checkpoint + precision
+/// overlay + flat tokenizer, optionally a vision tower), matching what
+/// upstream's `runner.py::build_server_cmd()` reads off its own `bundle`
+/// dict (`bundle['checkpoint']`/`bundle['overlay']`/`bundle['tokenizer_dir']`/
+/// `bundle.get('vision_tower')`) to build the `HALOGEN_*` env vars.
+pub struct ResolvedHalogenBundle {
+    pub models_dir: PathBuf,
+    pub checkpoint: String,
+    pub overlay: String,
+    pub tokenizer_dir: String,
+    /// Only 2 of the 4 vendored bundles carry this (the "+vision" variants)
+    /// — absent for the other 2, mirroring upstream's `bundle.get(...)`
+    /// (not a required key).
+    pub vision_tower: Option<String>,
+}
 
+/// Resolves `bundle_id` (a halogen catalog entry id) to its on-disk
+/// location, rejecting the request if the bundle is unknown or any of its
+/// manifest files is missing/incomplete — mirrors upstream's own
+/// `incomplete_files(bundle, directory)` gate inside `build_server_cmd`,
+/// which raises before ever constructing the podman command.
+pub fn resolve_downloaded_halogen_bundle(bundle_id: &str) -> Result<ResolvedHalogenBundle, DownloadError> {
+    let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::Halogen, bundle_id)?;
+    let ModelPayload::Halogen(m) = &payload else {
+        return Err(DownloadError::Internal(
+            "halogen catalog entry did not carry a Halogen payload".to_string(),
+        ));
+    };
+    let models_dir = effective_models_dir(SupportedServingBackend::Halogen, &storage);
+    let built = build_download(SupportedServingBackend::Halogen, &payload, &models_dir, None)?;
+    match check_completeness(&built.expected_files, &built.destination) {
+        CompletenessResult::Complete => {}
+        other => {
+            return Err(DownloadError::Validation(format!(
+                "halogen bundle `{bundle_id}` is not fully downloaded yet ({other:?}) — download it \
+                 first via the Models tab before starting a server for it"
+            )));
+        }
+    }
+    let vision_tower = m.extra.get("vision_tower").and_then(serde_json::Value::as_str).map(str::to_string);
+    Ok(ResolvedHalogenBundle {
+        models_dir,
+        checkpoint: m.checkpoint.clone(),
+        overlay: m.overlay.clone(),
+        tokenizer_dir: m.tokenizer_dir.clone(),
+        vision_tower,
+    })
+}
 
 /// Streaming SHA256 verification for a backend's catalog entry (only
 /// meaningful when its files carry `sha256` — today, only `r9v`; mirrors

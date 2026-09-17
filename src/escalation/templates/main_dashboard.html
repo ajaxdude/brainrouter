@@ -561,21 +561,27 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
     </div>
 
-    <!-- PR7: ds4 Server Mode (design doc §11/§12) — headless detached
-         `podman run` servers, structurally distinct from the Toolboxes tab
-         above (`toolbox create` dev-shells never receive engine_args; only
-         Server Mode's plain `podman run` does). v1 scope: ds4 only, single
-         instance, standalone (single-node) launch — multi-node/DSpark/
-         SSD-streaming/MTP are reachable via the custom-args escape hatch. -->
+    <!-- PR7/PR8: ds4 + halogen Server Mode (design doc §11/§12/§13) —
+         headless detached `podman run` servers, structurally distinct from
+         the Toolboxes tab above (`toolbox create` dev-shells never receive
+         engine_args; only Server Mode's plain `podman run` does). Backend
+         tabs mirror the Downloads view's #toolbox-models-backend-tabs
+         pattern. ds4: single instance, standalone (single-node) launch —
+         multi-node/DSpark/SSD-streaming/MTP are reachable via the
+         custom-args escape hatch. halogen: bundle-based model resolution,
+         env-var-only launch shape, no custom_args (upstream has none). -->
     <div id="server-mode-view" style="display:none;max-width:900px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+        <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
+      </div>
       <div style="font-size:11px;color:var(--textMute);margin-bottom:14px">
-        Launch a headless ds4 inference server directly from an already-downloaded model — no cockpit install required.
-        v1 covers ds4 only, one instance at a time, standalone (single-node) mode. Multi-node roles, DSpark,
-        SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args field below —
-        see the design doc §12.
+        Launch a headless inference server directly from an already-downloaded model — no cockpit install required.
+        v1 covers ds4 and halogen, one instance per backend at a time, standalone (single-node) mode. ds4's multi-node
+        roles, DSpark, SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args
+        field below — see the design doc §12/§13.
       </div>
 
-      <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+      <div id="sm-panel-ds4" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
         <div style="font-size:13px;font-weight:600;margin-bottom:10px">ds4 server</div>
         <div style="display:flex;flex-direction:column;gap:8px">
           <label style="font-size:11px;color:var(--textMute)">Toolbox
@@ -607,7 +613,58 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
 
       <div id="sm-ds4-status" style="font-size:12px;color:var(--textMute)">Loading status…</div>
+
+      <!-- PR8: halogen Server Mode (§13). Bundle-based model resolution
+           (checkpoint + overlay + tokenizer_dir, optional vision_tower) and
+           an env-var-only in-container launch shape (no CLI args, no
+           custom_args escape hatch — upstream's own builder has none to
+           mirror), unlike ds4's CLI-flag/custom_args shape above. -->
+      <div id="sm-panel-halogen" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">halogen server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-halogen-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Bundle (already downloaded)
+            <select id="sm-halogen-bundle" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context size
+              <input id="sm-halogen-ctx" type="number" value="65536" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-halogen-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-halogen-port" type="number" value="8001" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV pool positions
+              <input id="sm-halogen-kv-pool" type="number" value="65536" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">KV slots
+              <input id="sm-halogen-kv-slots" type="number" value="1" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Prompt cache
+              <select id="sm-halogen-prompt-cache" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+                <option value="0">0 — off</option>
+                <option value="1">1 — exact-repeat reuse</option>
+                <option value="2" selected>2 — fast prefix reuse (default)</option>
+              </select>
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startHalogenServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopHalogenServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-halogen-status" style="display:none;font-size:12px;color:var(--textMute)">Loading status…</div>
     </div>
+
 
   </div><!-- /content -->
 </div><!-- /main -->
@@ -2806,31 +2863,60 @@ function scheduleToolboxModelsPoll() {
   }
 }
 
-// ─── PR7: ds4 Server Mode (design doc §11/§12) ──────────────────────────────
+// ─── PR7/PR8: ds4 + halogen Server Mode (design doc §11/§12/§13) ───────────
 // Headless detached `podman run` servers — structurally distinct from the
-// Toolboxes-tab dev-shells above. v1: ds4 only, single instance, standalone
+// Toolboxes-tab dev-shells above. One instance per backend, standalone
 // launch. Lifecycle is synchronous request/response (no job registry like
 // the downloads above) — `status` always reflects live `podman inspect`
 // state, matching src/server_mode.rs's "no persisted state" design.
+const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen'];
+let serverModeActiveBackend = 'ds4';
 let serverModeStatus = null;
+let serverModeHalogenStatus = null;
+
+function renderServerModeBackendTabs() {
+  const el = document.getElementById('server-mode-backend-tabs');
+  if (!el) return;
+  el.innerHTML = SERVER_MODE_CAPABLE_BACKENDS.map(b => {
+    const active = b === serverModeActiveBackend;
+    const label = TOOLBOX_BACKEND_LABELS[b] || b;
+    return `<button onclick="setServerModeBackend(${JSON.stringify(b)})" style="font-size:11px;padding:5px 12px;border-radius:6px;border:1px solid var(--border);cursor:pointer;background:${active ? 'var(--bg3)' : 'var(--panel)'};color:${active ? 'var(--cyan)' : 'var(--textDim)'}">${escHtml(label)}</button>`;
+  }).join('');
+}
+
+function setServerModeBackend(backend) {
+  serverModeActiveBackend = backend;
+  renderServerModeBackendTabs();
+  document.getElementById('sm-panel-ds4').style.display = backend === 'ds4' ? 'block' : 'none';
+  document.getElementById('sm-ds4-status').style.display = backend === 'ds4' ? 'block' : 'none';
+  document.getElementById('sm-panel-halogen').style.display = backend === 'halogen' ? 'block' : 'none';
+  document.getElementById('sm-halogen-status').style.display = backend === 'halogen' ? 'block' : 'none';
+}
 
 async function loadServerMode() {
   // Reuses toolboxCatalogData (loaded by refreshSlow()) for the toolbox
-  // dropdown, and fetches the model catalog + local-presence sweep fresh
+  // dropdowns, and fetches the model catalog + local-presence sweep fresh
   // (same endpoints the Downloads view uses) to list only already-
-  // downloaded ds4 models — starting a server needs a complete model on
-  // disk, not just a catalog entry.
-  const [modelsRes, statusRes, serverStatusRes] = await Promise.all([
+  // downloaded models per backend — starting a server needs a complete
+  // model/bundle on disk, not just a catalog entry.
+  renderServerModeBackendTabs();
+  setServerModeBackend(serverModeActiveBackend);
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes] = await Promise.all([
     safeFetch('/api/toolbox-models'),
     safeFetch('/api/model-downloads/status'),
     safeFetch('/api/server-mode/ds4/status'),
+    safeFetch('/api/server-mode/halogen/status'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
   if (statusRes) toolboxModelPresence = statusRes.models || [];
-  if (serverStatusRes) serverModeStatus = serverStatusRes;
+  if (ds4StatusRes) serverModeStatus = ds4StatusRes;
+  if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
   renderServerModeToolboxOptions();
   renderServerModeModelOptions();
   renderServerModeStatus();
+  renderServerModeHalogenToolboxOptions();
+  renderServerModeHalogenBundleOptions();
+  renderServerModeHalogenStatus();
 }
 
 function renderServerModeToolboxOptions() {
@@ -2903,6 +2989,92 @@ async function startDs4Server() {
 async function stopDs4Server() {
   try {
     const r = await fetch('/api/server-mode/ds4/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+// PR8: halogen Server Mode (§13). Bundle-based model resolution instead of
+// ds4's single flat file, and no custom_args field — upstream's own
+// builder has nothing equivalent to mirror (every tunable is an env var
+// already exposed as its own form field above).
+function renderServerModeHalogenToolboxOptions() {
+  const el = document.getElementById('sm-halogen-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const halogenToolboxes = allToolboxes.filter(tb => tb.backend === 'halogen' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('halogen');
+  el.innerHTML = halogenToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (halogenToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeHalogenBundleOptions() {
+  const el = document.getElementById('sm-halogen-bundle');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'halogen');
+  const entries = (bc && bc.entries) || [];
+  const complete = entries.filter(e => {
+    const p = presenceFor('halogen', e.id);
+    return p && p.completeness && p.completeness.kind === 'complete';
+  });
+  const previouslySelected = el.value;
+  if (!complete.length) {
+    el.innerHTML = '<option value="">No downloaded halogen bundles — use Downloads to fetch one first</option>';
+    return;
+  }
+  el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (complete.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeHalogenStatus() {
+  const el = document.getElementById('sm-halogen-status');
+  if (!el || !serverModeHalogenStatus) return;
+  if (!serverModeHalogenStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeHalogenStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeHalogenStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const bundleLabel = serverModeHalogenStatus.model_id ? ' · bundle: ' + escHtml(serverModeHalogenStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${bundleLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeHalogenStatus.container_name)})</span>`;
+}
+
+async function startHalogenServer() {
+  const toolboxId = document.getElementById('sm-halogen-toolbox').value;
+  const bundleId = document.getElementById('sm-halogen-bundle').value;
+  const host = document.getElementById('sm-halogen-host').value;
+  const port = parseInt(document.getElementById('sm-halogen-port').value, 10);
+  const contextSize = parseInt(document.getElementById('sm-halogen-ctx').value, 10);
+  const kvPoolPositions = parseInt(document.getElementById('sm-halogen-kv-pool').value, 10);
+  const kvSlots = parseInt(document.getElementById('sm-halogen-kv-slots').value, 10);
+  const promptCache = document.getElementById('sm-halogen-prompt-cache').value;
+  if (!toolboxId || !bundleId) { alert('Pick a toolbox and an already-downloaded bundle first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/halogen/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolbox_id: toolboxId, bundle_id: bundleId, host, port,
+        context_size: contextSize, kv_pool_positions: kvPoolPositions,
+        kv_slots: kvSlots, prompt_cache: promptCache,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeHalogenStatus = j;
+    renderServerModeHalogenStatus();
+  } catch (e) {}
+}
+
+async function stopHalogenServer() {
+  try {
+    const r = await fetch('/api/server-mode/halogen/stop', { method: 'POST' });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
   } catch (e) {}

@@ -232,6 +232,29 @@ pub fn apply_active_platform(platform_id: &str) -> Result<(), ApplyError> {
     })
 }
 
+/// Merges arbitrary `backends.<backend_id>` key/value pairs (PR8+), same
+/// reload-verify-write contract as [`apply_default_toolbox`]. Every value
+/// lands in [`BackendSettings::extra`] via serde's `#[serde(flatten)]` —
+/// there is no per-backend Rust-typed field for these (e.g. halogen's
+/// `host`/`port`/`context`/`pool`/`slots`/`prompt_cache`/`bundle_id`,
+/// mirroring upstream's own `save_backend_settings(backend_id, {...})`
+/// call in `*/server.py::_start_confirmed()`), unlike `default_toolboxes`/
+/// `models_dir` which are cockpit-schema-stable enough to model explicitly.
+/// Callers should pass [`Value::String`] for every value (even numeric
+/// ones) to match upstream's own storage shape exactly — cockpit's own
+/// `Input` widgets save `.value` as a plain string, never a JSON number.
+pub fn apply_backend_setting_values(
+    backend_id: &str,
+    updates: Vec<(&str, Value)>,
+) -> Result<(), ApplyError> {
+    apply(|cfg| {
+        let backend = cfg.backends.entry(backend_id.to_string()).or_default();
+        for (key, value) in updates {
+            backend.extra.insert(key.to_string(), value);
+        }
+    })
+}
+
 fn apply(mutate: impl FnOnce(&mut CockpitConfig)) -> Result<(), ApplyError> {
     let path = config_path();
     let dir = path
@@ -433,5 +456,53 @@ mod tests {
         let cfg: CockpitConfig = serde_json::from_str("{}").expect("parses");
         assert_eq!(cfg.hf_token, None);
         assert_eq!(cfg.models_dir("llama_cpp"), None);
+    }
+
+    #[test]
+    fn backend_setting_values_merge_into_extra_and_round_trip() {
+        // Same "exercise the mutate-and-write-atomic core directly" pattern
+        // as apply_default_toolbox_preserves_unrelated_keys_round_trip
+        // (apply()'s own config_path() lookup isn't overridable in-process)
+        // — this asserts apply_backend_setting_values' actual merge
+        // semantics: unknown key/value pairs land in BackendSettings::extra
+        // (there's no typed `host`/`port`/etc. field) and never clobber
+        // sibling backends or already-set typed fields on the same backend.
+        let dir = std::env::temp_dir().join(format!("brainrouter-cockpit-config-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"backends":{"halogen":{"models_dir":"/data/halogen-models"},"ds4":{"default_toolboxes":{"strix-halo":"strix-halo-ds4-rocm-10-0"}}}}"#,
+        )
+        .expect("seed file");
+
+        let mut cfg: CockpitConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let backend = cfg.backends.entry("halogen".to_string()).or_default();
+        for (key, value) in [
+            ("host", Value::String("127.0.0.1".to_string())),
+            ("port", Value::String("8731".to_string())),
+            ("bundle_id", Value::String("qwen38-flash-next-w4b-quality".to_string())),
+        ] {
+            backend.extra.insert(key.to_string(), value);
+        }
+        write_atomic(&path, &cfg).expect("atomic write");
+
+        let written: CockpitConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let halogen = &written.backends["halogen"];
+        assert_eq!(halogen.extra.get("host"), Some(&Value::String("127.0.0.1".to_string())));
+        assert_eq!(halogen.extra.get("port"), Some(&Value::String("8731".to_string())));
+        assert_eq!(
+            halogen.extra.get("bundle_id"),
+            Some(&Value::String("qwen38-flash-next-w4b-quality".to_string()))
+        );
+        // Pre-existing typed field on the same backend and the sibling
+        // backend's own settings both survive untouched.
+        assert_eq!(halogen.models_dir.as_deref(), Some("/data/halogen-models"));
+        assert_eq!(
+            written.default_toolbox("ds4", "strix-halo"),
+            Some("strix-halo-ds4-rocm-10-0")
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
