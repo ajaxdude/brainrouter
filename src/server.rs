@@ -237,6 +237,9 @@ async fn handle_request(
         // PR2 §5c) — prefix-gated like /api/upgrade/ so a future sub-path under
         // this same prefix is never accidentally left ungated.
         || (method == "POST" && path.starts_with("/api/toolbox-containers"))
+        // PR3: cockpit config.json explicit "apply" writes (§4) — these write
+        // to a file outside brainrouter's own state, so gate them the same way.
+        || (method == "POST" && path.starts_with("/api/cockpit-config/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -897,6 +900,24 @@ async fn handle_request(
         ("POST", p) if p.starts_with("/api/toolbox-containers/") && p.ends_with("/adopt") => {
             let name = p.trim_start_matches("/api/toolbox-containers/").trim_end_matches("/adopt").trim_end_matches('/');
             let resp = adopt_toolbox_container(&state, name).await;
+            into_unsync(resp)
+        }
+
+        // ── PR3: cockpit config.json Phase-1 read + explicit apply (§4) ─────
+        ("GET", "/api/cockpit-config") => {
+            let resp = cockpit_config_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/cockpit-config/default-toolbox") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = apply_cockpit_default_toolbox(&body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/cockpit-config/active-platform") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = apply_cockpit_active_platform(&body_bytes).await;
             into_unsync(resp)
         }
 
@@ -2388,6 +2409,77 @@ pub async fn delete_toolbox_container(state: &AppState, container_name: &str) ->
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
                 error: format!("Failed to exec toolbox: {}", e),
             })
+        }
+    }
+}
+
+// ── PR3: cockpit config.json Phase-1 read + explicit "apply" write (§4) ────
+
+/// `GET /api/cockpit-config` — read-only snapshot of cockpit's shared
+/// config.json, including the resolved path/owner so a HOME/config-path
+/// mismatch between brainrouter and an interactively-run cockpit is
+/// visible in the dashboard rather than silent.
+pub async fn cockpit_config_status_response() -> Response<Full<Bytes>> {
+    json_response(StatusCode::OK, &crate::cockpit_config::load())
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyDefaultToolboxRequest {
+    backend_id: String,
+    platform_id: String,
+    toolbox_id: String,
+}
+
+/// `POST /api/cockpit-config/default-toolbox` — the explicit, user-
+/// triggered single-write "apply" action for one backend's default toolbox
+/// on one platform. Only ever touches
+/// `backends.<backend_id>.default_toolboxes.<platform_id>`; every other key
+/// in the file round-trips untouched (§4).
+pub async fn apply_cockpit_default_toolbox(body: &[u8]) -> Response<Full<Bytes>> {
+    let req: ApplyDefaultToolboxRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::cockpit_config::apply_default_toolbox(&req.backend_id, &req.platform_id, &req.toolbox_id) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" })),
+        Err(crate::cockpit_config::ApplyError::NotAvailable) => {
+            json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: crate::cockpit_config::ApplyError::NotAvailable.to_string() })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to apply cockpit default-toolbox setting");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e.to_string() })
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyActivePlatformRequest {
+    platform_id: String,
+}
+
+/// `POST /api/cockpit-config/active-platform` — same contract as
+/// [`apply_cockpit_default_toolbox`], for the top-level `active_platform` key.
+pub async fn apply_cockpit_active_platform(body: &[u8]) -> Response<Full<Bytes>> {
+    let req: ApplyActivePlatformRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::cockpit_config::apply_active_platform(&req.platform_id) {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" })),
+        Err(crate::cockpit_config::ApplyError::NotAvailable) => {
+            json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: crate::cockpit_config::ApplyError::NotAvailable.to_string() })
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to apply cockpit active-platform setting");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e.to_string() })
         }
     }
 }

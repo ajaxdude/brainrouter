@@ -289,6 +289,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
   </div>
 
   <!-- All toolboxes -->
+  <div id="cockpit-config-status" style="padding:0 12px 4px;font-size:9px;color:var(--textMute);font-family:'JetBrains Mono',monospace;display:none"></div>
   <div id="toolbox-list" style="padding:0 12px;display:flex;flex-direction:column;gap:2px"></div>
 
   <!-- Independent routing roles -->
@@ -2341,6 +2342,10 @@ async function togglePromptRewrite() {
 // actually exists right now", correlated by container_name.
 let toolboxCatalogData = null;
 let toolboxContainersData = null;
+// PR3: cockpit's shared config.json, read-only snapshot (§4). `null` until
+// the first /api/cockpit-config fetch resolves; `config: null` inside it
+// means "file absent" (a normal state, not an error — see `.error` for that).
+let cockpitConfigData = null;
 
 const TOOLBOX_BACKEND_LABELS = {
   llama_cpp: 'llama.cpp',
@@ -2360,6 +2365,48 @@ const TOOLBOX_BACKEND_LABELS = {
 // halo-toolboxes:...`), matching current behavior rather than guessing new
 // behavior. Revisit once Q1 lands real detection.
 const CURRENT_PLATFORM_ID = 'strix-halo';
+
+// PR3 §4: cockpit's own per-backend override (`config.json`'s
+// `backends.<id>.default_toolboxes.<platform>`) takes precedence; the
+// catalog's `platform.defaults[backend]` is only a fallback recommendation
+// when cockpit has no override (or its config.json doesn't exist at all).
+function effectiveDefaultToolbox(backend) {
+  const cfg = cockpitConfigData && cockpitConfigData.config;
+  const override = cfg && cfg.backends && cfg.backends[backend] && cfg.backends[backend].default_toolboxes
+    && cfg.backends[backend].default_toolboxes[CURRENT_PLATFORM_ID];
+  if (override) return override;
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  return (platform && platform.defaults && platform.defaults[backend]) || null;
+}
+
+function renderCockpitConfigStatus() {
+  const el = document.getElementById('cockpit-config-status');
+  if (!el || !cockpitConfigData) return;
+  el.style.display = 'block';
+  if (cockpitConfigData.error) {
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--red)">read error</span>`;
+  } else if (!cockpitConfigData.exists) {
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--textMute)">not found (ai-toolbox-cockpit not installed on this host)</span>`;
+  } else {
+    const plat = (cockpitConfigData.config && cockpitConfigData.config.active_platform) || '—';
+    el.title = cockpitConfigData.path;
+    el.innerHTML = `cockpit config: <span style="color:var(--green)">linked</span> · active_platform=${escHtml(plat)}`;
+  }
+}
+
+async function setDefaultToolbox(backend, toolboxId) {
+  try {
+    await fetch('/api/cockpit-config/default-toolbox', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend_id: backend, platform_id: CURRENT_PLATFORM_ID, toolbox_id: toolboxId }),
+    });
+  } catch (e) {}
+  setTimeout(() => { refreshSlow(); }, 1000);
+}
 
 function renderToolboxes() {
   const el = document.getElementById('toolbox-list');
@@ -2384,15 +2431,23 @@ function renderToolboxes() {
 
   el.innerHTML = order.map(backend => {
     const label = TOOLBOX_BACKEND_LABELS[backend] || backend;
-    const rows = groups[backend].map(tb => renderToolboxRow(tb, byName[tb.container_name])).join('');
+    const defaultId = effectiveDefaultToolbox(backend);
+    const rows = groups[backend].map(tb => renderToolboxRow(tb, byName[tb.container_name], backend, defaultId)).join('');
     return `<div style="padding:6px 0 2px;font-size:9px;letter-spacing:1px;color:var(--textMute);text-transform:uppercase">${escHtml(label)}</div>${rows}`;
   }).join('');
 }
 
-function renderToolboxRow(tb, c) {
+function renderToolboxRow(tb, c, backend, defaultId) {
   const exists = !!c;
   const color = exists ? (c.running ? 'var(--green)' : 'var(--textMute)') : 'var(--border)';
   const name = tb.name || tb.id;
+  const isDefault = defaultId === tb.id;
+  // PR3: star marks the effective default toolbox for this backend+platform
+  // (cockpit config override, or catalog fallback — see effectiveDefaultToolbox);
+  // non-default rows get a click-to-set affordance instead.
+  const star = isDefault
+    ? `<span style="color:var(--amber);font-size:10px" title="Default toolbox for ${escHtml(backend)} on ${escHtml(CURRENT_PLATFORM_ID)}">★</span>`
+    : `<span onclick="event.stopPropagation();setDefaultToolbox(${JSON.stringify(backend)}, ${JSON.stringify(tb.id)})" style="color:var(--border);font-size:10px;cursor:pointer" title="Set as default toolbox for ${escHtml(backend)} on ${escHtml(CURRENT_PLATFORM_ID)}">☆</span>`;
   let right;
   if (!exists) {
     right = `<button onclick="event.stopPropagation();createToolboxContainer(${JSON.stringify(tb.id)})" title="Create container for ${escHtml(name)}"
@@ -2418,10 +2473,12 @@ function renderToolboxRow(tb, c) {
   const sub = exists ? [c.status, c.local_created ? 'built ' + c.local_created : ''].filter(Boolean).join(' · ') : 'not created';
   return `<div style="display:flex;align-items:center;gap:8px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:default" title="${escHtml(tb.container_name)} — ${escHtml(sub)}">
     <span style="width:5px;height:5px;border-radius:99px;background:${color};flex-shrink:0"></span>
+    ${star}
     <span style="color:var(--textDim);flex:1">${escHtml(name)}</span>
     ${right}
   </div>`;
 }
+
 
 async function upgradeIfAvailable(svc) {
   const btn = event && event.target;
@@ -2690,13 +2747,14 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
     safeFetch('/api/prompt-rewrite'),
     safeFetch('/api/toolbox-catalog'),
     safeFetch('/api/toolbox-containers'),
+    safeFetch('/api/cockpit-config'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
@@ -2704,7 +2762,8 @@ async function refreshSlow() {
   if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
   if (catalogRes) { toolboxCatalogData = catalogRes; }
   if (containersRes) { toolboxContainersData = containersRes; }
-  if (catalogRes || containersRes) { renderToolboxes(); }
+  if (cockpitConfigRes) { cockpitConfigData = cockpitConfigRes; renderCockpitConfigStatus(); }
+  if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
 }
 
 // ─── In-flight requests (llama-swap parity) ─────────────────────────────────

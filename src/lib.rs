@@ -5,6 +5,7 @@ pub mod benchmark_lab;
 pub mod daemon_client;
 pub mod bridge;
 pub mod classifier;
+pub mod cockpit_config;
 pub mod config;
 pub mod escalation;
 pub mod inference_state;
