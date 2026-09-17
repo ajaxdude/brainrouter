@@ -49,18 +49,22 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 2. [Configure](#configure)
 3. [Connect your harness](#connect-your-harness)
 4. [Dashboard guide](#dashboard-guide)
-5. [Model observability and regression alerts](#model-observability-and-regression-alerts)
-6. [Benchmark explorer](#benchmark-explorer)
-7. [Headless CLI](#headless-cli-brainrouter-cli)
-8. [MCP code review guide](#mcp-code-review-guide)
-9. [Bridge: Discord and Signal](#bridge-discord-and-signal)
-10. [Reference](#reference)
-11. [Planned, not shipped](#planned-not-shipped)
+5. [Toolbox backend management](#toolbox-backend-management)
+6. [Model observability and regression alerts](#model-observability-and-regression-alerts)
+7. [Benchmark explorer](#benchmark-explorer)
+8. [Headless CLI](#headless-cli-brainrouter-cli)
+9. [MCP code review guide](#mcp-code-review-guide)
+10. [Bridge: Discord and Signal](#bridge-discord-and-signal)
+11. [Reference](#reference)
+12. [Planned, not shipped](#planned-not-shipped)
 
-This documents the implemented source through `3691dcc` (2026-09-07).
-Source transfer or a Git update is not a binary rollout: building, installing,
-and restarting a running service are separate operations. See [PRD.md](PRD.md)
-for requirements and the explicit boundary between shipped and future work.
+This documents the implemented source through `3691dcc` (2026-09-07), extended
+through `5bd04d3` (2025-09-19) by the native ds4/halogen/vllm/r9v toolbox
+backend integration — see [Toolbox backend management](#toolbox-backend-management)
+and `docs/design/ai-toolbox-cockpit-integration.md`. Source transfer or a Git
+update is not a binary rollout: building, installing, and restarting a running
+service are separate operations. See [PRD.md](PRD.md) for requirements and the
+explicit boundary between shipped and future work.
 
 ---
 
@@ -472,6 +476,71 @@ Preferences persist across restart. Existing reviews and their continuations
 retain the original reviewer; see [Routing controls](#routing-controls) for
 precedence, migration, commands, and exact fallback behavior.
 
+## Toolbox backend management
+
+brainrouter is a native Rust webui for [kyuz0's `ai-toolbox-cockpit`](https://github.com/kyuz0/ai-toolbox-cockpit) —
+a Python Textual TUI with no CLI/API mode. It covers **`ds4`, `halogen`,
+`vllm`, `r9v`, and `llama_cpp`** toolboxes/models/servers; **`comfyui`
+(image-gen) is never surfaced.** Everything below works whether or not
+cockpit itself is installed on the host. Full design rationale lives in
+`docs/design/ai-toolbox-cockpit-integration.md`.
+
+### Toolboxes panel
+
+Lists podman containers across all five backends (not just llama.cpp),
+sourced from a vendored, weekly-CI-refreshed copy of cockpit's own
+`toolboxes.json`/`models.json` catalog (`assets/cockpit-catalog/`). From here
+you can create a new toolbox from any catalog entry, pull+recreate
+(update) an existing one, delete one, or **adopt** a container you created
+outside brainrouter (via cockpit or manually) so it shows up as managed.
+
+### Server Mode panel
+
+Starts/stops/checks status of headless, detached servers for `ds4`,
+`halogen`, `vllm`, and `r9v` — separate from the interactive Toolboxes-tab
+containers. Each backend's own defaults (batch size, GPU layers, KV cache
+type, etc.) come straight from the catalog's `toolbox_defaults`. **R9V ships
+behind an explicit "unverified" badge** — no real 2×AMD R9700 hardware was
+reachable to validate ROCm/HSA device passthrough end-to-end; command
+construction is verified against upstream source, not live hardware.
+
+### Models panel
+
+Browse the catalog's models per backend and trigger downloads through each
+backend's own native mechanism (`ds4`/`halogen`/`r9v`/`llama_cpp`; `vllm`
+pulls from Hugging Face on demand at server start instead, matching
+upstream). Progress is a raw log tail, not a byte-level progress bar — the
+underlying `hf` CLI has no machine-readable progress output to drive one.
+
+### Shared config with cockpit
+
+If `~/.config/ai-toolbox-cockpit/config.json` exists, brainrouter reads it
+directly for `active_platform` and per-backend default toolboxes, so both
+tools agree on one source of truth. Writing back is an **explicit,
+user-triggered "apply" action** scoped to those same keys — brainrouter never
+performs continuous background read-modify-write against this file, since no
+locking protocol exists between the two tools to make that safe. If the
+config directory is absent, brainrouter says so rather than silently
+creating it.
+
+### Sankey and benchmark integration
+
+The dashboard's routing Sankey and the [Benchmark explorer](#benchmark-explorer)
+both gained **backend** (which toolbox family) and **engine**
+(vulkan/rocm/etc.) as dimensions. Only `llama_cpp` traffic is genuinely
+routed through brainrouter's router today; every other backend's activity
+renders in an explicit `status_only` bucket — real request-routing
+integration for Server Mode containers is unshipped (see
+[Planned, not shipped](#planned-not-shipped)).
+
+### What's not here yet
+
+- **No CLI parity.** `brainrouter cli toolboxes`/`upgrade toolbox` remain
+  llama.cpp-only; the new backends are dashboard/API-only.
+- **No request routing to Server Mode containers.** Starting a ds4/halogen/
+  vllm/r9v server makes it visible and manageable, not dispatchable as live
+  LLM traffic.
+
 ## Model observability and regression alerts
 
 Open **`http://127.0.0.1:9099/models`** or select **Model activity** in the dashboard. An exact local model key connects read-only backend status, active registry requests, completed stream measurements, recent routing results, and an explicitly selected historical benchmark reference. `/models?model=<URL-encoded-key>` links to a model. `/running` and `/v1/models` are polled with two-second timeouts and 1 MiB response limits; `/props` is queried only for up to four already-ready proxies. Polls run independently of routing, with a five-second pause between polls. Before the first poll completes, the API reports an awaiting-observation state; an empty initial list is not proof that no models exist. Missing quantization, runtime identity, RAM/VRAM, live token rates, or prefill progress remain unavailable, never inferred from model names, file sizes, elapsed time, or benchmark peaks.
@@ -541,6 +610,31 @@ compiler/build flags, optimization feature states, and capture timestamps stay
 separate. `unsupported`, `disabled`, `enabled`, and `requested_unavailable` are
 data states, not proof that a backend implements or executed a feature.
 Draft-artifact references must exist.
+
+### Backend/engine dimensions and the spider chart
+
+`runtimes.backend` already carried an engine enum (e.g. `llama_cpp`,
+`vulkan`); `migrations/0003_toolbox_serving_dimension.sql` adds
+`serving_runtimes` and `toolbox_catalog_snapshot` — nullable, additive
+columns/tables recording which toolbox backend (`ds4`/`halogen`/`vllm`/`r9v`/
+`llama_cpp`) and compute engine (`vulkan`/`rocm`/etc.) produced a run, without
+requiring older rows to be backfilled. `/api/benchmarks/filters` and
+`/api/benchmarks/runs` both accept `backend`/`engine` alongside the existing
+`family`/`workload`/`quant_name` filters.
+
+A new **spider/radar chart** lets you pick two or more axes from **models,
+harnesses, engine, backend, toolbox, speed, and TEPR** and plot one polygon
+per selected series (e.g. compare `r9v` vs. `llama_cpp` across three models).
+Backed by `GET /api/benchmarks/spider`.
+
+> **TEPR ("token efficiency to positive result") is a proposed metric, not an
+> established one** — flagged here for explicit sign-off, not a silent
+> assumption: `TEPR = total_tokens_consumed / count(runs where the task's
+> quality outcome is a pass)` for the selected axis bucket, expressed as
+> tokens-per-successful-task. A bucket with zero passing runs has undefined
+> TEPR (reported as `null`, not `Infinity` or `0`) — do not read `null` as
+> "perfectly efficient." See `docs/design/ai-toolbox-cockpit-integration.md`
+> for the full rationale before relying on this number.
 
 ### Native Benchmark Lab
 
@@ -827,6 +921,11 @@ brainrouter cli llama-swap-config set ./config.yaml
 ```
 
 CLI spelling vs dashboard: `llama-cpp` (CLI value) is the `llama.cpp` row in the dashboard sidebar — same component. `toolbox` (upgrade value) is the `toolboxes` container image.
+
+`brainrouter cli toolboxes`/`upgrade toolbox` remain **llama.cpp-only** — the
+`ds4`/`halogen`/`vllm`/`r9v` toolbox/model/Server-Mode management described in
+[Toolbox backend management](#toolbox-backend-management) is dashboard/API-only
+today, with no CLI equivalent yet.
 
 ### Reviews
 
@@ -1143,6 +1242,30 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `GET/POST` | `/api/config` | Read raw YAML / validate and replace YAML; source changes require restart |
 | `GET/POST` | `/api/llama-swap-config` | Read/write llama-swap YAML |
 
+#### Toolbox backend management
+
+Native Rust management for `ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp` toolboxes,
+models, and detached servers — brainrouter as a webui for `ai-toolbox-cockpit`,
+without needing cockpit installed or running. `comfyui` is never exposed.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/toolbox-catalog` | Typed `toolboxes.json` catalog (all 5 backends) |
+| `GET` | `/api/toolbox-models` | Typed `models.json` catalog |
+| `GET` | `/api/toolbox-containers` | Podman containers across all 5 backends, with ownership/adoption status |
+| `POST` | `/api/toolbox-containers` | Create a container from a catalog entry |
+| `POST` | `/api/toolbox-containers/:name/update`\|`/delete`\|`/adopt` | Pull+recreate / remove / adopt-as-managed |
+| `GET/POST` | `/api/model-downloads` | List / start a download job (ds4/halogen/r9v/llama_cpp; not vllm, which pulls from HF on demand) |
+| `GET` | `/api/model-downloads/:id` | Job detail — raw-log-tail progress, no byte-level bar |
+| `POST` | `/api/model-downloads/:id/cancel` | Cancel a download job |
+| `POST` | `/api/model-downloads/verify` | Verify a downloaded model's integrity |
+| `POST` | `/api/model-downloads/r9v/prepare-ple` | R9V's second readiness gate |
+| `GET/POST` | `/api/server-mode/{ds4,halogen,vllm,r9v}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
+| `POST` | `/api/server-mode/vllm/cache-paths` / `/api/server-mode/r9v/paths` | Per-backend path configuration |
+| `GET` | `/api/serving-identities` | Read-only registry of running Server Mode containers; **bookkeeping only, not routing** |
+| `GET` | `/api/cockpit-config` | Read cockpit's own `~/.config/ai-toolbox-cockpit/config.json` |
+| `POST` | `/api/cockpit-config/default-toolbox`\|`/active-platform` | Explicit single-write "apply" back to cockpit's config |
+
 #### Model observability
 
 | Method | Path | Notes |
@@ -1168,6 +1291,7 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `GET` | `/api/benchmarks/runs` | Filtered page; supports `page`, `per_page` (1-100), `q`, `status`, `family`, `backend`, `workload`, `quant_name`, `speculator_type`, `sort`, and `order` |
 | `GET` | `/api/benchmarks/runs/:id` | Full run detail within row/sample/byte limits; explicit 413 otherwise |
 | `GET` | `/api/benchmarks/filters` | Deterministically ordered filter values |
+| `GET` | `/api/benchmarks/spider` | Radar-chart series for a picked axis pair: models/harnesses/engine/backend/toolbox/speed/TEPR (see [Benchmark explorer](#benchmark-explorer)) |
 | `GET` | `/api/benchmarks/export` | `format=csv` or `format=jsonl` (default); all matching summaries or explicit 413; 10,000-run / 8 MiB cap |
 | `GET` | `/api/benchmarks/examples/:name` | Synthetic bundle, template, matrix YAML/JSON, or llama-bench JSON download; no inserts |
 | `POST` | `/api/benchmarks/prepare` | Reusable template plus run fields / optional selected experiment / llama-bench output -> validated bundle preview |
@@ -1301,3 +1425,23 @@ plans found in the separate Quant Lab / Model Compare notes:
 Ember/Flash environment provisioning and cache-building work are not shipped
 Brainrouter features. Imported metrics, declared hashes and existing charts do
 not imply that these execution or verification pipelines exist.
+
+**ai-toolbox-cockpit integration gaps** (see
+`docs/design/ai-toolbox-cockpit-integration.md` for full rationale):
+
+- No `brainrouter cli` parity for ds4/halogen/vllm/r9v toolbox, model, or
+  Server Mode management — dashboard/API-only today.
+- No request routing to Server Mode containers; they're visible and
+  manageable, not dispatchable as live LLM traffic (`status_only` in the
+  serving-identity registry and Sankey).
+- R9V command construction is verified against upstream source only — no real
+  2×AMD R9700 (or other ROCm) hardware was available to validate it end to
+  end; treat it as an explicit "unverified" feature until confirmed on real
+  hardware.
+- config.json sharing is single-write "apply," not continuous bidirectional
+  sync — concurrent edits from cockpit and brainrouter are not merged live.
+- TEPR ("token efficiency to positive result") is a **proposed** benchmark
+  metric pending explicit user sign-off, not an established one.
+- No automatic ROCm/ROCm-vs-Vulkan hardware detection; engine selection is
+  driven by the catalog and user choice, not host GPU introspection.
+
