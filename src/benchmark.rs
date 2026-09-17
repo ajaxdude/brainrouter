@@ -1947,6 +1947,237 @@ fn non_empty_filter(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+const SPIDER_MIN_SAMPLE_SIZE: u64 = 3;
+const SPIDER_MIN_SERIES_VALUES: usize = 2;
+const SPIDER_MAX_SERIES_VALUES: usize = 5;
+/// Separator joining `family`/`workload` into one grouping key for the
+/// `FamilyWorkload` series kind. Not expected to appear inside a real family
+/// or workload name; documented here rather than defended against, matching
+/// how the rest of this module treats catalog/import data as trusted-shape.
+const SPIDER_PAIR_SEPARATOR: &str = "::";
+
+/// Design doc §17: the entity dimension the user compares polygons by. Never
+/// itself a radar axis — see `SpiderAxis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiderSeriesKind {
+    Family,
+    Workload,
+    FamilyWorkload,
+}
+
+impl SpiderSeriesKind {
+    /// The `run_summary` grouping expression for this series kind. Used
+    /// identically as the `SELECT` key and as the target of the `IN (...)`
+    /// restriction to the caller's chosen `series_values` — one expression,
+    /// no separate filter-column mapping to keep in sync.
+    fn group_expr(self) -> &'static str {
+        match self {
+            Self::Family => "rs.family",
+            Self::Workload => "rs.workload",
+            Self::FamilyWorkload => "(rs.family || '::' || rs.workload)",
+        }
+    }
+
+    /// §17's cohort-pinning rule: a single `workload` facet value is required
+    /// unless the series itself already iterates over workload/harness (in
+    /// which case every produced entity is already single-workload by
+    /// construction).
+    fn requires_workload_pin(self) -> bool {
+        matches!(self, Self::Family)
+    }
+}
+
+/// Design doc §17: a continuous, plottable radar spoke. Categorical
+/// dimensions (engine/backend/toolbox/model/harness) are facet/series keys
+/// only and never appear here (§8's v3 resolution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiderAxis {
+    Tepr,
+    Speed,
+}
+
+impl SpiderAxis {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tepr => "tepr",
+            Self::Speed => "speed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpiderQuery {
+    pub backend: Option<String>,
+    pub toolbox_backend: Option<String>,
+    pub toolbox_id: Option<String>,
+    pub compute_api: Option<String>,
+    pub workload: Option<String>,
+    pub family: Option<String>,
+    pub quant_name: Option<String>,
+    pub series: SpiderSeriesKind,
+    pub series_values: Vec<String>,
+    pub axes: Vec<SpiderAxis>,
+}
+
+impl SpiderQuery {
+    pub fn parse(query: Option<&str>) -> BenchmarkResult<Self> {
+        let mut backend = None;
+        let mut toolbox_backend = None;
+        let mut toolbox_id = None;
+        let mut compute_api = None;
+        let mut workload = None;
+        let mut family = None;
+        let mut quant_name = None;
+        let mut series = None;
+        let mut series_values = None;
+        let mut axes = None;
+        for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            let value = value.into_owned();
+            match key.as_ref() {
+                "backend" => backend = non_empty_filter(value),
+                "toolbox_backend" => toolbox_backend = non_empty_filter(value),
+                "toolbox_id" => toolbox_id = non_empty_filter(value),
+                "compute_api" => compute_api = non_empty_filter(value),
+                "workload" => workload = non_empty_filter(value),
+                "family" => family = non_empty_filter(value),
+                "quant_name" => quant_name = non_empty_filter(value),
+                "series" => {
+                    series = Some(match value.as_str() {
+                        "family" => SpiderSeriesKind::Family,
+                        "workload" => SpiderSeriesKind::Workload,
+                        "family_workload" => SpiderSeriesKind::FamilyWorkload,
+                        other => {
+                            return Err(BenchmarkError::Validation(format!(
+                                "series must be one of family, workload, family_workload (got {other})"
+                            )))
+                        }
+                    });
+                }
+                "series_values" => {
+                    series_values = Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                "axes" => {
+                    let mut parsed = Vec::new();
+                    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                        parsed.push(match token {
+                            "tepr" => SpiderAxis::Tepr,
+                            "speed" => SpiderAxis::Speed,
+                            other => {
+                                return Err(BenchmarkError::Validation(format!(
+                                    "axes must be tepr and/or speed (got {other})"
+                                )))
+                            }
+                        });
+                    }
+                    axes = Some(parsed);
+                }
+                unknown => {
+                    return Err(BenchmarkError::Validation(format!(
+                        "unknown query parameter: {unknown}"
+                    )))
+                }
+            }
+        }
+        let series = series.ok_or_else(|| {
+            BenchmarkError::Validation(
+                "series is required: one of family, workload, family_workload".into(),
+            )
+        })?;
+        let series_values = series_values.unwrap_or_default();
+        if !(SPIDER_MIN_SERIES_VALUES..=SPIDER_MAX_SERIES_VALUES).contains(&series_values.len()) {
+            return Err(BenchmarkError::Validation(format!(
+                "series_values must list between {SPIDER_MIN_SERIES_VALUES} and {SPIDER_MAX_SERIES_VALUES} entities to compare"
+            )));
+        }
+        let mut deduped = series_values.clone();
+        deduped.sort();
+        deduped.dedup();
+        if deduped.len() != series_values.len() {
+            return Err(BenchmarkError::Validation(
+                "series_values must not repeat the same entity".into(),
+            ));
+        }
+        let axes = axes.unwrap_or_default();
+        if axes.len() < 2 {
+            return Err(BenchmarkError::Validation(
+                "axes must include at least 2 of: tepr, speed".into(),
+            ));
+        }
+        let mut deduped_axes = axes.clone();
+        deduped_axes.sort_by_key(|axis| axis.as_str());
+        deduped_axes.dedup();
+        if deduped_axes.len() != axes.len() {
+            return Err(BenchmarkError::Validation(
+                "axes must not repeat the same dimension".into(),
+            ));
+        }
+        if series.requires_workload_pin() && workload.is_none() {
+            return Err(BenchmarkError::Validation(
+                "pin a single workload/harness (the `workload` filter) when comparing by model; or switch to comparing by harness".into(),
+            ));
+        }
+        Ok(Self {
+            backend,
+            toolbox_backend,
+            toolbox_id,
+            compute_api,
+            workload,
+            family,
+            quant_name,
+            series,
+            series_values,
+            axes,
+        })
+    }
+
+    /// Adapts this query's facet subset into `RunQuery`'s shape so
+    /// `query_where()` can be reused verbatim rather than re-implemented —
+    /// only the facet fields are populated; paging/sort/search stay at their
+    /// (unused-by-`query_where`) defaults.
+    fn as_run_query(&self) -> RunQuery {
+        RunQuery {
+            backend: self.backend.clone(),
+            toolbox_backend: self.toolbox_backend.clone(),
+            toolbox_id: self.toolbox_id.clone(),
+            compute_api: self.compute_api.clone(),
+            workload: self.workload.clone(),
+            family: self.family.clone(),
+            quant_name: self.quant_name.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpiderSeriesResult {
+    pub key: String,
+    pub label: String,
+    pub axis_values: BTreeMap<String, Option<f64>>,
+    pub sample_n: BTreeMap<String, u64>,
+    pub insufficient_data: BTreeMap<String, bool>,
+    pub aggregated_dimensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpiderChartResponse {
+    pub axes: Vec<String>,
+    pub series: Vec<SpiderSeriesResult>,
+    pub min_sample_size: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpiderAxisPoint {
+    value: Option<f64>,
+    sample_n: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkStore {
     path: PathBuf,
@@ -2987,6 +3218,96 @@ impl BenchmarkStore {
         }))
     }
 
+    /// Design doc §17: computes the spider/radar chart's per-entity,
+    /// per-axis values. Facets narrow the run population exactly like
+    /// `query_runs()` (reusing the same `query_where()` builder); `series`
+    /// determines which column groups runs into the plotted entities;
+    /// `axes` selects which continuous metrics are computed. Every requested
+    /// `series_values` entry is always present in the response (even with
+    /// zero matching runs), so a caller can distinguish "no data" from
+    /// "server forgot this series."
+    pub fn spider_chart(&self, query: &SpiderQuery) -> BenchmarkResult<SpiderChartResponse> {
+        let connection = self.connect()?;
+        let (where_sql, base_values) = query_where(&query.as_run_query());
+        let group_expr = query.series.group_expr();
+
+        let speed_points = if query.axes.contains(&SpiderAxis::Speed) {
+            spider_speed_points(
+                &connection,
+                &where_sql,
+                &base_values,
+                group_expr,
+                &query.series_values,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        let tepr_points = if query.axes.contains(&SpiderAxis::Tepr) {
+            spider_tepr_points(
+                &connection,
+                &where_sql,
+                &base_values,
+                group_expr,
+                &query.series_values,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+
+        // `family` is only ever "aggregated" (as opposed to pinned or itself
+        // being the series) when it's neither: left as a free facet while
+        // some other dimension is the series.
+        let aggregated_dimensions = if !matches!(query.series, SpiderSeriesKind::Family)
+            && query.family.is_none()
+        {
+            vec!["family".to_string()]
+        } else {
+            Vec::new()
+        };
+
+        let series = query
+            .series_values
+            .iter()
+            .map(|key| {
+                let mut axis_values = BTreeMap::new();
+                let mut sample_n = BTreeMap::new();
+                let mut insufficient_data = BTreeMap::new();
+                for axis in &query.axes {
+                    let points = match axis {
+                        SpiderAxis::Speed => &speed_points,
+                        SpiderAxis::Tepr => &tepr_points,
+                    };
+                    let point = points.get(key).cloned().unwrap_or_default();
+                    let axis_name = axis.as_str().to_string();
+                    axis_values.insert(axis_name.clone(), point.value);
+                    sample_n.insert(axis_name.clone(), point.sample_n);
+                    insufficient_data.insert(axis_name, point.sample_n < SPIDER_MIN_SAMPLE_SIZE);
+                }
+                let label = if matches!(query.series, SpiderSeriesKind::FamilyWorkload) {
+                    key.splitn(2, SPIDER_PAIR_SEPARATOR)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                } else {
+                    key.clone()
+                };
+                SpiderSeriesResult {
+                    key: key.clone(),
+                    label,
+                    axis_values,
+                    sample_n,
+                    insufficient_data,
+                    aggregated_dimensions: aggregated_dimensions.clone(),
+                }
+            })
+            .collect();
+
+        Ok(SpiderChartResponse {
+            axes: query.axes.iter().map(|axis| axis.as_str().to_string()).collect(),
+            series,
+            min_sample_size: SPIDER_MIN_SAMPLE_SIZE,
+        })
+    }
+
     pub fn export_runs(&self, mut query: RunQuery, format: &str) -> BenchmarkResult<String> {
         if !matches!(format, "jsonl" | "csv") {
             return Err(BenchmarkError::Validation(
@@ -3361,6 +3682,133 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Appends `clause` to an existing `WHERE ...`/empty string produced by
+/// `query_where()`, without assuming which case it's in.
+fn append_and(where_sql: &str, clause: &str) -> String {
+    if where_sql.is_empty() {
+        format!("WHERE {clause}")
+    } else {
+        format!("{where_sql} AND {clause}")
+    }
+}
+
+/// Binds `series_values` as an `IN (...)` restriction on `group_expr`,
+/// appended to `base_values`/`where_sql`. Shared by the speed and TEPR
+/// per-entity queries so the placeholder numbering/parameter order logic
+/// exists in exactly one place.
+fn spider_series_filter(
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+    extra_clause: Option<&str>,
+) -> (String, Vec<SqlValue>) {
+    let mut values = base_values.to_vec();
+    let placeholder_start = values.len();
+    for value in series_values {
+        values.push(SqlValue::Text(value.clone()));
+    }
+    let in_list = (0..series_values.len())
+        .map(|index| format!("?{}", placeholder_start + index + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut clause = format!("{group_expr} IN ({in_list})");
+    if let Some(extra) = extra_clause {
+        clause = format!("{clause} AND {extra}");
+    }
+    (append_and(where_sql, &clause), values)
+}
+
+fn spider_speed_points(
+    connection: &Connection,
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+) -> BenchmarkResult<BTreeMap<String, SpiderAxisPoint>> {
+    let (where_sql, values) = spider_series_filter(
+        where_sql,
+        base_values,
+        group_expr,
+        series_values,
+        Some("rs.generation_tps IS NOT NULL"),
+    );
+    let sql = format!(
+        "SELECT {group_expr} AS entity_key, AVG(rs.generation_tps) AS avg_value, COUNT(*) AS n
+         FROM run_summary rs
+         {where_sql}
+         GROUP BY entity_key"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<f64>>(1)?,
+            row.get::<_, u64>(2)?,
+        ))
+    })?;
+    let mut points = BTreeMap::new();
+    for row in rows {
+        let (key, value, sample_n) = row?;
+        points.insert(key, SpiderAxisPoint { value, sample_n });
+    }
+    Ok(points)
+}
+
+/// `run_tokens` first collapses `quality_results` to one row per run (a run
+/// can have several tasks/metrics): `actual_tokens` sums every observed
+/// `generated_tokens` for the run (§17's `actual_tokens_consumed`);
+/// `any_failed` is nonzero iff at least one row explicitly recorded
+/// `passed = 0` — rows with `passed IS NULL` (continuous, non-verdict
+/// metrics such as `elegance.*`) are neutral and never veto an
+/// otherwise-passing run (§17's refinement of §8's "positive" rule).
+fn spider_tepr_points(
+    connection: &Connection,
+    where_sql: &str,
+    base_values: &[SqlValue],
+    group_expr: &str,
+    series_values: &[String],
+) -> BenchmarkResult<BTreeMap<String, SpiderAxisPoint>> {
+    let (where_sql, values) =
+        spider_series_filter(where_sql, base_values, group_expr, series_values, None);
+    let sql = format!(
+        "WITH run_tokens AS (
+            SELECT run_id,
+                   SUM(generated_tokens) AS actual_tokens,
+                   SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS any_failed
+            FROM quality_results
+            GROUP BY run_id
+         )
+         SELECT {group_expr} AS entity_key,
+                SUM(rt.actual_tokens) AS total_tokens,
+                SUM(CASE WHEN rs.status = 'succeeded' AND rt.any_failed = 0 THEN 1 ELSE 0 END) AS positive_count,
+                COUNT(*) AS n
+         FROM run_summary rs
+         JOIN run_tokens rt ON rt.run_id = rs.run_id
+         {where_sql}
+         GROUP BY entity_key"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, u64>(3)?,
+        ))
+    })?;
+    let mut points = BTreeMap::new();
+    for row in rows {
+        let (key, total_tokens, positive_count, sample_n) = row?;
+        let value = match total_tokens {
+            Some(total) if positive_count > 0 => Some(total as f64 / positive_count as f64),
+            _ => None,
+        };
+        points.insert(key, SpiderAxisPoint { value, sample_n });
+    }
+    Ok(points)
+}
+
 fn distinct_values(
     connection: &Connection,
     sql: &str,
@@ -3697,6 +4145,186 @@ mod tests {
             quality_results: Vec::new(),
             telemetry_samples: Vec::new(),
         }
+    }
+
+    fn quality_result(
+        id: &str,
+        run_id: &str,
+        metric_name: &str,
+        passed: Option<bool>,
+        generated_tokens: Option<u64>,
+    ) -> QualityResult {
+        QualityResult {
+            id: id.into(),
+            run_id: run_id.into(),
+            task_id: "task-1".into(),
+            metric_name: metric_name.into(),
+            metric_value: Some(1.0),
+            passed,
+            compile_succeeded: Some(true),
+            tests_passed: Some(1),
+            tests_total: Some(1),
+            generated_tokens,
+            duration_ms: Some(1.0),
+            output_path: None,
+            log_path: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn spider_query_parse_rejects_family_series_without_a_pinned_workload() {
+        let error = SpiderQuery::parse(Some("series=family&series_values=A,B&axes=tepr,speed"))
+            .unwrap_err();
+        assert!(error.to_string().contains("pin a single workload"));
+    }
+
+    #[test]
+    fn spider_query_parse_allows_workload_series_without_a_pinned_workload() {
+        SpiderQuery::parse(Some("series=workload&series_values=A,B&axes=tepr,speed"))
+            .expect("workload series needs no workload pin");
+    }
+
+    #[test]
+    fn spider_query_parse_requires_two_to_five_series_values() {
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A&axes=tepr,speed"
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("between 2 and 5"));
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A,B,C,D,E,F&axes=tepr,speed"
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("between 2 and 5"));
+    }
+
+    #[test]
+    fn spider_query_parse_requires_at_least_two_axes() {
+        let error = SpiderQuery::parse(Some("series=workload&series_values=A,B&axes=tepr"))
+            .unwrap_err();
+        assert!(error.to_string().contains("at least 2"));
+    }
+
+    #[test]
+    fn spider_query_parse_rejects_unknown_axis_and_series() {
+        assert!(SpiderQuery::parse(Some(
+            "series=workload&series_values=A,B&axes=tepr,made_up"
+        ))
+        .is_err());
+        assert!(SpiderQuery::parse(Some(
+            "series=made_up&series_values=A,B&axes=tepr,speed"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn spider_chart_averages_tokens_across_attempts_but_counts_only_positive_runs() {
+        let test = test_store();
+
+        // Positive run: one clean pass@1 verdict, 100 actual tokens.
+        let mut pass_run = bundle("run-qwen-pass", 0, RunStatus::Succeeded);
+        pass_run.quality_results = vec![quality_result(
+            "q-pass",
+            "run-qwen-pass",
+            "pass@1",
+            Some(true),
+            Some(100),
+        )];
+        test.store.ingest(&pass_run).unwrap();
+
+        // Failed attempt: still costs tokens (200), must count in the numerator
+        // but not the denominator. Cloned from `pass_run` (not a fresh
+        // `bundle()` call) so the shared `runtime-1`/`hardware-1`/etc. rows
+        // stay byte-identical across ingests — those are immutable once
+        // written, and a fresh `bundle()` call's own `built_at: Utc::now()`
+        // would otherwise conflict with the first ingest's value.
+        let mut fail_run = pass_run.clone();
+        fail_run.run.id = "run-qwen-fail".into();
+        fail_run.run.repetition = 1;
+        fail_run.performance_metrics.as_mut().unwrap().run_id = "run-qwen-fail".into();
+        fail_run.quality_results = vec![quality_result(
+            "q-fail",
+            "run-qwen-fail",
+            "pass@1",
+            Some(false),
+            Some(200),
+        )];
+        test.store.ingest(&fail_run).unwrap();
+
+        // Positive run whose only *other* quality row is a non-verdict
+        // continuous metric (passed=NULL) — must not veto its own positivity.
+        let mut elegance_run = pass_run.clone();
+        elegance_run.run.id = "run-qwen-elegance".into();
+        elegance_run.run.repetition = 2;
+        elegance_run.performance_metrics.as_mut().unwrap().run_id = "run-qwen-elegance".into();
+        elegance_run.quality_results = vec![
+            quality_result(
+                "q-verdict",
+                "run-qwen-elegance",
+                "pass@1",
+                Some(true),
+                Some(90),
+            ),
+            quality_result(
+                "q-elegance",
+                "run-qwen-elegance",
+                "elegance.readability",
+                None,
+                None,
+            ),
+        ];
+        test.store.ingest(&elegance_run).unwrap();
+
+        let query = SpiderQuery::parse(Some(
+            "series=family&series_values=Qwen,Llama&axes=tepr,speed&workload=long-context",
+        ))
+        .unwrap();
+        let response = test.store.spider_chart(&query).unwrap();
+        assert_eq!(response.min_sample_size, SPIDER_MIN_SAMPLE_SIZE);
+        assert_eq!(response.axes, vec!["tepr".to_string(), "speed".to_string()]);
+
+        let qwen = response.series.iter().find(|s| s.key == "Qwen").unwrap();
+        // total tokens = 100 + 200 + 90 = 390; positive runs = 2 (pass + elegance).
+        assert_eq!(qwen.axis_values["tepr"], Some(390.0 / 2.0));
+        assert_eq!(qwen.sample_n["tepr"], 3);
+        assert!(!qwen.insufficient_data["tepr"]);
+        assert!(qwen.axis_values["speed"].is_some());
+        assert!(qwen.aggregated_dimensions.is_empty());
+
+        let llama = response.series.iter().find(|s| s.key == "Llama").unwrap();
+        assert_eq!(llama.axis_values["tepr"], None);
+        assert_eq!(llama.sample_n["tepr"], 0);
+        assert!(llama.insufficient_data["tepr"]);
+    }
+
+    #[test]
+    fn spider_chart_family_workload_pair_series_needs_no_workload_pin() {
+        let test = test_store();
+        let mut run = bundle("run-pair", 0, RunStatus::Succeeded);
+        run.quality_results = vec![quality_result(
+            "q-pair",
+            "run-pair",
+            "pass@1",
+            Some(true),
+            Some(50),
+        )];
+        test.store.ingest(&run).unwrap();
+
+        let query = SpiderQuery::parse(Some(
+            "series=family_workload&series_values=Qwen::long-context,Other::other&axes=tepr,speed",
+        ))
+        .unwrap();
+        let response = test.store.spider_chart(&query).unwrap();
+        let matched = response
+            .series
+            .iter()
+            .find(|s| s.key == "Qwen::long-context")
+            .unwrap();
+        assert_eq!(matched.label, "Qwen / long-context");
+        assert_eq!(matched.axis_values["tepr"], Some(50.0));
     }
 
     #[test]

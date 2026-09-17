@@ -233,6 +233,10 @@ fn dispatch(
         ("GET", "/api/benchmarks/filters") => {
             Ok(json_response(StatusCode::OK, &store.filter_options()?))
         }
+        ("GET", "/api/benchmarks/spider") => Ok(json_response(
+            StatusCode::OK,
+            &store.spider_chart(&SpiderQuery::parse(query)?)?,
+        )),
         ("GET", "/api/benchmarks/runs") => Ok(json_response(
             StatusCode::OK,
             &store.query_runs(&RunQuery::parse(query)?)?,
