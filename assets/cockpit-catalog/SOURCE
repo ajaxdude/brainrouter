@@ -1,0 +1,41 @@
+# Vendored source: ai-toolbox-cockpit catalog
+
+These two files are vendored verbatim (byte-for-byte, no reformatting) from
+kyuz0's `ai-toolbox-cockpit` project. brainrouter does not fork the schema —
+it treats these as an upstream data feed and validates them structurally at
+build/CI time via `scripts/sync-toolbox-catalog.sh` and
+`src/toolbox_catalog/schema_validate.rs`.
+
+- Upstream repo: https://github.com/kyuz0/ai-toolbox-cockpit
+- Pinned commit: `6959d068c020f3f33bfb8ef743e7ba44a6390dda`
+- Commit date: 2026-09-16 12:18:56 +0000
+- Vendored files:
+  - `ai_toolbox_cockpit/assets/models.json`  -> `models.json`
+  - `ai_toolbox_cockpit/assets/toolboxes.json` -> `toolboxes.json`
+- Upstream schema reference (not vendored, for validator parity checks only):
+  `ai_toolbox_cockpit/catalog/schema.py` (schema_version 3 as of the pinned commit)
+- Fetched: see `scripts/sync-toolbox-catalog.sh` git history / CI run for the
+  exact fetch date each time this pin is bumped.
+
+## Updating the pin
+
+Run `scripts/sync-toolbox-catalog.sh` (see that script for flags). It clones
+upstream at `HEAD`, structurally validates both files with the Rust validator
+(`cargo run --bin toolbox-catalog-check` / `cargo test toolbox_catalog::`),
+diffs against the currently vendored copies, and — if different — updates
+this file's pinned commit SHA/date and overwrites `models.json` /
+`toolboxes.json`. It never auto-commits; review the diff like any other
+dependency bump. The scheduled CI workflow
+(`.github/workflows/sync-toolbox-catalog.yml`) runs this weekly and opens a
+PR when the pin would move.
+
+## Known backend IDs as of this pin
+
+`llama_cpp`, `ds4`, `halogen`, `vllm`, `r9v`, `comfyui`. brainrouter's
+`CatalogBackendId` (see `src/toolbox_catalog.rs`, added in PR2) parses all six
+losslessly but only treats `llama_cpp`, `ds4`, `halogen`, `vllm`, `r9v` as
+serving backends; `comfyui` is intentionally out of scope (image generation,
+not coding-relevant — see `docs/design/ai-toolbox-cockpit-integration.md`).
+Any backend id encountered outside this known set is preserved as
+`CatalogBackendId::Other(String)` rather than rejected, so a new upstream
+backend never breaks catalog loading.

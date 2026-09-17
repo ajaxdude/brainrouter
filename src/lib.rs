@@ -18,6 +18,7 @@ pub mod routing_profile;
 pub mod server;
 pub mod session;
 pub mod stream;
+pub mod toolbox_catalog;
 pub mod types;
 pub mod routing_events;
 pub mod inflight;

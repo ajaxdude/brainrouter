@@ -1,0 +1,68 @@
+name: Sync toolbox catalog
+
+# Weekly check for upstream ai-toolbox-cockpit catalog changes
+# (assets/cockpit-catalog/{models,toolboxes}.json). Never auto-merges: it
+# only opens a PR for a human to review, exactly like any other dependency
+# bump (see docs/design/ai-toolbox-cockpit-integration.md §3).
+on:
+  schedule:
+    # Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout brainrouter
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-toolbox-catalog-check-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run catalog sync (apply mode)
+        run: scripts/sync-toolbox-catalog.sh
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git status --porcelain -- assets/cockpit-catalog | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open pull request
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: sync vendored ai-toolbox-cockpit catalog"
+          title: "chore: sync vendored ai-toolbox-cockpit catalog"
+          body: |
+            Automated weekly sync of `assets/cockpit-catalog/{models,toolboxes}.json`
+            from [kyuz0/ai-toolbox-cockpit](https://github.com/kyuz0/ai-toolbox-cockpit).
+
+            The candidate catalog passed structural validation
+            (`src/toolbox_catalog/schema_validate.rs`) before being vendored, but a
+            human should still review this diff before merging — an upstream schema
+            or content change can affect brainrouter's toolbox/model UI once PR2+ of
+            the integration lands. See `assets/cockpit-catalog/SOURCE` for the new
+            pinned commit.
+          branch: sync-toolbox-catalog
+          delete-branch: true
+          labels: |
+            dependencies
+            ai-toolbox-cockpit-integration

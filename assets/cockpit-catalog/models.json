@@ -1,0 +1,2269 @@
+{
+  "schema_version": 2,
+  "backends": {
+    "llama_cpp": {
+      "kind": "gguf",
+      "storage": {
+        "config_key": "models_dir",
+        "default": "~/models"
+      },
+      "config": {
+        "calibrated_ubatches": [
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-IQ2_XXS*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-c1-rocm-vkperf-baseline-20260813-r2-001-fw1-strix-llama-rocm-deepseek-v4-flash-iq2-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-IQ2_XXS*.gguf","serving_config":"dspark","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-c1-rocm-vkperf-dspark-20260813-r2-001-fw1-strix-llama-rocm-deepseek-v4-flash-iq2-coding-depth-curves-dspark-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-IQ3_XXS*.gguf","serving_config":"dspark","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-c1-rocm-vkperf-dspark-20260813-r2-002-fw2-strix-llama-rocm-deepseek-v4-flash-iq3-coding-depth-curves-dspark-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-IQ2_XXS*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-c1-rocm-vkperf-baseline-20260813-r2-003-fw1-strix-llama-vulkan-performance-deepseek-v4-flash-iq2-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-IQ2_XXS*.gguf","serving_config":"dspark","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-c1-rocm-vkperf-dspark-20260813-r2-003-fw1-strix-llama-vulkan-performance-deepseek-v4-flash-iq2-coding-depth-curves-dspark-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-deepseek-v4-flash-0731-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-IQ3_XXS*.gguf","serving_config":"dspark-vulkan-kv-q8","kv_cache_type":"q8_0","batch_size":2048,"ubatch_size":2048,"source_job":"deepseek-v4flash-iq3-c1-fw2-vkperf-dspark-kvq8-20260813-001-fw2-strix-llama-vulkan-performance-deepseek-v4-flash-iq3-coding-depth-curves-dspark-vulkan-kv-q8-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-lfm2-5-1-2b-instruct-gguf","toolbox_id":"r9700-llama-vulkan-radv","filename_pattern":"*BF16*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"r9700-lfm25-bf16-c1-c2-c4-c8-c16-20260812-002-double-lift-r9700-llama-vulkan-lfm25-1p2b-instruct-bf16-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-lfm2-5-1-2b-instruct-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*BF16*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"lfm25-bf16-rocm-vulkan-cuda-c1-c4-c8-c16-r2-20260809-001-fw1-strix-llama-rocm-lfm25-1p2b-instruct-bf16-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-lfm2-5-1-2b-instruct-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*BF16*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"lfm25-bf16-vulkan-c1-c4-c8-c16-retry-20260809-001-fw2-strix-llama-vulkan-lfm25-1p2b-instruct-bf16-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-lfm2-5-1-2b-instruct-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*BF16*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"lfm25-vulkan-performance-c1-c4-c8-c16-20260809-001-fw1-strix-llama-vulkan-performance-lfm25-1p2b-instruct-bf16-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-muse-glimmer-30b-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"muse-glimmer-30b-q4-rocm-vulkan-c1-c4-c8-c16-r2-20260811-001-fw1-strix-llama-rocm-muse-glimmer-30b-q4-coding-depth-curves-baseline-a2","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-muse-glimmer-30b-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"muse-glimmer-30b-q4-rocm-vulkan-c1-c4-c8-c16-r2-20260811-002-fw2-strix-llama-vulkan-muse-glimmer-30b-q4-coding-depth-curves-baseline-a2","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-27b-mtp-gguf","toolbox_id":"r9700-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-27b-q4-r9700-c1-vram-only-20260812-001-002-double-lift-r9700-llama-vulkan-qwen36-27b-q4-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-27b-mtp-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-27b-q8-fw1-fw2-rocm-radv-vulkanperf-c1-c2-c4-c8-c16-20260811-001-001-fw1-strix-llama-rocm-qwen36-27b-q8-coding-depth-curves-baseline-a3","source_job_status":"failed"},
+          {"model_id":"llama-unsloth-qwen3-6-27b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":256,"source_job":"qwen36-27b-q8-fw1-fw2-rocm-radv-vulkanperf-c1-c2-c4-c8-c16-20260811-001-002-fw2-strix-llama-vulkan-qwen36-27b-q8-coding-depth-curves-baseline-a3","source_job_status":"failed"},
+          {"model_id":"llama-unsloth-qwen3-6-27b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-27b-q8-fw1-fw2-rocm-radv-vulkanperf-c1-c2-c4-c8-c16-20260811-001-003-fw1-strix-llama-vulkan-performance-qwen36-27b-q8-coding-depth-curves-baseline-a1","source_job_status":"failed"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"r9700-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"r9700-qwen36-q4-vram-c1-c2-c4-20260811-002-double-lift-r9700-llama-vulkan-qwen36-35b-a3b-q4-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"r9700-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"mtp-2","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-r9700-mtp2-c1-20260812-001-002-double-lift-r9700-llama-vulkan-qwen36-35b-a3b-q4-coding-depth-curves-mtp-2-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"r9700-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"mtp-3","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-r9700-mtp3-c1-20260812-001-002-double-lift-r9700-llama-vulkan-qwen36-35b-a3b-q4-coding-depth-curves-mtp-3-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-001-fw1-strix-llama-rocm-qwen36-35b-a3b-q4-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-002-fw2-strix-llama-rocm-qwen36-35b-a3b-q8-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-003-fw1-strix-llama-vulkan-qwen36-35b-a3b-q4-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-004-fw2-strix-llama-vulkan-qwen36-35b-a3b-q8-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-005-fw1-strix-llama-vulkan-performance-qwen36-35b-a3b-q4-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-6-35b-a3b-mtp-gguf","toolbox_id":"strix-halo-llama-vulkan-radv-performance","filename_pattern":"*UD-Q8_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":2048,"source_job":"qwen36-35b-q4-q8-rocm-vulkan-vulkanperf-cuda-c1-c4-c8-c16-20260809-006-fw2-strix-llama-vulkan-performance-qwen36-35b-a3b-q8-coding-depth-curves-baseline-a1","source_job_status":"complete"},
+          {"model_id":"llama-unsloth-qwen3-8-27b-gguf","toolbox_id":"strix-halo-llama-rocm-10-0","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":256,"source_job":"qwen38-27b-q4-fw1-fw2-rocm714-radv-radvperf-c1-c4-c8-c16-20260815-r1-001-fw1-strix-llama-rocm-qwen38-27b-q4-coding-depth-curves-baseline-a1","source_job_status":"partial"},
+          {"model_id":"llama-unsloth-qwen3-8-27b-gguf","toolbox_id":"strix-halo-llama-vulkan-radv","filename_pattern":"*UD-Q4_K_XL*.gguf","serving_config":"baseline","kv_cache_type":"default","batch_size":2048,"ubatch_size":256,"source_job":"qwen38-27b-q4-fw1-fw2-rocm714-radv-radvperf-c1-c4-c8-c16-20260815-r1-002-fw2-strix-llama-vulkan-qwen38-27b-q4-coding-depth-curves-baseline-a1","source_job_status":"partial"}
+        ]
+      },
+      "models": [
+        {
+          "name": "DeepSeek V4 Flash 0731",
+          "repo": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+          "dspark": {
+            "supported": true,
+            "patterns": [
+              "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf",
+              "dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf"
+            ],
+            "default_pattern": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf",
+            "default_draft_n": 3,
+            "default_ngl": 99,
+            "fit": "off"
+          },
+          "toolbox_defaults": {
+            "strix-halo-llama-vulkan-radv-performance": {
+              "batch_size": 2048,
+              "ubatch_size": 2048,
+              "parallel_sequences": 1,
+              "kv_cache_type": "q8_0"
+            }
+          },
+          "default_inference_profile": "Thinking (Effort: High)",
+          "inference_profiles": {
+            "Thinking (Effort: Max)": {
+              "description": "Recommended for tasks requiring maximal reasoning effort",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"max\"}'"
+            },
+            "Thinking (Effort: High)": {
+              "description": "Recommended for tasks requiring high reasoning effort",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"high\"}'"
+            },
+            "Thinking (Default)": {
+              "description": "Default reasoning behavior",
+              "args": "--reasoning on"
+            },
+            "Non-thinking (Disable Reasoning)": {
+              "description": "Recommended for disabling reasoning entirely",
+              "args": "--reasoning off --chat-template-kwargs '{\"enable_thinking\":false}'"
+            }
+          },
+          "id": "llama-unsloth-deepseek-v4-flash-0731-gguf"
+        },
+        {
+          "name": "Qwen 3.5 122B A10B",
+          "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 40 --min-p 0.0 --presence-penalty 2.0 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-5-122b-a10b-gguf"
+        },
+        {
+          "name": "Qwen 3.5 122B A10B Uncensored (HauhauCS)",
+          "repo": "HauhauCS/Qwen3.5-122B-A10B-Uncensored-HauhauCS-Aggressive",
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0"
+            },
+            "Non-thinking (General)": {
+              "description": "Recommended for general non-thinking tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5"
+            },
+            "Non-thinking (Reasoning)": {
+              "description": "Recommended for reasoning tasks in non-thinking mode",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 40 --min-p 0.0 --presence-penalty 2.0"
+            }
+          },
+          "id": "llama-hauhaucs-qwen3-5-122b-a10b-uncensored-hauhaucs-aggressive"
+        },
+        {
+          "name": "Qwen 3.6 35B A3B",
+          "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-6-35b-a3b-gguf"
+        },
+        {
+          "name": "Qwen 3.6 35B A3B Uncensored (HauhauCS)",
+          "repo": "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive",
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0"
+            },
+            "Non-thinking (General)": {
+              "description": "Recommended for general non-thinking tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5"
+            },
+            "Non-thinking (Reasoning)": {
+              "description": "Recommended for reasoning tasks in non-thinking mode",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 40 --min-p 0.0 --presence-penalty 2.0"
+            }
+          },
+          "id": "llama-hauhaucs-qwen3-6-35b-a3b-uncensored-hauhaucs-aggressive"
+        },
+        {
+          "name": "Qwen 3.6 27B",
+          "repo": "unsloth/Qwen3.6-27B-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-6-27b-gguf"
+        },
+        {
+          "name": "Qwen 3.8 27B",
+          "repo": "unsloth/Qwen3.8-27B-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 2,
+            "default_np": 1
+          },
+          "default_inference_profile": "Thinking (Effort: XHigh)",
+          "inference_profiles": {
+            "Thinking (Effort: XHigh)": {
+              "description": "Default; thorough reasoning for complex tasks",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"xhigh\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Medium)": {
+              "description": "Balances reasoning quality and speed",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"medium\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Low)": {
+              "description": "Faster, lower-cost reasoning",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"low\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (No Reasoning)": {
+              "description": "Disables thinking for direct instruct responses",
+              "args": "--reasoning off --chat-template-kwargs '{\"enable_thinking\":false}' --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-8-27b-gguf"
+        },
+        {
+          "name": "Qwen 3.8 27B ROCmFP4 FAST",
+          "repo": "julianmb/Qwen-3.8-27B-ROCmFP4-FAST-GGUF",
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 4,
+            "default_np": 1
+          },
+          "compatible_toolboxes": [
+            "rocmfpx"
+          ],
+          "id": "llama-julianmb-qwen-3-8-27b-rocmfp4-fast-gguf"
+        },
+        {
+          "name": "Qwen 3.8 Flash Next",
+          "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "auxiliary_downloads": [
+            {
+              "name": "drluoto MTP sidecars",
+              "repo": "drluoto/Qwen3.8-Flash-Next-MTP-GGUF",
+              "role": "mtp",
+              "recommended_filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+              "description": "External MTP heads for the Strix Halo Flash Next fork. Q8_0 is the ROCm-validated default; Q4_K_M and bf16 remain available as alternatives."
+            },
+            {
+              "name": "EngramHalo Strix Halo MTP sidecar",
+              "repo": "EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF",
+              "role": "mtp",
+              "recommended_filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+              "description": "Dedicated Q8_0 MTP sidecar used by Aristo94/EngramHalo.cpp's measured Strix Halo configuration."
+            }
+          ],
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 2,
+            "default_np": 1
+          },
+          "toolbox_defaults": {
+            "r9700-llama-rocm-10-0": {
+              "gpu_layers": null
+            },
+            "r9700-llama-vulkan-radv": {
+              "gpu_layers": null
+            }
+          },
+          "default_inference_profile": "Thinking (Effort: XHigh)",
+          "inference_profiles": {
+            "Thinking (Effort: XHigh)": {
+              "description": "Default; thorough reasoning for complex tasks",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"xhigh\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Medium)": {
+              "description": "Balances reasoning quality and speed",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"medium\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Low)": {
+              "description": "Faster, lower-cost reasoning",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"low\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (No Reasoning)": {
+              "description": "Disables thinking for direct instruct responses",
+              "args": "--reasoning off --chat-template-kwargs '{\"enable_thinking\":false}' --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-8-flash-next-gguf"
+        },
+        {
+          "name": "Qwen 3.8 27B ROCmFP4 Strix MTP",
+          "repo": "kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "draft_models": [
+              "mtp-Qwen3.8-27B-Q4_0.gguf",
+              "mtp-Qwen3.8-27B-Q8_0.gguf"
+            ],
+            "default_draft_n": 4,
+            "default_np": 1
+          },
+          "default_inference_profile": "Thinking (Effort: XHigh)",
+          "inference_profiles": {
+            "Thinking (Effort: XHigh)": {
+              "description": "Default; thorough reasoning for complex tasks",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"xhigh\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Medium)": {
+              "description": "Balances reasoning quality and speed",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"medium\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Low)": {
+              "description": "Faster, lower-cost reasoning",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"low\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (No Reasoning)": {
+              "description": "Disables thinking for direct instruct responses",
+              "args": "--reasoning off --chat-template-kwargs '{\"enable_thinking\":false}' --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-kingjones777-qwen3-8-27b-rocmfp4-strix-mtp-gguf"
+        },
+        {
+          "name": "Qwen 3.8 27B ROCmI4 MTP",
+          "repo": "cafonez/Qwen3.8-27B-ROCmI4-MTP-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 16,
+            "default_np": 1
+          },
+          "default_inference_profile": "Thinking (Effort: XHigh)",
+          "inference_profiles": {
+            "Thinking (Effort: XHigh)": {
+              "description": "Default; thorough reasoning for complex tasks",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"xhigh\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Medium)": {
+              "description": "Balances reasoning quality and speed",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"medium\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Thinking (Effort: Low)": {
+              "description": "Faster, lower-cost reasoning",
+              "args": "--reasoning on --chat-template-kwargs '{\"reasoning_effort\":\"low\"}' --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (No Reasoning)": {
+              "description": "Disables thinking for direct instruct responses",
+              "args": "--reasoning off --chat-template-kwargs '{\"enable_thinking\":false}' --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-cafonez-qwen3-8-27b-rocmi4-mtp-gguf"
+        },
+        {
+          "name": "Qwen 3.6 27B MTP",
+          "repo": "unsloth/Qwen3.6-27B-MTP-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 2,
+            "default_np": 1
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-6-27b-mtp-gguf"
+        },
+        {
+          "name": "Qwen 3.6 35B A3B MTP",
+          "repo": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 2,
+            "default_np": 1
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-6-35b-a3b-mtp-gguf"
+        },
+        {
+          "name": "Qwen 3.5 122B A10B MTP",
+          "repo": "unsloth/Qwen3.5-122B-A10B-MTP-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 2,
+            "default_np": 1
+          },
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks (e.g. WebDev)",
+              "args": "--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+            },
+            "Instruct (General)": {
+              "description": "Recommended for general instruct (non-thinking) tasks",
+              "args": "--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 --repeat-penalty 1.0"
+            },
+            "Instruct (Reasoning)": {
+              "description": "Recommended for instruct (non-thinking) reasoning tasks",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 40 --min-p 0.0 --presence-penalty 2.0 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-qwen3-5-122b-a10b-mtp-gguf"
+        },
+        {
+          "name": "Gemma 4 26B A4B IT",
+          "repo": "unsloth/gemma-4-26B-A4B-it-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "Google recommended sampling parameters",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 64"
+            }
+          },
+          "id": "llama-unsloth-gemma-4-26b-a4b-it-gguf"
+        },
+        {
+          "name": "Gemma 4 31B IT",
+          "repo": "unsloth/gemma-4-31B-it-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "Google recommended sampling parameters",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 64"
+            }
+          },
+          "id": "llama-unsloth-gemma-4-31b-it-gguf"
+        },
+        {
+          "name": "Devstral 2 123B Instruct",
+          "repo": "unsloth/Devstral-2-123B-Instruct-2512-GGUF",
+          "inference_profiles": {
+            "Coding/Agentic": {
+              "description": "Mistral recommended for software engineering tasks",
+              "args": "--temp 0.15"
+            }
+          },
+          "id": "llama-unsloth-devstral-2-123b-instruct-2512-gguf"
+        },
+        {
+          "name": "GLM 4.7 Flash",
+          "repo": "unsloth/GLM-4.7-Flash-GGUF",
+          "inference_profiles": {
+            "General Use": {
+              "description": "Unsloth recommended for general chat",
+              "args": "--temp 1.0 --top-p 0.95 --min-p 0.01 --repeat-penalty 1.0"
+            },
+            "Tool Calling": {
+              "description": "Optimized for function/tool-calling",
+              "args": "--temp 0.7 --top-p 1.0 --min-p 0.01 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-glm-4-7-flash-gguf"
+        },
+        {
+          "name": "GLM 5.2",
+          "repo": "unsloth/GLM-5.2-GGUF",
+          "inference_profiles": {
+            "Thinking (General)": {
+              "description": "Z.AI recommended for general thinking/reasoning tasks",
+              "args": "--temp 1.0 --top-p 0.95 --min-p 0.01 --repeat-penalty 1.0"
+            },
+            "Thinking (Coding)": {
+              "description": "Recommended for precise coding tasks",
+              "args": "--temp 0.6 --top-p 0.95 --min-p 0.01 --repeat-penalty 1.0"
+            },
+            "Non-thinking (General)": {
+              "description": "Recommended for general non-thinking chat tasks",
+              "args": "--temp 0.7 --top-p 0.8 --min-p 0.01 --repeat-penalty 1.0"
+            },
+            "Tool Calling": {
+              "description": "Optimized for function/tool-calling",
+              "args": "--temp 0.7 --top-p 1.0 --min-p 0.01 --repeat-penalty 1.0"
+            }
+          },
+          "id": "llama-unsloth-glm-5-2-gguf"
+        },
+        {
+          "name": "GLM 5.3 Flash",
+          "repo": "unsloth/GLM-5.3-Flash-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "default_inference_profile": "Thinking (Effort: Max)",
+          "inference_profiles": {
+            "Thinking (Effort: Max)": {
+              "description": "Unsloth default; maximum reasoning for complicated tasks",
+              "args": "--chat-template-kwargs '{\"reasoning_effort\":\"max\"}' --temp 1.0 --top-p 0.95"
+            },
+            "Thinking (Effort: High)": {
+              "description": "High reasoning effort with Unsloth's default sampling",
+              "args": "--chat-template-kwargs '{\"reasoning_effort\":\"high\"}' --temp 1.0 --top-p 0.95"
+            },
+            "Thinking (Effort: Low)": {
+              "description": "Low reasoning effort with Unsloth's default sampling",
+              "args": "--chat-template-kwargs '{\"reasoning_effort\":\"low\"}' --temp 1.0 --top-p 0.95"
+            },
+            "DeepSWE": {
+              "description": "Unsloth's DeepSWE evaluation sampling settings",
+              "args": "--temp 0.95 --top-p 1.0"
+            }
+          },
+          "id": "llama-unsloth-glm-5-3-flash-gguf"
+        },
+        {
+          "name": "GPT OSS 120B",
+          "repo": "unsloth/gpt-oss-120b-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "Unsloth repository sampling parameters",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0"
+            }
+          },
+          "id": "llama-unsloth-gpt-oss-120b-gguf"
+        },
+        {
+          "name": "GPT OSS 20B",
+          "repo": "unsloth/gpt-oss-20b-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "Unsloth repository sampling parameters",
+              "args": "--temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0"
+            }
+          },
+          "id": "llama-unsloth-gpt-oss-20b-gguf"
+        },
+        {
+          "name": "Llama 2 7B",
+          "repo": "TheBloke/Llama-2-7B-GGUF",
+          "no_jinja": true,
+          "id": "llama-thebloke-llama-2-7b-gguf"
+        },
+        {
+          "name": "LFM2.5 1.2B Instruct",
+          "repo": "unsloth/LFM2.5-1.2B-Instruct-GGUF",
+          "id": "llama-unsloth-lfm2-5-1-2b-instruct-gguf"
+        },
+        {
+          "name": "Muse Glimmer 30B",
+          "repo": "unsloth/Muse-Glimmer-30B-GGUF",
+          "vision_projector": {
+            "patterns": [
+              "mmproj-*.gguf"
+            ]
+          },
+          "inference_profiles": {
+            "Default": {
+              "description": "Meta recommended sampling parameters",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 64"
+            }
+          },
+          "id": "llama-unsloth-muse-glimmer-30b-gguf"
+        },
+        {
+          "name": "MiniMax M2.7",
+          "repo": "unsloth/MiniMax-M2.7-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "MiniMax recommended sampling parameters",
+              "args": "--temp 1.0 --top-p 0.95 --top-k 40"
+            }
+          },
+          "id": "llama-unsloth-minimax-m2-7-gguf"
+        },
+        {
+          "name": "Ministral 3 14B Instruct",
+          "repo": "unsloth/Ministral-3-14B-Instruct-2512-GGUF",
+          "inference_profiles": {
+            "Coding/Agentic": {
+              "description": "Mistral recommended for local/edge tasks",
+              "args": "--temp 0.15"
+            }
+          },
+          "id": "llama-unsloth-ministral-3-14b-instruct-2512-gguf"
+        },
+        {
+          "name": "Nemotron 3 Super 120B A12B",
+          "repo": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+          "inference_profiles": {
+            "Default": {
+              "description": "NVIDIA recommended sampling parameters",
+              "args": "--temp 1.0 --top-p 0.95"
+            }
+          },
+          "id": "llama-unsloth-nvidia-nemotron-3-super-120b-a12b-gguf"
+        },
+        {
+          "name": "Qwopus3.6 27B v2 Chadrock ROCmFP4 MTP",
+          "repo": "jcbtc/qwopus3.6-27b-v2-chadrock-rocmfp4-mtp",
+          "mtp": {
+            "supported": true,
+            "default_draft_n": 3,
+            "default_np": 1
+          },
+          "compatible_toolboxes": [
+            "rocm-7.2.4-rocmfp4"
+          ],
+          "inference_profiles": {
+            "Strix Lean": {
+              "description": "Recommended for Strix Halo",
+              "args": "--temp 0.7 --top-p 0.9 --top-k 40 -b 512 -ub 512 -ctk q8_0 -ctv q8_0 --spec-draft-n-min 0 --spec-draft-p-min 0.0 --spec-draft-p-split 0.10 --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 --reasoning on -dev ROCm0"
+            }
+          },
+          "id": "llama-jcbtc-qwopus3-6-27b-v2-chadrock-rocmfp4-mtp"
+        },
+        {
+          "name": "Qwen3 30B A3B Instruct 2507 (HRX test)",
+          "repo": "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+          "id": "llama-unsloth-qwen3-30b-a3b-instruct-2507-gguf"
+        }
+      ]
+    },
+    "ds4": {
+      "kind": "gguf_file",
+      "storage": {
+        "config_key": "models_dir",
+        "default": "~/ds4"
+      },
+      "models": [
+        {
+          "name": "DeepSeek V4 Flash 0731 — IQ2_XXS imatrix (~80.8 GB)",
+          "family": "deepseek-v4",
+          "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+          "size_gb": 80.8,
+          "recommended": false,
+          "server_defaults": {
+            "standalone_ctx": 262144
+          },
+          "id": "ds4-deepseek-v4-flash-iq2xxs-w2q2k-aprojq8-sexpq8-outq8-chat-v2-imatrix-0731-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash 0731 — Hybrid Q2/Q4 imatrix (~97 GB) — Higher Quality",
+          "family": "deepseek-v4",
+          "filename": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
+          "size_gb": 97.0,
+          "recommended": false,
+          "server_defaults": {
+            "prefill_chunk": 2048
+          },
+          "id": "ds4-deepseek-v4-flash-layers37-42q4kexperts-otherexpertlayersiq2xxsgateup-q2kdown-aprojq8-sexpq8-outq8-chat-v2-imatrix-fixed-0731-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash 0731 — Q4 imatrix (~153.3 GB)",
+          "family": "deepseek-v4",
+          "filename": "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+          "size_gb": 153.3,
+          "recommended": false,
+          "server_defaults": {
+            "dist_prefill_chunk": 512,
+            "dist_prefill_window": 2
+          },
+          "id": "ds4-deepseek-v4-flash-q4kexperts-f16hc-f16compressor-f16indexer-q8attn-q8shared-q8out-chat-v2-imatrix-0731-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash 0731 — MXFP4 experts (~156 GB)",
+          "family": "deepseek-v4",
+          "filename": "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
+          "size_gb": 156.0,
+          "recommended": false,
+          "id": "ds4-deepseek-v4-flash-mxfp4experts-f16hc-f16compressor-f16indexer-q8attn-q8shared-q8out-chat-v2-mxfp4-0731-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash 0731 — DSpark support (~5.99 GB)",
+          "family": "deepseek-v4",
+          "filename": "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
+          "artifact_role": "dspark_support",
+          "size_gb": 5.99,
+          "recommended": false,
+          "id": "ds4-deepseek-v4-flash-dspark-support-0731-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash Vision Experimental — IQ2_XXS (~81 GiB) — Recommended",
+          "family": "deepseek-v4-vision",
+          "filename": "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf",
+          "size_gb": 81.0,
+          "recommended": true,
+          "server_defaults": {
+            "standalone_ctx": 262144
+          },
+          "sha256": "8f2d42c0071ccf8a98f391cc2b835fd123f12330690b3059dbb7707920e5ad9e",
+          "id": "ds4-deepseek-v4-flash-vision-exp-iq2xxs-w2q2k-aprojq8-sexpq8-outq8-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash Vision Experimental — Hybrid Q2/Q4 (~91 GiB)",
+          "family": "deepseek-v4-vision",
+          "filename": "DeepSeek-V4-Flash-Vision-Exp-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8.gguf",
+          "size_gb": 91.0,
+          "recommended": false,
+          "sha256": "cded4517bb9d033e778e8bc4ccf1e79ba96d1c2d2b9f1c071c1d4a9037c51b02",
+          "id": "ds4-deepseek-v4-flash-vision-exp-layers37-42q4kexperts-otherexpertlayersiq2xxsgateup-q2kdown-aprojq8-sexpq8-outq8-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash Vision Experimental — MXFP4 experts (~145 GiB)",
+          "family": "deepseek-v4-vision",
+          "filename": "DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf",
+          "size_gb": 145.0,
+          "recommended": false,
+          "sha256": "fc1efb96fa26e654b3530ce5f4b926b189a936d41d94dc1903c832f1e18eb3e7",
+          "id": "ds4-deepseek-v4-flash-vision-exp-mxfp4experts-f16hc-f16compressor-f16indexer-q8attn-q8shared-q8out-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash Vision Encoder (~0.9 GiB)",
+          "family": "deepseek-v4-vision",
+          "filename": "DeepSeek-V4-Flash-Vision-Encoder.gguf",
+          "artifact_role": "vision_encoder",
+          "size_gb": 0.9,
+          "recommended": false,
+          "sha256": "00cd4d81a435364967400a95c42703343e11da6b6f18c5143fe76e1d94d5035f",
+          "id": "ds4-deepseek-v4-flash-vision-encoder-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "DeepSeek V4 Flash Vision Experimental — DSpark support (~5.6 GiB)",
+          "family": "deepseek-v4-vision",
+          "filename": "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf",
+          "artifact_role": "dspark_support",
+          "size_gb": 5.6,
+          "recommended": false,
+          "sha256": "0807a67fd9ce5874bfc60d8d2461f50e11657e3dd94913d3473f85aa679bc877",
+          "id": "ds4-deepseek-v4-flash-vision-exp-dspark-support-gguf",
+          "repo": "antirez/deepseek-v4-gguf"
+        },
+        {
+          "name": "GLM 5.3 Flash Q2 (~96.5 GB) — 128 GB Strix Halo Recommended",
+          "family": "glm-5.3-flash",
+          "repo": "antirez/glm-5.3-flash-gguf",
+          "filename": "GLM-5.3-Flash-Q2.gguf",
+          "size_gb": 96.5,
+          "recommended": true,
+          "server_defaults": {
+            "standalone_ctx": 262144
+          },
+          "id": "ds4-glm-5-3-flash-q2-gguf"
+        },
+        {
+          "name": "GLM 5.3 Flash Q4_K (~191 GB) — Higher Quality",
+          "family": "glm-5.3-flash",
+          "repo": "antirez/glm-5.3-flash-gguf",
+          "filename": "GLM-5.3-Flash-Q4_K.gguf",
+          "size_gb": 191.0,
+          "recommended": false,
+          "server_defaults": {
+            "standalone_ctx": 4096
+          },
+          "id": "ds4-glm-5-3-flash-q4-k-gguf"
+        },
+        {
+          "name": "GLM 5.3 Flash Vision Encoder (~1.13 GB)",
+          "family": "glm-5.3-flash",
+          "repo": "antirez/glm-5.3-flash-gguf",
+          "filename": "GLM-5.3-Flash-Vision-Encoder.gguf",
+          "artifact_role": "vision_encoder",
+          "size_gb": 1.13,
+          "recommended": false,
+          "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a",
+          "id": "ds4-glm-5-3-flash-vision-encoder-gguf"
+        },
+        {
+          "name": "DeepSeek V4.1 Flash — Q2",
+          "family": "deepseek-v4.1-flash",
+          "repo": "antirez/deepseek-v4.1-flash-gguf",
+          "filename": "DeepSeek-V4.1-Flash-Q2.gguf",
+          "artifact_role": "main",
+          "size_gb": 365.714,
+          "recommended": false,
+          "sha256": "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42",
+          "id": "ds4-deepseek-v4-1-flash-q2-gguf"
+        },
+        {
+          "name": "DeepSeek V4.1 Flash — Q4 part 1 of 2",
+          "family": "deepseek-v4.1-flash",
+          "repo": "antirez/deepseek-v4.1-flash-gguf",
+          "filename": "DeepSeek-V4.1-Flash-Q4.gguf.part1",
+          "artifact_role": "main",
+          "size_gb": 480.0,
+          "recommended": false,
+          "sha256": "6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246",
+          "id": "ds4-deepseek-v4-1-flash-q4-gguf-part1"
+        },
+        {
+          "name": "DeepSeek V4.1 Flash — Q4 part 2 of 2",
+          "family": "deepseek-v4.1-flash",
+          "repo": "antirez/deepseek-v4.1-flash-gguf",
+          "filename": "DeepSeek-V4.1-Flash-Q4.gguf.part2",
+          "artifact_role": "main",
+          "size_gb": 38.596,
+          "recommended": false,
+          "sha256": "7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0",
+          "id": "ds4-deepseek-v4-1-flash-q4-gguf-part2"
+        },
+        {
+          "name": "DeepSeek V4.1 Flash — Vision Encoder",
+          "family": "deepseek-v4.1-flash",
+          "repo": "antirez/deepseek-v4.1-flash-gguf",
+          "filename": "DeepSeek-V4.1-Flash-Vision.gguf",
+          "artifact_role": "vision_encoder",
+          "size_gb": 0.971,
+          "recommended": false,
+          "sha256": "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15",
+          "id": "ds4-deepseek-v4-1-flash-vision-gguf"
+        },
+        {
+          "name": "Qwen 3.8 Flash Next — Q2 (~137.1 GiB)",
+          "family": "qwen3.8-flash-next",
+          "repo": "antirez/qwen3.8-flash-next-gguf",
+          "filename": "Qwen3.8-Flash-Next-Q2.gguf",
+          "artifact_role": "main",
+          "size_gb": 137.1,
+          "recommended": false,
+          "id": "ds4-qwen3-8-flash-next-q2-gguf"
+        },
+        {
+          "name": "Qwen 3.8 Flash Next — Q4 (~165.1 GiB) — Higher Quality",
+          "family": "qwen3.8-flash-next",
+          "repo": "antirez/qwen3.8-flash-next-gguf",
+          "filename": "Qwen3.8-Flash-Next-Q4.gguf",
+          "artifact_role": "main",
+          "size_gb": 165.11,
+          "recommended": false,
+          "id": "ds4-qwen3-8-flash-next-q4-gguf"
+        }
+      ],
+      "config": {
+        "default_repo": "antirez/deepseek-v4-gguf",
+        "families": {
+          "deepseek-v4": {
+            "coordinator_layers": "0:21",
+            "worker_layers": "22:output",
+            "dspark_enabled": true,
+            "dspark_support_filename": "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
+            "dspark_confidence": 0.7
+          },
+          "deepseek-v4-vision": {
+            "coordinator_layers": "0:21",
+            "worker_layers": "22:output",
+            "dspark_enabled": true,
+            "dspark_support_filename": "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf",
+            "dspark_confidence": 0.7
+          },
+          "glm-5.3-flash": {
+            "standalone_ctx": 262144
+          },
+          "deepseek-v4.1-flash": {},
+          "qwen3.8-flash-next": {}
+        },
+        "default_server_defaults": {}
+      }
+    },
+    "vllm": {
+      "kind": "hf_repository",
+      "storage": {
+        "config_key": "hf_home",
+        "default": "~/.cache/huggingface"
+      },
+      "models": [
+        {
+          "id": "vllm-meta-llama-meta-llama-3-1-8b-instruct",
+          "name": "Meta-Llama-3.1-8B-Instruct",
+          "repo": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+          "trust_remote": false,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "max_num_seqs": "64",
+          "max_tokens": "32768",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "llama3_json"
+          ]
+        },
+        {
+          "id": "vllm-redhatai-meta-llama-3-1-8b-instruct-fp8-dynamic",
+          "name": "Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
+          "repo": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
+          "trust_remote": false,
+          "valid_tp": [
+            1
+          ],
+          "enforce_eager": true,
+          "env": {
+            "VLLM_STRIX_FP8_TRITON": "1",
+            "VLLM_ROCM_USE_AITER": "0"
+          },
+          "max_num_seqs": "64",
+          "max_tokens": "32768",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "llama3_json"
+          ]
+        },
+        {
+          "id": "vllm-google-gemma-4-26b-a4b-it",
+          "name": "gemma-4-26B-A4B-it",
+          "repo": "google/gemma-4-26B-A4B-it",
+          "trust_remote": false,
+          "enforce_eager": false,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "max_num_seqs": "64",
+          "max_tokens": "32768",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "gemma4",
+            "--reasoning-parser",
+            "gemma4"
+          ]
+        },
+        {
+          "id": "vllm-google-gemma-4-31b-it",
+          "name": "gemma-4-31B-it",
+          "repo": "google/gemma-4-31B-it",
+          "trust_remote": false,
+          "enforce_eager": false,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "max_num_seqs": "64",
+          "max_tokens": "32768",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "gemma4",
+            "--reasoning-parser",
+            "gemma4"
+          ]
+        },
+        {
+          "id": "vllm-openai-gpt-oss-20b",
+          "name": "gpt-oss-20b",
+          "repo": "openai/gpt-oss-20b",
+          "trust_remote": true,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "max_num_seqs": "64",
+          "max_tokens": "8192",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "openai",
+            "--reasoning-parser",
+            "openai_gptoss"
+          ]
+        },
+        {
+          "id": "vllm-openai-gpt-oss-120b",
+          "name": "gpt-oss-120b",
+          "repo": "openai/gpt-oss-120b",
+          "trust_remote": true,
+          "valid_tp": [
+            1
+          ],
+          "max_num_seqs": "64",
+          "max_tokens": "8192",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "openai",
+            "--reasoning-parser",
+            "openai_gptoss"
+          ]
+        },
+        {
+          "id": "vllm-deepseek-ai-deepseek-v4-flash-0731",
+          "name": "DeepSeek-V4-Flash-0731",
+          "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+          "trust_remote": true,
+          "valid_tp": [
+            1
+          ],
+          "enforce_eager": true,
+          "attention_backend": null,
+          "attention_backend_label": "ROCM_FLASHMLA_SPARSE_DSV4 (model-specific)",
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0"
+          },
+          "ctx": "262144",
+          "max_num_seqs": "1",
+          "max_tokens": "256",
+          "extra_flags": [
+            "--kv-cache-dtype",
+            "fp8",
+            "--block-size",
+            "256",
+            "--max-num-batched-tokens",
+            "256",
+            "--logprobs-mode",
+            "processed_logprobs"
+          ]
+        },
+        {
+          "id": "vllm-qwen-qwen3-6-35b-a3b",
+          "name": "Qwen3.6-35B-A3B",
+          "repo": "Qwen/Qwen3.6-35B-A3B",
+          "trust_remote": true,
+          "valid_tp": [
+            1
+          ],
+          "attention_backend": "ROCM_AITER_UNIFIED_ATTN",
+          "env": {
+            "VLLM_ROCM_USE_AITER": "0",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0"
+          },
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3"
+          ]
+        },
+        {
+          "id": "vllm-liquidai-lfm2-5-1-2b-instruct",
+          "name": "LFM2.5-1.2B-Instruct",
+          "repo": "LiquidAI/LFM2.5-1.2B-Instruct",
+          "trust_remote": false,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "attention_backend": "ROCM_AITER_UNIFIED_ATTN",
+          "env": {
+            "VLLM_ROCM_USE_AITER": "0",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0"
+          },
+          "ctx": "128000",
+          "max_num_seqs": "64",
+          "max_tokens": "16384"
+        },
+        {
+          "id": "vllm-meta-models-muse-glimmer-30b",
+          "name": "Muse-Glimmer-30B",
+          "repo": "meta-models/Muse-Glimmer-30B",
+          "trust_remote": false,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "attention_backend": "ROCM_AITER_UNIFIED_ATTN",
+          "env": {
+            "VLLM_ROCM_USE_AITER": "0",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0"
+          },
+          "ctx": "131072",
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--model-impl",
+            "transformers"
+          ]
+        },
+        {
+          "id": "vllm-cyankiwi-qwen3-6-35b-a3b-awq-4bit",
+          "name": "Qwen3.6-35B-A3B-AWQ-4bit",
+          "repo": "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+          "trust_remote": true,
+          "valid_tp": [
+            1
+          ],
+          "enforce_eager": true,
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3"
+          ]
+        },
+        {
+          "id": "vllm-cyankiwi-qwen3-5-122b-a10b-awq-4bit",
+          "name": "Qwen3.5-122B-A10B-AWQ-4bit",
+          "repo": "cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit",
+          "trust_remote": true,
+          "valid_tp": [
+            1,
+            2
+          ],
+          "enforce_eager": true,
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3"
+          ]
+        },
+        {
+          "id": "vllm-cyankiwi-qwen3-5-122b-a10b-awq-8bit",
+          "name": "Qwen3.5-122B-A10B-AWQ-8bit",
+          "repo": "cyankiwi/Qwen3.5-122B-A10B-AWQ-8bit",
+          "trust_remote": true,
+          "valid_tp": [
+            2
+          ],
+          "enforce_eager": true,
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3"
+          ]
+        },
+        {
+          "id": "vllm-cyankiwi-minimax-m2-7-awq-4bit",
+          "name": "MiniMax-M2.7-AWQ-4bit",
+          "repo": "cyankiwi/MiniMax-M2.7-AWQ-4bit",
+          "trust_remote": true,
+          "valid_tp": [
+            2
+          ],
+          "enforce_eager": true,
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "minimax_m2",
+            "--reasoning-parser",
+            "deepseek_r1"
+          ]
+        },
+        {
+          "id": "vllm-ayysasha-minimax-m2-7-awq-g32-strix-2h",
+          "name": "MiniMax-M2.7-AWQ-G32-STRIX-2H",
+          "repo": "ayysasha/MiniMax-M2.7-AWQ-G32-STRIX-2H",
+          "trust_remote": true,
+          "valid_tp": [
+            2
+          ],
+          "enforce_eager": true,
+          "ctx": "131072",
+          "max_num_seqs": "64",
+          "max_tokens": "16384",
+          "extra_flags": [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "minimax_m2",
+            "--reasoning-parser",
+            "deepseek_r1"
+          ]
+        }
+      ],
+      "config": {
+        "policy_source": "amd-strix-halo-vllm-toolboxes/scripts/models.py",
+        "default_attention_backend": "TRITON_ATTN",
+        "attention_backends": [
+          "TRITON_ATTN",
+          "ROCM_ATTN",
+          "ROCM_AITER_UNIFIED_ATTN"
+        ],
+        "default_gpu_memory_utilization": "0.90"
+      }
+    },
+    "comfyui": {
+      "kind": "workflow_bundle",
+      "storage": {
+        "config_key": "models_dir",
+        "default": "~/comfy-models"
+      },
+      "bundles": [
+        {
+          "name": "Qwen Image (Base 20B)",
+          "keywords": [
+            "Qwen-Image"
+          ],
+          "exclude_keywords": [
+            "LoRA",
+            "Edit",
+            "GGUF"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "BF16 (Standard / High Quality)",
+              "args": [
+                "1 bf16"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "1"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-base-20b",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image + Lightning LoRA (4-steps)",
+          "keywords": [
+            "Qwen-Image",
+            "LoRA"
+          ],
+          "exclude_keywords": [
+            "GGUF"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "BF16 (Standard / High Quality)",
+              "args": [
+                "1 bf16",
+                "3"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "1",
+                "3"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-lightning-lora-4-steps",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image Edit (Base)",
+          "keywords": [
+            "Qwen-Image-Edit"
+          ],
+          "exclude_keywords": [
+            "LoRA",
+            "GGUF"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "BF16 (Standard / High Quality)",
+              "args": [
+                "2 bf16"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "2"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-edit-base",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image Edit + Lightning LoRA",
+          "keywords": [
+            "Qwen-Image-Edit",
+            "LoRA"
+          ],
+          "exclude_keywords": [
+            "GGUF"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "BF16 (Standard / High Quality)",
+              "args": [
+                "2 bf16",
+                "4"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "2",
+                "4"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-edit-lightning-lora",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image 2512 GGUF Q4_K_M",
+          "keywords": [
+            "Qwen-Image-2512",
+            "GGUF",
+            "20-Steps"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "Q4_K_M diffusion model + Q4 text encoder",
+              "args": [
+                "5"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-2512-gguf-q4-k-m",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image 2512 GGUF + Lightning LoRA",
+          "keywords": [
+            "Qwen-Image-2512",
+            "GGUF",
+            "LoRA"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "Q4_K_M diffusion model + Q4 text encoder + 4-step LoRA",
+              "args": [
+                "5",
+                "3"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-2512-gguf-lightning-lora",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image Edit 2511 GGUF Q4_K_M",
+          "keywords": [
+            "Qwen-Image-Edit-2511",
+            "GGUF",
+            "20-Steps"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "Q4_K_M diffusion model + Q4 text encoder",
+              "args": [
+                "6"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-edit-2511-gguf-q4-k-m",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Qwen Image Edit 2511 GGUF + Lightning LoRA",
+          "keywords": [
+            "Qwen-Image-Edit-2511",
+            "GGUF",
+            "LoRA"
+          ],
+          "script": "get_qwen_image.sh",
+          "variants": [
+            {
+              "name": "Q4_K_M diffusion model + Q4 text encoder + 4-step LoRA",
+              "args": [
+                "6",
+                "4"
+              ]
+            }
+          ],
+          "id": "comfy-qwen-image-edit-2511-gguf-lightning-lora",
+          "recipe_id": "get_qwen_image.sh"
+        },
+        {
+          "name": "Wan 2.2 - Image to Video (14B)",
+          "keywords": [
+            "Wan2.2",
+            "I2V"
+          ],
+          "script": "get_wan22.sh",
+          "variants": [
+            {
+              "name": "FP16 (Standard / High Quality)",
+              "args": [
+                "common fp16",
+                "14b-i2v fp16",
+                "lora"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "common",
+                "14b-i2v",
+                "lora"
+              ]
+            }
+          ],
+          "id": "comfy-wan-2-2-image-to-video-14b",
+          "recipe_id": "get_wan22.sh"
+        },
+        {
+          "name": "Wan 2.2 - Text to Video (14B)",
+          "keywords": [
+            "Wan2.2",
+            "T2V"
+          ],
+          "script": "get_wan22.sh",
+          "variants": [
+            {
+              "name": "FP16 (Standard / High Quality)",
+              "args": [
+                "common fp16",
+                "14b-t2v fp16",
+                "lora"
+              ]
+            },
+            {
+              "name": "FP8 (Compressed / Low Disk Usage)",
+              "args": [
+                "common",
+                "14b-t2v",
+                "lora"
+              ]
+            }
+          ],
+          "id": "comfy-wan-2-2-text-to-video-14b",
+          "recipe_id": "get_wan22.sh"
+        },
+        {
+          "name": "HunyuanVideo 1.5 - Image to Video (720p)",
+          "keywords": [
+            "Hunyuan",
+            "i2v"
+          ],
+          "script": "get_hunyuan15.sh",
+          "variants": [
+            {
+              "name": "Standard (FP16)",
+              "args": [
+                "common",
+                "720p-i2v",
+                "lora"
+              ]
+            }
+          ],
+          "id": "comfy-hunyuanvideo-1-5-image-to-video-720p",
+          "recipe_id": "get_hunyuan15.sh"
+        },
+        {
+          "name": "HunyuanVideo 1.5 - Text to Video (720p)",
+          "keywords": [
+            "Hunyuan",
+            "t2v"
+          ],
+          "script": "get_hunyuan15.sh",
+          "variants": [
+            {
+              "name": "Standard (FP16)",
+              "args": [
+                "common",
+                "720p-t2v",
+                "lora"
+              ]
+            }
+          ],
+          "id": "comfy-hunyuanvideo-1-5-text-to-video-720p",
+          "recipe_id": "get_hunyuan15.sh"
+        },
+        {
+          "name": "LTX-2.3 BF16 Dev + Distilled LoRA",
+          "keywords": [
+            "LTX-2.3",
+            "BF16",
+            "Dev",
+            "LoRA"
+          ],
+          "exclude_keywords": [
+            "GGUF"
+          ],
+          "script": "get_ltx2.sh",
+          "variants": [
+            {
+              "name": "Native BF16 checkpoint + compact distilled 1.1 LoRA (128GB recommended)",
+              "args": [
+                "bf16-common",
+                "bf16-dev",
+                "bf16-loras"
+              ]
+            }
+          ],
+          "id": "comfy-ltx-2-3-bf16-dev-distilled-lora",
+          "recipe_id": "get_ltx2.sh"
+        },
+        {
+          "name": "LTX-2.3 BF16 Distilled (No LoRA)",
+          "keywords": [
+            "LTX-2.3",
+            "BF16",
+            "Distilled",
+            "No-LoRA"
+          ],
+          "exclude_keywords": [
+            "GGUF",
+            "Dev"
+          ],
+          "script": "get_ltx2.sh",
+          "variants": [
+            {
+              "name": "Native BF16 distilled 1.1 checkpoint, no LoRAs (128GB recommended)",
+              "args": [
+                "bf16-common",
+                "bf16-distilled"
+              ]
+            }
+          ],
+          "id": "comfy-ltx-2-3-bf16-distilled-no-lora",
+          "recipe_id": "get_ltx2.sh"
+        },
+        {
+          "name": "LTX-2.3 GGUF Q6_K Dev + Distilled LoRA",
+          "keywords": [
+            "LTX-2.3",
+            "GGUF",
+            "Q6_K",
+            "Dev",
+            "LoRA"
+          ],
+          "script": "get_ltx2.sh",
+          "variants": [
+            {
+              "name": "Q6_K dev model + full-rank distilled 1.1 LoRA (lower memory)",
+              "args": [
+                "gguf-common",
+                "gguf-dev",
+                "gguf-lora"
+              ]
+            }
+          ],
+          "id": "comfy-ltx-2-3-gguf-q6-k-dev-distilled-lora",
+          "recipe_id": "get_ltx2.sh"
+        },
+        {
+          "name": "LTX-2.3 GGUF Q6_K Distilled (No LoRA)",
+          "keywords": [
+            "LTX-2.3",
+            "GGUF",
+            "Q6_K",
+            "Distilled",
+            "No-LoRA"
+          ],
+          "exclude_keywords": [
+            "Dev"
+          ],
+          "script": "get_ltx2.sh",
+          "variants": [
+            {
+              "name": "Q6_K distilled model, no LoRAs (lower memory)",
+              "args": [
+                "gguf-common",
+                "gguf-distilled"
+              ]
+            }
+          ],
+          "id": "comfy-ltx-2-3-gguf-q6-k-distilled-no-lora",
+          "recipe_id": "get_ltx2.sh"
+        },
+        {
+          "name": "MiniMax-H3 T2V",
+          "keywords": [
+            "minimax-h3",
+            "t2v"
+          ],
+          "exclude_keywords": [
+            "turbo",
+            "gguf"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "T2V model + shared encoder and VAEs",
+              "args": [
+                "common",
+                "fl2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-t2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 I2V",
+          "keywords": [
+            "minimax-h3",
+            "i2v"
+          ],
+          "exclude_keywords": [
+            "turbo",
+            "gguf"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "I2V model + shared encoder and VAEs",
+              "args": [
+                "common",
+                "fl2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-i2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 R2V",
+          "keywords": [
+            "minimax-h3",
+            "r2v"
+          ],
+          "exclude_keywords": [
+            "gguf"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "R2V model + shared encoder and VAEs",
+              "args": [
+                "common",
+                "ref2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-r2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 Turbo T2V",
+          "keywords": [
+            "minimax-h3",
+            "turbo",
+            "t2v"
+          ],
+          "exclude_keywords": [
+            "gguf"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "Turbo LoRA + T2V model, encoder and VAEs",
+              "args": [
+                "common",
+                "fl2va",
+                "turbo"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-turbo-t2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 Turbo I2V",
+          "keywords": [
+            "minimax-h3",
+            "turbo",
+            "i2v"
+          ],
+          "exclude_keywords": [
+            "gguf"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "Turbo LoRA + I2V model, encoder and VAEs",
+              "args": [
+                "common",
+                "fl2va",
+                "turbo"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-turbo-i2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 GGUF Turbo T2V",
+          "keywords": [
+            "minimax-h3",
+            "gguf",
+            "turbo",
+            "t2v"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "GGUF model and encoder + Turbo LoRA + shared VAEs",
+              "args": [
+                "gguf-common",
+                "gguf-fl2va",
+                "turbo"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-gguf-turbo-t2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 GGUF Turbo I2V",
+          "keywords": [
+            "minimax-h3",
+            "gguf",
+            "turbo",
+            "i2v"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "GGUF model and encoder + Turbo LoRA + shared VAEs",
+              "args": [
+                "gguf-common",
+                "gguf-fl2va",
+                "turbo"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-gguf-turbo-i2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 GGUF T2V",
+          "keywords": [
+            "minimax-h3",
+            "gguf",
+            "t2v"
+          ],
+          "exclude_keywords": [
+            "turbo"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "UD-Q2_K_XL diffusion model + Q2_K_M text encoder",
+              "args": [
+                "gguf-common",
+                "gguf-fl2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-gguf-t2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 GGUF I2V",
+          "keywords": [
+            "minimax-h3",
+            "gguf",
+            "i2v"
+          ],
+          "exclude_keywords": [
+            "turbo"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "UD-Q2_K_XL diffusion model + Q2_K_M text encoder",
+              "args": [
+                "gguf-common",
+                "gguf-fl2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-gguf-i2v",
+          "recipe_id": "get_minimax_h3.sh"
+        },
+        {
+          "name": "MiniMax-H3 GGUF R2V",
+          "keywords": [
+            "minimax-h3",
+            "gguf",
+            "r2v"
+          ],
+          "exclude_keywords": [
+            "turbo"
+          ],
+          "script": "get_minimax_h3.sh",
+          "variants": [
+            {
+              "name": "Q2_K diffusion model + Q2_K_M text encoder",
+              "args": [
+                "gguf-common",
+                "gguf-ref2va"
+              ]
+            }
+          ],
+          "id": "comfy-minimax-h3-gguf-r2v",
+          "recipe_id": "get_minimax_h3.sh"
+        }
+      ],
+      "config": {
+        "policy_source": "amd-strix-halo-comfyui-toolboxes/scripts/model_manager.py",
+        "model_manager_command": [
+          "model_manager"
+        ],
+        "workflows": [
+          "Hunyuan-Video-1.5_720p_i2v-4-step-lora.json",
+          "Hunyuan-Video-1.5_720p_t2v-4-step-lora.json",
+          "LTX-2.3-I2V-BF16-Dev-Distilled-LoRA.json",
+          "LTX-2.3-I2V-BF16-Distilled-No-LoRA.json",
+          "LTX-2.3-I2V-GGUF-Q6_K-Dev-Distilled-LoRA.json",
+          "LTX-2.3-I2V-GGUF-Q6_K-Distilled-No-LoRA.json",
+          "LTX-2.3-T2V-BF16-Dev-Distilled-LoRA.json",
+          "LTX-2.3-T2V-BF16-Distilled-No-LoRA.json",
+          "LTX-2.3-T2V-GGUF-Q6_K-Dev-Distilled-LoRA.json",
+          "LTX-2.3-T2V-GGUF-Q6_K-Distilled-No-LoRA.json",
+          "MiniMax-H3-GGUF-I2V.json",
+          "MiniMax-H3-GGUF-R2V.json",
+          "MiniMax-H3-GGUF-T2V.json",
+          "MiniMax-H3-GGUF-Turbo-I2V.json",
+          "MiniMax-H3-GGUF-Turbo-T2V.json",
+          "MiniMax-H3-I2V.json",
+          "MiniMax-H3-R2V.json",
+          "MiniMax-H3-T2V.json",
+          "MiniMax-H3-Turbo-I2V.json",
+          "MiniMax-H3-Turbo-T2V.json",
+          "Qwen-Image-2512-BF16-20-Steps.json",
+          "Qwen-Image-2512-BF16-4-Step-LoRA.json",
+          "Qwen-Image-2512-GGUF-Q4_K_M-20-Steps.json",
+          "Qwen-Image-2512-GGUF-Q4_K_M-4-Step-LoRA.json",
+          "Qwen-Image-Edit-2511-BF16-20-Steps.json",
+          "Qwen-Image-Edit-2511-BF16-4-Step-LoRA.json",
+          "Qwen-Image-Edit-2511-GGUF-Q4_K_M-20-Steps.json",
+          "Qwen-Image-Edit-2511-GGUF-Q4_K_M-4-Step-LoRA.json",
+          "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1-FP16.json",
+          "Wan2.2-T2V-A14B-FP16-4steps-lora-rank64-Seko-V2.json"
+        ]
+      }
+    },
+    "halogen": {
+      "kind": "hgn_bundle",
+      "storage": {
+        "config_key": "models_dir",
+        "default": "~/halogen-models"
+      },
+      "config": {},
+      "models": [
+        {
+          "id": "qwen38-flash-next-w4b-quality",
+          "name": "Qwen3.8-Flash-Next W4B — quality overlay",
+          "repo": "peonist-ai/halogen-qwen3.8-flash-next",
+          "revision": "ac23b1b223b4e9192d27c22367d4dbacf2b595ef",
+          "quant": "W4B",
+          "checkpoint": "qwen38-flash-next-w4b.hgn",
+          "overlay": "qwen38-flash-next-w4b.overlay.hgn",
+          "tokenizer_dir": "tokenizer",
+          "recommended": true,
+          "files": [
+            {
+              "path": "qwen38-flash-next-w4b.hgn",
+              "size_bytes": 124068083904
+            },
+            {
+              "path": "qwen38-flash-next-w4b.overlay.hgn",
+              "size_bytes": 2477677120
+            },
+            {
+              "path": "tokenizer/chat_template.jinja",
+              "size_bytes": 8952
+            },
+            {
+              "path": "tokenizer/generation_config.json",
+              "size_bytes": 202
+            },
+            {
+              "path": "tokenizer/merges.txt",
+              "size_bytes": 3353259
+            },
+            {
+              "path": "tokenizer/tokenizer.json",
+              "size_bytes": 12809320
+            },
+            {
+              "path": "tokenizer/tokenizer_config.json",
+              "size_bytes": 17928
+            },
+            {
+              "path": "tokenizer/vocab.json",
+              "size_bytes": 6722759
+            }
+          ]
+        },
+        {
+          "id": "qwen38-flash-next-w4b-speed",
+          "name": "Qwen3.8-Flash-Next W4B — speed overlay",
+          "repo": "peonist-ai/halogen-qwen3.8-flash-next",
+          "revision": "ac23b1b223b4e9192d27c22367d4dbacf2b595ef",
+          "quant": "W4B",
+          "checkpoint": "qwen38-flash-next-w4b.hgn",
+          "overlay": "qwen38-flash-next-w4b.overlay-speed.hgn",
+          "tokenizer_dir": "tokenizer",
+          "recommended": false,
+          "files": [
+            {
+              "path": "qwen38-flash-next-w4b.hgn",
+              "size_bytes": 124068083904
+            },
+            {
+              "path": "qwen38-flash-next-w4b.overlay-speed.hgn",
+              "size_bytes": 2383306048
+            },
+            {
+              "path": "tokenizer/chat_template.jinja",
+              "size_bytes": 8952
+            },
+            {
+              "path": "tokenizer/generation_config.json",
+              "size_bytes": 202
+            },
+            {
+              "path": "tokenizer/merges.txt",
+              "size_bytes": 3353259
+            },
+            {
+              "path": "tokenizer/tokenizer.json",
+              "size_bytes": 12809320
+            },
+            {
+              "path": "tokenizer/tokenizer_config.json",
+              "size_bytes": 17928
+            },
+            {
+              "path": "tokenizer/vocab.json",
+              "size_bytes": 6722759
+            }
+          ]
+        },
+        {
+          "id": "qwen38-flash-next-w4b-quality-vision",
+          "name": "Qwen3.8-Flash-Next W4B — quality overlay + vision",
+          "repo": "peonist-ai/halogen-qwen3.8-flash-next",
+          "revision": "ac23b1b223b4e9192d27c22367d4dbacf2b595ef",
+          "quant": "W4B",
+          "checkpoint": "qwen38-flash-next-w4b.hgn",
+          "overlay": "qwen38-flash-next-w4b.overlay.hgn",
+          "tokenizer_dir": "tokenizer",
+          "recommended": false,
+          "files": [
+            {
+              "path": "qwen38-flash-next-w4b.hgn",
+              "size_bytes": 124068083904
+            },
+            {
+              "path": "qwen38-flash-next-w4b.overlay.hgn",
+              "size_bytes": 2477677120
+            },
+            {
+              "path": "tokenizer/chat_template.jinja",
+              "size_bytes": 8952
+            },
+            {
+              "path": "tokenizer/generation_config.json",
+              "size_bytes": 202
+            },
+            {
+              "path": "tokenizer/merges.txt",
+              "size_bytes": 3353259
+            },
+            {
+              "path": "tokenizer/tokenizer.json",
+              "size_bytes": 12809320
+            },
+            {
+              "path": "tokenizer/tokenizer_config.json",
+              "size_bytes": 17928
+            },
+            {
+              "path": "tokenizer/vocab.json",
+              "size_bytes": 6722759
+            },
+            {
+              "path": "qwen38-flash-next-vision.hgn",
+              "size_bytes": 897916416
+            }
+          ],
+          "vision_tower": "qwen38-flash-next-vision.hgn"
+        },
+        {
+          "id": "qwen38-flash-next-w4b-speed-vision",
+          "name": "Qwen3.8-Flash-Next W4B — speed overlay + vision",
+          "repo": "peonist-ai/halogen-qwen3.8-flash-next",
+          "revision": "ac23b1b223b4e9192d27c22367d4dbacf2b595ef",
+          "quant": "W4B",
+          "checkpoint": "qwen38-flash-next-w4b.hgn",
+          "overlay": "qwen38-flash-next-w4b.overlay-speed.hgn",
+          "tokenizer_dir": "tokenizer",
+          "recommended": false,
+          "files": [
+            {
+              "path": "qwen38-flash-next-w4b.hgn",
+              "size_bytes": 124068083904
+            },
+            {
+              "path": "qwen38-flash-next-w4b.overlay-speed.hgn",
+              "size_bytes": 2383306048
+            },
+            {
+              "path": "tokenizer/chat_template.jinja",
+              "size_bytes": 8952
+            },
+            {
+              "path": "tokenizer/generation_config.json",
+              "size_bytes": 202
+            },
+            {
+              "path": "tokenizer/merges.txt",
+              "size_bytes": 3353259
+            },
+            {
+              "path": "tokenizer/tokenizer.json",
+              "size_bytes": 12809320
+            },
+            {
+              "path": "tokenizer/tokenizer_config.json",
+              "size_bytes": 17928
+            },
+            {
+              "path": "tokenizer/vocab.json",
+              "size_bytes": 6722759
+            },
+            {
+              "path": "qwen38-flash-next-vision.hgn",
+              "size_bytes": 897916416
+            }
+          ],
+          "vision_tower": "qwen38-flash-next-vision.hgn"
+        }
+      ]
+    },
+    "r9v": {
+      "kind": "r9v_package",
+      "storage": {
+        "config_key": "models_dir",
+        "default": "~/models/R9V-Qwen3.8-IQ4_XS"
+      },
+      "models": [
+        {
+          "id": "r9v-qwen38-flash-next-iq4-xs",
+          "name": "Qwen3.8 Flash Next — IQ4_XS + FP8 MTP + Q8 vision (tested)",
+          "recommended": true,
+          "repo": "Dyluhn/Qwen3.8-Flash-Next-R9V-IQ4_XS",
+          "revision": "bf836f0c20b6c92fcad4226ad3115eb8a19f7582",
+          "quant": "Unsloth UD-IQ4_XS target + official block-FP8 MTP + ggml-org Q8_0 mmproj",
+          "license": "Qwen Community License 1.0",
+          "platform_id": "r9700",
+          "profile_note": "Tested on 2× R9700 32 GB + 64 GB host RAM and NVMe. TP2, MTP2, 131072 context, one sequence.",
+          "files": [
+            {
+              "path": "LICENSE",
+              "role": "license",
+              "size_bytes": 3220,
+              "sha256": "9fc8eea719a230d8eae622605f56b5f094183df8b8d446c57eeb2628bc988313"
+            },
+            {
+              "path": "THIRD_PARTY_NOTICES.md",
+              "role": "third-party-notices",
+              "size_bytes": 1591,
+              "sha256": "cc9e2ae32f08edf2060d36477150a60df589fc24f800247e45bb6053e31480b7"
+            },
+            {
+              "path": "target/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+              "role": "target",
+              "size_bytes": 10946624,
+              "sha256": "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4"
+            },
+            {
+              "path": "target/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf",
+              "role": "target",
+              "size_bytes": 49835229856,
+              "sha256": "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"
+            },
+            {
+              "path": "target/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf",
+              "role": "target",
+              "size_bytes": 43836407744,
+              "sha256": "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"
+            },
+            {
+              "path": "mtp/config.json",
+              "role": "mtp-config",
+              "size_bytes": 66251,
+              "sha256": "5ef62a1b6f873355a1012906329545646d2fb04b6fa3a7d838734a7555fd4dd1"
+            },
+            {
+              "path": "mtp/model.safetensors",
+              "role": "mtp-checkpoint",
+              "size_bytes": 2698415880,
+              "sha256": "33c1160579174630f4222882da479b67f1554d84963a991b4f4f0b69237110c1"
+            },
+            {
+              "path": "mtp/mtp-fp8-block-manifest.json",
+              "role": "mtp-manifest",
+              "size_bytes": 525,
+              "sha256": "5a9405a8054262803b50ef78b97ebac14e548a003ab2196762c0d710b0090865"
+            },
+            {
+              "path": "vision/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+              "role": "vision-projector",
+              "size_bytes": 616703104,
+              "sha256": "b2e9b5e4a44c107f8867e67dbf09b607fd99ae33c1a97a60a6720aeb252a9dad"
+            },
+            {
+              "path": "metadata/tokenizer.json",
+              "role": "tokenizer",
+              "size_bytes": 12809320,
+              "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+            },
+            {
+              "path": "metadata/tokenizer_config.json",
+              "role": "tokenizer-config",
+              "size_bytes": 17928,
+              "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+            },
+            {
+              "path": "metadata/config.json",
+              "role": "model-config",
+              "size_bytes": 4745,
+              "sha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b"
+            },
+            {
+              "path": "metadata/chat_template.jinja",
+              "role": "chat-template",
+              "size_bytes": 8952,
+              "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+            },
+            {
+              "path": "metadata/preprocessor_config.json",
+              "role": "processor-config",
+              "size_bytes": 390,
+              "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+            },
+            {
+              "path": "metadata/generation_config.json",
+              "role": "generation-config",
+              "size_bytes": 202,
+              "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+            },
+            {
+              "path": "metadata/merges.txt",
+              "role": "tokenizer-merges",
+              "size_bytes": 3353259,
+              "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+            },
+            {
+              "path": "metadata/video_preprocessor_config.json",
+              "role": "video-processor-config",
+              "size_bytes": 385,
+              "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+            },
+            {
+              "path": "metadata/vocab.json",
+              "role": "tokenizer-vocabulary",
+              "size_bytes": 6722759,
+              "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+            },
+            {
+              "path": "manifests/hot-manifest-q4-vision-128k-multiprompt-r1-lru16-neutral.json",
+              "role": "expert-placement",
+              "size_bytes": 499174,
+              "sha256": "2f6f0e59f2555673430857d764b461d271941810a7e1a1d07090b599caf81c88"
+            }
+          ],
+          "ple": {
+            "filename": "per_layer_token_embd.iq4_nl.bin",
+            "size_bytes": 28800138240,
+            "sha256": "dd55c28902f38cd88134b2a569c51282c5ffce30080487e1a645740115c56cc3"
+          }
+        }
+      ]
+    }
+  }
+}
