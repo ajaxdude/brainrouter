@@ -319,11 +319,13 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <option value="auto">Auto (classifier)</option><option value="local">Local</option><option value="cloud">Cloud</option>
       </select>
       <input id="main-model" class="config-input" aria-label="Main model ID" placeholder="Backend default (optional ID)">
+      <select id="main-model-select" class="config-input" aria-label="Main local model" style="display:none" onchange="routingLocalModelChanged('main')"></select>
       <label for="reviewer-backend">Reviewer model</label>
       <select id="reviewer-backend" class="config-input" onchange="routingBackendChanged('reviewer')">
         <option value="auto">Auto (classifier)</option><option value="local">Local</option><option value="cloud">Cloud</option>
       </select>
       <input id="reviewer-model" class="config-input" aria-label="Reviewer model ID" placeholder="Backend default (optional ID)">
+      <select id="reviewer-model-select" class="config-input" aria-label="Reviewer local model" style="display:none" onchange="routingLocalModelChanged('reviewer')"></select>
       <label for="subagent-model">Subagent pool (local, subs alias only)</label>
       <input id="subagent-model" class="config-input" list="routing-local-models" placeholder="Unconfigured: legacy auto">
       <datalist id="routing-local-models"></datalist>
@@ -2520,6 +2522,10 @@ function updateBridges() {
 let routingProfile = null;
 let routingCloudEnabled = false;
 let routingProfileBusy = false;
+// Local model IDs as seen by llama-swap (from /api/routing-models). Drives the
+// constrained local-model dropdowns for the main/reviewer roles.
+let routingLocalModelIds = [];
+const LOCAL_CUSTOM = '__custom__';
 
 async function routingFetch(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
@@ -2533,10 +2539,77 @@ async function routingFetch(path, body) {
 function renderRoutingChoice(role, choice) {
   document.getElementById(role + '-backend').value = choice.backend;
   const input = document.getElementById(role + '-model');
-  input.value = choice.model || '';
-  input.disabled = choice.backend === 'auto';
-  input.setAttribute('list', 'routing-' + choice.backend + '-models');
-  input.placeholder = choice.backend === 'cloud' ? 'Manifest auto, or enter exact cloud ID' : 'Local default, or enter exact model ID';
+  const select = document.getElementById(role + '-model-select');
+  const backend = choice.backend;
+  if (backend === 'local') {
+    // Local model choice is a constrained dropdown of llama-swap-available
+    // models (user request: not a free-form field). buildLocalModelSelect keeps
+    // a saved-but-unlisted model and offers a "Custom ID…" escape hatch.
+    buildLocalModelSelect(role, choice.model || '');
+    select.style.display = '';
+    select.disabled = false;
+    input.style.display = 'none';
+    input.disabled = false;
+    input.value = '';
+  } else {
+    select.style.display = 'none';
+    input.style.display = '';
+    input.value = choice.model || '';
+    input.disabled = backend === 'auto';
+    input.setAttribute('list', 'routing-' + backend + '-models');
+    input.placeholder = backend === 'cloud' ? 'Manifest auto, or enter exact cloud ID' : 'Local default, or enter exact model ID';
+  }
+}
+
+// Populate a role's local-model dropdown from routingLocalModelIds. Always
+// offers "Local default" (empty value) and a "Custom ID…" escape hatch; a saved
+// model that llama-swap did not enumerate (renamed, or discovery errored) is
+// preserved as its own option so a strict dropdown never silently drops it.
+function buildLocalModelSelect(role, selectedModel) {
+  const select = document.getElementById(role + '-model-select');
+  const chosen = selectedModel || '';
+  select.replaceChildren();
+  const add = (value, label) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  };
+  add('', 'Local default');
+  routingLocalModelIds.forEach(id => add(id, id));
+  if (chosen && chosen !== LOCAL_CUSTOM && !routingLocalModelIds.includes(chosen)) {
+    add(chosen, chosen + ' (saved)');
+  }
+  add(LOCAL_CUSTOM, 'Custom ID…');
+  select.value = chosen === LOCAL_CUSTOM ? LOCAL_CUSTOM : chosen;
+}
+
+// Reveal the free-form input only when the user explicitly picks "Custom ID…".
+function routingLocalModelChanged(role) {
+  const select = document.getElementById(role + '-model-select');
+  const input = document.getElementById(role + '-model');
+  if (select.value === LOCAL_CUSTOM) {
+    input.style.display = '';
+    input.disabled = false;
+    input.value = '';
+    input.setAttribute('list', 'routing-local-models');
+    input.placeholder = 'Enter exact local model ID';
+    input.focus();
+  } else {
+    input.style.display = 'none';
+  }
+}
+
+// Effective model string for a role, reading whichever control is active.
+function routingModelValue(role) {
+  const backend = document.getElementById(role + '-backend').value;
+  if (backend === 'auto') return null;
+  if (backend === 'local') {
+    const select = document.getElementById(role + '-model-select');
+    if (select.value === LOCAL_CUSTOM) return document.getElementById(role + '-model').value || null;
+    return select.value || null;
+  }
+  return document.getElementById(role + '-model').value || null;
 }
 
 function routingBackendChanged(role) {
@@ -2548,7 +2621,7 @@ function routingBackendChanged(role) {
 function selectRoutingPreset() {
   const preset = document.getElementById('routing-preset').value;
   if (preset === 'custom') return;
-  const main = document.getElementById('main-model').value;
+  const main = routingModelValue('main') || '';
   const local = { backend: 'local', model: null };
   const cloud = { backend: 'cloud', model: null };
   const choices = {
@@ -2561,6 +2634,19 @@ function selectRoutingPreset() {
   };
   renderRoutingChoice('main', choices[preset][0]);
   renderRoutingChoice('reviewer', choices[preset][1]);
+  if (preset === 'local_custom') {
+    // This preset exists to type an explicit local main model, so open the main
+    // control directly in Custom mode (prefilled) rather than the default pick.
+    const select = document.getElementById('main-model-select');
+    const input = document.getElementById('main-model');
+    select.value = LOCAL_CUSTOM;
+    input.style.display = '';
+    input.disabled = false;
+    input.setAttribute('list', 'routing-local-models');
+    input.placeholder = 'Enter exact local model ID';
+    input.value = choices[preset][0].model || '';
+    input.focus();
+  }
   document.getElementById('routing-profile-message').textContent = preset === 'local_custom'
     ? 'Enter an explicit local main model, then save.' : 'Unsaved preset. Subagent pool is unchanged.';
 }
@@ -2606,6 +2692,15 @@ async function loadRoutingModels() {
       });
       if (data[backend].error) messages.push(backend + ': ' + data[backend].error);
     });
+    // Refresh the constrained local dropdowns, preserving each role's current
+    // selection (a custom entry is left untouched).
+    routingLocalModelIds = data.local.models || [];
+    ['main', 'reviewer'].forEach(role => {
+      const select = document.getElementById(role + '-model-select');
+      if (document.getElementById(role + '-backend').value === 'local' && select.value !== LOCAL_CUSTOM) {
+        buildLocalModelSelect(role, select.value || '');
+      }
+    });
     errors.textContent = messages.length ? messages.join(' · ') + ' You can still enter explicit provider IDs manually.'
       : 'Lists loaded. Manual provider IDs are also accepted; availability is checked by the provider when used.';
   } catch (error) {
@@ -2618,7 +2713,7 @@ async function saveRoutingProfile() {
   const message = document.getElementById('routing-profile-message');
   const choice = role => {
     const backend = document.getElementById(role + '-backend').value;
-    return backend === 'auto' ? { backend } : { backend, model: document.getElementById(role + '-model').value || null };
+    return backend === 'auto' ? { backend } : { backend, model: routingModelValue(role) };
   };
   const profile = {
     preset: document.getElementById('routing-preset').value,
