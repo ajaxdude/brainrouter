@@ -40,6 +40,8 @@ pub struct ReviewService {
     sessions: Arc<SessionManager>,
     preferences: Arc<ProfileStore>,
     active_reviews: Arc<Mutex<HashSet<String>>>,
+    /// Admission policy (memory-gated local reviewer, design H2).
+    admission: Arc<admission::AdmissionCtx>,
 }
 
 struct ActiveReviewGuard {
@@ -58,6 +60,9 @@ impl ReviewService {
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
         config: ReviewConfig,
+        admission_config: crate::config::ReviewAdmissionConfig,
+        manifest_enabled: bool,
+        fallback_model: String,
     ) -> Self {
         let preferences = router.profiles().cloned().unwrap_or_else(|| {
             Arc::new(ProfileStore::memory(RoutingProfile {
@@ -68,11 +73,19 @@ impl ReviewService {
             }, config.max_iterations).expect("validated review configuration"))
         });
 
+        // At least one permit even if misconfigured; validation elsewhere pins it to 1.
+        let permits = admission_config.local_review_permits.max(1) as usize;
         ReviewService {
             router,
             sessions,
             preferences,
             active_reviews: Arc::new(Mutex::new(HashSet::new())),
+            admission: Arc::new(admission::AdmissionCtx {
+                config: admission_config,
+                manifest_enabled,
+                fallback_model,
+                permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            }),
         }
     }
 
@@ -126,6 +139,7 @@ impl ReviewService {
             &self.sessions,
             &config_snapshot,
             &cwd,
+            &self.admission,
         )
         .await;
         drop(active_review);
@@ -324,6 +338,7 @@ impl ReviewService {
             &self.sessions,
             &config_snapshot,
             &session.cwd,
+            &self.admission,
         )
         .await;
         drop(active_review);
@@ -439,6 +454,7 @@ impl ReviewService {
         let det = details.clone();
         let cwd2 = cwd.clone();
         let history = session.conversation_history.clone();
+        let admission = Arc::clone(&self.admission);
         let notifier = self.sessions.register_notifier(&session_id);
 
         tokio::spawn(async move {
@@ -452,6 +468,7 @@ impl ReviewService {
                 &sessions,
                 &config_snapshot,
                 &cwd2,
+                &admission,
             )
             .await;
             drop(active_review);

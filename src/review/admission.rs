@@ -81,7 +81,12 @@ pub fn decide_backend(i: &AdmissionInputs) -> BackendDecision {
 
     let model_key = i.configured_model.unwrap_or(i.fallback_model);
     let Some(&budget) = i.budgets.get(model_key) else {
-        return cloud_or_block("budget_unavailable");
+        // No measured budget for this model → the gate has no data to reason
+        // with, so honor the intended local choice as-is (ungated). Operators
+        // opt in to memory-gated local review by configuring
+        // review_admission.local_model_budget_mb for the model. This keeps
+        // existing local-reviewer setups working unchanged.
+        return BackendDecision::Local;
     };
     if !i.permit_available {
         return cloud_or_block("permit_busy");
@@ -113,6 +118,126 @@ pub fn read_meminfo_available_mb() -> Option<u64> {
         }
     }
     None
+}
+
+/// Full admission outcome: the backend/model to run on plus a permit held for
+/// the whole run when admitted local, or a terminal `blocked` reason.
+pub enum AdmissionResult {
+    Admitted {
+        choice: crate::routing_profile::ModelChoice,
+        /// Held for the entire review run when admitted local (bounds
+        /// concurrent local reviews); `None` for cloud.
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
+    Blocked {
+        /// Becomes the `blocked:<reason>` surfaced to the caller.
+        reason: String,
+    },
+}
+
+/// Orchestrate the admission decision and permit lifecycle (design H2, v6).
+///
+/// The permit is only acquired on the local path, and only held when the final
+/// decision is local — so a cloud reviewer never briefly blocks a concurrent
+/// local one. `mem_available_mb` is injected for testability.
+pub fn admit(
+    configured: &crate::routing_profile::ModelChoice,
+    manifest_enabled: bool,
+    fallback_model: &str,
+    cfg: &crate::config::ReviewAdmissionConfig,
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    mem_available_mb: Option<u64>,
+) -> AdmissionResult {
+    use crate::routing_profile::ModelChoice;
+    let backend = configured.backend();
+    let inputs = |permit_available: bool| AdmissionInputs {
+        configured_backend: backend,
+        configured_model: configured.model(),
+        fallback_model,
+        manifest_enabled,
+        budgets: &cfg.local_model_budget_mb,
+        system_reserve_mb: cfg.system_reserve_mb,
+        mem_available_mb,
+        permit_available,
+    };
+    // Preserve the configured explicit model when the admitted backend matches
+    // the configured one; only synthesize a generic choice when overriding
+    // (auto→cloud/local, or local→cloud fallback).
+    let cloud_choice = || {
+        if backend == "cloud" {
+            configured.clone()
+        } else {
+            ModelChoice::Cloud { model: None }
+        }
+    };
+    let local_choice = || {
+        if backend == "local" {
+            configured.clone()
+        } else {
+            ModelChoice::local()
+        }
+    };
+
+    // First decide assuming a permit is available (it only matters for local).
+    match decide_backend(&inputs(true)) {
+        BackendDecision::Cloud { .. } => AdmissionResult::Admitted {
+            choice: cloud_choice(),
+            permit: None,
+        },
+        BackendDecision::Blocked { reason } => AdmissionResult::Blocked { reason },
+        BackendDecision::Local => {
+            // A `Local` decision arrives here either ungated (no measured
+            // budget) or gated (budget present + headroom passed). Only the
+            // gated path consumes the concurrency permit — the ungated/default
+            // path must proceed permit-less so it is never serialized or
+            // blocked (backward compatibility).
+            let model_key = configured.model().unwrap_or(fallback_model);
+            if !cfg.local_model_budget_mb.contains_key(model_key) {
+                return AdmissionResult::Admitted {
+                    choice: local_choice(),
+                    permit: None,
+                };
+            }
+            match std::sync::Arc::clone(permits).try_acquire_owned() {
+                Ok(permit) => AdmissionResult::Admitted {
+                    choice: local_choice(),
+                    permit: Some(permit),
+                },
+                // Budgeted local, but the permit is busy: fall back to cloud if
+                // available, else block (reason reflects the real cause).
+                Err(_) => match decide_backend(&inputs(false)) {
+                    BackendDecision::Cloud { .. } => AdmissionResult::Admitted {
+                        choice: cloud_choice(),
+                        permit: None,
+                    },
+                    _ => AdmissionResult::Blocked { reason: "permit_busy".to_string() },
+                },
+            }
+        }
+    }
+}
+
+/// Bundled admission dependencies, held by `ReviewService` and passed to the
+/// review loop so it can resolve the backend per run.
+pub struct AdmissionCtx {
+    pub config: crate::config::ReviewAdmissionConfig,
+    pub manifest_enabled: bool,
+    pub fallback_model: String,
+    pub permits: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl AdmissionCtx {
+    /// Resolve the backend for a run, reading live `/proc/meminfo`.
+    pub fn resolve(&self, configured: &crate::routing_profile::ModelChoice) -> AdmissionResult {
+        admit(
+            configured,
+            self.manifest_enabled,
+            &self.fallback_model,
+            &self.config,
+            &self.permits,
+            read_meminfo_available_mb(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -161,13 +286,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_without_cloud_and_no_budget_blocks() {
-        // Fresh-install contract (v6): auto -> local, no measured budget, no
-        // cloud -> blocked:budget_unavailable (never guesses).
+    fn auto_without_cloud_and_no_budget_honors_local() {
+        // Opt-in gate: auto→local with no cloud and no measured budget honors
+        // local (ungated) rather than blocking, so bare installs still review.
         let b = budgets(&[]);
         assert_eq!(
             decide_backend(&inputs("auto", false, &b, Some(999_999), true)),
-            BackendDecision::Blocked { reason: "budget_unavailable".to_string() }
+            BackendDecision::Local
         );
     }
 
@@ -225,5 +350,107 @@ mod tests {
             decide_backend(&inputs("local", true, &b, None, true)),
             BackendDecision::Cloud { reason: Some("meminfo_unavailable".to_string()) }
         );
+    }
+
+    // ── admit() orchestration (backend decision + permit lifecycle) ──────────
+    use crate::config::ReviewAdmissionConfig;
+    use crate::routing_profile::ModelChoice;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    fn admission_cfg(pairs: &[(&str, u64)], reserve: u64) -> ReviewAdmissionConfig {
+        ReviewAdmissionConfig {
+            local_model_budget_mb: budgets(pairs),
+            system_reserve_mb: reserve,
+            local_review_permits: 1,
+        }
+    }
+
+    #[test]
+    fn admit_cloud_holds_no_permit() {
+        let cfg = admission_cfg(&[], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        match admit(&ModelChoice::Auto, true, "fb", &cfg, &sem, Some(99_999)) {
+            AdmissionResult::Admitted { choice, permit } => {
+                assert_eq!(choice.backend(), "cloud");
+                assert!(permit.is_none());
+            }
+            _ => panic!("expected cloud admission"),
+        }
+        assert_eq!(sem.available_permits(), 1, "cloud must not retain a permit");
+    }
+
+    #[test]
+    fn admit_local_with_headroom_holds_the_permit() {
+        let cfg = admission_cfg(&[("m", 8000)], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        let choice = ModelChoice::Local { model: Some("m".to_string()) };
+        match admit(&choice, false, "fb", &cfg, &sem, Some(20_000)) {
+            AdmissionResult::Admitted { choice, permit } => {
+                assert_eq!(choice.backend(), "local");
+                assert!(permit.is_some());
+                assert_eq!(sem.available_permits(), 0, "local admission holds the permit");
+            }
+            _ => panic!("expected local admission"),
+        }
+    }
+
+    #[test]
+    fn admit_local_no_budget_honors_local() {
+        // No measured budget → honor the explicit local choice (ungated).
+        let cfg = admission_cfg(&[], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        match admit(&ModelChoice::local(), false, "fb", &cfg, &sem, Some(99_999)) {
+            AdmissionResult::Admitted { choice, .. } => assert_eq!(choice.backend(), "local"),
+            _ => panic!("expected local admission when no budget is configured"),
+        }
+    }
+
+    #[test]
+    fn admit_local_permit_busy_falls_back_to_cloud() {
+        let cfg = admission_cfg(&[("m", 8000)], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&sem).try_acquire_owned().unwrap(); // exhaust the single permit
+        let choice = ModelChoice::Local { model: Some("m".to_string()) };
+        match admit(&choice, true, "fb", &cfg, &sem, Some(20_000)) {
+            AdmissionResult::Admitted { choice, permit } => {
+                assert_eq!(choice.backend(), "cloud");
+                assert!(permit.is_none());
+            }
+            _ => panic!("expected cloud fallback when the permit is busy"),
+        }
+    }
+
+    #[test]
+    fn admit_preserves_the_configured_explicit_cloud_model() {
+        // Regression: admission must NOT drop the configured cloud model when
+        // it admits cloud (else the review routes to the wrong model).
+        let cfg = admission_cfg(&[], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        let choice = ModelChoice::Cloud { model: Some("review-cloud-test".to_string()) };
+        match admit(&choice, true, "fb", &cfg, &sem, None) {
+            AdmissionResult::Admitted { choice, .. } => {
+                assert_eq!(choice.model(), Some("review-cloud-test"));
+            }
+            _ => panic!("expected cloud admission preserving the configured model"),
+        }
+    }
+
+    #[test]
+    fn admit_ungated_local_ignores_a_busy_permit() {
+        // No budget → ungated local; it must NOT be gated by the concurrency
+        // permit, even when the single permit is exhausted, so the default
+        // path is never serialized/blocked (backward compatibility).
+        let cfg = admission_cfg(&[], 4096);
+        let sem = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&sem).try_acquire_owned().unwrap(); // exhaust the permit
+        let choice = ModelChoice::Local { model: Some("no-budget-model".to_string()) };
+        match admit(&choice, false, "fb", &cfg, &sem, Some(100)) {
+            AdmissionResult::Admitted { choice, permit } => {
+                assert_eq!(choice.backend(), "local");
+                assert!(permit.is_none(), "ungated local must not hold a permit");
+            }
+            _ => panic!("ungated local must be admitted even when the permit is busy"),
+        }
     }
 }

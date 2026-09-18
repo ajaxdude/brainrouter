@@ -360,6 +360,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         Arc::clone(&router),
         Arc::clone(&session_manager),
         review_config,
+        config.review_admission.clone(),
+        config.manifest.enabled,
+        config.llama_swap.fallback_model.clone(),
     ));
 
     let benchmark_lab = if !config.benchmarks.lab.enabled {

@@ -48,6 +48,9 @@ pub enum EscalationReason {
     /// LLM voluntarily returned "escalated" status (not an error).
     LlmEscalated,
     ConnectionFailed,
+    /// The memory-gated admission could not run the review (e.g. no cloud
+    /// backend and no measured budget / headroom for a local reviewer).
+    AdmissionBlocked,
 }
 
 impl EscalationReason {
@@ -57,6 +60,7 @@ impl EscalationReason {
             EscalationReason::LlmError => "llm_error",
             EscalationReason::LlmEscalated => "llm_escalated",
             EscalationReason::ConnectionFailed => "connection_failed",
+            EscalationReason::AdmissionBlocked => "admission_blocked",
         }
     }
 }

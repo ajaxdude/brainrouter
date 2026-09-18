@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::{
+    admission,
     context,
     prompt::build_review_prompt,
 };
@@ -58,9 +59,44 @@ pub async fn run_loop(
     sessions: &Arc<SessionManager>,
     config: &crate::config::ReviewConfig,
     project_dir: &str,
+    admission: &admission::AdmissionCtx,
 ) -> Result<ReviewResult> {
     config.validate()?;
-    let choice = config.model_choice()?;
+    // Resolve the reviewer backend for this run (design H2): auto→cloud-iff-
+    // manifest-else-local; local only with a measured budget + /proc/meminfo
+    // headroom + a permit; else cloud, or a terminal blocked reason. The permit
+    // (when local) is held for the whole loop.
+    let configured = config.model_choice()?;
+    let (choice, _admission_permit) = match admission.resolve(&configured) {
+        admission::AdmissionResult::Admitted { choice, permit } => (choice, permit),
+        admission::AdmissionResult::Blocked { reason } => {
+            let feedback = format!(
+                "Code review blocked: {reason}. Set review_admission.local_model_budget_mb \
+                 for the reviewer model, or enable the cloud backend."
+            );
+            let status = ReviewStatus::Escalated;
+            let escalation_reason = Some(EscalationReason::AdmissionBlocked);
+            sessions.update_session(
+                session_id,
+                SessionUpdate {
+                    status: Some(status.clone()),
+                    feedback: Some(feedback.clone()),
+                    reviewer_type: Some(ReviewerType::Llm),
+                    escalation_reason: escalation_reason.clone(),
+                    review_model: None,
+                    llm_turns: Some(Vec::new()),
+                },
+            );
+            return Ok(ReviewResult {
+                status,
+                feedback,
+                session_id: session_id.to_string(),
+                iteration_count: 0,
+                reviewer_type: ReviewerType::Llm,
+                escalation_reason,
+            });
+        }
+    };
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();

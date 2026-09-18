@@ -277,6 +277,9 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
         router,
         sessions.clone(),
         ReviewConfig::default(),
+        Default::default(),
+        false,
+        "default-local".to_string(),
     ));
     let id = service.start_review_async(
         "test".into(),
