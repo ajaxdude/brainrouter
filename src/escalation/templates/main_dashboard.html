@@ -326,8 +326,9 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </select>
       <input id="reviewer-model" class="config-input" aria-label="Reviewer model ID" placeholder="Backend default (optional ID)">
       <select id="reviewer-model-select" class="config-input" aria-label="Reviewer local model" style="display:none" onchange="routingLocalModelChanged('reviewer')"></select>
-      <label for="subagent-model">Subagent pool (local, subs alias only)</label>
-      <input id="subagent-model" class="config-input" list="routing-local-models" placeholder="Unconfigured: legacy auto">
+      <label for="subagent-model-select">Subagent pool (local, subs alias only)</label>
+      <select id="subagent-model-select" class="config-input" aria-label="Subagent local model pool" onchange="routingLocalModelChanged('subagent')"></select>
+      <input id="subagent-model" class="config-input" aria-label="Subagent model ID" list="routing-local-models" placeholder="Enter exact local model ID" style="display:none">
       <datalist id="routing-local-models"></datalist>
       <datalist id="routing-cloud-models"></datalist>
       <div style="display:flex;gap:6px">
@@ -2565,7 +2566,7 @@ function renderRoutingChoice(role, choice) {
 // offers "Local default" (empty value) and a "Custom ID…" escape hatch; a saved
 // model that llama-swap did not enumerate (renamed, or discovery errored) is
 // preserved as its own option so a strict dropdown never silently drops it.
-function buildLocalModelSelect(role, selectedModel) {
+function buildLocalModelSelect(role, selectedModel, defaultLabel) {
   const select = document.getElementById(role + '-model-select');
   const chosen = selectedModel || '';
   select.replaceChildren();
@@ -2575,7 +2576,7 @@ function buildLocalModelSelect(role, selectedModel) {
     option.textContent = label;
     select.appendChild(option);
   };
-  add('', 'Local default');
+  add('', defaultLabel || 'Local default');
   routingLocalModelIds.forEach(id => add(id, id));
   if (chosen && chosen !== LOCAL_CUSTOM && !routingLocalModelIds.includes(chosen)) {
     add(chosen, chosen + ' (saved)');
@@ -2601,8 +2602,10 @@ function routingLocalModelChanged(role) {
 }
 
 // Effective model string for a role, reading whichever control is active.
+// A role without a backend selector (the always-local subagent pool) is local.
 function routingModelValue(role) {
-  const backend = document.getElementById(role + '-backend').value;
+  const backendEl = document.getElementById(role + '-backend');
+  const backend = backendEl ? backendEl.value : 'local';
   if (backend === 'auto') return null;
   if (backend === 'local') {
     const select = document.getElementById(role + '-model-select');
@@ -2656,7 +2659,8 @@ function renderRoutingProfile(profile) {
   document.getElementById('routing-preset').value = profile.preset;
   renderRoutingChoice('main', profile.main);
   renderRoutingChoice('reviewer', profile.reviewer);
-  document.getElementById('subagent-model').value = profile.subagent_model || '';
+  buildLocalModelSelect('subagent', profile.subagent_model || '', 'Unconfigured (auto)');
+  document.getElementById('subagent-model').style.display = 'none';
   currentRoutingMode = profile.main.backend;
   const describe = choice => choice.backend + (choice.model ? ' / ' + choice.model : ' / default');
   document.getElementById('routing-saved').textContent = 'Saved: main ' + describe(profile.main)
@@ -2701,6 +2705,10 @@ async function loadRoutingModels() {
         buildLocalModelSelect(role, select.value || '');
       }
     });
+    const subSelect = document.getElementById('subagent-model-select');
+    if (subSelect.value !== LOCAL_CUSTOM) {
+      buildLocalModelSelect('subagent', subSelect.value || '', 'Unconfigured (auto)');
+    }
     errors.textContent = messages.length ? messages.join(' · ') + ' You can still enter explicit provider IDs manually.'
       : 'Lists loaded. Manual provider IDs are also accepted; availability is checked by the provider when used.';
   } catch (error) {
@@ -2718,7 +2726,7 @@ async function saveRoutingProfile() {
   const profile = {
     preset: document.getElementById('routing-preset').value,
     main: choice('main'), reviewer: choice('reviewer'),
-    subagent_model: document.getElementById('subagent-model').value || null,
+    subagent_model: routingModelValue('subagent'),
   };
   routingProfileBusy = true;
   document.getElementById('save-routing-profile').disabled = true;
