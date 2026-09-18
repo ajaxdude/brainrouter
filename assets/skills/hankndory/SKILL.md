@@ -286,7 +286,7 @@ Assume the role of an expert technical reviewer. Search for:
 
 Classify each finding as `blocking`, `important`, or `nit`. Include evidence, impact, and a concrete document fix. Do not inflate severity.
 
-Repeat independent critic reviews until there are no blocking findings and new feedback is consistently non-material, up to three rounds. If a fourth round would still be needed, or two reviews disagree on whether the same finding is blocking, stop iterating and escalate the specific disputed finding and both positions to the user instead.
+Repeat independent critic reviews until there are no blocking findings and new feedback is consistently non-material, up to ten rounds. If an eleventh round would still be needed, or two reviews disagree on whether the same finding is blocking, stop iterating and escalate the specific disputed finding and both positions to the user instead.
 
 ## Step 7: Implementation-readiness test
 
