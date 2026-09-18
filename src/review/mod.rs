@@ -6,6 +6,7 @@
 pub mod context;
 pub mod prompt;
 pub mod review_loop;
+pub mod runtime_state;
 
 use anyhow::Result;
 use std::{

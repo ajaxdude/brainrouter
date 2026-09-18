@@ -348,6 +348,18 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
     </div>
 
 
+  <!-- Code review master switch (FR-A) -->
+  <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Reviewer</div>
+  <div style="padding:0 12px 6px">
+    <div style="display:flex;align-items:center;gap:8px" title="Code review — when off, brainrouter review requests return 'disabled' immediately without contacting any model">
+      <span style="color:var(--textDim);font-size:11px;flex:1">code review</span>
+      <button id="toggle-codereview" onclick="toggleCodeReview()" title="Enable / disable the brainrouter code reviewer"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-codereview-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
+  </div>
+
   <!-- Nudge + reasoning tier (grouped) -->
   <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Nudge</div>
   <div style="padding:0 12px;display:flex;flex-direction:column;gap:6px">
@@ -2630,6 +2642,33 @@ async function saveRoutingProfile() {
 // ─── Nudge (thinking budget) controls ────────────────────────────────────────
 let nudgeData = null;
 
+// ─── Code review master switch (FR-A) ────────────────────────────────────────
+let codeReviewEnabled = true;
+let codeReviewBusy = false;
+async function toggleCodeReview() {
+  if (codeReviewBusy) return;
+  const next = !codeReviewEnabled;
+  if (!next && !confirm('Turn OFF the brainrouter code reviewer?\nReview requests will return "disabled" immediately without contacting any model, and agents may commit without a review.')) return;
+  codeReviewBusy = true;
+  applyToggle('codereview', next);
+  try {
+    const r = await fetch('/api/review/enabled', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (r.ok) {
+      const fresh = await r.json();
+      codeReviewEnabled = !!fresh.enabled;
+    } else {
+      console.warn('Code review toggle failed', r.status);
+    }
+  } catch(e) { /* keep last known state */ }
+  applyToggle('codereview', codeReviewEnabled);
+  codeReviewBusy = false;
+}
+
+
 function applyNudgeUI(n) {
   if (!n) return;
   applyToggle('nudge', !!n.enabled);
@@ -3892,7 +3931,7 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
@@ -3900,6 +3939,7 @@ async function refreshSlow() {
     safeFetch('/api/toolbox-catalog'),
     safeFetch('/api/toolbox-containers'),
     safeFetch('/api/cockpit-config'),
+    safeFetch('/api/review/enabled'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
@@ -3908,6 +3948,7 @@ async function refreshSlow() {
   if (catalogRes) { toolboxCatalogData = catalogRes; }
   if (containersRes) { toolboxContainersData = containersRes; }
   if (cockpitConfigRes) { cockpitConfigData = cockpitConfigRes; renderCockpitConfigStatus(); }
+  if (reviewRes) { codeReviewEnabled = !!reviewRes.enabled; applyToggle('codereview', codeReviewEnabled); }
   if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
 }
 

@@ -32,9 +32,18 @@ pub async fn handle_review_request(
     req: Request<Incoming>,
     review_service: Arc<ReviewService>,
     cwd: String,
+    code_review_enabled: bool,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
     let path = req.uri().path().to_string();
+
+    // FR-A: code-review master switch. When off, every review-START endpoint
+    // short-circuits to a terminal `disabled` result WITHOUT routing to any
+    // model or spawning a loop. Read/list/resolve/lgtm endpoints are
+    // unaffected, so any in-flight or historical session stays inspectable.
+    if review_start_is_gated(code_review_enabled, method, path.as_str()) {
+        return Ok(review_disabled_response());
+    }
 
     let response = match (method, path.as_str()) {
         // Review dashboard — redirect to unified dashboard
@@ -107,6 +116,33 @@ pub async fn handle_review_request(
     };
 
     Ok(response)
+}
+
+/// FR-A: exactly the review-START endpoints gated by the code-review master
+/// switch. Read/list/resolve/lgtm endpoints are never gated, so existing
+/// sessions remain inspectable and human-resolvable even while the switch is
+/// off. Pure and side-effect free for direct unit testing.
+fn review_start_is_gated(code_review_enabled: bool, method: &str, path: &str) -> bool {
+    !code_review_enabled
+        && method == "POST"
+        && matches!(
+            path,
+            "/review/api/request" | "/review/api/request-async" | "/review/api/continue"
+        )
+}
+
+/// FR-A: uniform terminal response when the code reviewer is switched off.
+///
+/// Every review-START endpoint returns HTTP 200 with a terminal `disabled`
+/// status (and a null `sessionId`, since no session is created) so the MCP
+/// thin client and the CLI stop immediately instead of polling a session that
+/// never exists. No model is contacted.
+fn review_disabled_response() -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    json_ok(&serde_json::json!({
+        "sessionId": serde_json::Value::Null,
+        "status": "disabled",
+        "feedback": "Code review is disabled in brainrouter (enable it in the dashboard or via POST /api/review/enabled).",
+    }))
 }
 
 /// POST /review/api/request — legacy blocking review trigger.
@@ -400,6 +436,48 @@ fn extract_session_id_from_resolve_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::review_start_is_gated;
+
+    #[test]
+    fn master_switch_gates_only_review_start_endpoints_when_disabled() {
+        // Disabled: the three START endpoints short-circuit to `disabled`.
+        for p in [
+            "/review/api/request",
+            "/review/api/request-async",
+            "/review/api/continue",
+        ] {
+            assert!(review_start_is_gated(false, "POST", p), "{p} should be gated when disabled");
+        }
+        // Disabled but non-START endpoints stay live so existing sessions
+        // remain inspectable and human-resolvable.
+        for p in [
+            "/review/api/resolve",
+            "/review/api/lgtm",
+            "/review/api/sessions",
+            "/review/api/sessions/abc",
+        ] {
+            assert!(!review_start_is_gated(false, "POST", p), "{p} must not be gated");
+        }
+        // GET is never gated.
+        assert!(!review_start_is_gated(false, "GET", "/review/api/request-async"));
+        // Enabled (default): nothing is gated.
+        for p in [
+            "/review/api/request",
+            "/review/api/request-async",
+            "/review/api/continue",
+        ] {
+            assert!(!review_start_is_gated(true, "POST", p), "{p} must not be gated when enabled");
+        }
+    }
+
+    #[test]
+    fn dashboard_has_code_review_toggle() {
+        let html = include_str!("templates/main_dashboard.html");
+        assert!(html.contains("toggle-codereview"), "missing code-review toggle button");
+        assert!(html.contains("toggleCodeReview()"), "missing toggle handler");
+        assert!(html.contains("/api/review/enabled"), "dashboard must call the toggle API");
+    }
+
     #[test]
     fn dashboard_review_actions_use_api_field_names_and_surface_errors() {
         let html = include_str!("templates/main_dashboard.html");

@@ -142,6 +142,9 @@ pub struct AppState {
     /// Runtime prompt-rewrite toggle (default on). When off, local routes
     /// forward the incoming prompt untouched.
     pub prompt_rewrite: Arc<AtomicBool>,
+    /// FR-A: code-review master switch (default on). Shared with the review
+    /// dispatch so a review request short-circuits to `disabled` when off.
+    pub code_review_enabled: Arc<AtomicBool>,
     /// In-flight request registry (dashboard tracking + cancel).
     pub inflight: Arc<crate::inflight::InflightRegistry>,
     /// Optional benchmark storage; an initialization error disables only the explorer.
@@ -259,6 +262,9 @@ async fn handle_request(
         // PR7: server-mode start/stop (§12) — launches/removes a detached
         // `podman run` container; prefix-gated the same way.
         || (method == "POST" && path.starts_with("/api/server-mode/"))
+        // FR-A: code-review master switch write path — prefix-gated like the
+        // other local-only mutating APIs.
+        || (method == "POST" && path.starts_with("/api/review/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -310,7 +316,12 @@ async fn handle_request(
 
     // Route /review/* to the escalation module
     if path.starts_with("/review") {
-        let result = escalation::handle_review_request(req, Arc::clone(&state.review_service), cwd).await;
+        let result = escalation::handle_review_request(
+            req,
+            Arc::clone(&state.review_service),
+            cwd,
+            state.code_review_enabled.load(AtomicOrdering::Relaxed),
+        ).await;
         return result;
     }
 
@@ -867,6 +878,35 @@ async fn handle_request(
                     "enabled": state.prompt_rewrite.load(AtomicOrdering::Relaxed),
                 })))
             }
+        }
+
+        // ── Code-review master switch API (FR-A) ───────────────────────────
+        // Default on. When off, review requests short-circuit to a terminal
+        // `disabled` result without contacting any model. GET is readable;
+        // POST is gated by the local-only destructive guard above.
+        ("GET", "/api/review/enabled") => {
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.code_review_enabled.load(AtomicOrdering::Relaxed),
+            })))
+        }
+
+        ("POST", "/api/review/enabled") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                state.code_review_enabled.store(enabled, AtomicOrdering::Relaxed);
+                // Persist so the choice survives a restart. A write failure is
+                // logged, not fatal — the in-memory switch already took effect.
+                if let Err(e) = crate::review::runtime_state::save_enabled(
+                    &crate::review::runtime_state::state_path(),
+                    enabled,
+                ) {
+                    tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
+                }
+            }
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.code_review_enabled.load(AtomicOrdering::Relaxed),
+            })))
         }
 
         // ── Toolboxes API (all llama-* toolbox containers) ──────────────────

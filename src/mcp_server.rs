@@ -199,6 +199,17 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
             // We poll for up to 30 minutes (360 × 5s) before giving up.
             let start_resp = client.post_json("/review/api/request-async", args).await?;
 
+            // FR-A: the code reviewer can be switched off. The async start then
+            // returns a terminal `disabled` status with no session to poll, so
+            // return immediately instead of demanding a sessionId or polling.
+            if start_resp.get("status").and_then(|v| v.as_str()) == Some("disabled") {
+                return Ok(serde_json::json!({
+                    "status": "disabled",
+                    "feedback": start_resp.get("feedback").cloned().unwrap_or(serde_json::Value::Null),
+                    "sessionId": serde_json::Value::Null,
+                }));
+            }
+
             let session_id = start_resp
                 .get("sessionId")
                 .and_then(|v| v.as_str())

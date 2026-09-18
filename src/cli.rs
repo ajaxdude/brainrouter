@@ -595,7 +595,11 @@ pub async fn run(args: CliArgs) -> Result<()> {
                     "cwd": cwd,
                 });
                 let resp = client.post_json("/review/api/request-async", body).await?;
-                if async_ {
+                if resp.get("status").and_then(|v| v.as_str()) == Some("disabled") {
+                    // FR-A: the reviewer is switched off — terminal `disabled`,
+                    // with no session to poll. Print and stop.
+                    print_json(&resp);
+                } else if async_ {
                     print_json(&resp);
                 } else {
                     let session_id = resp
