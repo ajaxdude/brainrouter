@@ -250,7 +250,7 @@ impl Router {
                 .map(|store| store.profile().main.selector())
                 .unwrap_or_else(|| "auto".into());
         }
-        self.route_resolved(request, session_id, cwd, user_agent).await
+        self.route_resolved(request, session_id, cwd, user_agent, true).await
     }
 
     /// Review calls use their session snapshot, never the live main or subs choice.
@@ -261,10 +261,11 @@ impl Router {
         session_id: Option<String>,
         cwd: String,
         user_agent: String,
+        allow_local_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         choice.validate()?;
         request.model = choice.selector();
-        self.route_resolved(request, session_id, cwd, user_agent).await
+        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback).await
     }
 
     async fn route_resolved(
@@ -273,6 +274,7 @@ impl Router {
         session_id: Option<String>,
         cwd: String,
         user_agent: String,
+        allow_local_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
@@ -298,14 +300,14 @@ impl Router {
                 info!("Direct cloud mode — routing to Manifest");
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                ("cloud-direct", "cloud", self.route_cloud(request).await)
+                ("cloud-direct", "cloud", self.route_cloud(request, allow_local_fallback).await)
             }
             model if model.starts_with("cloud/") => {
                 let model = model.strip_prefix("cloud/").unwrap();
                 crate::routing_profile::validate_model_id(model)?;
                 request.model = model.to_string();
                 tracker.set(Phase::CloudWaiting, Some(model.into()), Some("Manifest".into()), max_tokens);
-                ("cloud-direct", "cloud", self.route_cloud(request).await)
+                ("cloud-direct", "cloud", self.route_cloud(request, allow_local_fallback).await)
             }
             // Managed routing: Bonsai classify + subs pool. Only these tokens get
             // nudge/bonsai/subs treatment. Direct model keys are authoritative.
@@ -480,7 +482,10 @@ impl Router {
             RoutingDecision::Cloud => {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                ("cloud", "bonsai → cloud", self.route_cloud(request).await)
+                // Managed auto/Bonsai path keeps the PRD cloud→local fallback
+                // guarantee. Reviewer calls never reach here (they route via
+                // explicit cloud/local with allow_local_fallback=false).
+                ("cloud", "bonsai → cloud", self.route_cloud(request, true).await)
             }
             RoutingDecision::Local { model, tier } => {
                 tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
@@ -498,6 +503,7 @@ impl Router {
     async fn route_cloud(
         &self,
         mut request: ChatCompletionRequest,
+        allow_local_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         // Callers normalize managed aliases to auto; exact cloud IDs pass through.
         let requested_cloud_model = request.model.clone();
@@ -548,6 +554,16 @@ impl Router {
             warn!(provider = MANIFEST_KEY, "Manifest circuit open, skipping");
         }
 
+        // Cloud fallback → llama-swap with fallback_model.
+        // Reviewer calls (design H3) pass allow_local_fallback=false so a cloud
+        // reviewer never silently executes on a local model (which would use
+        // the wrong rubric and could load an unadmitted model / OOM). The
+        // failure surfaces and the review loop maps it to `escalated`.
+        if !allow_local_fallback {
+            anyhow::bail!(
+                "cloud reviewer route: Manifest unavailable (disabled, circuit open, or error) and local fallback is disabled"
+            );
+        }
         // Cloud fallback → llama-swap with fallback_model
         request.model = self.fallback_model.clone();
         let model_key = self.fallback_model.clone();

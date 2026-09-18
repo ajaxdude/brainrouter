@@ -252,7 +252,7 @@ async fn role_choices_and_client_models_are_independent() {
         (ModelChoice::Auto, "llama-swap", "default-local"),
     ] {
         let (response, info) = router
-            .route_with_choice(request("auto"), &choice, None, String::new(), String::new())
+            .route_with_choice(request("auto"), &choice, None, String::new(), String::new(), true)
             .await
             .unwrap();
         assert_eq!(info.effective_provider.as_deref(), Some(expected_provider));
@@ -355,6 +355,7 @@ async fn auto_reviewer_ignores_cloud_main_but_still_classifies() {
             None,
             String::new(),
             String::new(),
+            true,
         )
         .await
         .unwrap();
@@ -363,6 +364,32 @@ async fn auto_reviewer_ignores_cloud_main_but_still_classifies() {
     assert_eq!(info.effective_provider.as_deref(), Some("manifest"));
     assert_eq!(upstream.calls().last().unwrap().1, "auto");
     assert!(upstream.calls()[0].0.starts_with("/classifier"));
+}
+
+#[tokio::test]
+async fn strict_reviewer_cloud_route_errors_instead_of_local_fallback() {
+    // H3: reviewer calls pass allow_local_fallback=false. With Manifest
+    // disabled, a cloud-admitted reviewer must ERROR (so the loop escalates)
+    // rather than silently running on a local model — which would use the
+    // wrong rubric and could load an unadmitted model / OOM.
+    let upstream = SyntheticProviders::start().await;
+    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let disabled = router(&upstream, store, false, false);
+    let result = disabled
+        .route_with_choice(
+            request("auto"),
+            &cloud("explicit-cloud"),
+            None,
+            String::new(),
+            String::new(),
+            false,
+        )
+        .await;
+    assert!(result.is_err(), "strict cloud reviewer must error, not fall back to local");
+    assert!(
+        upstream.calls().iter().all(|call| !call.0.starts_with("/local")),
+        "no local upstream call should happen under strict routing"
+    );
 }
 
 #[tokio::test]
@@ -377,6 +404,7 @@ async fn disabled_cloud_and_cloud_failure_expose_requested_and_actual() {
             None,
             String::new(),
             String::new(),
+            true,
         )
         .await
         .unwrap();
@@ -409,6 +437,7 @@ async fn disabled_cloud_and_cloud_failure_expose_requested_and_actual() {
             None,
             String::new(),
             String::new(),
+            true,
         )
         .await
         .unwrap();
@@ -423,6 +452,7 @@ async fn disabled_cloud_and_cloud_failure_expose_requested_and_actual() {
             None,
             String::new(),
             String::new(),
+            true,
         )
         .await
         .is_err());
@@ -524,6 +554,7 @@ async fn presets_route_every_role_without_changing_the_pool() {
                 None,
                 String::new(),
                 String::new(),
+                true,
             )
             .await
             .unwrap();

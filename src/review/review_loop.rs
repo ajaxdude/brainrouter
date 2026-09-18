@@ -257,7 +257,7 @@ async fn call_llm_for_review(
 
 
     let (provider_response, route_info) = router
-        .route_with_choice(request, choice, Some(session_id.to_string()), project_dir.to_string(), String::new())
+        .route_with_choice(request, choice, Some(session_id.to_string()), project_dir.to_string(), String::new(), false)
         .await?;
 
     // Collect the SSE stream into a full text response

@@ -3,6 +3,7 @@
 //! `ReviewService` is the public face. Callers (HTTP handler, MCP handler)
 //! call `start_review` and receive a result once the loop completes or escalates.
 
+pub mod admission;
 pub mod context;
 pub mod prompt;
 pub mod review_loop;

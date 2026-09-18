@@ -15,6 +15,11 @@ pub struct BrainrouterConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Admission policy for the memory-gated local code reviewer (design H1).
+    /// Separate from `review` so its safety fields can't be lost through the
+    /// routing-profile round-trip.
+    #[serde(default)]
+    pub review_admission: ReviewAdmissionConfig,
     /// Independent main, reviewer and subagent choices. Omitted preserves local defaults.
     #[serde(default)]
     pub routing: Option<crate::routing_profile::RoutingProfile>,
@@ -379,6 +384,44 @@ fn apply_dir_mode(dir: &Path, mode: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Admission policy for a local code reviewer (design H1). Kept out of
+/// `ReviewConfig` (which is `deny_unknown_fields` and round-trips through the
+/// routing profile) so these safety fields survive a profile update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewAdmissionConfig {
+    /// Measured peak resident memory per local reviewer model key, in MiB. A
+    /// model with no entry here is never admitted locally (falls back to cloud
+    /// or is blocked) — the gate never guesses a budget.
+    pub local_model_budget_mb: std::collections::HashMap<String, u64>,
+    /// System/other-workload headroom kept free above the reviewer budget, MiB.
+    pub system_reserve_mb: u64,
+    /// Concurrent local reviews permitted. Pinned to 1 in this release.
+    pub local_review_permits: u32,
+}
+
+impl Default for ReviewAdmissionConfig {
+    fn default() -> Self {
+        ReviewAdmissionConfig {
+            local_model_budget_mb: std::collections::HashMap::new(),
+            system_reserve_mb: 4096,
+            local_review_permits: 1,
+        }
+    }
+}
+
+impl ReviewAdmissionConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.local_review_permits != 1 {
+            anyhow::bail!("review_admission.local_review_permits must be 1 in this release");
+        }
+        if self.local_model_budget_mb.values().any(|&v| v == 0) {
+            anyhow::bail!("review_admission.local_model_budget_mb values must be greater than 0");
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for the review service and escalation dashboard.
