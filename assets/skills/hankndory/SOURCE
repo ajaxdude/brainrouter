@@ -1,0 +1,16 @@
+Vendored HankNDory design skill.
+
+Origin : the user's own skill, ~/.copilot/skills/hankndory (repo: github.com/ajaxdude/HankNDory)
+License: MIT (see the front-matter in SKILL.md)
+Vendored: 2026-09-17
+
+This directory is a verbatim copy of the skill. The optional `install.sh` step
+copies it into the target user's OMP skills directory
+(~/.omp/agent/managed-skills/hankndory) and, when present, the Copilot skills
+directory (~/.copilot/skills/hankndory). Refresh this copy from the upstream
+skill whenever that skill changes.
+
+Not part of the copied skill payload:
+- SOURCE (this file)
+- APPEND_SYSTEM.snippet.md (installed separately as a managed block in
+  ~/.omp/agent/APPEND_SYSTEM.md by the installer)

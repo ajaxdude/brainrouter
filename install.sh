@@ -790,6 +790,60 @@ if [[ ${#HARNESSES_TO_INSTALL[@]} -gt 0 ]]; then
     done < <(human_users)
 fi
 
+# ── Step 15: HankNDory design skill (optional) ───────────────────────────────
+# Installs the vendored HankNDory design skill into the invoking user's OMP
+# (and Copilot, if present) skills directory, and merges a small managed block
+# into ~/.omp/agent/APPEND_SYSTEM.md reconciling brainrouter's review loop with
+# the HankNDory method. Opt-in and idempotent. Installing the files does NOT
+# enable brainrouter's (default-off) HankNDory UI integration — that is a
+# separate dashboard setting.
+if confirm_step "HankNDory design skill (optional)" \
+    "Copy the vendored design skill into ~/.omp/agent/managed-skills and reconcile APPEND_SYSTEM.md for ${SUDO_USER:-root}."; then
+    SKILL_SRC="${BR_SRC}/assets/skills/hankndory"
+    TARGET_USER="${SUDO_USER:-root}"
+    TARGET_HOME="$SUDO_USER_HOME"
+    if [[ ! -d "$SKILL_SRC" ]]; then
+        warn "    Vendored skill not found at $SKILL_SRC; skipping."
+    else
+        install_skill_into() {
+            local dest_parent="$1" dest="$1/hankndory"
+            if [[ -L "$dest_parent" || -L "$dest" ]]; then
+                warn "    Refusing to install into symlinked path: $dest"; return 1
+            fi
+            sudo -u "$TARGET_USER" mkdir -p "$dest/agents" "$dest/reference"
+            sudo -u "$TARGET_USER" cp -f "$SKILL_SRC/SKILL.md"                       "$dest/"
+            sudo -u "$TARGET_USER" cp -f "$SKILL_SRC/agents/ui_metadata.yaml"        "$dest/agents/"
+            sudo -u "$TARGET_USER" cp -f "$SKILL_SRC/reference/design-doc-template.md" "$dest/reference/"
+            ok "    Installed skill → $dest"
+        }
+        # OMP managed-skills is the primary target; create it if missing.
+        sudo -u "$TARGET_USER" mkdir -p "${TARGET_HOME}/.omp/agent/managed-skills"
+        install_skill_into "${TARGET_HOME}/.omp/agent/managed-skills" || true
+        # Copilot CLI skills dir too, only if the user already has one.
+        [[ -d "${TARGET_HOME}/.copilot/skills" ]] && install_skill_into "${TARGET_HOME}/.copilot/skills" || true
+
+        # Reconcile APPEND_SYSTEM.md — append the managed block once (backup first).
+        # Conservative: this appends the reconciled block; it does NOT auto-delete
+        # older hand-written review instructions. Review the .bak and remove any
+        # superseded lines (e.g. "routes to a local LLM") manually.
+        APPEND_FILE="${TARGET_HOME}/.omp/agent/APPEND_SYSTEM.md"
+        SNIPPET="${SKILL_SRC}/APPEND_SYSTEM.snippet.md"
+        MANAGED_MARK="# >>> brainrouter-managed (hankndory) v1 >>>"
+        if [[ -f "$SNIPPET" ]]; then
+            if [[ -f "$APPEND_FILE" ]] && grep -qF "$MANAGED_MARK" "$APPEND_FILE"; then
+                skip "    APPEND_SYSTEM.md already has the managed block; leaving as-is."
+            else
+                sudo -u "$TARGET_USER" mkdir -p "$(dirname "$APPEND_FILE")"
+                [[ -f "$APPEND_FILE" ]] && sudo -u "$TARGET_USER" cp -f "$APPEND_FILE" "${APPEND_FILE}.bak-$(date +%Y%m%d%H%M%S)"
+                sudo -u "$TARGET_USER" sh -c "printf '\n' >> '$APPEND_FILE' && cat '$SNIPPET' >> '$APPEND_FILE'"
+                ok "    Merged HankNDory managed block into APPEND_SYSTEM.md (backup kept)."
+            fi
+        fi
+        info "    If ~/.omp/agent/config.yml sets enableSkillCommands: false, slash-command"
+        info "    invocation stays off; the skill file is still loadable by OMP."
+    fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 BR_OK=0;   [[ -x /usr/local/bin/brainrouter ]] && BR_OK=1
