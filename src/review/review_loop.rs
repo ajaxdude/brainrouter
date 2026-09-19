@@ -132,6 +132,11 @@ pub async fn run_loop(
         None
     };
 
+    // Review language adapts to the admitted backend (design H6/R9): a small
+    // local model gets terse, numbered, strict-JSON-only criteria; cloud gets
+    // the expansive guidance. The admitted backend is fixed for the whole run.
+    let is_local = choice.backend() == "local";
+
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();
@@ -150,7 +155,7 @@ pub async fn run_loop(
             .await
             .unwrap_or_else(|_| context::ReviewContext { prd: None, git_diff: String::new(), agents_content: None });
 
-        let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history, design_content.as_deref());
+        let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history, design_content.as_deref(), is_local);
 
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.

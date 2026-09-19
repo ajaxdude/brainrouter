@@ -20,6 +20,7 @@ pub fn build_review_prompt(
     details: Option<&str>,
     session_history: &[String],
     design_doc: Option<&str>,
+    local: bool,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -67,8 +68,10 @@ pub fn build_review_prompt(
         sections.push(format!("# SESSION HISTORY\n\n{}", body));
     }
 
-    // 6. Review criteria (always last). Design-aware variant when a design is present.
-    sections.push(REVIEW_CRITERIA.to_string());
+    // 6. Review criteria (always last). Terse strict-JSON variant for local
+    // models; expansive guidance for cloud. Design-aware criteria appended when
+    // a design is present.
+    sections.push(if local { LOCAL_REVIEW_CRITERIA } else { REVIEW_CRITERIA }.to_string());
     if design_doc.is_some() {
         sections.push(DESIGN_DIVERGENCE_CRITERIA.to_string());
     }
@@ -99,6 +102,19 @@ Provide specific, actionable feedback when status is "needs_revision" or "escala
 - Suggest concrete improvements
 - Mention security, performance, or maintainability concerns"#;
 
+const LOCAL_REVIEW_CRITERIA: &str = r#"# REVIEW CRITERIA
+
+Reply with ONLY a JSON object. No prose before or after. Exactly:
+{"status":"approved|needs_revision|escalated","feedback":"..."}
+
+Rules:
+1. Output must be valid JSON and nothing else.
+2. "status" is one of: approved, needs_revision, escalated.
+3. "approved" = safe to merge. "needs_revision" = fix needed. "escalated" = needs a human.
+4. Put concrete, specific problems in "feedback" (file, line, why, fix).
+5. If unsure, use "escalated". Do not invent issues.
+6. Do not repeat the diff. Do not add markdown. JSON only."#;
+
 const DESIGN_DIVERGENCE_CRITERIA: &str = r#"# DESIGN-AWARE REVIEW (APPROVED DESIGN)
 
 An APPROVED DESIGN DOCUMENT section is included above. Judge the GIT DIFF against
@@ -125,16 +141,30 @@ mod tests {
 
     #[test]
     fn design_section_and_criteria_only_when_supplied() {
-        let without = build_review_prompt(&ctx(), "T1", "sum", None, &[], None);
+        let without = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false);
         assert!(!without.contains("APPROVED DESIGN DOCUMENT"));
         assert!(!without.contains("DESIGN-AWARE REVIEW"));
 
-        let with = build_review_prompt(&ctx(), "T1", "sum", None, &[], Some("THE DESIGN BODY"));
+        let with = build_review_prompt(&ctx(), "T1", "sum", None, &[], Some("THE DESIGN BODY"), false);
         assert!(with.contains("# APPROVED DESIGN DOCUMENT"));
         assert!(with.contains("THE DESIGN BODY"));
         assert!(with.contains("# DESIGN-AWARE REVIEW"));
         // The general criteria and JSON contract remain present in both.
         assert!(with.contains("REVIEW CRITERIA"));
         assert!(without.contains("REVIEW CRITERIA"));
+    }
+
+    #[test]
+    fn local_criteria_are_terse_and_json_only() {
+        let cloud = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false);
+        let local = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, true);
+        // Local variant demands JSON-only and drops the expansive guidance.
+        assert!(local.contains("ONLY a JSON object"));
+        assert!(!local.contains("Feedback Guidelines"));
+        // Cloud variant keeps the expansive guidance.
+        assert!(cloud.contains("Feedback Guidelines"));
+        assert!(!cloud.contains("ONLY a JSON object"));
+        // Both remain shorter-or-equal invariant: local is not longer than cloud.
+        assert!(local.len() <= cloud.len());
     }
 }
