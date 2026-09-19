@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod context;
+pub mod design_doc;
 pub mod prompt;
 pub mod review_loop;
 pub mod runtime_state;
