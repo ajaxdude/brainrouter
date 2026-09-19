@@ -6,6 +6,7 @@
 pub mod admission;
 pub mod context;
 pub mod design_doc;
+pub mod ledger;
 pub mod prompt;
 pub mod review_loop;
 pub mod runtime_state;
@@ -148,6 +149,9 @@ impl ReviewService {
         )
         .await;
         drop(active_review);
+        if let Ok(r) = &result {
+            ledger::record(r);
+        }
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -268,6 +272,7 @@ impl ReviewService {
         } else {
             ReviewStatus::NeedsRevision
         };
+        let status_str = new_status.as_str().to_string();
 
         self.sessions.update_session(
             session_id,
@@ -280,6 +285,9 @@ impl ReviewService {
                 llm_turns: None,
             },
         );
+        // Record the human resolution so the ledger reflects the final verdict,
+        // not just the LLM loop's escalation.
+        ledger::record_event(ledger::human_event(session_id, &status_str));
 
         Ok(())
     }
@@ -347,6 +355,9 @@ impl ReviewService {
         )
         .await;
         drop(active_review);
+        if let Ok(r) = &result {
+            ledger::record(r);
+        }
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -477,6 +488,9 @@ impl ReviewService {
             )
             .await;
             drop(active_review);
+            if let Ok(r) = &result {
+                ledger::record(r);
+            }
 
             match result {
                 Err(e) => {

@@ -363,6 +363,16 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
     </div>
   </div>
 
+  <!-- HankNDory design-aware status + verdict ledger (H8) -->
+  <div style="padding:0 12px 8px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px" title="Design-aware review: whether the reviewer judges diffs against an approved HankNDory design doc, and the recent review-outcome ledger">
+      <span style="color:var(--textDim);font-size:11px;flex:1">design-aware</span>
+      <span id="review-hankndory-state" style="font-size:10px;color:var(--textMute);overflow-wrap:anywhere">—</span>
+      <button class="br-btn" style="font-size:10px;padding:2px 6px" onclick="loadReviewStatus()">Refresh</button>
+    </div>
+    <div id="review-ledger" style="font-size:10px;color:var(--textDim);font-family:'JetBrains Mono',monospace;max-height:120px;overflow-y:auto;line-height:1.5"></div>
+  </div>
+
   <!-- Nudge + reasoning tier (grouped) -->
   <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Nudge</div>
   <div style="padding:0 12px;display:flex;flex-direction:column;gap:6px">
@@ -2771,6 +2781,41 @@ async function toggleCodeReview() {
   codeReviewBusy = false;
 }
 
+// ─── Design-aware review status + verdict ledger (H8) ────────────────────────
+async function loadReviewStatus() {
+  const stateEl = document.getElementById('review-hankndory-state');
+  const ledgerEl = document.getElementById('review-ledger');
+  if (!stateEl || !ledgerEl) return;
+  try {
+    const r = await fetch('/api/review/status');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.hankndory_integration) {
+      stateEl.textContent = 'on: ' + (d.design_doc_path || 'no path set');
+      stateEl.style.color = 'var(--green)';
+    } else {
+      stateEl.textContent = 'off';
+      stateEl.style.color = 'var(--textMute)';
+    }
+    const events = (d.recent_events || []).slice(-20).reverse();
+    ledgerEl.replaceChildren();
+    if (!events.length) {
+      ledgerEl.textContent = 'No review events yet.';
+      return;
+    }
+    events.forEach(e => {
+      const row = document.createElement('div');
+      const when = String(e.ts || '').replace('T', ' ').slice(0, 19);
+      const reason = e.escalation_reason ? ' · ' + String(e.escalation_reason).replaceAll('_', ' ') : '';
+      row.textContent = when + '  ' + e.status + reason + '  (' + (e.reviewer_type || '') + ', i' + (e.iteration_count ?? 0) + ')';
+      ledgerEl.appendChild(row);
+    });
+  } catch (err) {
+    stateEl.textContent = 'unavailable';
+    ledgerEl.textContent = 'Review status unavailable: ' + err.message;
+  }
+}
+
 
 function applyNudgeUI(n) {
   if (!n) return;
@@ -4268,6 +4313,7 @@ refreshSlow();
 refreshBonsai();
 loadRoutingProfile();
 loadRoutingModels();
+loadReviewStatus();
 
 // Poll intervals
 setInterval(refreshFast, 3000);

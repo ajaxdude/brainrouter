@@ -909,9 +909,31 @@ async fn handle_request(
             })))
         }
 
+        // ── Review status + verdict ledger (design G2/G4 / H8) ─────────────
+        // Local-only: audit toggles + recent review-outcome ledger events.
+        ("GET", "/api/review/status") => {
+            let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
+            let resp = if !is_local {
+                json_response(StatusCode::FORBIDDEN, &ErrorResponse {
+                    error: "review status is local-only".into(),
+                })
+            } else {
+                let cfg = state.review_service.get_config();
+                let events = crate::review::ledger::recent(
+                    &crate::review::ledger::ledger_path(),
+                    50,
+                );
+                json_response(StatusCode::OK, &serde_json::json!({
+                    "code_review_enabled": state.code_review_enabled.load(AtomicOrdering::Relaxed),
+                    "hankndory_integration": cfg.hankndory_integration,
+                    "design_doc_path": cfg.design_doc_path,
+                    "recent_events": events,
+                }))
+            };
+            into_unsync(resp)
+        }
+
         // ── Design-aware review approval (design G1 / H5) ──────────────────
-        // Approve the CURRENT design document by binding its SHA-256 in the
-        // approved-record. Editing the doc later invalidates approval.
         ("POST", "/api/review/approve-design") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
