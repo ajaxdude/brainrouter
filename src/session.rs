@@ -51,6 +51,12 @@ pub enum EscalationReason {
     /// The memory-gated admission could not run the review (e.g. no cloud
     /// backend and no measured budget / headroom for a local reviewer).
     AdmissionBlocked,
+    /// Design-aware review is on but the design document is not approved (or its
+    /// content changed since approval). Fail closed to a human.
+    DesignNotApproved,
+    /// Design-aware review is on but the design document could not be loaded
+    /// (missing, misconfigured path, unsupported platform, or unsafe path).
+    DesignUnavailable,
 }
 
 impl EscalationReason {
@@ -61,6 +67,8 @@ impl EscalationReason {
             EscalationReason::LlmEscalated => "llm_escalated",
             EscalationReason::ConnectionFailed => "connection_failed",
             EscalationReason::AdmissionBlocked => "admission_blocked",
+            EscalationReason::DesignNotApproved => "design_not_approved",
+            EscalationReason::DesignUnavailable => "design_unavailable",
         }
     }
 }

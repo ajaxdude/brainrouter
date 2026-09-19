@@ -513,6 +513,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 // ── Approved-record store (review_approvals.json) ────────────────────────────
 
 /// Canonical path for the approved-record file (beside `review_runtime_state.json`).
+///
+/// Note: entries are keyed by repo-relative design path only, so two distinct
+/// repositories that both hold an identically-named, byte-identical, approved
+/// design doc would share one record. The SHA-256 binding neutralizes the unsafe
+/// case (different content ⇒ mismatch ⇒ fail closed); this is acceptable under
+/// the single-primary-repo assumption of a local single-user host.
 pub fn approvals_path() -> PathBuf {
     crate::config::default_config_path().with_file_name(APPROVALS_FILE)
 }

@@ -439,6 +439,18 @@ pub struct ReviewConfig {
     /// Explicit local or cloud model ID. None uses the backend's default.
     #[serde(default)]
     pub forced_model: Option<String>,
+
+    /// HankNDory design-aware review (design G1). When true, a review only
+    /// proceeds if an *approved* design document is loaded, and the reviewer is
+    /// told to judge the diff against it. Default off (opt-in).
+    #[serde(default)]
+    pub hankndory_integration: bool,
+
+    /// Repo-relative path (under `docs/design/`) of the design document the
+    /// reviewer should judge against when `hankndory_integration` is on. Unset
+    /// while integration is on ⇒ the review fails closed (escalates).
+    #[serde(default)]
+    pub design_doc_path: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -455,6 +467,8 @@ impl Default for ReviewConfig {
             max_iterations: default_max_iterations(),
             forced_mode: default_review_mode(),
             forced_model: None,
+            hankndory_integration: false,
+            design_doc_path: None,
         }
     }
 }

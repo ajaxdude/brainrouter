@@ -909,6 +909,36 @@ async fn handle_request(
             })))
         }
 
+        // ── Design-aware review approval (design G1 / H5) ──────────────────
+        // Approve the CURRENT design document by binding its SHA-256 in the
+        // approved-record. Editing the doc later invalidates approval.
+        ("POST", "/api/review/approve-design") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let project_dir = val.get("project_dir").and_then(|v| v.as_str()).unwrap_or("");
+            let resp = match val.get("path").and_then(|v| v.as_str()) {
+                None => json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                    error: "Missing \"path\" (repo-relative design doc under docs/design/)".into(),
+                }),
+                Some(path) => review_approve_design(project_dir, path),
+            };
+            into_unsync(resp)
+        }
+
+        // Report the current design-approval outcome without recording anything.
+        ("POST", "/api/review/design-status") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let project_dir = val.get("project_dir").and_then(|v| v.as_str()).unwrap_or("");
+            let resp = match val.get("path").and_then(|v| v.as_str()) {
+                None => json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                    error: "Missing \"path\"".into(),
+                }),
+                Some(path) => review_design_status(project_dir, path),
+            };
+            into_unsync(resp)
+        }
+
         // ── Toolboxes API (all llama-* toolbox containers) ──────────────────
         ("GET", "/api/toolboxes") => {
             let resp = toolboxes_list().await;
@@ -2016,6 +2046,65 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
         }
     }
 }
+/// Approve the current design document by binding its SHA-256 in the
+/// approved-record. Fails if the doc cannot be safely loaded or is not marked
+/// approved-for-implementation with a human approval.
+fn review_approve_design(project_dir: &str, path: &str) -> Response<Full<Bytes>> {
+    use crate::review::design_doc;
+    match design_doc::load_design_doc(project_dir, path) {
+        Err(e) => json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+            error: format!("Cannot load design document: {e}"),
+        }),
+        Ok(doc) if !doc.doc_marks_approved() => json_response(StatusCode::CONFLICT, &ErrorResponse {
+            error: "Design is not marked approved-for-implementation with a human approval; cannot record approval.".into(),
+        }),
+        Ok(doc) => match design_doc::record_approval(
+            &design_doc::approvals_path(),
+            &doc.repo_rel_path,
+            &doc.sha256,
+            doc.approved_version.clone(),
+            "dashboard",
+        ) {
+            Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+                "approved": true,
+                "path": doc.repo_rel_path,
+                "sha256": doc.sha256,
+                "version": doc.approved_version,
+            })),
+            Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Could not record approval: {e}"),
+            }),
+        },
+    }
+}
+
+/// Report the current design-approval outcome without recording anything.
+fn review_design_status(project_dir: &str, path: &str) -> Response<Full<Bytes>> {
+    use crate::review::design_doc::{self, ApprovalOutcome};
+    match design_doc::load_design_doc(project_dir, path) {
+        Err(e) => json_response(StatusCode::OK, &serde_json::json!({
+            "state": "unavailable",
+            "detail": e.to_string(),
+        })),
+        Ok(doc) => {
+            let approvals = design_doc::load_approvals(&design_doc::approvals_path());
+            let outcome = design_doc::evaluate_approval(&doc, approvals.get(&doc.repo_rel_path));
+            let (state, detail) = match outcome {
+                ApprovalOutcome::Approved { .. } => ("approved", String::new()),
+                ApprovalOutcome::NotApproved(reason) => ("not_approved", reason),
+            };
+            json_response(StatusCode::OK, &serde_json::json!({
+                "state": state,
+                "detail": detail,
+                "path": doc.repo_rel_path,
+                "sha256": doc.sha256,
+                "version": doc.approved_version,
+                "doc_marks_approved": doc.doc_marks_approved(),
+            }))
+        }
+    }
+}
+
 pub async fn toolboxes_list() -> Response<Full<Bytes>> {
     use tokio::process::Command;
     let containers = Command::new("podman")

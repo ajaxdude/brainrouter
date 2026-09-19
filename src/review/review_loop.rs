@@ -97,6 +97,41 @@ pub async fn run_loop(
             });
         }
     };
+
+    // Design-aware review (design G1): when integration is on, resolve the
+    // approved design ONCE for the whole run. Fail closed to a human if it is
+    // unavailable or not approved — never review as if approved.
+    let design_content: Option<String> = if config.hankndory_integration {
+        match resolve_design(config, project_dir) {
+            Ok(content) => Some(content),
+            Err((reason, message)) => {
+                let status = ReviewStatus::Escalated;
+                let escalation_reason = Some(reason);
+                sessions.update_session(
+                    session_id,
+                    SessionUpdate {
+                        status: Some(status.clone()),
+                        feedback: Some(message.clone()),
+                        reviewer_type: Some(ReviewerType::Llm),
+                        escalation_reason: escalation_reason.clone(),
+                        review_model: None,
+                        llm_turns: Some(Vec::new()),
+                    },
+                );
+                return Ok(ReviewResult {
+                    status,
+                    feedback: message,
+                    session_id: session_id.to_string(),
+                    iteration_count: 0,
+                    reviewer_type: ReviewerType::Llm,
+                    escalation_reason,
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();
@@ -115,7 +150,7 @@ pub async fn run_loop(
             .await
             .unwrap_or_else(|_| context::ReviewContext { prd: None, git_diff: String::new(), agents_content: None });
 
-        let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history);
+        let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history, design_content.as_deref());
 
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
@@ -520,6 +555,40 @@ fn map_status(s: &str) -> ReviewStatus {
     }
 }
 
+/// Resolve the approved design document for a design-aware review run. Returns
+/// the document content on success, or `(reason, human-readable message)` to
+/// escalate on any failure (fail closed).
+fn resolve_design(
+    config: &crate::config::ReviewConfig,
+    project_dir: &str,
+) -> Result<String, (EscalationReason, String)> {
+    use crate::review::design_doc::{self, ApprovalOutcome};
+
+    let path = config.design_doc_path.as_deref().ok_or_else(|| {
+        (
+            EscalationReason::DesignUnavailable,
+            "Design-aware review is enabled but review.design_doc_path is not set.".to_string(),
+        )
+    })?;
+    let doc = design_doc::load_design_doc(project_dir, path).map_err(|e| {
+        (
+            EscalationReason::DesignUnavailable,
+            format!("Design-aware review could not load the design document: {e}"),
+        )
+    })?;
+    let approvals = design_doc::load_approvals(&design_doc::approvals_path());
+    match design_doc::evaluate_approval(&doc, approvals.get(&doc.repo_rel_path)) {
+        ApprovalOutcome::Approved { .. } => Ok(doc.content),
+        ApprovalOutcome::NotApproved(reason) => Err((
+            EscalationReason::DesignNotApproved,
+            format!(
+                "Design-aware review blocked: {reason}. \
+                 Approve the current design via POST /api/review/approve-design."
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +598,28 @@ mod tests {
         let text = format!("{}é malformed", "x".repeat(499));
         let error = parse_llm_response(&text).unwrap_err();
         assert!(error.to_string().contains("Could not parse JSON"));
+    }
+
+    #[test]
+    fn resolve_design_requires_a_configured_path() {
+        let config = crate::config::ReviewConfig {
+            hankndory_integration: true,
+            design_doc_path: None,
+            ..Default::default()
+        };
+        let err = resolve_design(&config, ".").unwrap_err();
+        assert_eq!(err.0, EscalationReason::DesignUnavailable);
+    }
+
+    #[test]
+    fn resolve_design_fails_closed_when_the_doc_is_missing() {
+        let config = crate::config::ReviewConfig {
+            hankndory_integration: true,
+            design_doc_path: Some("docs/design/does-not-exist-xyz.md".into()),
+            ..Default::default()
+        };
+        // Even in this repo (a real git root), a missing doc must not resolve.
+        let err = resolve_design(&config, ".").unwrap_err();
+        assert_eq!(err.0, EscalationReason::DesignUnavailable);
     }
 }

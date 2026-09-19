@@ -192,6 +192,11 @@ impl RoutingProfile {
 struct Preferences {
     profile: RoutingProfile,
     max_iterations: u32,
+    /// HankNDory design-aware review toggle + doc path, seeded from the YAML
+    /// review config at load (not persisted to routing_state.json, same as
+    /// `max_iterations`).
+    hankndory_integration: bool,
+    design_doc_path: Option<String>,
 }
 
 pub struct ProfileStore {
@@ -207,6 +212,8 @@ impl ProfileStore {
             state: Mutex::new(Preferences {
                 profile,
                 max_iterations,
+                hankndory_integration: false,
+                design_doc_path: None,
             }),
             path: None,
         })
@@ -216,6 +223,11 @@ impl ProfileStore {
         let mut store = Self::memory(profile, review.max_iterations).with_context(|| {
             format!("invalid initial routing preferences for {}", path.display())
         })?;
+        {
+            // Design-aware review settings are YAML-driven (like max_iterations),
+            // not part of the persisted routing profile.
+            store.seed_review_design(review);
+        }
         let mut migrated_from = None;
         match fs::read(&path) {
             Ok(bytes) => {
@@ -285,12 +297,22 @@ impl ProfileStore {
         self.state.lock().unwrap().profile.clone()
     }
 
-    pub fn review_config(&self) -> ReviewConfig {
-        let state = self.state.lock().unwrap();
+    /// Seed the YAML-driven design-aware review settings onto an in-memory
+    /// store. `load` calls this; the profiles-less `ReviewService` fallback calls
+    /// it too so an enabled config is never silently dropped to defaults.
+    pub fn seed_review_design(&mut self, review: &ReviewConfig) {
+        let state = self.state.get_mut().unwrap();
+        state.hankndory_integration = review.hankndory_integration;
+        state.design_doc_path = review.design_doc_path.clone();
+    }
+
+    pub fn review_config(&self) -> ReviewConfig {        let state = self.state.lock().unwrap();
         ReviewConfig {
             max_iterations: state.max_iterations,
             forced_mode: state.profile.reviewer.backend().into(),
             forced_model: state.profile.reviewer.model().map(str::to_owned),
+            hankndory_integration: state.hankndory_integration,
+            design_doc_path: state.design_doc_path.clone(),
         }
     }
 

@@ -66,12 +66,16 @@ impl ReviewService {
         fallback_model: String,
     ) -> Self {
         let preferences = router.profiles().cloned().unwrap_or_else(|| {
-            Arc::new(ProfileStore::memory(RoutingProfile {
+            let mut store = ProfileStore::memory(RoutingProfile {
                 preset: RoutingPreset::Custom,
                 main: ModelChoice::Auto,
                 reviewer: config.model_choice().expect("validated review configuration"),
                 subagent_model: None,
-            }, config.max_iterations).expect("validated review configuration"))
+            }, config.max_iterations).expect("validated review configuration");
+            // Carry the YAML design-aware settings so a profiles-less fallback
+            // never silently disables an enabled integration.
+            store.seed_review_design(&config);
+            Arc::new(store)
         });
 
         // At least one permit even if misconfigured; validation elsewhere pins it to 1.

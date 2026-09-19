@@ -293,6 +293,7 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
             max_iterations: 1,
             forced_mode: "local".into(),
             forced_model: Some("new-reviewer".into()),
+            ..ReviewConfig::default()
         })
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -635,7 +636,7 @@ async fn cli_uses_the_same_typed_profile_and_legacy_review_api() {
                 "cli-reviewer",
             ],
             "/api/review-config",
-            json!({"max_iterations":5,"forced_mode":"cloud","forced_model":"cli-reviewer"}),
+            json!({"max_iterations":5,"forced_mode":"cloud","forced_model":"cli-reviewer","hankndory_integration":false,"design_doc_path":null}),
         ),
     ];
     for (args, path, expected) in cases {
