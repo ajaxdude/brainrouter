@@ -250,7 +250,7 @@ impl Router {
                 .map(|store| store.profile().main.selector())
                 .unwrap_or_else(|| "auto".into());
         }
-        self.route_resolved(request, session_id, cwd, user_agent, true).await
+        self.route_resolved(request, session_id, cwd, user_agent, true, true).await
     }
 
     /// Review calls use their session snapshot, never the live main or subs choice.
@@ -265,7 +265,10 @@ impl Router {
     ) -> Result<(ProviderResponse, RouteInfo)> {
         choice.validate()?;
         request.model = choice.selector();
-        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback).await
+        // Reviewer path: never rewrite the local prompt (apply_local_rewrite=false)
+        // so the review criteria survive; never fall back to local on a cloud
+        // failure (allow_local_fallback threaded from the caller).
+        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false).await
     }
 
     async fn route_resolved(
@@ -275,6 +278,7 @@ impl Router {
         cwd: String,
         user_agent: String,
         allow_local_fallback: bool,
+        apply_local_rewrite: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
@@ -291,7 +295,12 @@ impl Router {
             "local" | "brainrouter/local" => {
                 info!("Direct local mode — rewriting system prompt");
                 tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
-                request.messages = self.maybe_rewrite_local(request.messages);
+                // Reviewer calls (design H9/FR-B) pass apply_local_rewrite=false so
+                // the review criteria system prompt survives a local route instead
+                // of being replaced by the lean coding prompt.
+                if apply_local_rewrite {
+                    request.messages = self.maybe_rewrite_local(request.messages);
+                }
                 request.model = self.fallback_model.clone();
                 ("local-direct", "local", self.route_local(request, true).await)
             }
