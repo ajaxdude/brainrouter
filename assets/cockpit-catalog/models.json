@@ -858,6 +858,18 @@
           "size_gb": 365.714,
           "recommended": false,
           "sha256": "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42",
+          "server_defaults": {
+            "standalone_ctx": 262144,
+            "distributed_ctx": 262144,
+            "ssd_streaming": true,
+            "ssd_experts": "92GB",
+            "tensor_parallel": true,
+            "distributed_transport": "tcp",
+            "distributed_port": 9911,
+            "rdma_device": "rocep194s0",
+            "rdma_port": 1,
+            "rdma_gid_index": 1
+          },
           "id": "ds4-deepseek-v4-1-flash-q2-gguf"
         },
         {

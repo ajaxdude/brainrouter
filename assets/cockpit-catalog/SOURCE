@@ -7,8 +7,8 @@ build/CI time via `scripts/sync-toolbox-catalog.sh` and
 `src/toolbox_catalog/schema_validate.rs`.
 
 - Upstream repo: https://github.com/kyuz0/ai-toolbox-cockpit
-- Pinned commit: `6959d068c020f3f33bfb8ef743e7ba44a6390dda`
-- Commit date: 2026-09-16 12:18:56 +0000
+- Pinned commit: `3a4032162640d1dd9096b86bcc2b79af232eaaae`
+- Commit date: 2026-09-19T15:35:37Z
 - Vendored files:
   - `ai_toolbox_cockpit/assets/models.json`  -> `models.json`
   - `ai_toolbox_cockpit/assets/toolboxes.json` -> `toolboxes.json`
