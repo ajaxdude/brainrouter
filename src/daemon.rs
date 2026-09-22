@@ -255,11 +255,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
     // FR-A: code reviewer on by default; the choice persists in
     // review_runtime_state.json beside routing_state.json.
-    let code_review_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        brainrouter::review::runtime_state::load_enabled(
+    // FR-A + FR-D: read both runtime flags in one load; reviewer on by default,
+    // PR-guideline injection off by default. Persisted in review_runtime_state.json.
+    let (code_review_flag, pr_guidelines_flag) =
+        brainrouter::review::runtime_state::load_state(
             &brainrouter::review::runtime_state::state_path(),
-        ),
-    ));
+        );
+    let code_review_enabled =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(code_review_flag));
+    let pr_guidelines_enabled =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(pr_guidelines_flag));
 
     // Create classifier pointing at the external server
     let classifier = Classifier::new(
@@ -433,6 +438,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         nudge_budgets: config.llama_swap.nudge.budgets,
         prompt_rewrite,
         code_review_enabled,
+        pr_guidelines_enabled,
         inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
         benchmark_store,
         benchmark_lab,

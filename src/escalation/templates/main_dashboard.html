@@ -361,6 +361,13 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <span id="toggle-codereview-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
       </button>
     </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:6px" title="PR guidelines — when on, brainrouter injects a directive telling the coding agent to split commits by layer/function/concern, keep them human-reviewable and individually deployable, and note when a rule is stretched or broken">
+      <span style="color:var(--textDim);font-size:11px;flex:1">PR guidelines</span>
+      <button id="toggle-prguidelines" onclick="togglePrGuidelines()" title="Enable / disable the PR-generation guideline"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-prguidelines-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
   </div>
 
   <!-- HankNDory design-aware status + verdict ledger (H8) -->
@@ -2781,6 +2788,31 @@ async function toggleCodeReview() {
   codeReviewBusy = false;
 }
 
+// ─── FR-D: PR generation guideline toggle ────────────────────────────────────
+let prGuidelinesEnabled = false;
+let prGuidelinesBusy = false;
+async function togglePrGuidelines() {
+  if (prGuidelinesBusy) return;
+  const next = !prGuidelinesEnabled;
+  prGuidelinesBusy = true;
+  applyToggle('prguidelines', next);
+  try {
+    const r = await fetch('/api/review/pr-guidelines', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (r.ok) {
+      const fresh = await r.json();
+      prGuidelinesEnabled = !!fresh.enabled;
+    } else {
+      console.warn('PR guidelines toggle failed', r.status);
+    }
+  } catch(e) { /* keep last known state */ }
+  applyToggle('prguidelines', prGuidelinesEnabled);
+  prGuidelinesBusy = false;
+}
+
 // ─── Design-aware review status + verdict ledger (H8) ────────────────────────
 async function loadReviewStatus() {
   const stateEl = document.getElementById('review-hankndory-state');
@@ -4079,7 +4111,7 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes, prGuidelinesRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
@@ -4088,6 +4120,7 @@ async function refreshSlow() {
     safeFetch('/api/toolbox-containers'),
     safeFetch('/api/cockpit-config'),
     safeFetch('/api/review/enabled'),
+    safeFetch('/api/review/pr-guidelines'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
@@ -4097,6 +4130,7 @@ async function refreshSlow() {
   if (containersRes) { toolboxContainersData = containersRes; }
   if (cockpitConfigRes) { cockpitConfigData = cockpitConfigRes; renderCockpitConfigStatus(); }
   if (reviewRes) { codeReviewEnabled = !!reviewRes.enabled; applyToggle('codereview', codeReviewEnabled); }
+  if (prGuidelinesRes) { prGuidelinesEnabled = !!prGuidelinesRes.enabled; applyToggle('prguidelines', prGuidelinesEnabled); }
   if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
 }
 

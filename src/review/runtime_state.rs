@@ -6,15 +6,22 @@
 //! startup. Writes are atomic (temp file in the same directory + rename), the
 //! same durability contract as the existing `routing_state.json` writer.
 //!
-//! Deliberately minimal: this first release persists only the single
-//! `code_review_enabled` flag. The deferred hardening track (see
-//! `docs/design/hankndory-brainrouter-integration.md`) layers a richer runtime
-//! state and an append-only ledger on top of this file's `schema_version`.
+//! Deliberately minimal: this file persists the `code_review_enabled` flag
+//! (FR-A) and the `pr_guidelines_enabled` flag (FR-D). Writes take both current
+//! values from the live atomics and rewrite the full snapshot under a lock, so a
+//! toggle of one flag never clobbers the other. The deferred ledger (see
+//! `docs/design/hankndory-brainrouter-integration.md`) is a separate file.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const FILE_NAME: &str = "review_runtime_state.json";
+
+/// Serializes the whole read-free write (both flags are supplied by the caller
+/// from the live atomics, so the writer never re-reads a possibly-corrupt file)
+/// so concurrent toggles cannot race on the temp path or lose an update.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReviewRuntimeState {
@@ -22,6 +29,10 @@ struct ReviewRuntimeState {
     schema_version: u32,
     #[serde(default = "default_true")]
     code_review_enabled: bool,
+    /// FR-D: inject the PR-generation guideline into agent proxy requests.
+    /// Opt-in, default off.
+    #[serde(default)]
+    pr_guidelines_enabled: bool,
 }
 
 fn default_schema_version() -> u32 {
@@ -36,6 +47,7 @@ impl Default for ReviewRuntimeState {
         ReviewRuntimeState {
             schema_version: 1,
             code_review_enabled: true,
+            pr_guidelines_enabled: false,
         }
     }
 }
@@ -45,48 +57,96 @@ pub fn state_path() -> PathBuf {
     crate::config::default_config_path().with_file_name(FILE_NAME)
 }
 
-/// Read the persisted `code_review_enabled` flag. Absent, unreadable, or
-/// corrupt ⇒ `true` (reviewer on by default). Never panics; never blocks
-/// startup.
-pub fn load_enabled(path: &Path) -> bool {
+/// Read both persisted runtime flags. Absent, unreadable, or corrupt ⇒ the
+/// defaults `(code_review_enabled = true, pr_guidelines_enabled = false)`.
+/// Never panics; never blocks startup.
+pub fn load_state(path: &Path) -> (bool, bool) {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<ReviewRuntimeState>(&bytes) {
-            Ok(state) => state.code_review_enabled,
+            Ok(state) => (state.code_review_enabled, state.pr_guidelines_enabled),
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(), error = %e,
-                    "Ignoring corrupt review_runtime_state.json; defaulting code review to on"
+                    "Ignoring corrupt review_runtime_state.json; using defaults"
                 );
-                true
+                (true, false)
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, false),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(), error = %e,
-                "Could not read review_runtime_state.json; defaulting code review to on"
+                "Could not read review_runtime_state.json; using defaults"
             );
-            true
+            (true, false)
         }
     }
 }
 
-/// Persist the `code_review_enabled` flag atomically (temp file + rename in the
-/// same directory).
-pub fn save_enabled(path: &Path, enabled: bool) -> std::io::Result<()> {
+/// Read the persisted `code_review_enabled` flag (default on).
+pub fn load_enabled(path: &Path) -> bool {
+    load_state(path).0
+}
+
+/// Read the persisted `pr_guidelines_enabled` flag (default off).
+pub fn load_pr_guidelines(path: &Path) -> bool {
+    load_state(path).1
+}
+
+/// Persist both runtime flags atomically. The caller passes the current values
+/// (from the live atomics), so this never re-reads the file and can never reset
+/// the sibling flag. Holds `WRITE_LOCK` across serialize → unique temp write →
+/// `sync_all` → rename → parent-dir fsync, so concurrent writers serialize and
+/// disk converges to the true runtime state. Single-writer daemon assumed (one
+/// process owns the file; no cross-process lock).
+pub fn save_state(
+    path: &Path,
+    code_review_enabled: bool,
+    pr_guidelines_enabled: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let state = ReviewRuntimeState {
         schema_version: 1,
-        code_review_enabled: enabled,
+        code_review_enabled,
+        pr_guidelines_enabled,
     };
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime-state path needs a parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    // Best-effort sweep of orphaned temp files from a prior crashed write. Safe
+    // under WRITE_LOCK: no other writer holds an in-flight temp right now.
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".review_runtime_state-") && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let tmp = parent.join(format!(".review_runtime_state-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok::<_, std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -98,39 +158,89 @@ mod tests {
     }
 
     #[test]
-    fn absent_file_defaults_to_enabled() {
+    fn absent_file_defaults() {
         let path = tmp_path();
-        assert!(load_enabled(&path), "missing file must default to on");
+        assert_eq!(load_state(&path), (true, false), "missing file: code-review on, pr off");
+        assert!(load_enabled(&path));
+        assert!(!load_pr_guidelines(&path));
     }
 
     #[test]
-    fn corrupt_file_defaults_to_enabled() {
+    fn corrupt_file_defaults() {
         let path = tmp_path();
         std::fs::write(&path, b"{ this is not json").unwrap();
-        assert!(load_enabled(&path), "corrupt file must default to on");
+        assert_eq!(load_state(&path), (true, false), "corrupt file: defaults");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn round_trips_disabled_and_enabled() {
+    fn round_trips_both_flags() {
         let path = tmp_path();
-        save_enabled(&path, false).unwrap();
-        assert!(!load_enabled(&path));
-        save_enabled(&path, true).unwrap();
-        assert!(load_enabled(&path));
+        save_state(&path, false, true).unwrap();
+        assert_eq!(load_state(&path), (false, true));
+        save_state(&path, true, false).unwrap();
+        assert_eq!(load_state(&path), (true, false));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn toggling_one_flag_preserves_the_other() {
+        // The endpoints pass both live atomics, so a full-snapshot write of the
+        // current values can never clobber the sibling flag.
+        let path = tmp_path();
+        save_state(&path, true, true).unwrap();
+        // Flip only code-review off, carrying pr's current value.
+        let (_code, pr) = load_state(&path);
+        save_state(&path, false, pr).unwrap();
+        assert_eq!(load_state(&path), (false, true));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn unknown_extra_fields_do_not_break_load() {
-        // Forward-compatibility: the hardening track adds fields to this file.
         let path = tmp_path();
         std::fs::write(
             &path,
-            br#"{"schema_version":2,"code_review_enabled":false,"future_field":123}"#,
+            br#"{"schema_version":2,"code_review_enabled":false,"pr_guidelines_enabled":true,"future_field":123}"#,
         )
         .unwrap();
-        assert!(!load_enabled(&path));
+        assert_eq!(load_state(&path), (false, true));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_state_sweeps_orphaned_temp_files() {
+        // Own subdirectory so the sweep can't touch sibling tests' temp dir.
+        let dir = std::env::temp_dir().join(format!("br-rtstate-sweep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let orphan = dir.join(".review_runtime_state-deadbeef.tmp");
+        std::fs::write(&orphan, b"stale").unwrap();
+        save_state(&path, true, true).unwrap();
+        assert!(!orphan.exists(), "a prior crashed write's temp must be swept");
+        assert_eq!(load_state(&path), (true, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writes_do_not_corrupt_the_file() {
+        let path = std::sync::Arc::new(tmp_path());
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let p = std::sync::Arc::clone(&path);
+            handles.push(std::thread::spawn(move || {
+                // Alternate values; the lock serializes and each write is a full
+                // valid snapshot (never a torn file).
+                save_state(&p, i % 2 == 0, i % 3 == 0).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Whatever landed last, the file parses to a valid (bool, bool) — not a
+        // torn/corrupt read that would fall back to defaults on a valid file.
+        let bytes = std::fs::read(path.as_ref()).unwrap();
+        assert!(serde_json::from_slice::<ReviewRuntimeState>(&bytes).is_ok());
+        let _ = std::fs::remove_file(path.as_ref());
     }
 }

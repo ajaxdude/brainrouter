@@ -145,6 +145,9 @@ pub struct AppState {
     /// FR-A: code-review master switch (default on). Shared with the review
     /// dispatch so a review request short-circuits to `disabled` when off.
     pub code_review_enabled: Arc<AtomicBool>,
+    /// FR-D: PR-generation-guideline switch (default off). When on, the two
+    /// public proxy handlers inject a PR-structuring directive into requests.
+    pub pr_guidelines_enabled: Arc<AtomicBool>,
     /// In-flight request registry (dashboard tracking + cancel).
     pub inflight: Arc<crate::inflight::InflightRegistry>,
     /// Optional benchmark storage; an initialization error disables only the explorer.
@@ -895,17 +898,45 @@ async fn handle_request(
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
                 state.code_review_enabled.store(enabled, AtomicOrdering::Relaxed);
-                // Persist so the choice survives a restart. A write failure is
+                // Persist BOTH live flags (full snapshot) so the choice survives a
+                // restart and never clobbers the sibling flag. Write failure is
                 // logged, not fatal — the in-memory switch already took effect.
-                if let Err(e) = crate::review::runtime_state::save_enabled(
+                if let Err(e) = crate::review::runtime_state::save_state(
                     &crate::review::runtime_state::state_path(),
                     enabled,
+                    state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
                 ) {
                     tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
                 }
             }
             into_unsync(json_response(StatusCode::OK, &serde_json::json!({
                 "enabled": state.code_review_enabled.load(AtomicOrdering::Relaxed),
+            })))
+        }
+
+        // ── FR-D: PR-generation guideline toggle ───────────────────────────
+        ("GET", "/api/review/pr-guidelines") => {
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+            })))
+        }
+
+        ("POST", "/api/review/pr-guidelines") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                state.pr_guidelines_enabled.store(enabled, AtomicOrdering::Relaxed);
+                // Full-snapshot persist of both live flags (see /enabled above).
+                if let Err(e) = crate::review::runtime_state::save_state(
+                    &crate::review::runtime_state::state_path(),
+                    state.code_review_enabled.load(AtomicOrdering::Relaxed),
+                    enabled,
+                ) {
+                    tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
+                }
+            }
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
             })))
         }
 
@@ -1472,6 +1503,64 @@ fn omp_sessions() -> serde_json::Value {
     serde_json::json!({"home": base.to_string_lossy().into_owned(), "sessions": sessions})
 }
 
+/// FR-D marker that prefixes the injected guideline. Reserved: any system
+/// message already containing this string suppresses re-injection (idempotency).
+const PR_GUIDELINE_MARKER: &str = "<!--BRAINROUTER:PR-GUIDELINES v1-->";
+
+/// FR-D PR-generation guideline injected (when the toggle is on) into agent
+/// proxy requests. Instructs the coding agent how to structure a PR's commits
+/// and to surface explicit notes whenever it stretches or breaks a rule.
+const PR_GUIDELINE_PROMPT: &str = "<!--BRAINROUTER:PR-GUIDELINES v1-->
+# PR GENERATION GUIDELINE
+
+When you create a pull request or a sequence of commits, follow these rules:
+
+1. Split the change into commits by layer, function, or cross-cutting concern —
+   one coherent, self-contained change per commit, never a single mixed dump.
+2. Keep each commit human-reviewable in size and complexity: a small, focused
+   diff a reviewer can fully understand in one sitting.
+3. Make each commit individually deployable in sequence — build and tests pass at
+   every commit, and no commit depends on a later one to be correct.
+4. If you must stretch or break any of rules 1-3, add an explicit note in the PR
+   description (and the relevant commit body) stating which rule, why, and the
+   trade-off, so the reviewer can see exactly where and why the rules bent.";
+
+/// FR-D: when `enabled`, insert the PR-generation guideline as one `system`
+/// message after the contiguous leading run of `system` messages (index 0 if
+/// none; end if all-system). Idempotent: skips if any system message already
+/// carries the marker in string content. No-op when disabled ⇒ the request is
+/// unchanged from the pre-FR-D path.
+fn maybe_inject_pr_guidelines(request: &mut ChatCompletionRequest, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let already_present = request.messages.iter().any(|m| {
+        m.role == "system"
+            && m.content
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains(PR_GUIDELINE_MARKER))
+    });
+    if already_present {
+        return;
+    }
+    let pos = request
+        .messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(request.messages.len());
+    request.messages.insert(
+        pos,
+        crate::types::ChatMessage {
+            role: "system".to_string(),
+            content: Some(serde_json::Value::String(PR_GUIDELINE_PROMPT.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    );
+}
+
 /// Handle POST /v1/chat/completions
 async fn handle_chat_completion(
     req: Request<Incoming>,
@@ -1482,7 +1571,13 @@ async fn handle_chat_completion(
     peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
-    let request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
+    // FR-D: inject the PR-generation guideline before the fingerprint/registry so
+    // in-flight and routing fingerprints see identical messages.
+    maybe_inject_pr_guidelines(
+        &mut request,
+        state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+    );
     // Router resolves managed defaults for both protocols and direct callers.
     // Spawn routing in a background task so we can return SSE headers immediately.
     // This prevents OMP's "first event" timeout from firing while llama-swap loads
@@ -1551,7 +1646,12 @@ async fn handle_anthropic_messages(
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
     let model = anthropic_req.model.clone();
-    let oai_request = anthropic_to_openai(anthropic_req);
+    let mut oai_request = anthropic_to_openai(anthropic_req);
+    // FR-D: inject before the in-flight fingerprint (same rationale as OpenAI).
+    maybe_inject_pr_guidelines(
+        &mut oai_request,
+        state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+    );
     // Spawn routing so SSE headers are returned immediately (same rationale as OpenAI path).
     let handle = state.inflight.register(
         "POST /v1/messages".to_string(),
@@ -4187,6 +4287,96 @@ async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FR-D: maybe_inject_pr_guidelines ─────────────────────────────────────
+    fn req(messages: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({ "model": "auto", "messages": messages })).unwrap()
+    }
+    fn marker_at(r: &ChatCompletionRequest, i: usize) -> bool {
+        r.messages[i].role == "system"
+            && r.messages[i]
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains(PR_GUIDELINE_MARKER))
+    }
+
+    #[test]
+    fn pr_guidelines_off_leaves_messages_unchanged() {
+        let mut r = req(serde_json::json!([
+            {"role": "system", "content": "You are OMP."},
+            {"role": "user", "content": "hi"},
+        ]));
+        maybe_inject_pr_guidelines(&mut r, false);
+        assert_eq!(r.messages.len(), 2);
+        assert!(!r.messages.iter().any(marker_present));
+    }
+
+    fn marker_present(m: &crate::types::ChatMessage) -> bool {
+        m.content.as_ref().and_then(serde_json::Value::as_str).is_some_and(|s| s.contains(PR_GUIDELINE_MARKER))
+    }
+
+    #[test]
+    fn pr_guidelines_inject_after_leading_system_block() {
+        let mut r = req(serde_json::json!([
+            {"role": "system", "content": "sys A"},
+            {"role": "system", "content": "sys B"},
+            {"role": "user", "content": "hi"},
+        ]));
+        maybe_inject_pr_guidelines(&mut r, true);
+        // Inserted at index 2 (after the two leading systems, before the user).
+        assert_eq!(r.messages.len(), 4);
+        assert!(marker_at(&r, 2));
+        assert_eq!(r.messages[3].role, "user");
+        // Original leading systems untouched.
+        assert_eq!(r.messages[0].content.as_ref().unwrap().as_str().unwrap(), "sys A");
+    }
+
+    #[test]
+    fn pr_guidelines_no_leading_system_inserts_at_front() {
+        let mut r = req(serde_json::json!([{"role": "user", "content": "hi"}]));
+        maybe_inject_pr_guidelines(&mut r, true);
+        assert_eq!(r.messages.len(), 2);
+        assert!(marker_at(&r, 0));
+        assert_eq!(r.messages[1].role, "user");
+    }
+
+    #[test]
+    fn pr_guidelines_all_system_appends_at_end() {
+        let mut r = req(serde_json::json!([
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+        ]));
+        maybe_inject_pr_guidelines(&mut r, true);
+        assert_eq!(r.messages.len(), 3);
+        assert!(marker_at(&r, 2));
+    }
+
+    #[test]
+    fn pr_guidelines_are_idempotent() {
+        let mut r = req(serde_json::json!([
+            {"role": "system", "content": "You are OMP."},
+            {"role": "user", "content": "hi"},
+        ]));
+        maybe_inject_pr_guidelines(&mut r, true);
+        let after_first = r.messages.len();
+        maybe_inject_pr_guidelines(&mut r, true);
+        assert_eq!(r.messages.len(), after_first, "second call must not duplicate");
+        assert_eq!(r.messages.iter().filter(|m| marker_present(m)).count(), 1);
+    }
+
+    #[test]
+    fn pr_guidelines_structured_content_is_not_a_false_positive() {
+        // A system message with non-string (array) content must not be scanned as
+        // carrying the marker, so injection still proceeds and nothing panics.
+        let mut r = req(serde_json::json!([
+            {"role": "system", "content": [{"type": "text", "text": "structured"}]},
+            {"role": "user", "content": "hi"},
+        ]));
+        maybe_inject_pr_guidelines(&mut r, true);
+        assert_eq!(r.messages.len(), 3);
+        assert!(marker_at(&r, 1));
+    }
 
     #[test]
     fn display_name_full_model_id() {
