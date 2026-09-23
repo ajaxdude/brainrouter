@@ -306,7 +306,21 @@ impl ProfileStore {
         state.design_doc_path = review.design_doc_path.clone();
     }
 
-    pub fn review_config(&self) -> ReviewConfig {        let state = self.state.lock().unwrap();
+    /// Runtime toggle for design-aware (HankNDory) review (Phase-1b). Updates the
+    /// in-memory value that `review_config()` returns (and thus `run_loop` reads);
+    /// durable persistence is via `review_runtime_state.json`, written by the
+    /// caller, not the routing-profile file.
+    pub fn set_hankndory_integration(&self, enabled: bool) {
+        self.state.lock().unwrap().hankndory_integration = enabled;
+    }
+
+    /// Read the current design-aware review flag (what `run_loop` will see).
+    pub fn hankndory_integration(&self) -> bool {
+        self.state.lock().unwrap().hankndory_integration
+    }
+
+    pub fn review_config(&self) -> ReviewConfig {
+        let state = self.state.lock().unwrap();
         ReviewConfig {
             max_iterations: state.max_iterations,
             forced_mode: state.profile.reviewer.backend().into(),

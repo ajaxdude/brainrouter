@@ -253,11 +253,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     ));
     let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)); // deep — Bonsai is off by default, so there is no classifier to pick a tier
     let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
-    // FR-A: code reviewer on by default; the choice persists in
-    // review_runtime_state.json beside routing_state.json.
-    // FR-A + FR-D: read both runtime flags in one load; reviewer on by default,
-    // PR-guideline injection off by default. Persisted in review_runtime_state.json.
-    let (code_review_flag, pr_guidelines_flag) =
+    // FR-A + FR-D + Phase-1b: read all runtime flags in one load. Reviewer on by
+    // default; PR-guideline injection off by default; HankNDory design-aware
+    // review = the runtime override if the dashboard has ever set it, else the
+    // YAML `review.hankndory_integration` seed. Persisted in
+    // review_runtime_state.json.
+    let (code_review_flag, pr_guidelines_flag, hankndory_override) =
         brainrouter::review::runtime_state::load_state(
             &brainrouter::review::runtime_state::state_path(),
         );
@@ -265,6 +266,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(code_review_flag));
     let pr_guidelines_enabled =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(pr_guidelines_flag));
+    // Apply the effective HankNDory value onto the live ProfileStore (its
+    // `review_config()` is what `run_loop` reads). ProfileStore::load already
+    // seeded the YAML value; override it only when the runtime file has a value.
+    let hankndory_effective = hankndory_override.unwrap_or(config.review.hankndory_integration);
+    profiles.set_hankndory_integration(hankndory_effective);
 
     // Create classifier pointing at the external server
     let classifier = Classifier::new(

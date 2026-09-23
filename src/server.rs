@@ -898,13 +898,14 @@ async fn handle_request(
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
                 state.code_review_enabled.store(enabled, AtomicOrdering::Relaxed);
-                // Persist BOTH live flags (full snapshot) so the choice survives a
-                // restart and never clobbers the sibling flag. Write failure is
+                // Persist ALL live flags (full snapshot) so the choice survives a
+                // restart and never clobbers a sibling flag. Write failure is
                 // logged, not fatal — the in-memory switch already took effect.
                 if let Err(e) = crate::review::runtime_state::save_state(
                     &crate::review::runtime_state::state_path(),
                     enabled,
                     state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+                    state.review_service.preferences().hankndory_integration(),
                 ) {
                     tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
                 }
@@ -926,17 +927,49 @@ async fn handle_request(
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
                 state.pr_guidelines_enabled.store(enabled, AtomicOrdering::Relaxed);
-                // Full-snapshot persist of both live flags (see /enabled above).
+                // Full-snapshot persist of all live flags (see /enabled above).
                 if let Err(e) = crate::review::runtime_state::save_state(
                     &crate::review::runtime_state::state_path(),
                     state.code_review_enabled.load(AtomicOrdering::Relaxed),
                     enabled,
+                    state.review_service.preferences().hankndory_integration(),
                 ) {
                     tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
                 }
             }
             into_unsync(json_response(StatusCode::OK, &serde_json::json!({
                 "enabled": state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+            })))
+        }
+
+        // ── Phase-1b: design-aware (HankNDory) review runtime toggle ────────
+        // Runtime override for `review.hankndory_integration`, persisted so the
+        // dashboard choice supersedes the YAML seed across restarts. The live
+        // value lives in the ProfileStore (what `run_loop` reads).
+        ("GET", "/api/review/hankndory") => {
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.review_service.preferences().hankndory_integration(),
+            })))
+        }
+
+        ("POST", "/api/review/hankndory") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
+                // Update the live value read by the review loop, then persist all
+                // flags (the override becomes authoritative over the YAML seed).
+                state.review_service.preferences().set_hankndory_integration(enabled);
+                if let Err(e) = crate::review::runtime_state::save_state(
+                    &crate::review::runtime_state::state_path(),
+                    state.code_review_enabled.load(AtomicOrdering::Relaxed),
+                    state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
+                    enabled,
+                ) {
+                    tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
+                }
+            }
+            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                "enabled": state.review_service.preferences().hankndory_integration(),
             })))
         }
 

@@ -7,10 +7,11 @@
 //! same durability contract as the existing `routing_state.json` writer.
 //!
 //! Deliberately minimal: this file persists the `code_review_enabled` flag
-//! (FR-A) and the `pr_guidelines_enabled` flag (FR-D). Writes take both current
-//! values from the live atomics and rewrite the full snapshot under a lock, so a
-//! toggle of one flag never clobbers the other. The deferred ledger (see
-//! `docs/design/hankndory-brainrouter-integration.md`) is a separate file.
+//! (FR-A), the `pr_guidelines_enabled` flag (FR-D), and the
+//! `hankndory_integration_enabled` runtime override (Phase-1b; `Option` so a
+//! runtime toggle supersedes the YAML seed without regressing a YAML `true`).
+//! Writes take the current values from the live sources and rewrite the full
+//! snapshot under a lock, so a toggle of one flag never clobbers the others.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,11 @@ struct ReviewRuntimeState {
     /// Opt-in, default off.
     #[serde(default)]
     pr_guidelines_enabled: bool,
+    /// Phase-1b: runtime override for design-aware (HankNDory) review. `None`
+    /// = never toggled at runtime ⇒ fall back to the YAML `review.hankndory_integration`
+    /// seed; `Some(b)` = the dashboard toggle is authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hankndory_integration_enabled: Option<bool>,
 }
 
 fn default_schema_version() -> u32 {
@@ -48,6 +54,7 @@ impl Default for ReviewRuntimeState {
             schema_version: 1,
             code_review_enabled: true,
             pr_guidelines_enabled: false,
+            hankndory_integration_enabled: None,
         }
     }
 }
@@ -57,28 +64,33 @@ pub fn state_path() -> PathBuf {
     crate::config::default_config_path().with_file_name(FILE_NAME)
 }
 
-/// Read both persisted runtime flags. Absent, unreadable, or corrupt ⇒ the
-/// defaults `(code_review_enabled = true, pr_guidelines_enabled = false)`.
-/// Never panics; never blocks startup.
-pub fn load_state(path: &Path) -> (bool, bool) {
+/// Read the persisted runtime flags. Absent, unreadable, or corrupt ⇒ defaults
+/// `(code_review_enabled = true, pr_guidelines_enabled = false,
+/// hankndory_integration_enabled = None)`. The third is an override: `None`
+/// means "not toggled at runtime, use the YAML seed." Never panics.
+pub fn load_state(path: &Path) -> (bool, bool, Option<bool>) {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<ReviewRuntimeState>(&bytes) {
-            Ok(state) => (state.code_review_enabled, state.pr_guidelines_enabled),
+            Ok(state) => (
+                state.code_review_enabled,
+                state.pr_guidelines_enabled,
+                state.hankndory_integration_enabled,
+            ),
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(), error = %e,
                     "Ignoring corrupt review_runtime_state.json; using defaults"
                 );
-                (true, false)
+                (true, false, None)
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, false, None),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(), error = %e,
                 "Could not read review_runtime_state.json; using defaults"
             );
-            (true, false)
+            (true, false, None)
         }
     }
 }
@@ -93,16 +105,29 @@ pub fn load_pr_guidelines(path: &Path) -> bool {
     load_state(path).1
 }
 
-/// Persist both runtime flags atomically. The caller passes the current values
-/// (from the live atomics), so this never re-reads the file and can never reset
-/// the sibling flag. Holds `WRITE_LOCK` across serialize → unique temp write →
-/// `sync_all` → rename → parent-dir fsync, so concurrent writers serialize and
-/// disk converges to the true runtime state. Single-writer daemon assumed (one
-/// process owns the file; no cross-process lock).
+/// Read the runtime HankNDory override (`None` ⇒ use the YAML seed).
+pub fn load_hankndory_override(path: &Path) -> Option<bool> {
+    load_state(path).2
+}
+
+/// Persist all runtime flags atomically. The caller passes the current values
+/// (from the live atomics / ProfileStore), so this never re-reads the file and
+/// can never reset a sibling flag. `hankndory_integration_enabled` is written as
+/// `Some(..)` so a runtime toggle becomes authoritative over the YAML seed.
+/// Holds `WRITE_LOCK` across serialize → unique temp write → `sync_all` →
+/// rename → parent-dir fsync. Single-writer daemon assumed.
+///
+/// Note: each caller samples the sibling flags just before calling this, outside
+/// `WRITE_LOCK`, so two *different* review toggles flipped within a sub-
+/// millisecond window could persist a stale sibling value. This is benign on the
+/// single-user dashboard (manual clicks can't race that tightly), live in-memory
+/// state is always correct, design-aware review fails *safe* if stale (it
+/// degrades to normal review), and the file self-heals on the next toggle.
 pub fn save_state(
     path: &Path,
     code_review_enabled: bool,
     pr_guidelines_enabled: bool,
+    hankndory_integration_enabled: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -111,6 +136,7 @@ pub fn save_state(
         schema_version: 1,
         code_review_enabled,
         pr_guidelines_enabled,
+        hankndory_integration_enabled: Some(hankndory_integration_enabled),
     };
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -160,39 +186,58 @@ mod tests {
     #[test]
     fn absent_file_defaults() {
         let path = tmp_path();
-        assert_eq!(load_state(&path), (true, false), "missing file: code-review on, pr off");
+        assert_eq!(load_state(&path), (true, false, None), "missing file defaults");
         assert!(load_enabled(&path));
         assert!(!load_pr_guidelines(&path));
+        assert_eq!(load_hankndory_override(&path), None);
     }
 
     #[test]
     fn corrupt_file_defaults() {
         let path = tmp_path();
         std::fs::write(&path, b"{ this is not json").unwrap();
-        assert_eq!(load_state(&path), (true, false), "corrupt file: defaults");
+        assert_eq!(load_state(&path), (true, false, None), "corrupt file: defaults");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn round_trips_both_flags() {
+    fn round_trips_flags() {
         let path = tmp_path();
-        save_state(&path, false, true).unwrap();
-        assert_eq!(load_state(&path), (false, true));
-        save_state(&path, true, false).unwrap();
-        assert_eq!(load_state(&path), (true, false));
+        save_state(&path, false, true, true).unwrap();
+        assert_eq!(load_state(&path), (false, true, Some(true)));
+        save_state(&path, true, false, false).unwrap();
+        assert_eq!(load_state(&path), (true, false, Some(false)));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn toggling_one_flag_preserves_the_other() {
-        // The endpoints pass both live atomics, so a full-snapshot write of the
-        // current values can never clobber the sibling flag.
+    fn toggling_one_flag_preserves_the_others() {
+        // The endpoints pass all live values, so a full-snapshot write can never
+        // clobber a sibling flag.
         let path = tmp_path();
-        save_state(&path, true, true).unwrap();
-        // Flip only code-review off, carrying pr's current value.
-        let (_code, pr) = load_state(&path);
-        save_state(&path, false, pr).unwrap();
-        assert_eq!(load_state(&path), (false, true));
+        save_state(&path, true, true, true).unwrap();
+        // Flip only code-review off, carrying pr + hankndory current values.
+        let (_code, pr, hank) = load_state(&path);
+        save_state(&path, false, pr, hank.unwrap_or(false)).unwrap();
+        assert_eq!(load_state(&path), (false, true, Some(true)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hankndory_override_is_none_until_written_then_authoritative() {
+        let path = tmp_path();
+        // Absent field ⇒ None (caller falls back to the YAML seed).
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"code_review_enabled":true,"pr_guidelines_enabled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(load_hankndory_override(&path), None);
+        // Once toggled, it is Some and authoritative.
+        save_state(&path, true, false, true).unwrap();
+        assert_eq!(load_hankndory_override(&path), Some(true));
+        save_state(&path, true, false, false).unwrap();
+        assert_eq!(load_hankndory_override(&path), Some(false));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -201,10 +246,10 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            br#"{"schema_version":2,"code_review_enabled":false,"pr_guidelines_enabled":true,"future_field":123}"#,
+            br#"{"schema_version":2,"code_review_enabled":false,"pr_guidelines_enabled":true,"hankndory_integration_enabled":true,"future_field":123}"#,
         )
         .unwrap();
-        assert_eq!(load_state(&path), (false, true));
+        assert_eq!(load_state(&path), (false, true, Some(true)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -216,9 +261,9 @@ mod tests {
         let path = dir.join(FILE_NAME);
         let orphan = dir.join(".review_runtime_state-deadbeef.tmp");
         std::fs::write(&orphan, b"stale").unwrap();
-        save_state(&path, true, true).unwrap();
+        save_state(&path, true, true, false).unwrap();
         assert!(!orphan.exists(), "a prior crashed write's temp must be swept");
-        assert_eq!(load_state(&path), (true, true));
+        assert_eq!(load_state(&path), (true, true, Some(false)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -231,13 +276,13 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 // Alternate values; the lock serializes and each write is a full
                 // valid snapshot (never a torn file).
-                save_state(&p, i % 2 == 0, i % 3 == 0).unwrap();
+                save_state(&p, i % 2 == 0, i % 3 == 0, i % 5 == 0).unwrap();
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        // Whatever landed last, the file parses to a valid (bool, bool) — not a
+        // Whatever landed last, the file parses to a valid struct — not a
         // torn/corrupt read that would fall back to defaults on a valid file.
         let bytes = std::fs::read(path.as_ref()).unwrap();
         assert!(serde_json::from_slice::<ReviewRuntimeState>(&bytes).is_ok());

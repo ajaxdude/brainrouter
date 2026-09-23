@@ -368,6 +368,13 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <span id="toggle-prguidelines-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
       </button>
     </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:6px" title="Design-aware review — when on, the reviewer judges the diff against an APPROVED HankNDory design doc (and fails closed if the design is missing or unapproved). Runtime override of review.hankndory_integration.">
+      <span style="color:var(--textDim);font-size:11px;flex:1">design-aware review</span>
+      <button id="toggle-hankndory" onclick="toggleHankndory()" title="Enable / disable design-aware (HankNDory) review"
+        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
+        <span id="toggle-hankndory-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
+      </button>
+    </div>
   </div>
 
   <!-- HankNDory design-aware status + verdict ledger (H8) -->
@@ -2813,6 +2820,33 @@ async function togglePrGuidelines() {
   prGuidelinesBusy = false;
 }
 
+// ─── Phase-1b: design-aware (HankNDory) review toggle ────────────────────────
+let hankndoryEnabled = false;
+let hankndoryBusy = false;
+async function toggleHankndory() {
+  if (hankndoryBusy) return;
+  const next = !hankndoryEnabled;
+  hankndoryBusy = true;
+  applyToggle('hankndory', next);
+  try {
+    const r = await fetch('/api/review/hankndory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (r.ok) {
+      const fresh = await r.json();
+      hankndoryEnabled = !!fresh.enabled;
+    } else {
+      console.warn('HankNDory toggle failed', r.status);
+    }
+  } catch(e) { /* keep last known state */ }
+  applyToggle('hankndory', hankndoryEnabled);
+  hankndoryBusy = false;
+  // Refresh the design-aware status line to reflect the change.
+  if (typeof loadReviewStatus === 'function') loadReviewStatus();
+}
+
 // ─── Design-aware review status + verdict ledger (H8) ────────────────────────
 async function loadReviewStatus() {
   const stateEl = document.getElementById('review-hankndory-state');
@@ -4111,7 +4145,7 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes, prGuidelinesRes] = await Promise.all([
+  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes, prGuidelinesRes, hankndoryRes] = await Promise.all([
     safeFetch('/api/versions'),
     safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
@@ -4121,6 +4155,7 @@ async function refreshSlow() {
     safeFetch('/api/cockpit-config'),
     safeFetch('/api/review/enabled'),
     safeFetch('/api/review/pr-guidelines'),
+    safeFetch('/api/review/hankndory'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
   if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
@@ -4131,6 +4166,7 @@ async function refreshSlow() {
   if (cockpitConfigRes) { cockpitConfigData = cockpitConfigRes; renderCockpitConfigStatus(); }
   if (reviewRes) { codeReviewEnabled = !!reviewRes.enabled; applyToggle('codereview', codeReviewEnabled); }
   if (prGuidelinesRes) { prGuidelinesEnabled = !!prGuidelinesRes.enabled; applyToggle('prguidelines', prGuidelinesEnabled); }
+  if (hankndoryRes) { hankndoryEnabled = !!hankndoryRes.enabled; applyToggle('hankndory', hankndoryEnabled); }
   if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
 }
 
