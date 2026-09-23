@@ -57,6 +57,9 @@ pub enum EscalationReason {
     /// Design-aware review is on but the design document could not be loaded
     /// (missing, misconfigured path, unsupported platform, or unsafe path).
     DesignUnavailable,
+    /// Diff/design evidence was truncated to fit the reviewer's context window
+    /// (or the task+criteria alone overflow it), so a confident verdict is unsafe.
+    TruncatedEvidence,
 }
 
 impl EscalationReason {
@@ -69,6 +72,7 @@ impl EscalationReason {
             EscalationReason::AdmissionBlocked => "admission_blocked",
             EscalationReason::DesignNotApproved => "design_not_approved",
             EscalationReason::DesignUnavailable => "design_unavailable",
+            EscalationReason::TruncatedEvidence => "truncated_evidence",
         }
     }
 }

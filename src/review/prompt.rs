@@ -4,15 +4,31 @@
 //! All string manipulation; no templating engine needed here.
 
 use super::context::{truncate, MAX_SECTION_SIZE, ReviewContext};
+use super::tokens::{self, HeuristicCounter, Section, SectionKind};
 
 /// Separator between sections.
 const SEP: &str = "\n\n============================================================\n\n";
 
-/// Build the complete LLM review prompt from context.
+/// Result of building the review prompt with the token budget applied.
+pub struct BuiltPrompt {
+    /// The assembled user-prompt text (budgeted).
+    pub text: String,
+    /// Diff/design evidence was trimmed/dropped/already-truncated ⇒ the loop
+    /// must not emit a confident `approved` (design R4).
+    pub truncated_required: bool,
+    /// Protected content (task + criteria) alone exceeds the budget ⇒ the loop
+    /// must terminally escalate without calling the LLM.
+    pub protected_overflow: bool,
+    /// Output-token reservation to use for the request's `max_tokens`.
+    pub max_output_tokens: usize,
+}
+
+/// Build the complete LLM review prompt from context, applying the token budget.
 ///
 /// When `design_doc` is `Some`, an APPROVED DESIGN DOCUMENT section is inserted
 /// and the criteria instruct the reviewer to check the diff for divergence from
-/// the approved design (HankNDory design-aware review, G1).
+/// the approved design (HankNDory design-aware review, G1). The whole prompt is
+/// budgeted to fit the reviewer's context window (design token-aware-review-budget).
 pub fn build_review_prompt(
     ctx: &ReviewContext,
     task_id: &str,
@@ -21,35 +37,55 @@ pub fn build_review_prompt(
     session_history: &[String],
     design_doc: Option<&str>,
     local: bool,
-) -> String {
-    let mut sections: Vec<String> = Vec::new();
+) -> BuiltPrompt {
+    let mut sections: Vec<Section> = Vec::new();
 
     // 1. PRD
     if let Some(prd) = &ctx.prd {
+        let truncated = prd.len() > MAX_SECTION_SIZE;
         let body = truncate(prd.clone(), MAX_SECTION_SIZE);
-        sections.push(format!("# PROJECT REQUIREMENTS DOCUMENT (PRD)\n\n{}", body));
+        sections.push(Section {
+            kind: SectionKind::Prd,
+            text: format!("# PROJECT REQUIREMENTS DOCUMENT (PRD)\n\n{}", body),
+            upstream_truncated: truncated,
+        });
     }
 
     // 1b. Approved design document (design-aware review).
     if let Some(design) = design_doc {
+        let truncated = design.len() > MAX_SECTION_SIZE;
         let body = truncate(design.to_string(), MAX_SECTION_SIZE);
-        sections.push(format!("# APPROVED DESIGN DOCUMENT\n\n{}", body));
+        sections.push(Section {
+            kind: SectionKind::ApprovedDesign,
+            text: format!("# APPROVED DESIGN DOCUMENT\n\n{}", body),
+            upstream_truncated: truncated,
+        });
     }
 
     // 2. Git diff
     let diff = ctx.git_diff.trim();
     if !diff.is_empty() {
+        let truncated = diff.len() > MAX_SECTION_SIZE;
         let body = truncate(diff.to_string(), MAX_SECTION_SIZE);
-        sections.push(format!("# GIT DIFF\n\n{}", body));
+        sections.push(Section {
+            kind: SectionKind::GitDiff,
+            text: format!("# GIT DIFF\n\n{}", body),
+            upstream_truncated: truncated,
+        });
     }
 
     // 3. Agent contract
     if let Some(agents) = &ctx.agents_content {
+        let truncated = agents.len() > MAX_SECTION_SIZE;
         let body = truncate(agents.clone(), MAX_SECTION_SIZE);
-        sections.push(format!("# AGENT CONTRACT (LLAMACPP.md)\n\n{}", body));
+        sections.push(Section {
+            kind: SectionKind::AgentContract,
+            text: format!("# AGENT CONTRACT (LLAMACPP.md)\n\n{}", body),
+            upstream_truncated: truncated,
+        });
     }
 
-    // 4. Task details
+    // 4. Task details (protected)
     {
         let mut task_section = format!(
             "# TASK DETAILS\n\n## Task ID\n{}\n\n## Summary\n{}",
@@ -58,25 +94,76 @@ pub fn build_review_prompt(
         if let Some(d) = details {
             task_section.push_str(&format!("\n\n## Details\n{}", d));
         }
-        sections.push(task_section);
+        sections.push(Section {
+            kind: SectionKind::TaskDetails,
+            text: task_section,
+            upstream_truncated: false,
+        });
     }
 
     // 5. Session history
     if !session_history.is_empty() {
         let history = session_history.join("\n\n");
+        let truncated = history.len() > MAX_SECTION_SIZE;
         let body = truncate(history, MAX_SECTION_SIZE);
-        sections.push(format!("# SESSION HISTORY\n\n{}", body));
+        sections.push(Section {
+            kind: SectionKind::SessionHistory,
+            text: format!("# SESSION HISTORY\n\n{}", body),
+            upstream_truncated: truncated,
+        });
     }
 
-    // 6. Review criteria (always last). Terse strict-JSON variant for local
-    // models; expansive guidance for cloud. Design-aware criteria appended when
-    // a design is present.
-    sections.push(if local { LOCAL_REVIEW_CRITERIA } else { REVIEW_CRITERIA }.to_string());
+    // 6. Review criteria (protected). Terse strict-JSON for local; expansive for
+    // cloud. Design-divergence criteria appended (protected) when design-aware.
+    sections.push(Section {
+        kind: SectionKind::Criteria,
+        text: if local { LOCAL_REVIEW_CRITERIA } else { REVIEW_CRITERIA }.to_string(),
+        upstream_truncated: false,
+    });
     if design_doc.is_some() {
-        sections.push(DESIGN_DIVERGENCE_CRITERIA.to_string());
+        sections.push(Section {
+            kind: SectionKind::DesignDivergence,
+            text: DESIGN_DIVERGENCE_CRITERIA.to_string(),
+            upstream_truncated: false,
+        });
     }
 
-    sections.join(SEP)
+    // Budget the whole prompt to the reviewer's context window.
+    let window = tokens::context_window(local);
+    let counter = HeuristicCounter::default();
+    // Overhead: the fixed system message + the SEP joins around ~8 sections.
+    let overhead = counter_overhead(&counter);
+    let plan = tokens::plan_budget(sections, window, &counter, overhead);
+
+    let mut rendered: Vec<String> = plan.sections.into_iter().map(|s| s.text).collect();
+    let text = {
+        let mut joined = String::new();
+        for (i, part) in rendered.drain(..).enumerate() {
+            if i > 0 {
+                joined.push_str(SEP);
+            }
+            joined.push_str(&part);
+        }
+        joined
+    };
+
+    BuiltPrompt {
+        text,
+        truncated_required: plan.truncated_required,
+        protected_overflow: plan.protected_overflow,
+        max_output_tokens: plan.max_output_tokens,
+    }
+}
+
+/// The reviewer system message. Shared by `call_llm_for_review` (which sends it)
+/// and the budget overhead estimate so they can't drift.
+pub const REVIEW_SYSTEM_MESSAGE: &str =
+    "You are a code review expert. Review the provided code changes carefully and respond with a JSON object as specified.";
+
+/// Fixed overhead the budget must reserve: the system message + separator joins.
+fn counter_overhead(counter: &HeuristicCounter) -> usize {
+    use super::tokens::TokenCounter;
+    counter.count(REVIEW_SYSTEM_MESSAGE) + counter.count(SEP) * 8
 }
 
 const REVIEW_CRITERIA: &str = r#"# REVIEW CRITERIA
@@ -141,11 +228,11 @@ mod tests {
 
     #[test]
     fn design_section_and_criteria_only_when_supplied() {
-        let without = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false);
+        let without = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false).text;
         assert!(!without.contains("APPROVED DESIGN DOCUMENT"));
         assert!(!without.contains("DESIGN-AWARE REVIEW"));
 
-        let with = build_review_prompt(&ctx(), "T1", "sum", None, &[], Some("THE DESIGN BODY"), false);
+        let with = build_review_prompt(&ctx(), "T1", "sum", None, &[], Some("THE DESIGN BODY"), false).text;
         assert!(with.contains("# APPROVED DESIGN DOCUMENT"));
         assert!(with.contains("THE DESIGN BODY"));
         assert!(with.contains("# DESIGN-AWARE REVIEW"));
@@ -156,8 +243,8 @@ mod tests {
 
     #[test]
     fn local_criteria_are_terse_and_json_only() {
-        let cloud = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false);
-        let local = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, true);
+        let cloud = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false).text;
+        let local = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, true).text;
         // Local variant demands JSON-only and drops the expansive guidance.
         assert!(local.contains("ONLY a JSON object"));
         assert!(!local.contains("Feedback Guidelines"));
@@ -166,5 +253,14 @@ mod tests {
         assert!(!cloud.contains("ONLY a JSON object"));
         // Both remain shorter-or-equal invariant: local is not longer than cloud.
         assert!(local.len() <= cloud.len());
+    }
+
+    #[test]
+    fn small_review_fits_and_is_not_flagged() {
+        let built = build_review_prompt(&ctx(), "T1", "sum", None, &[], None, false);
+        assert!(!built.truncated_required);
+        assert!(!built.protected_overflow);
+        assert!(built.max_output_tokens > 0);
+        assert!(built.text.contains("# GIT DIFF"));
     }
 }

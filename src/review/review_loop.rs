@@ -155,11 +155,37 @@ pub async fn run_loop(
             .await
             .unwrap_or_else(|_| context::ReviewContext { prd: None, git_diff: String::new(), agents_content: None });
 
-        let prompt = build_review_prompt(&ctx, task_id, summary, details, &session_history, design_content.as_deref(), is_local);
+        let built = build_review_prompt(&ctx, task_id, summary, details, &session_history, design_content.as_deref(), is_local);
+
+        // Totality (token budget): if the task + criteria alone exceed the
+        // reviewer's context window, do not call the LLM — terminally escalate.
+        if built.protected_overflow {
+            status = ReviewStatus::Escalated;
+            escalation_reason = Some(EscalationReason::TruncatedEvidence);
+            feedback = "Review escalated: the task and review criteria alone exceed the reviewer's context window; a code review cannot be performed safely.".to_string();
+            session_history.push(format!(
+                "Iteration {}:\nStatus: {}\nFeedback: {}",
+                iteration_count, status, feedback
+            ));
+            sessions.update_session(
+                session_id,
+                SessionUpdate {
+                    status: Some(ReviewStatus::Escalated),
+                    feedback: Some(feedback.clone()),
+                    reviewer_type: Some(ReviewerType::Llm),
+                    escalation_reason: Some(EscalationReason::TruncatedEvidence),
+                    review_model: None,
+                    llm_turns: Some(session_history.clone()),
+                },
+            );
+            break;
+        }
+        let truncated_required = built.truncated_required;
+        let max_output_tokens = built.max_output_tokens;
 
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
-        let result = call_llm_for_review(router, prompt.clone(), session_id, &choice, project_dir).await;
+        let result = call_llm_for_review(router, built.text, session_id, &choice, project_dir, max_output_tokens).await;
 
         match result {
             Err(e) => {
@@ -195,6 +221,25 @@ pub async fn run_loop(
                         status = map_status(&parsed.status);
                         feedback = parsed.feedback.clone();
 
+                        // R4: evidence was truncated to fit the context window, so a
+                        // confident approve/needs-revision is unsafe — escalate.
+                        let mut reason = if status == ReviewStatus::Escalated {
+                            Some(EscalationReason::LlmEscalated)
+                        } else {
+                            None
+                        };
+                        if truncated_required
+                            && matches!(status, ReviewStatus::Approved | ReviewStatus::NeedsRevision)
+                        {
+                            status = ReviewStatus::Escalated;
+                            reason = Some(EscalationReason::TruncatedEvidence);
+                            feedback = format!(
+                                "Review escalated: diff/design evidence was truncated to fit the reviewer's context window, so a confident verdict is unsafe. Reviewer's (partial) feedback: {}",
+                                parsed.feedback
+                            );
+                        }
+                        escalation_reason = reason.clone();
+
                         info!(
                             session_id,
                             iteration = iteration_count,
@@ -214,11 +259,7 @@ pub async fn run_loop(
                                 status: Some(status.clone()),
                                 feedback: Some(feedback.clone()),
                                 reviewer_type: Some(ReviewerType::Llm),
-                                escalation_reason: if status == ReviewStatus::Escalated {
-                                    Some(EscalationReason::LlmEscalated)
-                                } else {
-                                    None
-                                },
+                                escalation_reason: reason,
                                 review_model: Some(review_model),
                                 llm_turns: Some(session_history.clone()),
                             },
@@ -302,6 +343,7 @@ async fn call_llm_for_review(
     session_id: &str,
     choice: &crate::routing_profile::ModelChoice,
     project_dir: &str,
+    max_output_tokens: usize,
 ) -> Result<(String, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
         model: choice.selector(),
@@ -309,7 +351,7 @@ async fn call_llm_for_review(
             ChatMessage {
                 role: "system".to_string(),
                 content: Some(serde_json::Value::String(
-                    "You are a code review expert. Review the provided code changes carefully and respond with a JSON object as specified.".to_string()
+                    crate::review::prompt::REVIEW_SYSTEM_MESSAGE.to_string()
                 )),
                 name: None,
                 tool_calls: None,
@@ -325,7 +367,7 @@ async fn call_llm_for_review(
         ],
         stream: Some(true),
         temperature: Some(0.1),
-        max_tokens: Some(16384),
+        max_tokens: Some(max_output_tokens.min(u32::MAX as usize) as u32),
         top_p: None,
         stop: None,
         extra: serde_json::Value::Object(serde_json::Map::new()),
