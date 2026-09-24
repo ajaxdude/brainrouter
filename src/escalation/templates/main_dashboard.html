@@ -590,6 +590,7 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         start instead of a separate download step. Downloads run one at a time; progress is coarse (queued/downloading/
         complete), not a byte percentage — see the design doc §10.
       </div>
+      <div id="toolbox-hf-banner" style="margin-bottom:12px"></div>
       <div id="toolbox-models-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:22px">
         <div style="color:var(--textMute);font-size:12px">Loading...</div>
       </div>
@@ -622,6 +623,8 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         roles, DSpark, SSD-streaming, and MTP/vision-projector auto-configuration are reachable via the custom args
         field below — see the design doc §12/§13.
       </div>
+
+      <div id="server-mode-hf-banner" style="margin-bottom:12px"></div>
 
       <div id="sm-panel-ds4" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
         <div style="font-size:13px;font-weight:600;margin-bottom:10px">ds4 server</div>
@@ -1340,6 +1343,39 @@ function escHtml(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+// === hf-preflight pure helpers (unit-tested by scripts/test-hf-preflight-ui.cjs) ===
+// Depend only on escHtml + the globals document/toolboxHfPreflight. The
+// `hf` object comes from /api/model-downloads/status; found_on_path===false
+// means the Hugging Face CLI is not visible on the service PATH.
+function hfFromStatus(statusRes, prev) {
+  // Success-only: preserve the last-known preflight when the status fetch
+  // failed (statusRes falsy), so a transient error doesn't clear the warning.
+  return statusRes ? (statusRes.hf || null) : prev;
+}
+function hfBannerHtml(hf) {
+  if (!hf || hf.found_on_path !== false) return '';
+  const msg = escHtml(hf.message || 'Hugging Face CLI (hf) not found on PATH.');
+  const cmd = escHtml(hf.install_command || '');
+  return '<div style="border:1px solid var(--amber);background:rgba(240,180,60,0.12);'
+    + 'color:var(--text);border-radius:8px;padding:10px 12px;font-size:12px">'
+    + '⚠ ' + msg + (cmd ? ' <code style="font-family:\'JetBrains Mono\',monospace">' + cmd + '</code>' : '')
+    + '</div>';
+}
+function serverModeEmptyModelHint(kindLabel, hf) {
+  return (hf && hf.found_on_path === false)
+    ? 'Install the Hugging Face CLI to download models (see banner above)'
+    : 'No downloaded ' + kindLabel + ' — use Downloads to fetch one first';
+}
+function emptyModelOption(kindLabel, hf) {
+  return '<option value="">' + escHtml(serverModeEmptyModelHint(kindLabel, hf)) + '</option>';
+}
+function renderHfBanner(elId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = hfBannerHtml(toolboxHfPreflight);
+}
+// === end hf-preflight pure helpers ===
 
 function shortId(value) {
   const id = String(value || '');
@@ -3143,11 +3179,14 @@ function renderToolboxRow(tb, c, backend, defaultId) {
 // ─── PR6: model-download orchestration (§10) ────────────────────────────────
 // toolboxModelsData holds the vendored model catalog (/api/toolbox-models);
 // toolboxModelPresence holds the read-only local-presence sweep
-// (/api/model-downloads/status); toolboxDownloadJobs holds the job
-// registry's current list (/api/model-downloads). vllm is excluded — see
-// module docs in src/model_downloads.rs.
+// (/api/model-downloads/status); toolboxHfPreflight holds that same
+// response's advisory `hf` PATH-preflight (whether the Hugging Face CLI
+// downloads depend on is visible on the service PATH); toolboxDownloadJobs
+// holds the job registry's current list (/api/model-downloads). vllm is
+// excluded — see module docs in src/model_downloads.rs.
 let toolboxModelsData = null;
 let toolboxModelPresence = null;
+let toolboxHfPreflight = null;
 let toolboxDownloadJobs = [];
 let toolboxModelsActiveBackend = 'llama_cpp';
 let toolboxModelsPollTimer = null;
@@ -3164,8 +3203,12 @@ async function loadToolboxModels() {
     safeFetch('/api/model-downloads'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
-  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (statusRes) {
+    toolboxModelPresence = statusRes.models || [];
+    toolboxHfPreflight = hfFromStatus(statusRes, toolboxHfPreflight);
+  }
   if (jobsRes) toolboxDownloadJobs = jobsRes.jobs || [];
+  renderHfBanner('toolbox-hf-banner');
   renderToolboxModelsBackendTabs();
   renderToolboxModelsList();
   renderToolboxDownloadJobs();
@@ -3387,11 +3430,15 @@ async function loadServerMode() {
     safeFetch('/api/serving-identities'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
-  if (statusRes) toolboxModelPresence = statusRes.models || [];
+  if (statusRes) {
+    toolboxModelPresence = statusRes.models || [];
+    toolboxHfPreflight = hfFromStatus(statusRes, toolboxHfPreflight);
+  }
   if (ds4StatusRes) serverModeStatus = ds4StatusRes;
   if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
   if (vllmStatusRes) serverModeVllmStatus = vllmStatusRes;
   if (r9vStatusRes) serverModeR9vStatus = r9vStatusRes;
+  renderHfBanner('server-mode-hf-banner');
   renderServerModeToolboxOptions();
   renderServerModeModelOptions();
   renderServerModeStatus();
@@ -3472,7 +3519,7 @@ function renderServerModeModelOptions() {
   });
   const previouslySelected = el.value;
   if (!complete.length) {
-    el.innerHTML = '<option value="">No downloaded ds4 models — use Downloads to fetch one first</option>';
+    el.innerHTML = emptyModelOption('ds4 models', toolboxHfPreflight);
     return;
   }
   el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
@@ -3552,7 +3599,7 @@ function renderServerModeHalogenBundleOptions() {
   });
   const previouslySelected = el.value;
   if (!complete.length) {
-    el.innerHTML = '<option value="">No downloaded halogen bundles — use Downloads to fetch one first</option>';
+    el.innerHTML = emptyModelOption('halogen bundles', toolboxHfPreflight);
     return;
   }
   el.innerHTML = complete.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');

@@ -313,6 +313,118 @@ fn hf_binary() -> &'static str {
     "hf"
 }
 
+/// The exact command that installs the `hf` CLI onto the brainrouter service
+/// account's PATH, verified on the Strix Halo host (`~/.local/bin`, which is
+/// on the per-user systemd service PATH). Single runtime source of truth for
+/// the install hint surfaced by [`hf_preflight`]; a `#[test]` below asserts
+/// README.md and PRD.md both contain this exact string so docs cannot drift.
+const HF_INSTALL_COMMAND: &str = "python3 -m pip install --user -U \"huggingface_hub[cli]\"";
+
+/// Advisory PATH-preflight for the `hf` CLI, surfaced on `/api/model-downloads/status`.
+///
+/// `found_on_path` is a best-effort, conservative diagnostic — whether an
+/// executable file named [`hf_binary`] is visible on the service's PATH — not
+/// a guarantee the binary will launch (effective-user perms, `noexec`, or a
+/// bad interpreter can still make the real download spawn fail; that spawn
+/// remains authoritative). When not found, `message`/`install_command` carry
+/// the remediation; when found they are `None`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HfPreflight {
+    pub found_on_path: bool,
+    pub binary: String,
+    pub message: Option<String>,
+    pub install_command: Option<String>,
+}
+
+/// True when `p` resolves (following symlinks) to a regular file that carries
+/// an execute bit on Unix. A dangling symlink or missing file yields `false`.
+/// The execute-bit check is a heuristic (any of the three bits, not the
+/// effective-user bit); the per-job download spawn is the authoritative check.
+fn is_executable_file(p: &Path) -> bool {
+    match std::fs::metadata(p) {
+        Ok(md) => {
+            if !md.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve `name` against `entries` using an injected executable predicate.
+/// If `name` contains a path separator it is treated as a direct path; empty
+/// PATH entries are skipped (a stray `./name` must never be reported as
+/// "found"). The predicate injection keeps the empty-skip invariant testable
+/// without touching the filesystem or the process working directory.
+fn resolve_in_with<I, F>(entries: I, name: &str, is_exec: F) -> bool
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: Fn(&Path) -> bool,
+{
+    if name.contains('/') {
+        return is_exec(Path::new(name));
+    }
+    for entry in entries {
+        if entry.as_os_str().is_empty() {
+            continue;
+        }
+        if is_exec(&entry.join(name)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_in<I: IntoIterator<Item = PathBuf>>(entries: I, name: &str) -> bool {
+    resolve_in_with(entries, name, is_executable_file)
+}
+
+fn resolve_on_path(name: &str) -> bool {
+    match std::env::var_os("PATH") {
+        Some(path) => resolve_in(std::env::split_paths(&path), name),
+        None => false,
+    }
+}
+
+/// Build an [`HfPreflight`] from an already-resolved `found_on_path` bool.
+/// Separated from [`resolve_on_path`] so the field/nullability logic is unit
+/// testable without touching the process environment.
+pub(crate) fn build_preflight(found_on_path: bool) -> HfPreflight {
+    if found_on_path {
+        HfPreflight {
+            found_on_path: true,
+            binary: hf_binary().to_owned(),
+            message: None,
+            install_command: None,
+        }
+    } else {
+        HfPreflight {
+            found_on_path: false,
+            binary: hf_binary().to_owned(),
+            message: Some(
+                "The Hugging Face CLI (`hf`) was not found on the brainrouter service's PATH. \
+                 Model downloads run `hf`, so they need it installed and on the service PATH to work."
+                    .to_owned(),
+            ),
+            install_command: Some(HF_INSTALL_COMMAND.to_owned()),
+        }
+    }
+}
+
+/// Advisory preflight recomputed on each `/api/model-downloads/status` poll.
+pub fn hf_preflight() -> HfPreflight {
+    build_preflight(resolve_on_path(hf_binary()))
+}
+
 /// Builds the exact `hf download` argument list + expected post-download
 /// file set for one backend/model/quant combination, mirroring upstream's
 /// `get_download_cmd()` shapes verified live during PR6's design pass
@@ -1440,5 +1552,77 @@ mod tests {
         let registry = ModelDownloadRegistry::new();
         let err = registry.cancel("no-such-job").await.expect_err("must not find a nonexistent job");
         assert!(matches!(err, DownloadError::NotFound(_)));
+    }
+
+    #[test]
+    fn resolve_in_with_skips_empty_path_entries() {
+        // A leading empty PATH entry must never be probed (a stray ./hf must
+        // not be reported as "found"). The spy records exactly which paths the
+        // predicate is asked about — filesystem-/cwd-free, so it is race-safe.
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let found = resolve_in_with(vec![PathBuf::new(), PathBuf::from("/real")], "hf", |p| {
+            seen.borrow_mut().push(p.to_path_buf());
+            false
+        });
+        assert!(!found);
+        assert_eq!(seen.into_inner(), vec![PathBuf::from("/real/hf")]);
+    }
+
+    #[test]
+    fn resolve_in_with_treats_separatored_name_as_direct_path() {
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let _ = resolve_in_with(vec![PathBuf::from("/ignored")], "/abs/hf", |p| {
+            seen.borrow_mut().push(p.to_path_buf());
+            false
+        });
+        assert_eq!(seen.into_inner(), vec![PathBuf::from("/abs/hf")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_in_detects_executable_and_rejects_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hf = dir.path().join("hf");
+        std::fs::write(&hf, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&hf, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        assert!(!resolve_in(vec![dir.path().to_path_buf()], "hf"));
+        std::fs::set_permissions(&hf, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        assert!(resolve_in(vec![dir.path().to_path_buf()], "hf"));
+    }
+
+    #[test]
+    fn resolve_in_returns_false_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!resolve_in(vec![dir.path().to_path_buf()], "hf"));
+    }
+
+    #[test]
+    fn build_preflight_populates_hint_only_when_missing() {
+        let found = build_preflight(true);
+        assert!(found.found_on_path);
+        assert_eq!(found.binary, "hf");
+        assert!(found.message.is_none());
+        assert!(found.install_command.is_none());
+
+        let missing = build_preflight(false);
+        assert!(!missing.found_on_path);
+        assert_eq!(missing.install_command.as_deref(), Some(HF_INSTALL_COMMAND));
+        assert!(missing.message.is_some());
+    }
+
+    #[test]
+    fn install_command_is_documented_in_readme_and_prd() {
+        // R10: bind the runtime source of truth to the docs so it cannot drift.
+        assert!(
+            include_str!("../README.md").contains(HF_INSTALL_COMMAND),
+            "README.md must document HF_INSTALL_COMMAND verbatim",
+        );
+        assert!(
+            include_str!("../PRD.md").contains(HF_INSTALL_COMMAND),
+            "PRD.md must document HF_INSTALL_COMMAND verbatim",
+        );
     }
 }

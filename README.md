@@ -512,6 +512,19 @@ pulls from Hugging Face on demand at server start instead, matching
 upstream). Progress is a raw log tail, not a byte-level progress bar — the
 underlying `hf` CLI has no machine-readable progress output to drive one.
 
+**Prerequisite — the Hugging Face CLI.** `ds4`/`halogen`/`r9v`/`llama_cpp`
+downloads run the `hf` CLI on the host, so it must be installed and
+resolvable on the brainrouter **service's** PATH. Install it with:
+
+```bash
+python3 -m pip install --user -U "huggingface_hub[cli]"
+```
+
+If `hf` is missing, brainrouter shows a warning banner (with this command)
+on both the Models/Downloads and Server Mode panels, and downloads fail
+until it is installed — the empty model dropdowns in Server Mode are usually
+this, not a broken backend. (`vllm` needs no host download and is unaffected.)
+
 ### Shared config with cockpit
 
 If `~/.config/ai-toolbox-cockpit/config.json` exists, brainrouter reads it
@@ -1389,6 +1402,7 @@ synthetic import/planning fixtures are in `examples/benchmarks/`.
 cargo test --locked
 cargo clippy --locked --all-targets
 node --test scripts/test-benchmark-ui.cjs
+node --test scripts/test-hf-preflight-ui.cjs
 bash scripts/check-html-js.sh
 cargo build --locked --bin brainrouter
 ```

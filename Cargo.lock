@@ -177,6 +177,7 @@ dependencies = [
  "sha2",
  "shlex",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",

@@ -623,6 +623,20 @@ machine-readable progress output to consume.
 `POST /api/model-downloads/r9v/prepare-ple` step (a second readiness gate,
 `ModelPresence.ple_ready`) before a package is usable.
 
+**`GET /api/model-downloads/status` response schema.** Returns `{ "models":
+[ModelPresence…], "hf": { "found_on_path": bool, "binary": string,
+"message": string|null, "install_command": string|null } }`. The `hf` object
+is an advisory preflight: the `ds4`/`halogen`/`r9v`/`llama_cpp` download path
+runs the `hf` (Hugging Face) CLI on the host, so `found_on_path` reports
+whether an executable `hf` is visible on the brainrouter service's PATH (a
+best-effort scan; the authoritative check is still the per-job download
+spawn). When `found_on_path` is false, `message`/`install_command` are
+populated (`python3 -m pip install --user -U "huggingface_hub[cli]"`) and the
+dashboard shows a warning banner on the Models/Downloads and Server Mode
+panels; when true they are `null`. Install `hf` on the service PATH as a
+prerequisite for model downloads (`vllm` pulls at server start and needs no
+host `hf`).
+
 ### Server Mode (ds4/halogen/vllm/r9v detached servers)
 
 `src/server_mode.rs` starts/stops/checks-status of headless, detached

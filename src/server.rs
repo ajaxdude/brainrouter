@@ -2848,14 +2848,31 @@ pub async fn delete_toolbox_container(state: &AppState, container_name: &str) ->
 /// `GET /api/model-downloads/status` — read-only local-presence sweep
 /// across every download-capable backend's catalog entries (ds4/halogen/
 /// r9v; llama_cpp and vllm are excluded — see `model_downloads.rs` docs).
+/// Also returns an advisory `hf` PATH-preflight (see [`status_response_value`])
+/// so the dashboard can warn when the Hugging Face CLI downloads depend on is
+/// missing from the service PATH.
 pub async fn model_downloads_status_response() -> Response<Full<Bytes>> {
     match crate::model_downloads::local_presence_snapshot() {
-        Ok(presence) => json_response(StatusCode::OK, &serde_json::json!({ "models": presence })),
+        Ok(presence) => json_response(
+            StatusCode::OK,
+            &status_response_value(presence, crate::model_downloads::hf_preflight()),
+        ),
         Err(e) => {
             error!(error = %e, "Failed to compute model-download presence snapshot");
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e })
         }
     }
+}
+
+/// Builds the `/api/model-downloads/status` body: the local-presence `models`
+/// array (unchanged semantics) plus the additive advisory `hf` preflight
+/// object. Pure so the top-level response shape is deterministically testable
+/// without a live handler or filesystem.
+fn status_response_value(
+    presence: Vec<crate::model_downloads::ModelPresence>,
+    hf: crate::model_downloads::HfPreflight,
+) -> serde_json::Value {
+    serde_json::json!({ "models": presence, "hf": hf })
 }
 
 /// `GET /api/model-downloads` — list all known jobs (most-recent-first,
@@ -4320,6 +4337,26 @@ async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_response_value_has_models_and_additive_hf() {
+        // `models` passes through with unchanged semantics; `hf` is additive
+        // with exactly the four keys and correct nullability for each state.
+        let missing = status_response_value(Vec::new(), crate::model_downloads::build_preflight(false));
+        assert_eq!(missing["models"], serde_json::json!([]));
+        let obj = missing["hf"].as_object().expect("hf is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["binary", "found_on_path", "install_command", "message"]);
+        assert_eq!(missing["hf"]["found_on_path"], serde_json::json!(false));
+        assert!(missing["hf"]["message"].is_string());
+        assert!(missing["hf"]["install_command"].is_string());
+
+        let found = status_response_value(Vec::new(), crate::model_downloads::build_preflight(true));
+        assert_eq!(found["hf"]["found_on_path"], serde_json::json!(true));
+        assert!(found["hf"]["message"].is_null());
+        assert!(found["hf"]["install_command"].is_null());
+    }
 
     // ── FR-D: maybe_inject_pr_guidelines ─────────────────────────────────────
     fn req(messages: serde_json::Value) -> ChatCompletionRequest {
