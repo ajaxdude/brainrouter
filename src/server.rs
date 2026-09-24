@@ -2833,7 +2833,7 @@ pub async fn create_toolbox_container(state: &AppState, toolbox_id: &str) -> Res
             error: format!("Container '{}' already exists — use update or adopt instead.", tb.container_name),
         });
     }
-    recreate_toolbox_container(&state.managed_toolboxes_path, tb, false, true).await
+    recreate_toolbox_container(&state.managed_toolboxes_path, tb, true, true).await
 }
 
 /// `POST /api/toolbox-containers/{name}/update` — pull latest image + recreate.
