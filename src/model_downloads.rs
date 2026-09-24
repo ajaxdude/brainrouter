@@ -35,7 +35,10 @@ use tokio::process::Command;
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tracing::{error, warn};
 
-use crate::toolbox_catalog::{self, CatalogModelFile, ModelPayload, SupportedServingBackend};
+use crate::toolbox_catalog::{
+    self, CatalogModelFile, GufoModel, GufoRole, GufoSpeculativeMode, ModelPayload,
+    SupportedServingBackend,
+};
 
 /// In-memory job history cap. Unlike `benchmark_lab.rs`'s SQLite-persisted
 /// job store, this registry is deliberately in-memory only for v1 — a
@@ -283,10 +286,8 @@ fn resolve_catalog_entry(
                 .to_string(),
         ));
     }
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    let (_toolboxes, models) = vendored
-        .typed()
-        .map_err(|e| DownloadError::Internal(format!("failed to parse vendored model catalog: {e}")))?;
+    let (_toolboxes, models) = toolbox_catalog::load_effective_typed_catalog()
+        .map_err(|e| DownloadError::Internal(e.to_string()))?;
     let backend_catalog = models
         .backends
         .iter()
@@ -491,6 +492,12 @@ fn build_download(
         (SupportedServingBackend::R9v, ModelPayload::R9v(m)) => {
             Ok(build_multifile_download(&m.repo, &m.revision, &m.files, models_dir))
         }
+        (SupportedServingBackend::Gufo, ModelPayload::Gufo(m)) => {
+            // Each gufo entry (main or draft) is a single-repo, single-revision
+            // download of its one GGUF, verified by an exact-size completeness
+            // check (the overlay carries the exact LFS `size_bytes`).
+            Ok(build_multifile_download(&m.repo, &m.revision, &m.files, models_dir))
+        }
         _ => Err(DownloadError::Internal(
             "catalog payload variant does not match the requested backend".to_string(),
         )),
@@ -578,8 +585,8 @@ fn hf_subprocess_env() -> Vec<(String, String)> {
 /// possible without a chosen quant/pattern; `vllm` excluded per module
 /// docs). Used by `GET /api/model-downloads/status`.
 pub fn local_presence_snapshot() -> Result<Vec<ModelPresence>, String> {
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    let (_toolboxes, models) = vendored.typed().map_err(|e| format!("failed to parse vendored model catalog: {e}"))?;
+    let (_toolboxes, models) =
+        toolbox_catalog::load_effective_typed_catalog().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for backend_catalog in &models.backends {
         let Ok(backend) = SupportedServingBackend::try_from(&backend_catalog.backend) else {
@@ -652,6 +659,131 @@ pub fn resolve_downloaded_ds4_model(model_id: &str) -> Result<ResolvedDs4Model, 
         }
     }
     Ok(ResolvedDs4Model { models_dir, filename: m.filename.clone() })
+}
+
+/// How to serve a resolved gufo model: autoregressive (no draft) or DFlash2
+/// speculative decoding with a downloaded draft GGUF. Filenames are relative to
+/// the shared gufo models directory (mounted at `/models` in the server
+/// container). Design doc DI-6 (round-4 B1/B2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GufoServePlan {
+    Autoregressive { main_filename: String },
+    Dflash2 { main_filename: String, draft_filename: String },
+}
+
+/// An already-downloaded gufo model resolved for Server Mode: the shared models
+/// directory (host side of the `-v <models_dir>:/models:ro` mount) plus the
+/// serve plan. Analogous to [`ResolvedDs4Model`], but carries the
+/// main + optional-draft pairing.
+pub struct ResolvedGufoModel {
+    pub models_dir: PathBuf,
+    pub plan: GufoServePlan,
+}
+
+/// Pure core of [`resolve_downloaded_gufo_model`] (design doc round-4 I2):
+/// decides the serve plan for a `role=main` gufo entry given a way to look up
+/// its draft entry and a way to check any entry's on-disk completeness. Kept
+/// filesystem-free so all three cases (AR, complete DFlash2, missing draft) are
+/// unit-testable without downloads. A `role=main` model with a declared
+/// speculative draft is servable **only** when both the main and the draft are
+/// complete (design doc D7); a model with no `speculative` serves AR.
+fn plan_from_entry(
+    main: &GufoModel,
+    lookup_draft: impl Fn(&str) -> Option<GufoModel>,
+    is_complete: impl Fn(&GufoModel) -> bool,
+) -> Result<GufoServePlan, DownloadError> {
+    if main.role != GufoRole::Main {
+        return Err(DownloadError::Validation(format!(
+            "gufo model `{}` is a draft model, not a servable main model",
+            main.id
+        )));
+    }
+    let main_filename = main
+        .files
+        .first()
+        .ok_or_else(|| DownloadError::Internal(format!("gufo model `{}` has no file", main.id)))?
+        .path
+        .clone();
+    if !is_complete(main) {
+        return Err(DownloadError::Validation(format!(
+            "gufo model `{}` is not fully downloaded yet — download it first via the Models tab \
+             before starting a server for it",
+            main.id
+        )));
+    }
+
+    let Some(spec) = &main.speculative else {
+        return Ok(GufoServePlan::Autoregressive { main_filename });
+    };
+
+    let draft = lookup_draft(&spec.draft_model_id).ok_or_else(|| {
+        DownloadError::Internal(format!(
+            "gufo model `{}` references unknown draft catalog entry `{}`",
+            main.id, spec.draft_model_id
+        ))
+    })?;
+    if draft.role != GufoRole::Draft {
+        return Err(DownloadError::Internal(format!(
+            "gufo draft catalog entry `{}` is not role=draft",
+            draft.id
+        )));
+    }
+    let draft_filename = draft
+        .files
+        .first()
+        .ok_or_else(|| DownloadError::Internal(format!("gufo draft `{}` has no file", draft.id)))?
+        .path
+        .clone();
+    if !is_complete(&draft) {
+        return Err(DownloadError::Validation(format!(
+            "gufo model `{}` needs its DFlash2 draft `{}` downloaded first — download the draft \
+             via the Models tab before starting this server",
+            main.id, draft.id
+        )));
+    }
+    match spec.mode {
+        GufoSpeculativeMode::Dflash2 => Ok(GufoServePlan::Dflash2 {
+            main_filename,
+            draft_filename,
+        }),
+    }
+}
+
+/// Resolves `model_id` (a `role=main` gufo catalog entry id) to its on-disk
+/// serve plan, rejecting the request if the main — or, when it declares one,
+/// its DFlash2 draft — is unknown or not fully downloaded. Server Mode must
+/// never be pointed at a partial/missing download. Mirrors
+/// [`resolve_downloaded_ds4_model`], but returns the models dir + serve plan.
+pub fn resolve_downloaded_gufo_model(model_id: &str) -> Result<ResolvedGufoModel, DownloadError> {
+    let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::Gufo, model_id)?;
+    let ModelPayload::Gufo(main) = &payload else {
+        return Err(DownloadError::Internal(
+            "gufo catalog entry did not carry a Gufo payload".to_string(),
+        ));
+    };
+    let models_dir = effective_models_dir(SupportedServingBackend::Gufo, &storage);
+
+    // All gufo entries share the one gufo models dir, so completeness is a
+    // per-entry build_download + check_completeness in that dir.
+    let is_complete = |m: &GufoModel| -> bool {
+        let payload = ModelPayload::Gufo(m.clone());
+        match build_download(SupportedServingBackend::Gufo, &payload, &models_dir, None) {
+            Ok(built) => matches!(
+                check_completeness(&built.expected_files, &built.destination),
+                CompletenessResult::Complete
+            ),
+            Err(_) => false,
+        }
+    };
+    let lookup_draft = |id: &str| -> Option<GufoModel> {
+        match resolve_catalog_entry(SupportedServingBackend::Gufo, id) {
+            Ok((ModelPayload::Gufo(d), _)) => Some(d),
+            _ => None,
+        }
+    };
+
+    let plan = plan_from_entry(main, lookup_draft, is_complete)?;
+    Ok(ResolvedGufoModel { models_dir, plan })
 }
 
 /// An already-downloaded halogen catalog bundle's on-disk location,
@@ -817,10 +949,8 @@ pub fn resolve_downloaded_r9v_package(package_id: &str) -> Result<ResolvedR9vPac
 /// `features.server`-gated one, since preparing the PLE has nothing to do
 /// with Server Mode's own feature gate.
 fn resolve_r9v_toolbox_image(toolbox_id: &str) -> Result<String, DownloadError> {
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    let (catalog, _models) = vendored
-        .typed()
-        .map_err(|e| DownloadError::Internal(format!("failed to parse vendored toolbox catalog: {e}")))?;
+    let (catalog, _models) = toolbox_catalog::load_effective_typed_catalog()
+        .map_err(|e| DownloadError::Internal(e.to_string()))?;
     let tb = catalog
         .toolbox_by_id(toolbox_id)
         .filter(|t| t.supported_backend() == Some(SupportedServingBackend::R9v))
@@ -1391,6 +1521,112 @@ mod tests {
         assert_eq!(expand_tilde("~"), PathBuf::from("/home/testuser"));
         assert_eq!(expand_tilde("~/models"), PathBuf::from("/home/testuser/models"));
         assert_eq!(expand_tilde("/opt/models"), PathBuf::from("/opt/models"));
+    }
+
+    fn gufo_model(id: &str, role: GufoRole, draft: Option<&str>) -> GufoModel {
+        GufoModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            repo: "repo/x".to_string(),
+            revision: "rev".to_string(),
+            role,
+            files: vec![CatalogModelFile {
+                path: format!("{id}.gguf"),
+                size_bytes: 100,
+                role: None,
+                sha256: None,
+            }],
+            recommended: false,
+            ctx_default: Some(32768),
+            sessions_default: Some(2),
+            speculative: draft.map(|d| crate::toolbox_catalog::GufoSpeculative {
+                mode: GufoSpeculativeMode::Dflash2,
+                draft_model_id: d.to_string(),
+            }),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn plan_from_entry_autoregressive_when_no_speculative() {
+        let main = gufo_model("m", GufoRole::Main, None);
+        let plan = plan_from_entry(&main, |_| None, |_| true).unwrap();
+        assert_eq!(
+            plan,
+            GufoServePlan::Autoregressive { main_filename: "m.gguf".to_string() }
+        );
+    }
+
+    #[test]
+    fn plan_from_entry_dflash2_when_main_and_draft_complete() {
+        let main = gufo_model("m", GufoRole::Main, Some("d"));
+        let draft = gufo_model("d", GufoRole::Draft, None);
+        let plan = plan_from_entry(&main, move |id| (id == "d").then(|| draft.clone()), |_| true).unwrap();
+        assert_eq!(
+            plan,
+            GufoServePlan::Dflash2 {
+                main_filename: "m.gguf".to_string(),
+                draft_filename: "d.gguf".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_from_entry_errors_when_draft_incomplete() {
+        let main = gufo_model("m", GufoRole::Main, Some("d"));
+        let draft = gufo_model("d", GufoRole::Draft, None);
+        // main complete, draft not.
+        let err = plan_from_entry(&main, move |id| (id == "d").then(|| draft.clone()), |g: &GufoModel| g.id == "m")
+            .unwrap_err();
+        match err {
+            DownloadError::Validation(msg) => assert!(msg.contains("draft"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_from_entry_errors_when_main_incomplete() {
+        let main = gufo_model("m", GufoRole::Main, None);
+        assert!(matches!(
+            plan_from_entry(&main, |_| None, |_| false),
+            Err(DownloadError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn plan_from_entry_rejects_a_draft_role_used_as_main() {
+        let draft = gufo_model("d", GufoRole::Draft, None);
+        assert!(matches!(
+            plan_from_entry(&draft, |_| None, |_| true),
+            Err(DownloadError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn build_download_gufo_matches_single_repo_shape() {
+        let m = gufo_model("gufo-x", GufoRole::Main, None);
+        let built = build_download(
+            SupportedServingBackend::Gufo,
+            &ModelPayload::Gufo(m),
+            std::path::Path::new("/models/gufo"),
+            None,
+        )
+        .expect("must build");
+        assert_eq!(
+            built.args,
+            vec![
+                "download",
+                "repo/x",
+                "gufo-x.gguf",
+                "--revision",
+                "rev",
+                "--local-dir",
+                "/models/gufo",
+            ]
+        );
+        // Exact-size completeness expectation carried through.
+        assert_eq!(built.expected_files.len(), 1);
+        assert_eq!(built.expected_files[0].expected_size_bytes, Some(100));
     }
 
     #[test]

@@ -450,6 +450,16 @@ pub struct ServingRuntimeDefinition {
 
 impl ServingRuntimeDefinition {
     fn validate(&self) -> BenchmarkResult<()> {
+        // gufo is a valid serving backend but is deliberately out of scope for
+        // benchmark ingest in v1: the `serving_runtimes` table CHECK
+        // constraint (migrations/0003_toolbox_serving_dimension.sql) permits
+        // only the five original backends, so reject gufo here — before any
+        // SQL — with a clear message (design doc DI-8 / round-2 I3).
+        if self.toolbox_backend == toolbox_catalog::SupportedServingBackend::Gufo {
+            return Err(BenchmarkError::Validation(
+                "gufo serving-runtime benchmarking is not supported in v1".to_string(),
+            ));
+        }
         for (name, value) in [
             ("serving_runtime.id", self.id.as_str()),
             ("serving_runtime.toolbox_id", self.toolbox_id.as_str()),
@@ -4720,6 +4730,28 @@ mod tests {
         });
         assert!(matches!(
             test.store.ingest(&missing_id),
+            Err(BenchmarkError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn gufo_serving_runtime_is_rejected_before_sql() {
+        let test = test_store();
+        let mut run = bundle("run-gufo", 0, RunStatus::Succeeded);
+        run.serving_runtime = Some(ServingRuntimeDefinition {
+            id: "serving-runtime-gufo".into(),
+            toolbox_backend: SupportedServingBackend::Gufo,
+            toolbox_id: "strix-halo-gufo-runtime".into(),
+            compute_api: Backend::Rocm,
+            container_image: "ghcr.io/gufo-org/toolboxes/gufo-runtime:latest".into(),
+            catalog_snapshot_id: toolbox_catalog::vendored_catalog_snapshot().id,
+            metadata: BTreeMap::new(),
+        });
+        run.experiment.serving_runtime_id = Some("serving-runtime-gufo".into());
+        // Rejected by validation before any SQL — the serving_runtimes CHECK
+        // (which permits only the five original backends) is never reached.
+        assert!(matches!(
+            test.store.ingest(&run),
             Err(BenchmarkError::Validation(_))
         ));
     }

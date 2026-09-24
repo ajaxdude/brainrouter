@@ -36,6 +36,10 @@ pub enum CatalogBackendId {
     Halogen,
     Vllm,
     R9v,
+    /// Gufo (github.com/gufo-org/gufo) — a brainrouter-owned Strix-Halo
+    /// serving backend injected via the gufo catalog overlay (not in the
+    /// upstream cockpit catalog). Actionable like the other serving backends.
+    Gufo,
     /// Parsed, but never surfaced in any brainrouter UI/API list per
     /// requirement 1 — image generation, not coding-relevant.
     Comfyui,
@@ -54,6 +58,7 @@ impl CatalogBackendId {
             Self::Halogen => "halogen",
             Self::Vllm => "vllm",
             Self::R9v => "r9v",
+            Self::Gufo => "gufo",
             Self::Comfyui => "comfyui",
             Self::Other(raw) => raw,
         }
@@ -71,6 +76,7 @@ impl CatalogBackendId {
             "halogen" => Self::Halogen,
             "vllm" => Self::Vllm,
             "r9v" => Self::R9v,
+            "gufo" => Self::Gufo,
             "comfyui" => Self::Comfyui,
             other => Self::Other(other.to_string()),
         }
@@ -112,6 +118,7 @@ pub enum SupportedServingBackend {
     Halogen,
     Vllm,
     R9v,
+    Gufo,
 }
 
 impl SupportedServingBackend {
@@ -122,17 +129,19 @@ impl SupportedServingBackend {
             Self::Halogen => "halogen",
             Self::Vllm => "vllm",
             Self::R9v => "r9v",
+            Self::Gufo => "gufo",
         }
     }
 
-    /// All five supported backends, in a stable display order (matches the
+    /// All six supported backends, in a stable display order (matches the
     /// order they're introduced in the design doc / user requirements).
-    pub const ALL: [SupportedServingBackend; 5] = [
+    pub const ALL: [SupportedServingBackend; 6] = [
         SupportedServingBackend::LlamaCpp,
         SupportedServingBackend::Ds4,
         SupportedServingBackend::Halogen,
         SupportedServingBackend::Vllm,
         SupportedServingBackend::R9v,
+        SupportedServingBackend::Gufo,
     ];
 }
 
@@ -170,6 +179,7 @@ impl TryFrom<&CatalogBackendId> for SupportedServingBackend {
             CatalogBackendId::Halogen => Ok(Self::Halogen),
             CatalogBackendId::Vllm => Ok(Self::Vllm),
             CatalogBackendId::R9v => Ok(Self::R9v),
+            CatalogBackendId::Gufo => Ok(Self::Gufo),
             CatalogBackendId::Comfyui | CatalogBackendId::Other(_) => {
                 Err(UnsupportedBackend(value.clone()))
             }
@@ -185,6 +195,7 @@ impl From<SupportedServingBackend> for CatalogBackendId {
             SupportedServingBackend::Halogen => CatalogBackendId::Halogen,
             SupportedServingBackend::Vllm => CatalogBackendId::Vllm,
             SupportedServingBackend::R9v => CatalogBackendId::R9v,
+            SupportedServingBackend::Gufo => CatalogBackendId::Gufo,
         }
     }
 }
@@ -471,6 +482,7 @@ mod tests {
             ("halogen", CatalogBackendId::Halogen),
             ("vllm", CatalogBackendId::Vllm),
             ("r9v", CatalogBackendId::R9v),
+            ("gufo", CatalogBackendId::Gufo),
             ("comfyui", CatalogBackendId::Comfyui),
         ] {
             let parsed: CatalogBackendId =
@@ -499,6 +511,7 @@ mod tests {
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Halogen).is_ok());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Vllm).is_ok());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::R9v).is_ok());
+        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Gufo).is_ok());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Comfyui).is_err());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Other(
             "brand_new_future_backend".to_string()
@@ -525,8 +538,18 @@ mod tests {
         assert!(!comfyui_toolboxes.is_empty(), "fixture must contain comfyui toolboxes");
         assert!(comfyui_toolboxes.iter().all(|t| t.supported_backend().is_none()));
 
-        // Every supported backend has at least one toolbox in the real data.
-        for backend in SupportedServingBackend::ALL {
+        // Every *upstream* serving backend has at least one toolbox in the
+        // vendored data. `SupportedServingBackend::Gufo` is deliberately
+        // excluded here: it is a brainrouter-owned overlay backend (see
+        // `gufo_overlay`), not part of the vendored cockpit feed, and is
+        // asserted against the *effective* catalog instead.
+        for backend in [
+            SupportedServingBackend::LlamaCpp,
+            SupportedServingBackend::Ds4,
+            SupportedServingBackend::Halogen,
+            SupportedServingBackend::Vllm,
+            SupportedServingBackend::R9v,
+        ] {
             let count = catalog.toolboxes_for(backend).count();
             assert!(count > 0, "expected at least one toolbox for {backend}");
         }

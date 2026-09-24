@@ -12,6 +12,7 @@
 //! invocation sequences for ds4/halogen/vllm/r9v) are Wave 2 territory
 //! (PR7-PR11) and don't exist yet — this module is catalog data only.
 
+pub mod gufo_overlay;
 pub mod models;
 pub mod schema_validate;
 pub mod types;
@@ -21,8 +22,9 @@ use serde_json::Value;
 use schema_validate::ValidationReport;
 
 pub use models::{
-    CatalogModelEntry, CatalogModelFile, Ds4Model, HalogenModel, LlamaCppModel,
-    ModelBackendCatalog, ModelCatalog, ModelPayload, R9vModel, R9vPleFile, VllmModel,
+    CatalogModelEntry, CatalogModelFile, Ds4Model, GufoModel, GufoRole, GufoSpeculative,
+    GufoSpeculativeMode, HalogenModel, LlamaCppModel, ModelBackendCatalog, ModelCatalog,
+    ModelPayload, R9vModel, R9vPleFile, VllmModel,
 };
 pub use types::{
     CatalogBackendId, CatalogParseError, Channel, FeatureState, Maturity, Platform,
@@ -187,6 +189,70 @@ pub fn load_vendored_catalog() -> VendoredCatalog {
     }
 }
 
+/// Error from [`load_effective_typed_catalog`]: the gufo overlay could not be
+/// merged, or the merged catalog failed structural or gufo-semantic validation.
+/// Consumers treat this as fatal and **fail closed** — they surface an error
+/// rather than exposing a partial or invalid catalog (design doc DI-3/B2).
+#[derive(Debug)]
+pub struct EffectiveCatalogError {
+    pub errors: Vec<String>,
+}
+
+impl std::fmt::Display for EffectiveCatalogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "effective (vendored + gufo overlay) catalog is invalid: {}",
+            self.errors.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for EffectiveCatalogError {}
+
+/// Loads the **effective** catalog = the vendored cockpit feed with the
+/// brainrouter-owned gufo overlay merged in, validated as a whole, and parsed
+/// into the typed layer. This is the runtime source of truth for every catalog
+/// consumer that must see gufo (`/api/toolbox-catalog`, `/api/toolbox-models`,
+/// server-mode toolbox resolution, model downloads).
+///
+/// It is **fail-closed**: if the overlay can't merge, or the merged catalog
+/// fails [`schema_validate::validate_catalog`] (the same full structural
+/// validator the vendored feed gets — `gufo` is in
+/// [`schema_validate::KNOWN_BACKEND_IDS`] so this does not warn) or the gufo
+/// semantic checks ([`gufo_overlay::validate_merged`]), it returns `Err` and
+/// the caller surfaces an error instead of exposing partial/invalid data. The
+/// vendored loaders ([`load_vendored_catalog`], [`vendored_catalog_revision`],
+/// [`vendored_catalog_snapshot`]) stay pure.
+pub fn load_effective_typed_catalog(
+) -> Result<(types::ToolboxCatalog, models::ModelCatalog), EffectiveCatalogError> {
+    let vendored = load_vendored_catalog();
+    let (Some(toolboxes_json), Some(models_json)) = (vendored.toolboxes_json, vendored.models_json)
+    else {
+        return Err(EffectiveCatalogError {
+            errors: vec!["vendored catalog did not parse as JSON".to_string()],
+        });
+    };
+
+    let (merged_toolboxes, merged_models) = gufo_overlay::merge(&toolboxes_json, &models_json)
+        .map_err(|e| EffectiveCatalogError { errors: vec![e] })?;
+
+    // Full structural validation of the merged whole (gufo gets the same
+    // checks as vendored). Warnings are non-fatal; only errors fail closed.
+    let structural = schema_validate::validate_catalog(&merged_toolboxes, &merged_models);
+    let mut errors = structural.errors;
+    errors.extend(gufo_overlay::validate_merged(&merged_toolboxes, &merged_models));
+    if !errors.is_empty() {
+        return Err(EffectiveCatalogError { errors });
+    }
+
+    let toolboxes = types::ToolboxCatalog::parse(&merged_toolboxes)
+        .map_err(|e| EffectiveCatalogError { errors: vec![e.to_string()] })?;
+    let models = models::ModelCatalog::parse(&merged_models)
+        .map_err(|e| EffectiveCatalogError { errors: vec![e.to_string()] })?;
+    Ok((toolboxes, models))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +274,14 @@ mod tests {
         let catalog = load_vendored_catalog();
         let (toolboxes, models) = catalog.typed().expect("typed parse must succeed");
         assert!(!toolboxes.toolboxes.is_empty());
-        for backend in SupportedServingBackend::ALL {
+        // Gufo is a brainrouter overlay backend, not in the vendored feed.
+        for backend in [
+            SupportedServingBackend::LlamaCpp,
+            SupportedServingBackend::Ds4,
+            SupportedServingBackend::Halogen,
+            SupportedServingBackend::Vllm,
+            SupportedServingBackend::R9v,
+        ] {
             assert!(models.backend(backend).is_some(), "expected a {backend} models section");
         }
     }
@@ -236,5 +309,38 @@ mod tests {
             .expect("SOURCE must have a parseable pinned commit line");
         assert_eq!(commit.len(), 40, "expected a full git SHA: {commit}");
         assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn effective_catalog_includes_gufo_and_validates() {
+        let (toolboxes, models) =
+            load_effective_typed_catalog().expect("effective catalog must load");
+        // gufo toolbox is present and resolvable on strix-halo.
+        let gufo_tb = toolboxes
+            .toolbox_by_id("strix-halo-gufo-runtime")
+            .expect("gufo toolbox present");
+        assert_eq!(gufo_tb.supported_backend(), Some(SupportedServingBackend::Gufo));
+        assert!(toolboxes.runtime_profiles.contains_key(&gufo_tb.runtime_profile));
+        assert_eq!(
+            toolboxes.platform_id_for_toolbox("strix-halo-gufo-runtime"),
+            Some("strix-halo")
+        );
+        // gufo model section is present with a main + draft, all typed.
+        let gufo_models = models
+            .backend(SupportedServingBackend::Gufo)
+            .expect("gufo models section present");
+        assert!(gufo_models.entries.iter().any(|e| e.id == "gufo-qwen38-27b-q4kxl"));
+        assert!(gufo_models
+            .entries
+            .iter()
+            .any(|e| e.id == "gufo-qwen38-27b-dflash2-draft"));
+        assert!(gufo_models.entries.iter().all(|e| e.payload.is_some()));
+        // All six supported backends have a section in the effective catalog.
+        for backend in SupportedServingBackend::ALL {
+            assert!(
+                models.backend(backend).is_some(),
+                "expected {backend} in effective catalog"
+            );
+        }
     }
 }

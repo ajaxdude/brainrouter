@@ -75,6 +75,12 @@ pub fn openai_compatible_for_backend(backend: SupportedServingBackend) -> bool {
         // OpenAI-compatible-API doc comment plus vLLM's well-established
         // wire protocol (§16).
         SupportedServingBackend::Vllm => true,
+        // gufo is genuinely OpenAI-compatible (`/v1/chat/completions`,
+        // `/v1/completions`, `/v1/responses`, `/v1/models`, `/health` —
+        // github.com/gufo-org/gufo). This is accurate bookkeeping only; it
+        // does not make gufo a routable upstream (design doc D5, same as the
+        // other backends). A strong future routing candidate (Feature B).
+        SupportedServingBackend::Gufo => true,
         // Plausible (vLLM-lineage env-var surface) but not verified against
         // a live deployment — §16 deliberately does not upgrade this to
         // `true` without real evidence.
@@ -149,6 +155,7 @@ mod tests {
     fn openai_compatible_for_backend_matches_16_research() {
         assert!(openai_compatible_for_backend(SupportedServingBackend::LlamaCpp));
         assert!(openai_compatible_for_backend(SupportedServingBackend::Vllm));
+        assert!(openai_compatible_for_backend(SupportedServingBackend::Gufo));
         assert!(!openai_compatible_for_backend(SupportedServingBackend::Ds4));
         assert!(!openai_compatible_for_backend(SupportedServingBackend::Halogen));
         assert!(!openai_compatible_for_backend(SupportedServingBackend::R9v));

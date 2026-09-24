@@ -46,7 +46,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::model_downloads::{self, ResolvedDs4Model, ResolvedHalogenBundle, ResolvedR9vPackage};
+use crate::model_downloads::{
+    self, GufoServePlan, ResolvedDs4Model, ResolvedHalogenBundle, ResolvedR9vPackage,
+};
 use crate::toolbox_catalog::{self, RuntimeProfile, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition};
 
 /// Fixed container name for the (single-instance, v1) ds4 server-mode
@@ -72,6 +74,10 @@ pub const VLLM_SERVER_CONTAINER_NAME: &str = "brainrouter-vllm-server";
 /// container. Same brainrouter-own naming departure as the other three
 /// backends, not upstream's literal `ai-toolbox-cockpit-r9v-server`.
 pub const R9V_SERVER_CONTAINER_NAME: &str = "brainrouter-r9v-server";
+
+/// Fixed container name for the (single-instance, v1) gufo server-mode
+/// container. Same brainrouter-own naming departure as the other backends.
+pub const GUFO_SERVER_CONTAINER_NAME: &str = "brainrouter-gufo-server";
 
 /// Fallback binary name used when a toolbox's `backend_config` doesn't
 /// declare a `server_binary` override — every real vendored ds4 toolbox
@@ -348,14 +354,13 @@ pub fn build_ds4_server_command(
     Ok(args)
 }
 
-/// Loads and type-parses the vendored toolbox catalog once, shared by every
-/// backend's toolbox resolver below.
+/// Loads and type-parses the effective toolbox catalog (vendored + gufo
+/// overlay) once, shared by every backend's toolbox resolver below. Fail-closed
+/// (see `toolbox_catalog::load_effective_typed_catalog`).
 fn load_typed_toolbox_catalog() -> Result<ToolboxCatalog, ServerModeError> {
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    vendored
-        .typed()
+    toolbox_catalog::load_effective_typed_catalog()
         .map(|(catalog, _models)| catalog)
-        .map_err(|e| ServerModeError::Internal(format!("failed to parse vendored toolbox catalog: {e}")))
+        .map_err(|e| ServerModeError::Internal(e.to_string()))
 }
 
 /// Resolves `toolbox_id` to a catalog toolbox of `backend`, gated on
@@ -574,6 +579,185 @@ async fn container_server_status(backend: &'static str, container_name: &str, la
 
 pub async fn ds4_server_status() -> ServerStatus {
     container_server_status("ds4", DS4_SERVER_CONTAINER_NAME, LABEL_SERVER_MODEL).await
+}
+
+// ── gufo Server Mode (design doc DI-5) ─────────────────────────────────────
+//
+// gufo is a brainrouter-owned overlay backend (github.com/gufo-org/gufo): a
+// detached `podman run … gufo serve … llm` OpenAI server on Strix Halo. It
+// mirrors ds4's single-model shape (device flags from the runtime profile's
+// `engine_args`, via `upgrade_groups_for_podman`/`clean_engine_args_for_server`),
+// minus ds4-specific `--ipc=host`/`--cap-add SYS_PTRACE`/`DS4_ROCM_*` env, and
+// adds one thing no other backend does: an optional speculative DFlash2 draft
+// model as a *second* GGUF on the serve line. Argv order is verified against
+// the pinned gufo docs + the PC-1 `gufo serve --help` probe: `--host`/`--port`/
+// `--sessions` are `gufo serve` server options placed *before* the `llm`
+// subcommand; `--model`/`--served-model-name`/`--speculative`/`--dflash-model`/
+// `--context` follow `llm`.
+
+/// `POST /api/server-mode/gufo/start` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartGufoServerRequest {
+    /// Which gufo toolbox to source the image/`runtime_profile` from
+    /// (`strix-halo-gufo-runtime` today).
+    pub toolbox_id: String,
+    /// Which already-downloaded gufo `role=main` catalog model to serve.
+    pub model_id: String,
+    /// Context length (`gufo serve llm --context <n>`). Required; the dashboard
+    /// pre-fills the model's `ctx_default` (fallback 32768).
+    pub ctx: u32,
+    /// Preallocated GPU request sessions (`gufo serve --sessions <n>`).
+    /// Optional; defaults to the model's `sessions_default` or 2.
+    #[serde(default)]
+    pub sessions: Option<u32>,
+    /// Podman port-mapping bind address only (not the in-container `--host`,
+    /// which is always `0.0.0.0`). `"localhost"` → `127.0.0.1`; `"0.0.0.0"`
+    /// omits the bind-IP prefix.
+    pub host: String,
+    pub port: u16,
+    /// Free-text, shell-word-split and appended verbatim after the core args —
+    /// the escape hatch for any gufo flag not natively modeled.
+    #[serde(default)]
+    pub custom_args: Option<String>,
+}
+
+/// Builds the `podman run … <image> gufo serve … llm …` argument list for a
+/// resolved gufo model. For a [`GufoServePlan::Dflash2`] plan it appends
+/// `--speculative dflash2 --dflash-model /models/<draft>`; for
+/// [`GufoServePlan::Autoregressive`] it omits them. `--served-model-name` is set
+/// to `req.model_id` so the OpenAI-exposed model name is deterministic and
+/// equals `LABEL_SERVER_MODEL` (PC-1: gufo otherwise defaults it to the GGUF
+/// filename).
+pub fn build_gufo_server_command(
+    toolbox_image: &str,
+    runtime_profile: &RuntimeProfile,
+    models_dir: &std::path::Path,
+    plan: &GufoServePlan,
+    req: &StartGufoServerRequest,
+) -> Result<Vec<String>, ServerModeError> {
+    let engine_args =
+        upgrade_groups_for_podman(&clean_engine_args_for_server(&runtime_profile.engine_args));
+
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        GUFO_SERVER_CONTAINER_NAME.to_string(),
+    ];
+    args.extend(engine_args);
+
+    // Podman-only (brainrouter never shells docker), mirroring ds4/halogen.
+    args.extend(["--security-opt".to_string(), "label=disable".to_string()]);
+    // gufo's documented userns form.
+    args.push("--userns=keep-id:uid=1000,gid=1000".to_string());
+    // The gufo image is tagged `:latest` (no digest pin yet) — always pull the
+    // current published image, matching halogen-strix-halo's own policy.
+    args.push("--pull=always".to_string());
+
+    args.extend(["--label".to_string(), format!("{LABEL_MANAGED}=true")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_BACKEND}=gufo")]);
+    args.extend(["--label".to_string(), format!("{LABEL_SERVER_MODEL}={}", req.model_id)]);
+
+    let port_mapping = if req.host.is_empty() || req.host == "0.0.0.0" {
+        format!("{}:{}", req.port, req.port)
+    } else {
+        let bind_ip = if req.host == "localhost" { "127.0.0.1" } else { req.host.as_str() };
+        format!("{bind_ip}:{}:{}", req.port, req.port)
+    };
+    args.extend(["-p".to_string(), port_mapping]);
+    args.extend(["-v".to_string(), format!("{}:/models:ro", models_dir.display())]);
+    args.push(toolbox_image.to_string());
+
+    // `gufo serve` server options (before the `llm` subcommand).
+    args.push("gufo".to_string());
+    args.push("serve".to_string());
+    args.extend(["--host".to_string(), "0.0.0.0".to_string()]);
+    args.extend(["--port".to_string(), req.port.to_string()]);
+    let sessions = req.sessions.unwrap_or(2).max(1);
+    args.extend(["--sessions".to_string(), sessions.to_string()]);
+
+    // `llm` subcommand + its options.
+    args.push("llm".to_string());
+    let main_filename = match plan {
+        GufoServePlan::Autoregressive { main_filename } => main_filename,
+        GufoServePlan::Dflash2 { main_filename, .. } => main_filename,
+    };
+    args.extend(["--model".to_string(), format!("/models/{main_filename}")]);
+    args.extend(["--served-model-name".to_string(), req.model_id.clone()]);
+    if let GufoServePlan::Dflash2 { draft_filename, .. } = plan {
+        args.extend(["--speculative".to_string(), "dflash2".to_string()]);
+        args.extend(["--dflash-model".to_string(), format!("/models/{draft_filename}")]);
+    }
+    args.extend(["--context".to_string(), req.ctx.to_string()]);
+
+    if let Some(custom) = req.custom_args.as_deref().filter(|s| !s.trim().is_empty()) {
+        let extra = shlex::split(custom).ok_or_else(|| {
+            ServerModeError::Validation("custom_args is not valid shell-quoted text".to_string())
+        })?;
+        args.extend(extra);
+    }
+
+    Ok(args)
+}
+
+/// Resolves `toolbox_id` to a gufo catalog toolbox + its runtime profile, from
+/// the effective (vendored + gufo overlay) catalog.
+pub(crate) fn resolve_gufo_toolbox(
+    toolbox_id: &str,
+) -> Result<(ToolboxDefinition, RuntimeProfile), ServerModeError> {
+    let catalog = load_typed_toolbox_catalog()?;
+    resolve_toolbox_for_server(&catalog, SupportedServingBackend::Gufo, toolbox_id)
+}
+
+/// `POST /api/server-mode/gufo/start`: resolves the toolbox + already-downloaded
+/// model (main + required draft, per the serve plan), force-removes any
+/// pre-existing container of the fixed name, then runs the built command.
+pub async fn start_gufo_server(req: &StartGufoServerRequest) -> Result<(), ServerModeError> {
+    let (tb, profile) = resolve_gufo_toolbox(&req.toolbox_id)?;
+    let resolved = model_downloads::resolve_downloaded_gufo_model(&req.model_id)?;
+    let args =
+        build_gufo_server_command(&tb.image, &profile, &resolved.models_dir, &resolved.plan, req)?;
+
+    let _ = tokio::process::Command::new("podman")
+        .args(["rm", "-f", GUFO_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+
+    let out = tokio::process::Command::new("podman")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman run failed: {}", stderr.trim())))
+    }
+}
+
+/// `POST /api/server-mode/gufo/stop` — graceful stop then `rm -f` (idempotent),
+/// same contract as the other backends.
+pub async fn stop_gufo_server() -> Result<(), ServerModeError> {
+    let _ = tokio::process::Command::new("podman")
+        .args(["stop", "--time", "10", GUFO_SERVER_CONTAINER_NAME])
+        .output()
+        .await;
+    let out = tokio::process::Command::new("podman")
+        .args(["rm", "-f", GUFO_SERVER_CONTAINER_NAME])
+        .output()
+        .await
+        .map_err(|e| ServerModeError::Internal(format!("failed to exec podman: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(ServerModeError::Internal(format!("podman rm failed: {}", stderr.trim())))
+    }
+}
+
+pub async fn gufo_server_status() -> ServerStatus {
+    container_server_status("gufo", GUFO_SERVER_CONTAINER_NAME, LABEL_SERVER_MODEL).await
 }
 
 // ── PR8: halogen Server Mode (§13) ────────────────────────────────────────
@@ -1044,10 +1228,8 @@ fn resolve_vllm_model_and_base_policy(req: &StartVllmServerRequest) -> Result<(S
         (None, None) => Err(ServerModeError::Validation("either model_id or custom_repo is required".to_string())),
         (None, Some(repo)) => Ok((repo.to_string(), vllm_generic_default_policy_map())),
         (Some(id), None) => {
-            let vendored = toolbox_catalog::load_vendored_catalog();
-            let (_toolboxes, models) = vendored
-                .typed()
-                .map_err(|e| ServerModeError::Internal(format!("failed to parse vendored model catalog: {e}")))?;
+            let (_toolboxes, models) = toolbox_catalog::load_effective_typed_catalog()
+                .map_err(|e| ServerModeError::Internal(e.to_string()))?;
             let backend_catalog = models
                 .backends
                 .iter()
@@ -1940,6 +2122,125 @@ mod tests {
         let cmd = build_ds4_server_command("img", &amd_rocm_profile(), &model(), &r).expect("must build");
         let tail = &cmd[cmd.len() - 3..];
         assert_eq!(tail, &["--mtp", "--extra-flag", "value"]);
+    }
+
+    fn gufo_profile() -> RuntimeProfile {
+        // The brainrouter-owned gufo runtime profile
+        // (assets/gufo-catalog/toolboxes.json).
+        RuntimeProfile {
+            id: "strix-halo-gufo-rocm".to_string(),
+            engine_args: vec![
+                "--device".to_string(),
+                "/dev/kfd".to_string(),
+                "--device".to_string(),
+                "/dev/dri".to_string(),
+                "--group-add".to_string(),
+                "keep-groups".to_string(),
+                "--ulimit".to_string(),
+                "memlock=-1".to_string(),
+            ],
+        }
+    }
+
+    fn gufo_req() -> StartGufoServerRequest {
+        StartGufoServerRequest {
+            toolbox_id: "strix-halo-gufo-runtime".to_string(),
+            model_id: "gufo-qwen38-27b-q4kxl".to_string(),
+            ctx: 32768,
+            sessions: Some(2),
+            host: "localhost".to_string(),
+            port: 8080,
+            custom_args: None,
+        }
+    }
+
+    #[test]
+    fn build_gufo_server_command_dflash2_shape() {
+        let plan = GufoServePlan::Dflash2 {
+            main_filename: "Qwen3.8-27B-UD-Q4_K_XL.gguf".to_string(),
+            draft_filename: "Qwen3.8-27B-DFlash2-Q4_K_M.gguf".to_string(),
+        };
+        let cmd = build_gufo_server_command(
+            "ghcr.io/gufo-org/toolboxes/gufo-runtime:latest",
+            &gufo_profile(),
+            std::path::Path::new("/home/papa/models/gufo"),
+            &plan,
+            &gufo_req(),
+        )
+        .expect("must build");
+
+        assert_eq!(cmd[0..4], ["run", "-d", "--name", GUFO_SERVER_CONTAINER_NAME]);
+        // Strix-Halo device flags come straight from the runtime profile.
+        assert_eq!(
+            cmd[4..12],
+            [
+                "--device",
+                "/dev/kfd",
+                "--device",
+                "/dev/dri",
+                "--group-add",
+                "keep-groups",
+                "--ulimit",
+                "memlock=-1"
+            ]
+        );
+        assert!(cmd.windows(2).any(|w| w == ["--security-opt", "label=disable"]));
+        assert!(cmd.contains(&"--userns=keep-id:uid=1000,gid=1000".to_string()));
+        assert!(cmd.contains(&"--pull=always".to_string()));
+        // ds4-only flags must NOT leak into the gufo command.
+        assert!(!cmd.contains(&"--ipc=host".to_string()));
+        assert!(!cmd.windows(2).any(|w| w == ["--cap-add", "SYS_PTRACE"]));
+        assert!(cmd.windows(2).any(|w| w == ["--label", "io.brainrouter.server_backend=gufo"]));
+        assert!(cmd
+            .windows(2)
+            .any(|w| w == ["--label", "io.brainrouter.server_model=gufo-qwen38-27b-q4kxl"]));
+        assert!(cmd.windows(2).any(|w| w == ["-p", "127.0.0.1:8080:8080"]));
+        assert!(cmd.windows(2).any(|w| w == ["-v", "/home/papa/models/gufo:/models:ro"]));
+        assert!(cmd.contains(&"ghcr.io/gufo-org/toolboxes/gufo-runtime:latest".to_string()));
+        // Exact serve line: server opts before `llm`, model/served-name/
+        // speculative/context after it (PC-1-verified flag surface).
+        let joined = cmd.join(" ");
+        assert!(
+            joined.contains(
+                "gufo serve --host 0.0.0.0 --port 8080 --sessions 2 llm \
+                 --model /models/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+                 --served-model-name gufo-qwen38-27b-q4kxl \
+                 --speculative dflash2 --dflash-model /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+                 --context 32768"
+            ),
+            "unexpected argv: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_gufo_server_command_autoregressive_omits_speculative() {
+        let plan = GufoServePlan::Autoregressive {
+            main_filename: "M.gguf".to_string(),
+        };
+        let cmd =
+            build_gufo_server_command("img", &gufo_profile(), std::path::Path::new("/m"), &plan, &gufo_req())
+                .expect("must build");
+        assert!(!cmd.contains(&"--speculative".to_string()));
+        assert!(!cmd.contains(&"--dflash-model".to_string()));
+        let joined = cmd.join(" ");
+        assert!(
+            joined.contains(
+                "llm --model /models/M.gguf --served-model-name gufo-qwen38-27b-q4kxl --context 32768"
+            ),
+            "unexpected argv: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_gufo_server_command_binds_all_interfaces_when_host_is_0_0_0_0() {
+        let mut r = gufo_req();
+        r.host = "0.0.0.0".to_string();
+        let plan = GufoServePlan::Autoregressive {
+            main_filename: "M.gguf".to_string(),
+        };
+        let cmd = build_gufo_server_command("img", &gufo_profile(), std::path::Path::new("/m"), &plan, &r)
+            .expect("must build");
+        assert!(cmd.windows(2).any(|w| w == ["-p", "8080:8080"]));
     }
 
     #[test]

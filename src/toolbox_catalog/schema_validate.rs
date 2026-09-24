@@ -24,10 +24,13 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 /// Backend ids brainrouter/upstream currently know about. Mirrors upstream's
-/// `BACKEND_IDS` in `catalog/schema.py`. Used only to decide whether an
-/// unrecognized `backend` id should be reported as a warning — it is never
-/// used to reject an otherwise well-formed catalog entry.
-pub const KNOWN_BACKEND_IDS: &[&str] = &["llama_cpp", "ds4", "halogen", "vllm", "r9v", "comfyui"];
+/// `BACKEND_IDS` in `catalog/schema.py`, plus brainrouter's own `gufo` overlay
+/// backend (see `crate::toolbox_catalog::gufo_overlay`) so that validating the
+/// *effective* (vendored + gufo) catalog does not warn on gufo. Used only to
+/// decide whether an unrecognized `backend` id should be reported as a
+/// warning — it is never used to reject an otherwise well-formed catalog entry.
+pub const KNOWN_BACKEND_IDS: &[&str] =
+    &["llama_cpp", "ds4", "halogen", "vllm", "r9v", "comfyui", "gufo"];
 
 const FEATURE_IDS: &[&str] = &["interactive", "models", "server"];
 const FEATURE_STATES: &[&str] = &["supported", "experimental", "unavailable"];

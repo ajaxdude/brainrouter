@@ -155,6 +155,63 @@ pub struct R9vModel {
     pub extra: serde_json::Map<String, Value>,
 }
 
+/// Whether a `gufo` model entry is a serveable main model or a speculative
+/// draft. Closed (unlike [`CatalogModelFile::role`], a free string) so an
+/// unrecognized role fails typed parsing and is surfaced by
+/// `load_effective_typed_catalog` rather than silently accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GufoRole {
+    Main,
+    Draft,
+}
+
+/// The speculative-decoding mode a `gufo` main model uses. v1 is DFlash2-only;
+/// a non-`dflash2` overlay entry fails typed parsing (design doc D14/N2). MTP
+/// and DSpark are future variants, added only with their own download+serve
+/// contracts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GufoSpeculativeMode {
+    Dflash2,
+}
+
+/// A `gufo` main model's speculative-decoding configuration: which mode, and
+/// which other catalog entry (a `role=draft` [`GufoModel`]) supplies the draft
+/// GGUF. Downloaded and served as a separate entry (design doc D3/D7).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GufoSpeculative {
+    pub mode: GufoSpeculativeMode,
+    pub draft_model_id: String,
+}
+
+/// `gufo` model entry (brainrouter-owned overlay backend). Each entry is a
+/// single-repo `hf download` (`repo`+`revision`+one `files[]` GGUF). A
+/// `role=main` entry may declare a `speculative` draft (another entry with
+/// `role=draft`); an entry with no `speculative` serves autoregressive. The
+/// structural invariants (exactly one file, closed role/mode, a resolvable
+/// non-recursive draft ref) are enforced by `gufo_overlay::validate_merged`,
+/// not here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GufoModel {
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub revision: String,
+    pub role: GufoRole,
+    pub files: Vec<CatalogModelFile>,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub ctx_default: Option<u32>,
+    #[serde(default)]
+    pub sessions_default: Option<u32>,
+    #[serde(default)]
+    pub speculative: Option<GufoSpeculative>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
 /// Per-backend model payload. `id`/`name` are duplicated onto
 /// [`CatalogModelEntry`] itself (they're the two fields proven common across
 /// literally every backend, including `comfyui`) so callers that only care
@@ -167,6 +224,7 @@ pub enum ModelPayload {
     Halogen(HalogenModel),
     Vllm(VllmModel),
     R9v(R9vModel),
+    Gufo(GufoModel),
 }
 
 /// One model/bundle entry from `models.json`, tagged with which backend's
@@ -322,6 +380,7 @@ fn parse_payload(
         }
         SupportedServingBackend::Vllm => ModelPayload::Vllm(serde_json::from_value(raw.clone())?),
         SupportedServingBackend::R9v => ModelPayload::R9v(serde_json::from_value(raw.clone())?),
+        SupportedServingBackend::Gufo => ModelPayload::Gufo(serde_json::from_value(raw.clone())?),
     };
     Ok(Some(payload))
 }
@@ -341,7 +400,16 @@ mod tests {
         let catalog = ModelCatalog::parse(&doc).expect("must parse");
         assert_eq!(catalog.schema_version, 2);
 
-        for backend in SupportedServingBackend::ALL {
+        // Gufo is a brainrouter overlay backend, not part of the vendored
+        // cockpit feed, so it is asserted against the effective catalog
+        // (see `gufo_overlay`), not here.
+        for backend in [
+            SupportedServingBackend::LlamaCpp,
+            SupportedServingBackend::Ds4,
+            SupportedServingBackend::Halogen,
+            SupportedServingBackend::Vllm,
+            SupportedServingBackend::R9v,
+        ] {
             let entry = catalog
                 .backend(backend)
                 .unwrap_or_else(|| panic!("expected a {backend} section"));
@@ -428,5 +496,62 @@ mod tests {
         assert!(future.entries.iter().all(|e| e.payload.is_none()));
         // The raw entry is fully preserved even though there's no typed payload.
         assert!(future.entries[0].raw.get("filename").is_some());
+    }
+
+    #[test]
+    fn gufo_model_entry_parses_from_overlay_shape() {
+        // A main entry declaring a DFlash2 draft.
+        let raw = serde_json::json!({
+            "id": "gufo-qwen38-27b-q4kxl",
+            "name": "Qwen3.8-27B UD-Q4_K_XL (DFlash2)",
+            "repo": "unsloth/Qwen3.8-27B-GGUF",
+            "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+            "role": "main",
+            "recommended": true,
+            "ctx_default": 32768,
+            "sessions_default": 2,
+            "speculative": { "mode": "dflash2", "draft_model_id": "gufo-qwen38-27b-dflash2-draft" },
+            "files": [ { "path": "Qwen3.8-27B-UD-Q4_K_XL.gguf", "size_bytes": 17559178144u64 } ]
+        });
+        let payload = parse_payload(&CatalogBackendId::Gufo, &raw)
+            .expect("gufo entry must parse")
+            .expect("gufo is a supported backend");
+        match payload {
+            ModelPayload::Gufo(m) => {
+                assert_eq!(m.id, "gufo-qwen38-27b-q4kxl");
+                assert_eq!(m.role, GufoRole::Main);
+                assert_eq!(m.files.len(), 1);
+                assert_eq!(m.files[0].size_bytes, 17_559_178_144);
+                let spec = m.speculative.expect("declares a draft");
+                assert_eq!(spec.mode, GufoSpeculativeMode::Dflash2);
+                assert_eq!(spec.draft_model_id, "gufo-qwen38-27b-dflash2-draft");
+            }
+            other => panic!("expected Gufo payload, got {other:?}"),
+        }
+
+        // A draft entry with no speculative parses as role=draft.
+        let draft = serde_json::json!({
+            "id": "gufo-qwen38-27b-dflash2-draft",
+            "name": "Qwen3.8-27B DFlash2 draft (Q4_K_M)",
+            "repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+            "revision": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+            "role": "draft",
+            "files": [ { "path": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf", "size_bytes": 1143006816u64 } ]
+        });
+        match parse_payload(&CatalogBackendId::Gufo, &draft).unwrap().unwrap() {
+            ModelPayload::Gufo(m) => {
+                assert_eq!(m.role, GufoRole::Draft);
+                assert!(m.speculative.is_none());
+            }
+            other => panic!("expected Gufo payload, got {other:?}"),
+        }
+
+        // A non-dflash2 speculative mode fails typed parsing (v1 is dflash2-only).
+        let bad = serde_json::json!({
+            "id": "x", "name": "x", "repo": "r", "revision": "v", "role": "main",
+            "speculative": { "mode": "mtp", "draft_model_id": "y" },
+            "files": [ { "path": "a.gguf", "size_bytes": 1u64 } ]
+        });
+        assert!(parse_payload(&CatalogBackendId::Gufo, &bad).is_err());
     }
 }

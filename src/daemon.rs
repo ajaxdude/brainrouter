@@ -210,6 +210,23 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         );
     }
 
+    // Also verify the *effective* catalog (vendored + brainrouter's gufo
+    // overlay). This is the runtime source of truth for gufo-aware endpoints,
+    // which fail closed on a broken overlay, so surface any problem loudly
+    // here too. Never fatal.
+    match brainrouter::toolbox_catalog::load_effective_typed_catalog() {
+        Ok((toolboxes, models)) => info!(
+            toolboxes = toolboxes.toolboxes.len(),
+            model_backends = models.backends.len(),
+            "Effective toolbox catalog (with gufo overlay) loaded"
+        ),
+        Err(error) => warn!(
+            %error,
+            "Effective catalog (vendored + gufo overlay) is invalid; gufo-aware endpoints \
+             will fail closed until this is fixed"
+        ),
+    }
+
     let tcp_addr: std::net::SocketAddr = args
         .tcp_addr
         .parse()

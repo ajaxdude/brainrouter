@@ -1134,6 +1134,23 @@ async fn handle_request(
             into_unsync(resp)
         }
 
+        // ── gufo Server Mode (design doc DI-5/DI-7) ───────────────────────────
+        ("GET", "/api/server-mode/gufo/status") => {
+            let resp = server_mode_gufo_status_response().await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/gufo/start") => {
+            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let resp = server_mode_gufo_start_response(&state, &body_bytes).await;
+            into_unsync(resp)
+        }
+
+        ("POST", "/api/server-mode/gufo/stop") => {
+            let resp = server_mode_gufo_stop_response(&state).await;
+            into_unsync(resp)
+        }
+
         // ── PR8: halogen Server Mode (§13) ────────────────────────────────────
         ("GET", "/api/server-mode/halogen/status") => {
             let resp = server_mode_halogen_status_response().await;
@@ -2403,17 +2420,11 @@ struct ContainerSnapshot {
 /// over a dedicated error enum for read paths that should essentially never
 /// fail (the catalog is embedded at compile time and covered by unit tests).
 fn load_typed_toolbox_catalog() -> Result<ToolboxCatalog, String> {
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    if !vendored.report.is_ok() {
-        warn!(
-            errors = ?vendored.report.errors,
-            warnings = ?vendored.report.warnings,
-            "Vendored toolbox catalog has structural validation issues"
-        );
-    }
-    let (toolboxes, _models) = vendored
-        .typed()
-        .map_err(|e| format!("failed to parse vendored toolbox catalog: {e}"))?;
+    // Effective catalog = vendored cockpit feed + brainrouter's gufo overlay,
+    // validated as a whole and fail-closed (see
+    // `toolbox_catalog::load_effective_typed_catalog`).
+    let (toolboxes, _models) =
+        toolbox_catalog::load_effective_typed_catalog().map_err(|e| e.to_string())?;
     Ok(toolboxes)
 }
 
@@ -2583,16 +2594,15 @@ pub async fn toolbox_catalog_response() -> Response<Full<Bytes>> {
     }))
 }
 
-/// `GET /api/toolbox-models` — the vendored model catalog, restricted to
-/// the 5 supported backends.
+/// `GET /api/toolbox-models` — the effective model catalog (vendored + gufo
+/// overlay), restricted to the supported backends.
 pub async fn toolbox_models_response() -> Response<Full<Bytes>> {
-    let vendored = toolbox_catalog::load_vendored_catalog();
-    let (_toolboxes, models) = match vendored.typed() {
+    let (_toolboxes, models) = match toolbox_catalog::load_effective_typed_catalog() {
         Ok(v) => v,
         Err(e) => {
-            error!(error = %e, "Failed to load toolbox model catalog");
+            error!(error = %e, "Failed to load effective toolbox model catalog");
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("failed to parse vendored model catalog: {e}"),
+                error: format!("failed to load effective model catalog: {e}"),
             });
         }
     };
@@ -3629,7 +3639,63 @@ pub async fn server_mode_ds4_stop_response(state: &AppState) -> Response<Full<By
     }
 }
 
-// ── PR8: halogen Server Mode (§13) ────────────────────────────────────────
+// ── gufo Server Mode (design doc DI-7) ────────────────────────────────────
+
+/// `GET /api/server-mode/gufo/status` — live `podman inspect`, no persisted state.
+pub async fn server_mode_gufo_status_response() -> Response<Full<Bytes>> {
+    let status = crate::server_mode::gufo_server_status().await;
+    json_response(StatusCode::OK, &status)
+}
+
+/// `POST /api/server-mode/gufo/start` — body:
+/// `{"toolbox_id","model_id","ctx":<n>,"sessions":<n?>,"host","port":<n>,"custom_args"?}`.
+pub async fn server_mode_gufo_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
+    let request: crate::server_mode::StartGufoServerRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
+                error: format!("invalid request body: {e}"),
+            });
+        }
+    };
+    match crate::server_mode::start_gufo_server(&request).await {
+        Ok(()) => {
+            if let Ok((_, profile)) = crate::server_mode::resolve_gufo_toolbox(&request.toolbox_id) {
+                register_serving_identity(
+                    state,
+                    crate::toolbox_catalog::SupportedServingBackend::Gufo,
+                    crate::server_mode::GUFO_SERVER_CONTAINER_NAME,
+                    request.toolbox_id.clone(),
+                    &profile,
+                    serving_identity_endpoint(&request.host, request.port),
+                )
+                .await;
+            }
+            let status = crate::server_mode::gufo_server_status().await;
+            json_response(StatusCode::OK, &status)
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
+
+/// `POST /api/server-mode/gufo/stop` — graceful stop then `rm -f`, and
+/// deregister the serving identity.
+pub async fn server_mode_gufo_stop_response(state: &AppState) -> Response<Full<Bytes>> {
+    match crate::server_mode::stop_gufo_server().await {
+        Ok(()) => {
+            state.serving_identities.deregister(crate::server_mode::GUFO_SERVER_CONTAINER_NAME).await;
+            json_response(StatusCode::OK, &serde_json::json!({
+                "status": "ok",
+                "message": "gufo server stopped.",
+            }))
+        }
+        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
+            error: e.message().to_string(),
+        }),
+    }
+}
 
 /// `GET /api/server-mode/halogen/status` — always reads live `podman
 /// inspect` state, same no-persisted-registry contract as ds4's status

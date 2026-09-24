@@ -1,0 +1,37 @@
+{
+  "runtime_profiles": {
+    "strix-halo-gufo-rocm": {
+      "engine_args": [
+        "--device",
+        "/dev/kfd",
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "keep-groups",
+        "--ulimit",
+        "memlock=-1"
+      ]
+    }
+  },
+  "toolboxes": [
+    {
+      "id": "strix-halo-gufo-runtime",
+      "backend": "gufo",
+      "name": "Gufo Runtime (Strix Halo)",
+      "container_name": "gufo-runtime",
+      "group": "Server only",
+      "image": "ghcr.io/gufo-org/toolboxes/gufo-runtime:latest",
+      "channel": "stable",
+      "maturity": "experimental",
+      "description": "gufo OpenAI-compatible inference server for Strix Halo (gfx1151). Pull the image here; start it in Server Mode. Not a Toolbx/Distrobox image.",
+      "runtime_profile": "strix-halo-gufo-rocm",
+      "toolbox_compatible": false,
+      "features": {
+        "interactive": "unavailable",
+        "models": "supported",
+        "server": "experimental"
+      }
+    }
+  ],
+  "attach_platform": "strix-halo"
+}

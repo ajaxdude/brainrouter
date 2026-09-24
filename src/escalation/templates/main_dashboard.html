@@ -659,6 +659,48 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
 
       <div id="sm-ds4-status" style="font-size:12px;color:var(--textMute)">Loading status…</div>
 
+      <!-- gufo Server Mode (design doc DI-7). Single-file model like ds4, plus
+           an optional speculative DFlash2 draft (a second GGUF on the serve
+           line) and a `sessions` field; the served model name is set to the
+           model id. -->
+      <div id="sm-panel-gufo" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;max-width:560px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px">gufo server</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--textMute)">Toolbox
+            <select id="sm-gufo-toolbox" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <label style="font-size:11px;color:var(--textMute)">Model (main; its DFlash2 draft must also be downloaded)
+            <select id="sm-gufo-model" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px"></select>
+          </label>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Context
+              <input id="sm-gufo-ctx" type="number" value="32768" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Sessions
+              <input id="sm-gufo-sessions" type="number" value="2" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <label style="font-size:11px;color:var(--textMute);flex:1">Host (bind address)
+              <input id="sm-gufo-host" type="text" value="localhost" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+            <label style="font-size:11px;color:var(--textMute);flex:1">Port
+              <input id="sm-gufo-port" type="number" value="8080" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+            </label>
+          </div>
+          <label style="font-size:11px;color:var(--textMute)">Custom args (optional, shell-quoted)
+            <input id="sm-gufo-custom-args" type="text" placeholder="e.g. --draft-tokens 5" style="width:100%;font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);margin-top:2px">
+          </label>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button onclick="startGufoServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Start</button>
+            <button onclick="stopGufoServer()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Stop</button>
+            <button onclick="loadServerMode()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--textDim);cursor:pointer">Refresh status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sm-gufo-status" style="display:none;font-size:12px;color:var(--textMute)">Loading status…</div>
+
       <!-- PR8: halogen Server Mode (§13). Bundle-based model resolution
            (checkpoint + overlay + tokenizer_dir, optional vision_tower) and
            an env-var-only in-container launch shape (no CLI args, no
@@ -3050,6 +3092,7 @@ const TOOLBOX_BACKEND_LABELS = {
   halogen: 'Halogen',
   vllm: 'vLLM',
   r9v: 'R9V',
+  gufo: 'Gufo',
 };
 
 // The catalog spans several hardware platforms (strix-halo, r9700, gb10,
@@ -3190,7 +3233,7 @@ let toolboxHfPreflight = null;
 let toolboxDownloadJobs = [];
 let toolboxModelsActiveBackend = 'llama_cpp';
 let toolboxModelsPollTimer = null;
-const DOWNLOAD_CAPABLE_BACKENDS = ['llama_cpp', 'ds4', 'halogen', 'r9v'];
+const DOWNLOAD_CAPABLE_BACKENDS = ['llama_cpp', 'ds4', 'halogen', 'r9v', 'gufo'];
 const DOWNLOAD_STATUS_COLORS = {
   queued: 'var(--textMute)', downloading: 'var(--cyan)', running: 'var(--cyan)', verifying: 'var(--violet)',
   complete: 'var(--green)', failed: 'var(--red)', cancelled: 'var(--textMute)',
@@ -3380,12 +3423,13 @@ function scheduleToolboxModelsPoll() {
 // launch. Lifecycle is synchronous request/response (no job registry like
 // the downloads above) — `status` always reflects live `podman inspect`
 // state, matching src/server_mode.rs's "no persisted state" design.
-const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm', 'r9v'];
+const SERVER_MODE_CAPABLE_BACKENDS = ['ds4', 'halogen', 'vllm', 'r9v', 'gufo'];
 let serverModeActiveBackend = 'ds4';
 let serverModeStatus = null;
 let serverModeHalogenStatus = null;
 let serverModeVllmStatus = null;
 let serverModeR9vStatus = null;
+let serverModeGufoStatus = null;
 
 function renderServerModeBackendTabs() {
   const el = document.getElementById('server-mode-backend-tabs');
@@ -3410,6 +3454,8 @@ function setServerModeBackend(backend) {
   document.getElementById('sm-panel-r9v').style.display = backend === 'r9v' ? 'block' : 'none';
   document.getElementById('sm-r9v-status').style.display = backend === 'r9v' ? 'block' : 'none';
   document.getElementById('sm-panel-r9v-paths').style.display = backend === 'r9v' ? 'block' : 'none';
+  document.getElementById('sm-panel-gufo').style.display = backend === 'gufo' ? 'block' : 'none';
+  document.getElementById('sm-gufo-status').style.display = backend === 'gufo' ? 'block' : 'none';
 }
 
 async function loadServerMode() {
@@ -3420,13 +3466,14 @@ async function loadServerMode() {
   // model/bundle on disk, not just a catalog entry.
   renderServerModeBackendTabs();
   setServerModeBackend(serverModeActiveBackend);
-  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes, servingIdentitiesRes] = await Promise.all([
+  const [modelsRes, statusRes, ds4StatusRes, halogenStatusRes, vllmStatusRes, r9vStatusRes, gufoStatusRes, servingIdentitiesRes] = await Promise.all([
     safeFetch('/api/toolbox-models'),
     safeFetch('/api/model-downloads/status'),
     safeFetch('/api/server-mode/ds4/status'),
     safeFetch('/api/server-mode/halogen/status'),
     safeFetch('/api/server-mode/vllm/status'),
     safeFetch('/api/server-mode/r9v/status'),
+    safeFetch('/api/server-mode/gufo/status'),
     safeFetch('/api/serving-identities'),
   ]);
   if (modelsRes) toolboxModelsData = modelsRes;
@@ -3438,6 +3485,7 @@ async function loadServerMode() {
   if (halogenStatusRes) serverModeHalogenStatus = halogenStatusRes;
   if (vllmStatusRes) serverModeVllmStatus = vllmStatusRes;
   if (r9vStatusRes) serverModeR9vStatus = r9vStatusRes;
+  if (gufoStatusRes) serverModeGufoStatus = gufoStatusRes;
   renderHfBanner('server-mode-hf-banner');
   renderServerModeToolboxOptions();
   renderServerModeModelOptions();
@@ -3451,6 +3499,9 @@ async function loadServerMode() {
   renderServerModeR9vToolboxOptions();
   renderServerModeR9vPackageOptions();
   renderServerModeR9vStatus();
+  renderServerModeGufoToolboxOptions();
+  renderServerModeGufoModelOptions();
+  renderServerModeGufoStatus();
   renderServingIdentities(servingIdentitiesRes && servingIdentitiesRes.identities || []);
 }
 
@@ -3562,6 +3613,102 @@ async function startDs4Server() {
 async function stopDs4Server() {
   try {
     const r = await fetch('/api/server-mode/ds4/stop', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
+  } catch (e) {}
+  loadServerMode();
+}
+
+// gufo Server Mode (design doc DI-7). Single flat GGUF like ds4, but the
+// dropdown lists a main model only when it — and its declared DFlash2 draft,
+// if any — is fully downloaded, and start sends an optional `sessions`.
+function renderServerModeGufoToolboxOptions() {
+  const el = document.getElementById('sm-gufo-toolbox');
+  if (!el) return;
+  const allToolboxes = (toolboxCatalogData && toolboxCatalogData.toolboxes) || [];
+  const platforms = (toolboxCatalogData && toolboxCatalogData.platforms) || [];
+  const platform = platforms.find(p => p.id === CURRENT_PLATFORM_ID);
+  const allowedIds = platform ? new Set(platform.toolbox_ids) : null;
+  const gufoToolboxes = allToolboxes.filter(tb => tb.backend === 'gufo' && (!allowedIds || allowedIds.has(tb.id)));
+  const previouslySelected = el.value;
+  const defaultId = effectiveDefaultToolbox('gufo');
+  el.innerHTML = gufoToolboxes.map(tb => `<option value="${escHtml(tb.id)}">${escHtml(tb.name || tb.id)}${tb.id === defaultId ? ' (default)' : ''}</option>`).join('');
+  if (gufoToolboxes.some(tb => tb.id === previouslySelected)) el.value = previouslySelected;
+  else if (defaultId) el.value = defaultId;
+}
+
+function renderServerModeGufoModelOptions() {
+  const el = document.getElementById('sm-gufo-model');
+  if (!el) return;
+  const backends = (toolboxModelsData && toolboxModelsData.backends) || [];
+  const bc = backends.find(b => b.backend === 'gufo');
+  const entries = (bc && bc.entries) || [];
+  const isComplete = (id) => {
+    const p = presenceFor('gufo', id);
+    return !!(p && p.completeness && p.completeness.kind === 'complete');
+  };
+  const draftIdOf = (e) => (e.payload && e.payload.speculative && e.payload.speculative.draft_model_id) || null;
+  const mains = entries.filter(e => e.payload && e.payload.role === 'main');
+  // A main is servable only when it (and its declared DFlash2 draft, if any)
+  // is fully downloaded (design doc D7).
+  const servable = mains.filter(e => {
+    if (!isComplete(e.id)) return false;
+    const draftId = draftIdOf(e);
+    return !draftId || isComplete(draftId);
+  });
+  const previouslySelected = el.value;
+  if (!servable.length) {
+    // Distinguish "main downloaded but its draft is missing" from "nothing downloaded".
+    const mainReadyDraftMissing = mains.some(e => {
+      const draftId = draftIdOf(e);
+      return isComplete(e.id) && draftId && !isComplete(draftId);
+    });
+    el.innerHTML = mainReadyDraftMissing
+      ? '<option value="">Main model downloaded — download its DFlash2 draft too (Models tab)</option>'
+      : emptyModelOption('gufo models', toolboxHfPreflight);
+    return;
+  }
+  el.innerHTML = servable.map(e => `<option value="${escHtml(e.id)}">${escHtml(e.name || e.id)}</option>`).join('');
+  if (servable.some(e => e.id === previouslySelected)) el.value = previouslySelected;
+}
+
+function renderServerModeGufoStatus() {
+  const el = document.getElementById('sm-gufo-status');
+  if (!el || !serverModeGufoStatus) return;
+  if (!serverModeGufoStatus.exists) {
+    el.innerHTML = '<span style="color:var(--textMute)">Not running</span>';
+    return;
+  }
+  const color = serverModeGufoStatus.running ? 'var(--green)' : 'var(--amber)';
+  const state = serverModeGufoStatus.running ? 'running' : 'exited (crashed or stopped outside the dashboard)';
+  const modelLabel = serverModeGufoStatus.model_id ? ' · model: ' + escHtml(serverModeGufoStatus.model_id) : '';
+  el.innerHTML = `<span style="color:${color}">●</span> ${escHtml(state)}${modelLabel} <span style="color:var(--textMute)">(container: ${escHtml(serverModeGufoStatus.container_name)})</span>`;
+}
+
+async function startGufoServer() {
+  const toolboxId = document.getElementById('sm-gufo-toolbox').value;
+  const modelId = document.getElementById('sm-gufo-model').value;
+  const ctx = parseInt(document.getElementById('sm-gufo-ctx').value, 10);
+  const sessions = parseInt(document.getElementById('sm-gufo-sessions').value, 10);
+  const host = document.getElementById('sm-gufo-host').value;
+  const port = parseInt(document.getElementById('sm-gufo-port').value, 10);
+  const customArgs = document.getElementById('sm-gufo-custom-args').value;
+  if (!toolboxId || !modelId) { alert('Pick a toolbox and an already-downloaded model first.'); return; }
+  try {
+    const r = await fetch('/api/server-mode/gufo/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolbox_id: toolboxId, model_id: modelId, ctx, sessions: Number.isFinite(sessions) ? sessions : undefined, host, port, custom_args: customArgs || undefined }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('Start failed: ' + (j.error || r.status)); return; }
+    serverModeGufoStatus = j;
+    renderServerModeGufoStatus();
+  } catch (e) {}
+}
+
+async function stopGufoServer() {
+  try {
+    const r = await fetch('/api/server-mode/gufo/stop', { method: 'POST' });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { alert('Stop failed: ' + (j.error || r.status)); return; }
   } catch (e) {}
