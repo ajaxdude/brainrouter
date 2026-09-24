@@ -89,6 +89,7 @@ use crate::types::ChatCompletionRequest;
 use crate::provider::ProviderResponse;
 use crate::stream::{DeferredStream, SafeStream, StreamFormat, KEEPALIVE_INTERVAL};
 use crate::inflight::SniffStream;
+use crate::managed_toolboxes::OwnershipEntry;
 use crate::toolbox_catalog::{
     self, SupportedServingBackend, ToolboxCatalog, ToolboxDefinition,
 };
@@ -157,6 +158,8 @@ pub struct AppState {
     pub benchmark_lab: Result<Arc<crate::benchmark_lab::BenchmarkLab>, String>,
     /// Read-only model observations and separately persisted operator settings.
     pub observability: Arc<crate::observability::Observability>,
+    /// Local sidecar mapping toolbox container names to exact podman IDs.
+    pub managed_toolboxes_path: PathBuf,
     /// Per-container-name mutation lock for toolbox create/update/delete/adopt,
     /// so two concurrent requests for the same container name queue instead of
     /// racing `podman`/`toolbox` invocations against each other. Different
@@ -571,6 +574,7 @@ async fn handle_request(
 
         ("POST", "/api/upgrade/toolbox") => {
             let resp = upgrade_toolbox(
+                &state,
                 "llama-vulkan-radv",
                 "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv",
             )
@@ -587,7 +591,7 @@ async fn handle_request(
                     error: "Missing toolbox container name".into(),
                 })
             } else if let Some(image) = toolbox_container_image(name).await {
-                upgrade_toolbox(name, &image).await
+                upgrade_toolbox(&state, name, &image).await
             } else {
                 json_response(StatusCode::NOT_FOUND, &ErrorResponse {
                     error: format!("No such toolbox container: {}", name),
@@ -1044,7 +1048,7 @@ async fn handle_request(
         }
 
         ("GET", "/api/toolbox-containers") => {
-            let resp = toolbox_containers_list().await;
+            let resp = toolbox_containers_list(&state).await;
             into_unsync(resp)
         }
 
@@ -2380,15 +2384,17 @@ async fn hub_toolbox_tag_dates() -> std::collections::HashMap<String, String> {
 // `docs/design/ai-toolbox-cockpit-integration.md` §5c for the API contract
 // and the decisions recorded while implementing this.
 
-/// Podman label brainrouter attaches to every toolbox container it creates,
-/// so it can tell "brainrouter made this" apart from "a container that
-/// happens to share a catalog `container_name` but was made some other way
-/// (e.g. by cockpit directly)". See §5c: attaching these via `toolbox
-/// create --label` is unverified in this environment (Open question 6) and
-/// deliberately allowed to fail loudly rather than being silently skipped.
+/// Legacy podman label still honored for backwards compatibility.
 const LABEL_MANAGED: &str = "io.brainrouter.managed";
-const LABEL_CATALOG_ID: &str = "io.brainrouter.catalog_id";
-const LABEL_CATALOG_REVISION: &str = "io.brainrouter.catalog_revision";
+
+type ToolboxOpResult = Result<(), Box<Response<Full<Bytes>>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerSnapshot {
+    id: String,
+    managed_label: String,
+    image: String,
+}
 
 /// Loads and type-parses the vendored toolbox catalog, restricted to
 /// entries brainrouter can act on. Returns a human-readable error string
@@ -2411,19 +2417,37 @@ fn load_typed_toolbox_catalog() -> Result<ToolboxCatalog, String> {
     Ok(toolboxes)
 }
 
-/// Whether a podman container carries brainrouter's ownership label.
-/// Absence (including "no such container") is treated as unmanaged, not an
-/// error — callers already know whether the container exists from `podman
-/// ps`, this only answers the ownership question for ones that do.
-async fn toolbox_container_is_managed(name: &str) -> bool {
+async fn inspect_container(name: &str) -> Option<ContainerSnapshot> {
     let out = tokio::process::Command::new("podman")
-        .args(["inspect", "--format", &format!("{{{{ index .Config.Labels \"{LABEL_MANAGED}\" }}}}"), name])
+        .args([
+            "inspect",
+            "--format",
+            &format!("{{{{.Id}}}}|{{{{ index .Config.Labels \"{LABEL_MANAGED}\" }}}}|{{{{.Image}}}}"),
+            name,
+        ])
         .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
-        _ => false,
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut parts = stdout.trim().splitn(3, '|');
+    let id = parts.next()?.to_string();
+    let managed_label = parts.next().unwrap_or_default().to_string();
+    let image = parts.next().unwrap_or_default().to_string();
+    (!id.is_empty()).then_some(ContainerSnapshot { id, managed_label, image })
+}
+
+fn authorize(snapshot: Option<&ContainerSnapshot>, entry: Option<&OwnershipEntry>) -> bool {
+    let Some(snapshot) = snapshot else { return false; };
+    snapshot.managed_label == "true" || entry.map(|entry| entry.container_id == snapshot.id).unwrap_or(false)
+}
+
+async fn toolbox_container_is_managed(name: &str, sidecar_path: &std::path::Path) -> bool {
+    let snapshot = inspect_container(name).await;
+    let entry = crate::managed_toolboxes::get(sidecar_path, name);
+    authorize(snapshot.as_ref(), entry.as_ref())
 }
 
 /// `Some(repo)` if `image` is hosted on Docker Hub in the implicit
@@ -2588,7 +2612,7 @@ pub async fn toolbox_models_response() -> Response<Full<Bytes>> {
 /// all 5 supported backends. A podman container whose name matches no
 /// catalog `container_name` is omitted, same effective behavior as the
 /// old prefix filter, now catalog-driven instead of hardcoded.
-pub async fn toolbox_containers_list() -> Response<Full<Bytes>> {
+pub async fn toolbox_containers_list(state: &AppState) -> Response<Full<Bytes>> {
     let catalog = match load_typed_toolbox_catalog() {
         Ok(c) => c,
         Err(e) => {
@@ -2631,7 +2655,7 @@ pub async fn toolbox_containers_list() -> Response<Full<Bytes>> {
 
     let mut list: Vec<serde_json::Value> = Vec::with_capacity(matched.len());
     for (name, tb, image, status, created_at) in &matched {
-        let managed = toolbox_container_is_managed(name).await;
+        let managed = toolbox_container_is_managed(name, &state.managed_toolboxes_path).await;
         let (local_created, latest_created, update_available) =
             freshness.get(image).cloned().unwrap_or_default();
         list.push(serde_json::json!({
@@ -2666,77 +2690,130 @@ async fn lock_toolbox_container(state: &AppState, name: &str) -> tokio::sync::Ow
     entry.lock_owned().await
 }
 
-/// Shared create/update/adopt primitive: pulls (if `pull`) the toolbox's
-/// catalog image, force-removes any existing container of that name, then
-/// recreates it via `toolbox create` with brainrouter's ownership labels.
-/// Assumes the caller already holds the per-container-name lock.
-async fn recreate_toolbox_container(tb: &ToolboxDefinition, pull: bool) -> Response<Full<Bytes>> {
-    let container = &tb.container_name;
-    let image = &tb.image;
+fn ownership_entry(container_id: String, image: String, catalog_id: String) -> OwnershipEntry {
+    OwnershipEntry {
+        container_id,
+        image,
+        catalog_id,
+        catalog_revision: toolbox_catalog::vendored_catalog_revision(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
 
-    if pull {
-        let pull_out = tokio::process::Command::new("podman").args(["pull", image]).output().await;
-        match pull_out {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                error!(%stderr, %container, %image, "podman pull failed");
-                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                    error: format!("podman pull failed: {}", stderr.trim()),
-                });
-            }
-            Err(e) => {
-                error!(error = %e, %container, "Failed to exec podman pull");
-                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                    error: format!("Failed to exec podman: {}", e),
-                });
-            }
+async fn pull_toolbox_image(container: &str, image: &str) -> ToolboxOpResult {
+    let pull_out = tokio::process::Command::new("podman").args(["pull", image]).output().await;
+    match pull_out {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container, %image, "podman pull failed");
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("podman pull failed: {}", stderr.trim()),
+            })))
+        }
+        Err(e) => {
+            error!(error = %e, %container, "Failed to exec podman pull");
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec podman: {}", e),
+            })))
         }
     }
+}
 
-    // Force-remove any existing container of this name (idempotent: fine if absent).
-    let _ = tokio::process::Command::new("toolbox").args(["rm", "--force", container]).output().await;
-
-    let revision = toolbox_catalog::vendored_catalog_revision();
+async fn toolbox_create(container: &str, image: &str) -> ToolboxOpResult {
     let create = tokio::process::Command::new("toolbox")
-        .args([
-            "create",
-            "--image",
-            image,
-            "--label",
-            &format!("{LABEL_MANAGED}=true"),
-            "--label",
-            &format!("{LABEL_CATALOG_ID}={}", tb.id),
-            "--label",
-            &format!("{LABEL_CATALOG_REVISION}={revision}"),
-            container,
-        ])
+        .args(["create", "--image", image, container])
         .output()
         .await;
-
     match create {
-        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": format!("Toolbox container '{container}' created."),
-        })),
+        Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             error!(%stderr, %container, %image, "toolbox create failed");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!(
-                    "toolbox create failed: {} (if this mentions an unrecognized --label flag, \
-                     see design doc §5c / Open question 6 — toolbox's --label support is unverified)",
-                    stderr.trim()
-                ),
-            })
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("toolbox create failed: {}", stderr.trim()),
+            })))
         }
         Err(e) => {
             error!(error = %e, %container, "Failed to exec toolbox create");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
                 error: format!("Failed to exec toolbox: {}", e),
-            })
+            })))
         }
     }
+}
+
+async fn podman_rm_force(container_id: &str, container_name: &str) -> ToolboxOpResult {
+    let remove = tokio::process::Command::new("podman")
+        .args(["rm", "--force", container_id])
+        .output()
+        .await;
+    match remove {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(%stderr, %container_name, container_id, "podman rm failed");
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("podman rm failed: {}", stderr.trim()),
+            })))
+        }
+        Err(e) => {
+            error!(error = %e, %container_name, container_id, "Failed to exec podman rm");
+            Err(Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+                error: format!("Failed to exec podman: {}", e),
+            })))
+        }
+    }
+}
+
+fn record_toolbox_ownership(sidecar_path: &std::path::Path, container: &str, entry: OwnershipEntry) -> ToolboxOpResult {
+    crate::managed_toolboxes::record(sidecar_path, container, entry).map_err(|e| {
+        error!(error = %e, %container, "Failed to write managed-toolboxes sidecar");
+        Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("failed to persist toolbox ownership: {e}"),
+        }))
+    })
+}
+
+fn remove_toolbox_ownership(sidecar_path: &std::path::Path, container: &str) -> ToolboxOpResult {
+    crate::managed_toolboxes::remove(sidecar_path, container).map_err(|e| {
+        error!(error = %e, %container, "Failed to remove managed-toolboxes sidecar entry");
+        Box::new(json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("failed to remove toolbox ownership: {e}"),
+        }))
+    })
+}
+
+async fn recreate_toolbox_container(
+    sidecar_path: &std::path::Path,
+    tb: &ToolboxDefinition,
+    pull: bool,
+    cleanup_on_record_failure: bool,
+) -> Response<Full<Bytes>> {
+    let container = &tb.container_name;
+    let image = &tb.image;
+    if pull {
+        if let Err(resp) = pull_toolbox_image(container, image).await { return *resp; }
+    }
+    if let Err(resp) = toolbox_create(container, image).await { return *resp; }
+    let Some(snapshot) = inspect_container(container).await else {
+        return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("toolbox create succeeded but container '{container}' could not be inspected"),
+        });
+    };
+    let entry = ownership_entry(snapshot.id.clone(), image.clone(), tb.id.clone());
+    if let Err(resp) = record_toolbox_ownership(sidecar_path, container, entry) {
+        if cleanup_on_record_failure {
+            let _ = podman_rm_force(&snapshot.id, container).await;
+        } else {
+            error!(container_id = %snapshot.id, %container, "Toolbox ownership persist failed after recreate");
+        }
+        return *resp;
+    }
+    json_response(StatusCode::OK, &serde_json::json!({
+        "status": "ok",
+        "message": format!("Toolbox container '{container}' created."),
+    }))
 }
 
 /// `POST /api/toolbox-containers` — create a new container for `toolbox_id`.
@@ -2751,15 +2828,12 @@ pub async fn create_toolbox_container(state: &AppState, toolbox_id: &str) -> Res
         });
     };
     let _guard = lock_toolbox_container(state, &tb.container_name).await;
-    if toolbox_container_image(&tb.container_name).await.is_some() {
+    if inspect_container(&tb.container_name).await.is_some() {
         return json_response(StatusCode::CONFLICT, &ErrorResponse {
-            error: format!(
-                "Container '{}' already exists — use update or adopt instead.",
-                tb.container_name
-            ),
+            error: format!("Container '{}' already exists — use update or adopt instead.", tb.container_name),
         });
     }
-    recreate_toolbox_container(tb, false).await
+    recreate_toolbox_container(&state.managed_toolboxes_path, tb, false, true).await
 }
 
 /// `POST /api/toolbox-containers/{name}/update` — pull latest image + recreate.
@@ -2768,79 +2842,62 @@ pub async fn update_toolbox_container(state: &AppState, container_name: &str) ->
         Ok(c) => c,
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
     };
-    let Some(tb) = catalog
-        .toolboxes
-        .iter()
-        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
-    else {
+    let Some(tb) = catalog.toolboxes.iter().find(|t| t.container_name == container_name && t.supported_backend().is_some()) else {
         return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
             error: format!("No catalog toolbox with container_name: {container_name}"),
         });
     };
     let _guard = lock_toolbox_container(state, container_name).await;
-    recreate_toolbox_container(tb, true).await
+    let Some(snapshot) = inspect_container(container_name).await else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: format!("No such container: {container_name}") });
+    };
+    let entry = crate::managed_toolboxes::get(&state.managed_toolboxes_path, container_name);
+    if !authorize(Some(&snapshot), entry.as_ref()) {
+        return json_response(StatusCode::FORBIDDEN, &ErrorResponse { error: format!("Container '{container_name}' is not brainrouter-managed.") });
+    }
+    if let Err(resp) = pull_toolbox_image(container_name, &tb.image).await { return *resp; }
+    if let Err(resp) = podman_rm_force(&snapshot.id, container_name).await { return *resp; }
+    recreate_toolbox_container(&state.managed_toolboxes_path, tb, false, false).await
 }
 
-/// `POST /api/toolbox-containers/{name}/adopt` — recreate-in-place (no
-/// pull) to attach ownership labels to a pre-existing unmanaged container.
-/// See §5c for why this can't be a label-only no-op.
+/// `POST /api/toolbox-containers/{name}/adopt` — record ownership of the exact live container ID.
 pub async fn adopt_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
     let catalog = match load_typed_toolbox_catalog() {
         Ok(c) => c,
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
     };
-    let Some(tb) = catalog
-        .toolboxes
-        .iter()
-        .find(|t| t.container_name == container_name && t.supported_backend().is_some())
-    else {
+    let Some(tb) = catalog.toolboxes.iter().find(|t| t.container_name == container_name && t.supported_backend().is_some()) else {
         return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
             error: format!("No catalog toolbox with container_name: {container_name}"),
         });
     };
     let _guard = lock_toolbox_container(state, container_name).await;
-    if toolbox_container_image(container_name).await.is_none() {
-        return json_response(StatusCode::NOT_FOUND, &ErrorResponse {
-            error: format!("No such container: {container_name}"),
-        });
+    let Some(snapshot) = inspect_container(container_name).await else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: format!("No such container: {container_name}") });
+    };
+    let existing_entry = crate::managed_toolboxes::get(&state.managed_toolboxes_path, container_name);
+    if authorize(Some(&snapshot), existing_entry.as_ref()) {
+        return json_response(StatusCode::CONFLICT, &ErrorResponse { error: format!("Container '{container_name}' is already brainrouter-managed.") });
     }
-    if toolbox_container_is_managed(container_name).await {
-        return json_response(StatusCode::CONFLICT, &ErrorResponse {
-            error: format!("Container '{container_name}' is already brainrouter-managed."),
-        });
-    }
-    recreate_toolbox_container(tb, false).await
+    let entry = ownership_entry(snapshot.id, snapshot.image, tb.id.clone());
+    if let Err(resp) = record_toolbox_ownership(&state.managed_toolboxes_path, container_name, entry) { return *resp; }
+    json_response(StatusCode::OK, &serde_json::json!({ "status": "ok", "message": format!("Toolbox container '{container_name}' adopted.") }))
 }
 
 /// `POST /api/toolbox-containers/{name}/delete` — idempotent force-remove.
 pub async fn delete_toolbox_container(state: &AppState, container_name: &str) -> Response<Full<Bytes>> {
     let _guard = lock_toolbox_container(state, container_name).await;
-    if toolbox_container_image(container_name).await.is_none() {
-        return json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "already removed",
-        }));
+    let Some(snapshot) = inspect_container(container_name).await else {
+        if let Err(resp) = remove_toolbox_ownership(&state.managed_toolboxes_path, container_name) { return *resp; }
+        return json_response(StatusCode::OK, &serde_json::json!({ "status": "ok", "message": "already removed" }));
+    };
+    let entry = crate::managed_toolboxes::get(&state.managed_toolboxes_path, container_name);
+    if !authorize(Some(&snapshot), entry.as_ref()) {
+        return json_response(StatusCode::FORBIDDEN, &ErrorResponse { error: format!("Container '{container_name}' is not brainrouter-managed.") });
     }
-    let remove = tokio::process::Command::new("toolbox").args(["rm", "--force", container_name]).output().await;
-    match remove {
-        Ok(out) if out.status.success() => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": format!("Toolbox container '{container_name}' removed."),
-        })),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(%stderr, %container_name, "toolbox rm failed");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("toolbox rm failed: {}", stderr.trim()),
-            })
-        }
-        Err(e) => {
-            error!(error = %e, %container_name, "Failed to exec toolbox rm");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec toolbox: {}", e),
-            })
-        }
-    }
+    if let Err(resp) = podman_rm_force(&snapshot.id, container_name).await { return *resp; }
+    if let Err(resp) = remove_toolbox_ownership(&state.managed_toolboxes_path, container_name) { return *resp; }
+    json_response(StatusCode::OK, &serde_json::json!({ "status": "ok", "message": format!("Toolbox container '{container_name}' removed.") }))
 }
 
 // ── PR6: model-download orchestration (§10) ──────────────────────────────
@@ -3861,66 +3918,36 @@ async fn toolbox_container_image(container: &str) -> Option<String> {
     (!image.is_empty()).then_some(image)
 }
 
-async fn upgrade_toolbox(container: &str, image: &str) -> Response<Full<Bytes>> {
+async fn upgrade_toolbox(state: &AppState, container: &str, image: &str) -> Response<Full<Bytes>> {
     info!(%container, %image, "Upgrading toolbox container...");
-
-    // 1. Pull the new image
-    let pull = tokio::process::Command::new("podman")
-        .args(["pull", image])
-        .output()
-        .await;
-
-    match pull {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(%stderr, "podman pull failed");
-            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("podman pull failed: {}", stderr.trim()),
-            });
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to exec podman pull");
-            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec podman: {}", e),
-            });
-        }
+    let _guard = lock_toolbox_container(state, container).await;
+    let Some(snapshot) = inspect_container(container).await else {
+        return json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: format!("No such toolbox container: {}", container) });
+    };
+    let entry = crate::managed_toolboxes::get(&state.managed_toolboxes_path, container);
+    if !authorize(Some(&snapshot), entry.as_ref()) {
+        return json_response(StatusCode::FORBIDDEN, &ErrorResponse { error: format!("Container '{container}' is not brainrouter-managed.") });
     }
-
-    // 2. Remove the existing toolbox container (force, it may be running)
-    let _ = tokio::process::Command::new("toolbox")
-        .args(["rm", "--force", container])
-        .output()
-        .await;
-
-    // 3. Recreate the toolbox container from the fresh image
-    let create = tokio::process::Command::new("toolbox")
-        .args(["create", "--image", image, container])
-        .output()
-        .await;
-
-    match create {
-        Ok(out) if out.status.success() => {
-            json_response(StatusCode::OK, &serde_json::json!({
-                "status": "ok",
-                "message": "Toolbox container recreated with latest image."
-            }))
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            error!(%stderr, "toolbox create failed");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Pull succeeded but toolbox create failed: {}", stderr.trim()),
-            })
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to exec toolbox create");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to exec toolbox: {}", e),
-            })
-        }
+    if let Err(resp) = pull_toolbox_image(container, image).await { return *resp; }
+    if let Err(resp) = podman_rm_force(&snapshot.id, container).await { return *resp; }
+    if let Err(resp) = toolbox_create(container, image).await { return *resp; }
+    let Some(new_snapshot) = inspect_container(container).await else {
+        return json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
+            error: format!("toolbox create succeeded but container '{container}' could not be inspected"),
+        });
+    };
+    let catalog_id = entry.as_ref().map(|entry| entry.catalog_id.clone()).unwrap_or_else(|| "legacy-upgrade".to_string());
+    let ownership = ownership_entry(new_snapshot.id.clone(), image.to_string(), catalog_id);
+    if let Err(resp) = record_toolbox_ownership(&state.managed_toolboxes_path, container, ownership) {
+        error!(container_id = %new_snapshot.id, %container, "Toolbox ownership persist failed after legacy upgrade");
+        return *resp;
     }
+    json_response(StatusCode::OK, &serde_json::json!({
+        "status": "ok",
+        "message": "Toolbox container recreated with latest image."
+    }))
 }
+
 async fn handle_update_review_config(
     req: Request<Incoming>,
     service: &ReviewService,
@@ -4337,6 +4364,39 @@ async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ownership(id: &str) -> OwnershipEntry {
+        OwnershipEntry {
+            container_id: id.to_string(),
+            image: "docker.io/example/toolbox:latest".to_string(),
+            catalog_id: "catalog-toolbox".to_string(),
+            catalog_revision: "rev-1".to_string(),
+            created_at: "2026-09-24T00:00:00Z".to_string(),
+        }
+    }
+
+    fn snapshot(id: &str, managed_label: &str) -> ContainerSnapshot {
+        ContainerSnapshot {
+            id: id.to_string(),
+            managed_label: managed_label.to_string(),
+            image: "docker.io/example/toolbox:latest".to_string(),
+        }
+    }
+
+    #[test]
+    fn toolbox_authorize_matrix_uses_legacy_label_or_exact_sidecar_id() {
+        let labeled = snapshot("live-id", "true");
+        assert!(authorize(Some(&labeled), None), "legacy label authorizes");
+
+        let unlabeled = snapshot("live-id", "");
+        let matching = ownership("live-id");
+        assert!(authorize(Some(&unlabeled), Some(&matching)), "matching sidecar id authorizes");
+
+        let mismatched = ownership("old-id");
+        assert!(!authorize(Some(&unlabeled), Some(&mismatched)), "same-name replacement is unmanaged");
+        assert!(!authorize(Some(&unlabeled), None), "neither source is unmanaged");
+        assert!(!authorize(None, Some(&matching)), "absent live container is not authorized");
+    }
 
     #[test]
     fn status_response_value_has_models_and_additive_hf() {

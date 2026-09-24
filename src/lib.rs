@@ -10,6 +10,7 @@ pub mod config;
 pub mod escalation;
 pub mod inference_state;
 pub mod health;
+pub mod managed_toolboxes;
 pub mod peer_cwd;
 pub mod prompt_rewriter;
 pub mod provider;
@@ -28,4 +29,3 @@ pub mod model_downloads;
 pub mod observability;
 pub mod server_mode;
 pub mod serving_identity;
-

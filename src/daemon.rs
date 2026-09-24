@@ -162,6 +162,7 @@ pub struct ServeArgs {
 pub async fn run(args: ServeArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(config::default_socket_path);
     let config_path = args.config.unwrap_or_else(config::default_config_path);
+    let managed_toolboxes_path = config_path.with_file_name("managed_toolboxes.json");
 
     // Config
     let config = config::load(&config_path)
@@ -449,6 +450,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         benchmark_store,
         benchmark_lab,
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
+        managed_toolboxes_path,
         toolbox_container_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         model_downloads: Arc::new(brainrouter::model_downloads::ModelDownloadRegistry::new()),
         serving_identities: Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new()),
