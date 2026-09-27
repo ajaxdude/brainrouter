@@ -55,18 +55,19 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, body::Frame, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use tracing::{debug, error, info, warn};
 use std::sync::LazyLock;
+use sha2::{Digest, Sha256};
 
 /// Shared HTTP client for lightweight polling and version checks.
 /// Each call site sets its own `.timeout()` on the request builder.
@@ -124,6 +125,8 @@ pub struct AppState {
     /// Path to llama-swap's config file (used by the restart-local-stack
     /// endpoint and the context-size setter).
     pub llama_swap_config_path: PathBuf,
+    /// Serializes all llama-swap config writers, including raw edits and generated registrations.
+    pub llama_swap_config_lock: Arc<tokio::sync::Mutex<()>>,
     /// Our own TCP listen address (for the "open dashboard" button).
     pub tcp_addr: String,
     /// Runtime control of the Bonsai classifier llama-server (dashboard
@@ -266,6 +269,7 @@ fn request_is_destructive(method: &str, path: &str, has_query: bool) -> bool {
         // plain no-query GET stays ungated, like GET /api/routing-profile.
         || (matches!(method, "POST" | "DELETE") && path == "/api/project-pin")
         || (method == "GET" && path == "/api/project-pin" && has_query)
+        || (method == "POST" && path.starts_with("/api/llama-swap/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -1425,6 +1429,11 @@ async fn handle_request(
             }
         }
 
+        ("POST", "/api/llama-swap/register-model") => {
+            let resp = register_llama_swap_model_request(req, &state).await;
+            into_unsync(resp)
+        }
+
         ("GET", "/api/llama-swap-config") => {
             match std::fs::read_to_string(&state.llama_swap_config_path) {
                 Ok(yaml) => {
@@ -1467,9 +1476,9 @@ async fn handle_request(
                         into_unsync(resp)
                     }
                     Ok(_) => {
-                        let tmp_path = state.llama_swap_config_path.with_extension("yaml.tmp");
-                        let write_result = std::fs::write(&tmp_path, body.as_bytes())
-                            .and_then(|_| std::fs::rename(&tmp_path, &state.llama_swap_config_path));
+                        let _guard = state.llama_swap_config_lock.lock().await;
+                        let tmp_path = unique_sibling_path(&state.llama_swap_config_path, "tmp");
+                        let write_result = atomic_write_path(&state.llama_swap_config_path, &tmp_path, body.as_bytes());
                         if let Err(e) = write_result {
                             let _ = std::fs::remove_file(&tmp_path);
                             let resp = json_response(
@@ -2285,11 +2294,21 @@ async fn restart_llama_cpp() -> Response<Full<Bytes>> {
 
 /// Restart a systemd user service. Only allows a fixed set of service names.
 async fn restart_service(service: &str) -> Response<Full<Bytes>> {
+    match restart_systemd_user_service(service).await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
+            "status": "ok",
+            "service": service,
+            "message": format!("{} restarted", service)
+        })),
+        Err(e) if e.starts_with("Unknown service:") => json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: e }),
+        Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse { error: e }),
+    }
+}
+
+async fn restart_systemd_user_service(service: &str) -> Result<(), String> {
     const ALLOWED: &[&str] = &["llama-swap", "manifest", "brainrouter"];
     if !ALLOWED.contains(&service) {
-        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-            error: format!("Unknown service: {}", service),
-        });
+        return Err(format!("Unknown service: {}", service));
     }
 
     info!(service, "Restarting systemd user service");
@@ -2301,24 +2320,16 @@ async fn restart_service(service: &str) -> Response<Full<Bytes>> {
     match output {
         Ok(out) if out.status.success() => {
             info!(service, "Service restarted successfully");
-            json_response(StatusCode::OK, &serde_json::json!({
-                "status": "ok",
-                "service": service,
-                "message": format!("{} restarted", service)
-            }))
+            Ok(())
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             error!(service, %stderr, "systemctl restart returned non-success");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to restart {}: {}", service, stderr.trim()),
-            })
+            Err(format!("Failed to restart {}: {}", service, stderr.trim()))
         }
         Err(e) => {
             error!(service, error = %e, "systemctl restart failed");
-            json_response(StatusCode::INTERNAL_SERVER_ERROR, &ErrorResponse {
-                error: format!("Failed to restart {}: {}", service, e),
-            })
+            Err(format!("Failed to restart {}: {}", service, e))
         }
     }
 }
@@ -2692,6 +2703,151 @@ pub async fn toolbox_catalog_response() -> Response<Full<Bytes>> {
         "toolboxes": toolboxes,
         "platforms": catalog.platforms,
     }))
+}
+
+
+#[derive(Debug, Deserialize)]
+struct RegisterLlamaSwapModelRequest {
+    model_id: String,
+    quant_pattern: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterLlamaSwapModelResponse {
+    status: &'static str,
+    llama_swap_id: String,
+    model_path: String,
+    message: String,
+    reloaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+async fn register_llama_swap_model_request(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+    let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+    if body_bytes.len() > 16_384 {
+        return json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: "Request body too large (max 16KB)".to_string() });
+    }
+    let request: RegisterLlamaSwapModelRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: format!("invalid request body: {e}") }),
+    };
+    match register_llama_swap_model(state, request).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => json_response(StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse { error: e.message().to_string() }),
+    }
+}
+
+async fn register_llama_swap_model(state: &AppState, request: RegisterLlamaSwapModelRequest) -> Result<RegisterLlamaSwapModelResponse, crate::llama_swap_register::RegisterError> {
+    use crate::llama_swap_register::{build_entry, insert_model_entry, path_visibility_warning, resolve_primary_gguf, RegisterError};
+    use crate::model_downloads::{effective_models_dir, resolve_catalog_entry};
+    use crate::toolbox_catalog::{ModelPayload, SupportedServingBackend};
+
+    if request.model_id.trim().is_empty() || request.quant_pattern.trim().is_empty() {
+        return Err(RegisterError::BadRequest("model_id and quant_pattern are required".to_string()));
+    }
+    let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::LlamaCpp, &request.model_id).map_err(register_error_from_download)?;
+    let ModelPayload::LlamaCpp(model) = &payload else {
+        return Err(RegisterError::BadRequest("only llama_cpp catalog entries can be registered in llama-swap; use Server Mode for ds4/halogen/vllm/r9v/gufo".to_string()));
+    };
+    let models_dir = effective_models_dir(SupportedServingBackend::LlamaCpp, &storage);
+    let repo_basename = model.repo.rsplit('/').next().unwrap_or(&model.repo);
+    let destination = models_dir.join(repo_basename);
+    let model_path = resolve_primary_gguf(&destination, &request.quant_pattern)?;
+    let warning = path_visibility_warning(&model_path);
+    let entry = build_entry(&request.model_id, &model.name, &model_path);
+
+    let _guard = state.llama_swap_config_lock.lock().await;
+    let config_path = &state.llama_swap_config_path;
+    let original = std::fs::read(config_path).map_err(|e| RegisterError::Internal(format!("failed to read llama-swap config `{}`: {e}", config_path.display())))?;
+    let original_hash = sha256_hex(&original);
+    let original_text = String::from_utf8(original.clone()).map_err(|e| RegisterError::BadRequest(format!("llama-swap config is not valid UTF-8: {e}")))?;
+    let new_text = insert_model_entry(&original_text, &request.model_id, &entry)?;
+    let changed = config_hash_changed(config_path, &original_hash).map_err(|e| RegisterError::Internal(format!("failed to re-read llama-swap config `{}`: {e}", config_path.display())))?;
+    if changed {
+        return Err(RegisterError::Conflict("llama-swap config changed while preparing registration; retry".to_string()));
+    }
+
+    let bak_path = rolling_backup_path(config_path);
+    std::fs::write(&bak_path, &original).map_err(|e| RegisterError::Internal(format!("failed to write llama-swap config backup `{}`: {e}", bak_path.display())))?;
+    let tmp_path = unique_sibling_path(config_path, "tmp");
+    if let Err(e) = atomic_write_path(config_path, &tmp_path, new_text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(RegisterError::Internal(format!("failed to write llama-swap config: {e}")));
+    }
+
+    if let Err(e) = restart_systemd_user_service("llama-swap").await {
+        restore_llama_swap_config(config_path, &bak_path).map_err(|restore_err| RegisterError::Internal(format!("registered config failed reload ({e}) and restore failed: {restore_err}; backup is `{}`", bak_path.display())))?;
+        let _ = restart_systemd_user_service("llama-swap").await;
+        return Ok(RegisterLlamaSwapModelResponse { status: "registered_reload_failed_restored", llama_swap_id: request.model_id, model_path: model_path.display().to_string(), message: format!("llama-swap reload failed and the previous config was restored: {e}"), reloaded: false, warning });
+    }
+    if let Err(e) = poll_llama_swap_model(&state.llama_swap_url, &request.model_id).await {
+        restore_llama_swap_config(config_path, &bak_path).map_err(|restore_err| RegisterError::Internal(format!("registered config did not become healthy ({e}) and restore failed: {restore_err}; backup is `{}`", bak_path.display())))?;
+        let _ = restart_systemd_user_service("llama-swap").await;
+        return Ok(RegisterLlamaSwapModelResponse { status: "registered_reload_failed_restored", llama_swap_id: request.model_id, model_path: model_path.display().to_string(), message: format!("llama-swap reload did not report the new model and the previous config was restored: {e}"), reloaded: false, warning });
+    }
+    Ok(RegisterLlamaSwapModelResponse { status: "registered", llama_swap_id: request.model_id, model_path: model_path.display().to_string(), message: "Registered baseline in llama-swap and verified it appears in /v1/models".to_string(), reloaded: true, warning })
+}
+
+fn register_error_from_download(e: crate::model_downloads::DownloadError) -> crate::llama_swap_register::RegisterError {
+    match e {
+        crate::model_downloads::DownloadError::Validation(m) | crate::model_downloads::DownloadError::NotFound(m) => crate::llama_swap_register::RegisterError::BadRequest(m),
+        crate::model_downloads::DownloadError::Conflict(m) => crate::llama_swap_register::RegisterError::Conflict(m),
+        crate::model_downloads::DownloadError::Internal(m) => crate::llama_swap_register::RegisterError::Internal(m),
+    }
+}
+
+fn unique_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("config.yaml");
+    path.with_file_name(format!("{file_name}.{pid}.{nonce}.{suffix}", pid = std::process::id(), nonce = uuid::Uuid::new_v4()))
+}
+
+fn rolling_backup_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("config.yaml");
+    path.with_file_name(format!("{file_name}.bak"))
+}
+
+fn config_hash_changed(path: &Path, original_hash: &str) -> Result<bool, std::io::Error> {
+    let current = std::fs::read(path)?;
+    Ok(sha256_hex(&current) != original_hash)
+}
+
+fn atomic_write_path(path: &Path, tmp_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(tmp_path, bytes).and_then(|_| std::fs::rename(tmp_path, path))
+}
+
+fn restore_llama_swap_config(path: &Path, bak_path: &Path) -> std::io::Result<()> {
+    let bytes = std::fs::read(bak_path)?;
+    let tmp_path = unique_sibling_path(path, "restore.tmp");
+    atomic_write_path(path, &tmp_path, &bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+async fn poll_llama_swap_model(llama_swap_url: &str, id: &str) -> Result<(), String> {
+    let url = format!("{}/v1/models", llama_swap_url);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last_error = String::new();
+    while std::time::Instant::now() < deadline {
+        match VERSION_CLIENT.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(body) if llama_swap_models_contains(&body, id) => return Ok(()),
+                Ok(_) => last_error = format!("model `{id}` not present in /v1/models yet"),
+                Err(e) => last_error = format!("failed to parse /v1/models response: {e}"),
+            },
+            Err(e) => last_error = format!("failed to fetch /v1/models: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+    Err(last_error)
+}
+
+fn llama_swap_models_contains(body: &serde_json::Value, id: &str) -> bool {
+    body.get("data").and_then(|d| d.as_array()).is_some_and(|arr| arr.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id)))
 }
 
 /// `GET /api/toolbox-models` — the effective model catalog (vendored + gufo
@@ -4637,6 +4793,58 @@ mod tests {
     }
 
     // ── Per-project model pins: gate + POST decoder (Phase 2) ────────────────
+
+    #[test]
+    fn llama_swap_gate_covers_register_subpaths() {
+        assert!(request_is_destructive("POST", "/api/llama-swap/register-model", false));
+        assert!(request_is_destructive("POST", "/api/llama-swap/future", false));
+        assert!(request_is_destructive("POST", "/api/llama-swap-config", false));
+        assert!(!request_is_destructive("GET", "/api/llama-swap/register-model", false));
+    }
+
+    fn server_test_dir(name: &str) -> PathBuf {
+        let p = std::env::current_dir().unwrap().join("target").join("server_file_transaction_tests").join(name);
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn llama_swap_atomic_write_replaces_file_and_removes_temp() {
+        let dir = server_test_dir("atomic-write");
+        let path = dir.join("config.yaml");
+        let tmp = unique_sibling_path(&path, "tmp");
+        std::fs::write(&path, b"old").unwrap();
+        atomic_write_path(&path, &tmp, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn llama_swap_restore_is_byte_identical_to_backup() {
+        let dir = server_test_dir("restore");
+        let path = dir.join("config.yaml");
+        let bak = rolling_backup_path(&path);
+        let original = b"models:
+  old:
+    cmd: old
+";
+        std::fs::write(&path, b"changed").unwrap();
+        std::fs::write(&bak, original).unwrap();
+        restore_llama_swap_config(&path, &bak).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn llama_swap_external_change_detection_flags_hash_mismatch() {
+        let dir = server_test_dir("external-change");
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, b"original").unwrap();
+        let captured = sha256_hex(&std::fs::read(&path).unwrap());
+        assert!(!config_hash_changed(&path, &captured).unwrap());
+        std::fs::write(&path, b"changed").unwrap();
+        assert!(config_hash_changed(&path, &captured).unwrap());
+    }
 
     #[test]
     fn project_pin_gate_covers_mutations_and_the_resolver() {

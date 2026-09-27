@@ -2,12 +2,13 @@
 
 ## Status
 
-- Workflow state: `critic-revisions-required` — Dory critic round 1 returned **FAIL (6 blocking)**. Two are structural/deployment blockers beyond config-safety: **B2** (brainrouter does not track completed llama_cpp downloads or their `quant_pattern` — `expected_files` empty + llama_cpp excluded from presence, so there is no "completed llama_cpp row" to attach the action to) and **B6** (the `${ls}`=`llama-server-toolbox` wrapper likely maps only specific host dirs into llama-server's runtime, so a model in `~/models`/`/home/papa/...` may not be loadable). **Deferred** pending (a) B6 deployment verification and (b) a B2 UX decision (add `quant_pattern` to `ModelDownloadJob` + a completed-jobs registration row, or a different entry point) — both benefit from the user's input. Prioritizing the toolbox `--label` fix and Feature B (routing) first: higher-value to the "llama-swap parity" goal and lower-risk (no critical-config mutation).
+- Workflow state: `approved-for-implementation` — Dory critic round 1 blockers B1–B6 and important findings I1–I3 have all been resolved by verified follow-up investigation and the v2 design below. Implementation may proceed from this document.
 - Change classification: **standard** — new public endpoint + mutation of the critical, hand-tuned `llama-swap` `config.yaml` (gates all local inference) + dashboard UI. High blast radius on the config file → full rigor.
-- Human review: user unavailable, delegated ("work autonomously, make good decisions"). Human review before implementation skipped by delegation per HankNDory rule 7; isolated Dory critic + mean review still run. **Because this mutates the live llama-swap config, every write is backup-guarded + YAML-validated + atomic + restore-on-failure**, so a wrong entry degrades to "one extra baseline model that fails to load / a clean abort," never corruption of existing models.
+- Human approval: skipped by explicit user delegation/autopilot for this implementation session. The coordinator supplied concrete resolutions for every Dory blocker and instructed implementation; recorded per HankNDory rule 7. Safety guardrails remain mandatory: lock + backup + YAML validation + atomic write + reload health poll + restore-on-failure.
 
 Revisions:
-- v1 — 2026-09-24 — Initial draft.
+- v1 — 2026-09-24 — Initial draft; Dory critic round 1 found 6 blockers and 3 important findings.
+- v2 — 2026-09-27 — Incorporated resolved B1–B6/I1–I3 decisions: pattern-scoped GGUF resolver, job-retained `quant_pattern`, structural YAML dedup + safe text insertion, shared config writer lock, backup/atomic/reload/health/restore contract, destructive route gate, toolbox path visibility warning, and expanded tests. Marked approved-for-implementation.
 
 ## Problem
 
@@ -50,59 +51,52 @@ Verified from repository + live (`127.0.0.1:9099` via brainrouter):
 
 ## Requirements and acceptance criteria
 
-R1. New `POST /api/llama-swap/register-model` with body `{ "model_id": "<catalog llama_cpp id>", "quant_pattern": "<the pattern the user downloaded>" }`. Returns `{status, llama_swap_id, model_path, message}` on success. — AC: curl with a completed download returns 200 + the appended id; the config gains exactly one entry.
+R1. New `POST /api/llama-swap/register-model` with typed JSON body `{ "model_id": "<catalog llama_cpp id>", "quant_pattern": "<the pattern the completed download job used>" }`. Returns `{status, llama_swap_id, model_path, message, reloaded, warning?}`. — AC: a completed llama_cpp download can be registered; the config gains exactly one entry.
 
-R2. Backend restriction: only `llama_cpp`. A non-llama_cpp `model_id` → 400 with a message pointing at Server Mode. — AC: ds4/halogen id → 400.
+R2. Backend restriction: the request implies backend `llama_cpp`; resolve `model_id` only in the llama_cpp catalog. A non-llama_cpp/server-mode model id is rejected with 400 guidance to use Server Mode. — AC: ds4/halogen/vllm/r9v/gufo ids do not register into llama-swap.
 
-R3. GGUF path resolution (deterministic, or fail): given `destination = effective_models_dir(LlamaCpp).join(repo_basename)`, resolve the primary `.gguf`:
-   1. gather `*.gguf` under `destination` recursively;
-   2. if none → 409 "no .gguf found (download incomplete?)";
-   3. if any name matches `*-00001-of-*.gguf` → use it (first shard; llama-server finds the rest);
-   4. else if `quant_pattern` ends in `.gguf` and a file whose name == basename(pattern) exists → use it;
-   5. else if exactly one `.gguf` → use it;
-   6. else → 409 "ambiguous: multiple GGUFs, none a first shard; register manually" (never guess). — AC: unit tests cover each branch with a tempdir.
+R3. GGUF path resolution is deterministic and quant-scoped. `resolve_primary_gguf(destination, quant_pattern)` recursively gathers `*.gguf`; if `quant_pattern` ends in `.gguf`, match the basename with `*` wildcard support; otherwise scope to `destination/<pattern>/`. Reject auxiliary GGUFs containing `mmproj`, `mtp`, `draft`, `vision`, `dspark`, `-spec`, or `speculat` (case-insensitive). If a first shard `*-00001-of-NNNNN.gguf` is in scope, verify all `NNNNN` shards exist and choose shard 1; otherwise choose exactly one primary GGUF; zero/incomplete/ambiguous states return 409 and never guess. Canonicalize the selected path. — AC: unit tests cover exact, glob, folder, auxiliary, complete shard, incomplete shard, none, and ambiguous branches.
 
-R4. llama-swap id + dedup: `llama_swap_id` = the catalog `model_id` (already a stable slug). If a top-level key of that name already exists in the config's `models:` map → 409 "already registered". — AC: re-registering the same id → 409, config unchanged.
+R4. llama-swap id + dedup: `llama_swap_id` = catalog `model_id`. `insert_model_entry` parses the full YAML, requires a top-level `models` mapping, and rejects existing structural keys (including quoted keys). — AC: re-registering the same id returns 409 and config is unchanged.
 
-R5. Safe mutation: read config → verify `models:` key exists → insert the new entry text immediately after the `models:` line (2-space-indented key) → `serde_yaml::from_str::<Value>`-validate the full result → **write a `.bak` copy of the pre-change config** → atomic tmp+rename → if the post-write validate/reload path errors, restore from `.bak`. — AC: a forced-invalid entry never replaces the good config (restore verified in a test of the pure builder).
+R5. Safe insertion preserves hand-tuned config text: build a 2-space-indented entry, insert immediately after the top-level block-style `models:` line (or convert `models: {}` to block style), re-parse the full YAML, and assert the id is under top-level `models`. Non-empty inline `models: {...}` returns a clear error instead of corrupting. — AC: tests cover block insertion, quoted-key dedup, `models:` inside a block scalar, `models: {}`, non-empty inline, invalid base config, and scalar/path escaping.
 
-R6. Reload llama-swap after a successful write (reuse the `/api/restart/llama-swap` mechanism). Report reload failure distinctly from write success. — AC: after register, `/api/models/llama-swap` lists the new id.
+R6. Concurrency + rollback: add `AppState.llama_swap_config_lock` and acquire it in both the new register handler and existing `POST /api/llama-swap-config`. Under the register lock, read bytes + hash, build/validate the new text, re-read/hash to detect external changes, write a unique `.bak`, atomic write via a unique temp filename + rename, restart llama-swap, poll `{llama_swap_url}/v1/models` for up to about 30 seconds, and atomically restore from `.bak` on reload/health failure. — AC: no half-written or unvalidated config is left behind; response distinguishes `registered` from `registered_reload_failed_restored`.
 
-R7. Generated entry is a documented baseline:
+R7. Generated entry is a documented baseline, not tuned:
    ```yaml
      "<id>":
-       name: "<catalog name> (registered from download)"
+       name: "<catalog name> (registered baseline)"
        cmd: |
          ${ls}
          --port ${PORT}
          ${common}
-         --model <resolved absolute path>
+         --model '<resolved absolute path>'
    ```
-   — AC: the entry parses and references the real macros; UI shows a "baseline — tune as needed" note.
+   Paths are shell-quoted. If the canonical path is not under `/mnt` or `$HOME`, registration is allowed but the response includes a toolbox visibility warning. The success message says the baseline was verified only if `/v1/models` contains the id after reload. — AC: output parses and uses existing macros; UI message includes baseline/reload status.
 
-R8. Dashboard: on a **completed llama_cpp** download row (Downloads tab), a "Register in llama-swap" button → POST → toast the result (id + baseline note, or the specific error). Absent for other backends / incomplete rows. — AC: button present only for completed llama_cpp entries; asserted by a UI test.
+R8. Dashboard: on completed `llama_cpp` download-job rows only, show "Register in llama-swap". The button posts the row's retained `{model_id, quant_pattern}`. It is absent for incomplete/running jobs and all non-llama_cpp backends. — AC: UI test asserts render gating and request body.
 
-R9. Tests: Rust unit tests for `resolve_primary_gguf` (all R3 branches, tempdir) and the pure `insert_model_entry(config_text, id, entry) -> Result<String>` builder (inserts after `models:`, dedup rejects, output re-parses; invalid base config errors). A UI test asserting the button wiring. — AC: `cargo test --locked` + `node --test` pass.
+R9. Tests and gates: add Rust unit tests for resolver + inserter + destructive gate, a Node UI test, and run `cargo test --locked -- --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, `bash scripts/check-html-js.sh`, and `node --test scripts/test-llama-swap-register-ui.cjs`. No validation may load a model or manually restart llama-swap.
 
 ## Technical plan
 
-New module `src/llama_swap_register.rs` with pure, testable cores:
-- `resolve_primary_gguf(destination: &Path, quant_pattern: &str) -> Result<PathBuf, RegisterError>` (R3).
-- `build_entry(id, name, model_path) -> String` (R7 baseline block).
-- `insert_model_entry(config_text: &str, id: &str, entry_block: &str) -> Result<String, RegisterError>` (R4 dedup + R5 insert-after-`models:` + full-parse validate).
+New module `src/llama_swap_register.rs` contains pure, testable cores:
+- `resolve_primary_gguf(destination: &Path, quant_pattern: &str) -> Result<PathBuf, RegisterError>` implements the B1 resolver contract, including quant scoping, auxiliary rejection, shard completeness, canonicalization, and fail-on-ambiguity.
+- `build_entry(id, name, model_path) -> String` emits the R7 baseline block with YAML-escaped id/name and shell-quoted model path.
+- `insert_model_entry(config_text, id, entry_block) -> Result<String, RegisterError>` parses structurally, dedups structurally, inserts text after top-level `models:`, re-parses, and verifies placement.
+- `RegisterError` maps to 400/409/500 for the handler.
 
-`server.rs` handler `register_llama_swap_model(state, body)`:
-1. parse body; resolve catalog entry for `model_id`; enforce llama_cpp (R2).
-2. compute `destination`; `resolve_primary_gguf` (R3).
-3. read config; `insert_model_entry` (dedup + build + validate) (R4/R5).
-4. backup `.bak`; atomic write (mirror `:1349`); on write error restore (R5).
-5. trigger llama-swap reload (R6); return result.
+`src/model_downloads.rs` adds `quant_pattern: Option<String>` to `ModelDownloadJob`, populates it from `StartDownloadRequest`, and exposes `effective_models_dir` + `resolve_catalog_entry` as `pub(crate)` so the server can re-validate against the catalog and on-disk layout rather than trusting the browser.
 
-Dashboard: `renderToolboxModelRow` (llama_cpp, completed) gains the button → `registerInLlamaSwap(modelId, quantPattern)` → `POST /api/llama-swap/register-model` → toast.
+`src/server.rs` adds `POST /api/llama-swap/register-model`, the `/api/llama-swap/` destructive gate, and `AppState.llama_swap_config_lock`. The existing raw config writer also takes the lock. The register handler resolves the llama_cpp catalog entry, computes destination from `effective_models_dir + repo_basename`, resolves the GGUF, inserts the entry, writes backup + unique temp + rename under the lock, restarts llama-swap through the same systemd mechanism, polls `/v1/models`, and restores the backup on reload/health failure.
 
+Dashboard flow:
 ```
-Downloads(llama_cpp, complete) ──"Register in llama-swap"──▶ POST /api/llama-swap/register-model
-   └─ resolve_primary_gguf → insert_model_entry(dedup+validate) → backup+atomic write → reload → /api/models/llama-swap shows it
+completed llama_cpp download job (with quant_pattern)
+  └─ Register in llama-swap
+      └─ POST /api/llama-swap/register-model
+          └─ resolve GGUF → insert validated entry → backup+atomic write → restart → /v1/models poll → success or restored failure
 ```
 
 ## Alternatives considered
@@ -114,7 +108,24 @@ Downloads(llama_cpp, complete) ──"Register in llama-swap"──▶ POST /api
 - **ds4/halogen/r9v in llama-swap.** Out of scope: served by their own Server-Mode servers; the equivalent is routing to the serving-identity (separate feature).
 
 ## Detailed implementation
-(enumerated files: `src/llama_swap_register.rs` new; `src/server.rs` handler + route + reload reuse; `src/lib.rs` module decl; `src/escalation/templates/main_dashboard.html` button + `registerInLlamaSwap` + a UI test in `scripts/`; no schema/migration.) Ordered: pure cores + tests → handler/route → UI + test → docs.
+
+Files:
+- `src/llama_swap_register.rs` — **new**. Implements `RegisterError`, `resolve_primary_gguf`, shard/auxiliary helpers, `build_entry`, `insert_model_entry`, `path_visibility_warning`, and unit tests.
+- `src/lib.rs` — **modify**. Add `pub mod llama_swap_register;`.
+- `src/model_downloads.rs` — **modify**. Add `quant_pattern` to `ModelDownloadJob`, populate it for download jobs, keep it `None` for PLE jobs, and make `effective_models_dir` / `resolve_catalog_entry` `pub(crate)`.
+- `src/server.rs` — **modify**. Add typed request/response for registration, route `POST /api/llama-swap/register-model`, shared `llama_swap_config_lock`, destructive gate coverage, locked raw config writer, unique temp/backup helpers, restart helper refactor, `/v1/models` health poll, restore-on-failure behavior, and gate unit test.
+- `src/daemon.rs` — **modify**. Initialize `llama_swap_config_lock` in `AppState`.
+- `src/escalation/templates/main_dashboard.html` — **modify**. Render Register button only for completed llama_cpp download jobs with `quant_pattern`; add `registerInLlamaSwap(modelId, quantPattern)` POST + operator alert.
+- `scripts/test-llama-swap-register-ui.cjs` — **new**. Node VM test for button gating and POST body.
+- `docs/design/llama-swap-register-downloaded-gguf.md` — **modify**. Record v2 blocker resolutions and implementation log.
+
+Implementation order:
+1. Update this design doc to v2 and mark `approved-for-implementation`.
+2. Add pure module + unit tests.
+3. Persist `quant_pattern` on download jobs and expose the catalog/path helpers.
+4. Add server state lock, route gate, handler, transaction helpers, restart health poll, and locked existing config writer.
+5. Add dashboard button/action and UI test.
+6. Run focused tests, full Rust tests, clippy, HTML/JS check, and Node UI test.
 
 ## Testing and evaluation
 - Rust: `resolve_primary_gguf` (single/glob/folder/sharded/none/ambiguous via tempdir); `insert_model_entry` (insert-after-models, dedup 409, re-parse valid, invalid-base errors). `cargo test --locked -- --test-threads=1`.
@@ -163,5 +174,22 @@ None blocking. (ds4-via-llama-swap-wrapper and Server-Mode routing are explicitl
   - Self-audit: relied on nothing beyond the doc + referenced files; treated unverified `hf`/`llama-server-toolbox` behavior as blockers, not assumptions.
   - Disposition: **deferred** (see Status). B2 (UX/download-tracking) and B6 (deployment path-namespace) need investigation + a user decision before a safe v2; the epic proceeds with the toolbox `--label` fix and Feature B first.
 
+- **Readiness resolution — Round 2** (doc v2; 2026-09-27; coordinator-provided verified decisions plus repository re-read during implementation).
+  - Verdict: **READY / approved-for-implementation**.
+  - B1 resolved by quant-scoped `resolve_primary_gguf`, auxiliary rejection, shard completeness, canonicalization, and 409-on-ambiguity.
+  - B2 resolved by storing `quant_pattern` on `ModelDownloadJob` and rendering registration on completed llama_cpp job rows; server still re-validates catalog + disk.
+  - B3 resolved by structural YAML parse/dedup before text insertion and re-parse/placement assertion after insertion; inline `models: {}` handled safely.
+  - B4 resolved by shared `llama_swap_config_lock`, backup, hash re-check, unique temp+rename, restart, `/v1/models` health poll, and restore-on-failure response.
+  - B5 resolved by `/api/llama-swap/` destructive gate and typed, size-capped JSON body.
+  - B6 resolved by verified toolbox path contract: `/mnt/models` and `$HOME` are visible; canonical paths outside `/mnt`/`$HOME` are allowed with a warning; baseline label does not claim load tuning.
+  - I1 resolved by reloading only after a successful validated write and reporting reload/restored status distinctly.
+  - I2 resolved by making `effective_models_dir` / catalog lookup `pub(crate)` and validating the request as llama_cpp-only.
+  - I3 resolved by adding Rust resolver/inserter/gate tests and a named UI test.
+  - Self-audit: no unresolved implementation question remains outside this v2 document and its referenced files.
+
+## Implementation log
+
+- 2026-09-27 — Implemented v2 design in `src/llama_swap_register.rs`, `src/model_downloads.rs`, `src/server.rs`, `src/daemon.rs`, `src/lib.rs`, dashboard HTML, and `scripts/test-llama-swap-register-ui.cjs`. Validation results are recorded in the final session report.
+
 ## Human approval
-Skipped by explicit user delegation ("work autonomously, make good decisions"); user unavailable. Recorded per HankNDory rule 7. Isolated Dory critic + mean review still performed. Safety design (backup/validate/atomic/restore) chosen specifically because deploy is unattended on a critical config.
+Skipped by explicit user delegation/autopilot for this implementation session. The coordinator supplied concrete, verified resolutions for every prior Dory blocker and instructed implementation. Recorded per HankNDory rule 7.

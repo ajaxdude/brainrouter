@@ -459,6 +459,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
             std::fs::canonicalize(&p).unwrap_or(p)
         },
+        llama_swap_config_lock: Arc::new(tokio::sync::Mutex::new(())),
         tcp_addr: tcp_addr.to_string(),
         manifest_enabled: config.manifest.enabled,
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(routing_mode)),

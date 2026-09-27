@@ -104,6 +104,10 @@ pub struct ModelDownloadJob {
     /// The catalog entry this job concerns — a model id for `Download`
     /// jobs, r9v's package id for `PreparePle` jobs.
     pub model_id: String,
+    /// The llama_cpp quant/pattern used for this download, retained so a
+    /// completed job row can safely offer downstream registration actions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant_pattern: Option<String>,
     /// Where the job's output lands — the model's destination directory
     /// for `Download` jobs, r9v's `ple_dir` for `PreparePle` jobs.
     pub destination: String,
@@ -263,7 +267,7 @@ pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
 /// config.json"), falling back to the catalog's own
 /// `backends.<id>.storage.default` (verified present for all four
 /// download-capable backends in the vendored fixture — see design doc §10).
-fn effective_models_dir(backend: SupportedServingBackend, storage: &serde_json::Value) -> PathBuf {
+pub(crate) fn effective_models_dir(backend: SupportedServingBackend, storage: &serde_json::Value) -> PathBuf {
     let cockpit = crate::cockpit_config::load();
     let override_dir = cockpit.config.as_ref().and_then(|c| c.models_dir(backend.as_str()));
     let catalog_default = storage.get("default").and_then(serde_json::Value::as_str);
@@ -275,7 +279,7 @@ fn effective_models_dir(backend: SupportedServingBackend, storage: &serde_json::
 /// and the backend's `storage` metadata (§10). Returns a `Validation` error
 /// (not `NotFound`) for `vllm`/unsupported backends, since that's a request
 /// shape problem, not a missing-resource one.
-fn resolve_catalog_entry(
+pub(crate) fn resolve_catalog_entry(
     backend: SupportedServingBackend,
     model_id: &str,
 ) -> Result<(ModelPayload, serde_json::Value), DownloadError> {
@@ -1054,6 +1058,7 @@ impl ModelDownloadRegistry {
             kind: JobKind::Download,
             backend,
             model_id: request.model_id.clone(),
+            quant_pattern: request.quant_pattern.clone(),
             destination: built.destination.display().to_string(),
             status: DownloadStatus::Queued,
             message: "Waiting for the download execution slot".to_string(),
@@ -1114,6 +1119,7 @@ impl ModelDownloadRegistry {
             kind: JobKind::PreparePle,
             backend: SupportedServingBackend::R9v,
             model_id: req.package_id.clone(),
+            quant_pattern: None,
             destination: resolved.ple_dir.display().to_string(),
             status: DownloadStatus::Queued,
             message: "Waiting for the job execution slot".to_string(),

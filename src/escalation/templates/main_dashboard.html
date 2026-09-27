@@ -3683,7 +3683,6 @@ function renderToolboxModelRow(entry) {
 
   const runningJob = toolboxDownloadJobs.find(j => j.backend === backend && j.model_id === entry.id
     && (j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying'));
-
   let action;
   if (runningJob) {
     action = `<span style="font-size:10px;color:var(--cyan)">${escHtml(runningJob.status)}…</span>
@@ -3694,7 +3693,7 @@ function renderToolboxModelRow(entry) {
     // static catalog — the catalog has no quant/pattern field for
     // llama_cpp at all. Replicating that live lookup is out of scope for
     // this PR (design doc §10), so the operator types the pattern
-    // themselves, same info they'd see on the HF repo page.
+    // themselves, same info they'd see on the HF repo page..
     const inputId = 'quant-input-' + entry.id;
     action = `<input id="${inputId}" placeholder="quant pattern e.g. Q4_K_M.gguf or BF16" style="font-size:11px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);width:200px">
       <button onclick="startModelDownload(${JSON.stringify(backend)}, ${JSON.stringify(entry.id)}, document.getElementById(${JSON.stringify(inputId)}).value)" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--cyan);cursor:pointer">Download</button>`;
@@ -3737,6 +3736,23 @@ async function cancelModelDownload(jobId) {
   loadToolboxModels();
 }
 
+async function registerInLlamaSwap(modelId, quantPattern) {
+  try {
+    const r = await fetch('/api/llama-swap/register-model', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_id: modelId, quant_pattern: quantPattern }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert('llama-swap registration failed: ' + (j.error || r.status)); return; }
+    let msg = `${j.llama_swap_id || modelId}: ${j.message || j.status || 'registered baseline'}`;
+    if (j.warning) msg += `\nWarning: ${j.warning}`;
+    alert(msg);
+  } catch (e) {
+    alert('llama-swap registration failed: ' + e);
+  }
+  loadToolboxModels();
+}
+
 async function verifyModelChecksums(backend, modelId) {
   try {
     const r = await fetch('/api/model-downloads/verify', {
@@ -3765,12 +3781,15 @@ function renderToolboxDownloadJobRow(job) {
   const color = DOWNLOAD_STATUS_COLORS[job.status] || 'var(--textMute)';
   const terminal = job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled';
   const cancelBtn = terminal ? '' : `<button onclick="cancelModelDownload(${JSON.stringify(job.id)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--red);cursor:pointer">Cancel</button>`;
+  const registerBtn = job.backend === 'llama_cpp' && job.kind === 'download' && job.status === 'complete' && job.quant_pattern
+    ? `<button onclick="registerInLlamaSwap(${JSON.stringify(job.model_id)}, ${JSON.stringify(job.quant_pattern)})" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--green);cursor:pointer" title="Register the completed downloaded GGUF as a llama-swap baseline entry">Register in llama-swap</button>`
+    : '';
   return `<div style="display:flex;flex-direction:column;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
     <div style="display:flex;align-items:center;gap:8px">
       <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0"></span>
       <span style="font-size:11px;font-weight:600;color:var(--text)">${escHtml(TOOLBOX_BACKEND_LABELS[job.backend] || job.backend)} · ${escHtml(job.model_id)}</span>
       <span style="font-size:10px;color:${color}">${escHtml(job.status)}</span>
-      <span style="margin-left:auto">${cancelBtn}</span>
+      <span style="margin-left:auto;display:flex;gap:6px">${registerBtn}${cancelBtn}</span>
     </div>
     <div style="font-size:10px;color:var(--textMute);overflow-wrap:anywhere">${escHtml(job.message || '')}</div>
   </div>`;
