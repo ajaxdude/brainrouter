@@ -4,7 +4,7 @@
   <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
 </p>
 
-A Rust proxy and local control plane between coding harnesses and LLMs. Choose independent Main, Reviewer, and local Subagent roles, inspect current model activity and completed-stream measurements, and explore imported benchmarks without running benchmark jobs. Bonsai classification and Manifest cloud access are opt-in; the defaults stay local. Core management and reviews have a headless CLI, while the benchmark and model-observability pages also expose HTTP APIs.
+A Rust proxy and local control plane between coding harnesses and LLMs. Choose independent Main, Reviewer, and local Subagent roles globally or per Git project, inspect current model activity and completed-stream measurements, manage six local serving backends, and explore imported benchmarks without running benchmark jobs. Bonsai classification and Manifest cloud access are opt-in; the defaults stay local. Core management and reviews have a headless CLI, while the dashboard, benchmark, model-download, project-pin, and model-observability pages also expose HTTP APIs.
 
 ```
 coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
@@ -25,14 +25,14 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 ```
 
 - **One endpoint, all harnesses.** OpenAI-compatible on `POST /v1/chat/completions`. Anthropic-compatible on `POST /v1/messages`. Every harness connects to the same `:9099`.
-- **Independent routing roles.** Choose Main, Reviewer (explicit local or cloud ID), and a separate local Subagent pool, or apply a named preset. Legacy `auto`, `local`, `cloud`, and `subs` aliases remain supported. Cloud and Bonsai stay off by default.
+- **Independent routing roles.** Choose Main, Reviewer (explicit local or cloud ID), and a separate local Subagent pool, or apply a named preset. Per-project pins can override those three roles for one Git repository while every unpinned project inherits the global profile. Legacy `auto`, `local`, `cloud`, and `subs` aliases remain supported. Cloud and Bonsai stay off by default.
 - **Off by default, opt in.** Fresh installs run fully local with a single hop — no Bonsai model download, no Manifest stack, no cloud API key required.
 
 - **Optional local prompt rewriting.** Managed local routes can use a lean system prompt. Rewriting is off at startup, requires a running healthy Bonsai to enable through the control API, and never rewrites explicit local model selections.
 - **Subs pool routing.** `subs` / `brainrouter/subs` selects the separate local pool (initially `llama_swap.subs_model`). The pool is independent of Main and Reviewer; clearing it restores classifier/auto behavior, not the Main override.
 - **Manifest cloud failover.** When Manifest is enabled, `cloud` traffic goes through it (runs locally in Docker, picks the cloud provider) and falls back to llama-swap's `fallback_model` on failure.
-- **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). The review LLM reads your PRD, git diff, and task summary, then either approves or gives actionable feedback.
-- **Dashboard.** Live routing feed, review session list, version display, one-click upgrades and service restarts — all at `http://127.0.0.1:9099`.
+- **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). Runtime toggles control whether review runs, whether PR-structuring guidance is injected into agent requests, and whether HankNDory design-aware review must compare the diff with an approved design. The reviewer prompt is budgeted against a conservative local/cloud context window before any LLM call.
+- **Dashboard.** Overview, Models, Benchmarks, and Config are the primary destinations. A command strip keeps model scope/role controls, flush/restart/sync actions, health, and quality posture visible at `http://127.0.0.1:9099`.
 - **Benchmark explorer.** Import reproducible model/runtime/hardware results, compare throughput, memory, context scaling, quantizations, runtimes, speculation, and quality, inspect configurations, and export filtered CSV or JSONL at `http://127.0.0.1:9099/benchmarks`.
 - **Headless CLI.** `brainrouter cli` covers status, operations, routing profiles, and reviews. Use HTTP for benchmark and observability workflows without a dedicated CLI command. See [Headless CLI](#headless-cli-brainrouter-cli).
 - **Model observability.** `/models` shows exact local model activity, available metadata, uniquely correlated completed measurements, indicative rolling warnings, and explicit benchmark references. Missing measurements and unverified comparability are visible, not fabricated.
@@ -59,8 +59,8 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 12. [Planned, not shipped](#planned-not-shipped)
 
 This documents the implemented source through `3691dcc` (2026-09-07), extended
-through `5bd04d3` (2025-09-19) by the native ds4/halogen/vllm/r9v toolbox
-backend integration — see [Toolbox backend management](#toolbox-backend-management)
+through `32935d1` by the native ds4/halogen/vllm/r9v/gufo toolbox
+backend integration, dashboard navigation redesign, per-project model pins, and review hardening — see [Toolbox backend management](#toolbox-backend-management)
 and `docs/design/ai-toolbox-cockpit-integration.md`. Source transfer or a Git
 update is not a binary rollout: building, installing, and restarting a running
 service are separate operations. See [PRD.md](PRD.md) for requirements and the
@@ -441,17 +441,23 @@ Version metadata is cached and refreshed in the background (normally every
 controls are explicit operations; they are not triggered by opening model or
 benchmark pages.
 
-### Service controls (nav bar)
+### Navigation and command strip
 
-The sidebar includes four restart controls and a model-flush action:
+The dashboard left rail is intentionally small: **Overview**, **Models**, **Benchmarks**, and **Config**. **Models** opens internal sub-tabs for **Local models**, **Downloads**, and **Serving**, plus a **Model activity ↗** link to the standalone `/models` page. **Overview** keeps the live cards, Sankey, in-flight table, KPIs, and HankNDory verdict ledger. **Config** holds quality toggles, bridge controls, toolbox management, service status, service restarts, raw YAML editors, and agent files.
 
-| Button | What it does |
+The always-visible command strip above the content contains:
+
+| Control | What it does |
 |---|---|
-| **Restart llama-swap** | `systemctl --user restart llama-swap` |
-| **Restart llama.cpp** | Refreshes the toolbox container (runs configured restart script) |
-| **Restart Manifest** | `docker compose restart manifest` |
-| **Restart brainrouter** | `systemctl --user restart brainrouter` — page reloads after 3 s |
-| **⏏ Flush Models** | Unloads every model from llama-swap memory (frees VRAM) without restarting; models reload on next request |
+| **Scope** | Switches between the global routing profile and loaded Git projects with per-project pins |
+| **Main backend/model** | Edits the active scope's Main role; reviewer and subagent controls live in the expander |
+| **Flush Models** | Unloads every model from llama-swap memory (frees VRAM) without restarting |
+| **Restart Local Stack** | Restarts `llama-swap` |
+| **Sync Models → OMP** | Writes llama-swap model keys into OMP's models file |
+| **Health pill** | Summarizes service health from `/api/service-health` |
+| **Quality posture** | Shows reasoning, code-review, HankNDory, and PR-guideline state from their existing APIs |
+
+Rare restarts — **Restart llama.cpp**, **Restart Manifest**, and **Restart brainrouter** — are under Config → Service controls.
 
 ### Review sessions
 
@@ -476,43 +482,96 @@ Preferences persist across restart. Existing reviews and their continuations
 retain the original reviewer; see [Routing controls](#routing-controls) for
 precedence, migration, commands, and exact fallback behavior.
 
+### Per-project model pins
+
+Use the command strip's **Scope** selector to keep one global profile while pinning different model choices for specific repositories. A project key is the canonical absolute Git repository root of the request `cwd`; non-Git and relative paths cannot be pinned and simply inherit the global profile. The dashboard can resolve an arbitrary absolute path with `GET /api/project-pin?path=...`, then shows whether each role is inherited or pinned.
+
+Pins are per role:
+
+| Role | Stored value | Used when |
+|---|---|---|
+| **main** | `{backend, model}` or inherit | Client sends empty/default, `auto`, or `brainrouter/auto` |
+| **reviewer** | `{backend, model}` or inherit | Fresh review session is created; continuations keep the original snapshot |
+| **subagent** | Local model key or inherit | Client sends `subs` or `brainrouter/subs` |
+
+Main routing precedence is **explicit request model > project pin > global profile > auto**. Reviewer pins are injected into the new review's `ReviewConfig` before admission; subagent pins only affect the `subs` aliases. Pins persist across restart in owner-only `project_pins.json` next to the default config state. `POST /api/project-pin` is a strict full replacement body with `path`, `main`, `reviewer`, and `subagent` keys (use `null` to inherit); unknown or missing fields are rejected. `DELETE /api/project-pin` removes by normalized `key`. Mutating calls, and the `?path=` resolver, are loopback/CSRF-gated.
+
+### Quality and review controls
+
+Config → **Quality** exposes four runtime toggles: thinking-budget nudge
+(`/api/nudge`), code review on/off (`/api/review/enabled`), PR-generation
+guidelines (`/api/review/pr-guidelines`), HankNDory design-aware review
+(`/api/review/hankndory`), plus local prompt rewrite (`/api/prompt-rewrite`).
+The command strip posture line reflects those same states, and the Overview
+right rail shows the HankNDory verdict ledger from `/api/review/status`.
+
+The model strip uses constrained local dropdowns for **Main**, **Reviewer**,
+and the always-local **Subagent pool** when provider discovery succeeds, while
+preserving explicit/custom IDs for unavailable or cloud models. The reviewer
+dropdown affects new review snapshots only; the subagent dropdown affects only
+the `subs` aliases.
+
+Reviews also use a token-aware prompt budget: the prompt builder estimates the
+whole review prompt against conservative defaults (8K local, 128K cloud),
+reserves output tokens, and terminally escalates rather than returning a
+confident approval if protected task/criteria text overflows or required
+diff/design evidence had to be truncated.
+
 ## Toolbox backend management
 
 brainrouter is a native Rust webui for [kyuz0's `ai-toolbox-cockpit`](https://github.com/kyuz0/ai-toolbox-cockpit) —
 a Python Textual TUI with no CLI/API mode. It covers **`ds4`, `halogen`,
-`vllm`, `r9v`, and `llama_cpp`** toolboxes/models/servers; **`comfyui`
+`vllm`, `r9v`, `gufo`, and `llama_cpp`** toolboxes/models/servers; **`comfyui`
 (image-gen) is never surfaced.** Everything below works whether or not
 cockpit itself is installed on the host. Full design rationale lives in
 `docs/design/ai-toolbox-cockpit-integration.md`.
 
 ### Toolboxes panel
 
-Lists podman containers across all five backends (not just llama.cpp),
+Lists podman containers across all six backends (not just llama.cpp),
 sourced from a vendored, weekly-CI-refreshed copy of cockpit's own
-`toolboxes.json`/`models.json` catalog (`assets/cockpit-catalog/`). From here
-you can create a new toolbox from any catalog entry, pull+recreate
+`toolboxes.json`/`models.json` catalog (`assets/cockpit-catalog/`) plus the
+brainrouter-owned gufo overlay. From here you can create a new toolbox from any catalog entry, pull+recreate
 (update) an existing one, delete one, or **adopt** a container you created
 outside brainrouter (via cockpit or manually) so it shows up as managed.
+
+Fedora Toolbx does not support `toolbox create --label`, so ownership for
+brainrouter-created toolboxes is recorded in an owner-only
+`managed_toolboxes.json` sidecar keyed by podman container ID. Destructive
+operations are allowed only for legacy-labeled containers or when the sidecar
+ID matches the live container ID; update/delete use ID-bound `podman rm
+--force <id>`, and adopt records the current live ID without recreating it.
 
 ### Server Mode panel
 
 Starts/stops/checks status of headless, detached servers for `ds4`,
-`halogen`, `vllm`, and `r9v` — separate from the interactive Toolboxes-tab
-containers. Each backend's own defaults (batch size, GPU layers, KV cache
-type, etc.) come straight from the catalog's `toolbox_defaults`. **R9V ships
-behind an explicit "unverified" badge** — no real 2×AMD R9700 hardware was
-reachable to validate ROCm/HSA device passthrough end-to-end; command
+`halogen`, `vllm`, `r9v`, and `gufo` — separate from the interactive
+Toolboxes-tab containers. Each backend's own defaults (batch size, GPU
+layers, KV cache type, etc.) come straight from the effective catalog. **R9V
+ships behind an explicit "unverified" badge** — no real 2×AMD R9700 hardware
+was reachable to validate ROCm/HSA device passthrough end-to-end; command
 construction is verified against upstream source, not live hardware.
+
+**gufo** is a brainrouter-owned overlay backend, not part of the vendored
+upstream cockpit catalog. It targets Strix Halo with ROCm and the image
+`ghcr.io/gufo-org/toolboxes/gufo-runtime:latest`. Server Mode launches a
+fixed detached container with `gufo serve --host 0.0.0.0 --port <port>
+--sessions <n> llm --model /models/<main>.gguf --served-model-name <id>
+--context <ctx>`; models that declare a DFlash2 draft add
+`--speculative dflash2 --dflash-model /models/<draft>.gguf`. gufo is recorded
+as OpenAI-compatible serving identity bookkeeping (`engine=rocm`,
+`openai_compatible=true`) but is still not a routable `/v1/chat/completions`
+upstream.
 
 ### Models panel
 
 Browse the catalog's models per backend and trigger downloads through each
-backend's own native mechanism (`ds4`/`halogen`/`r9v`/`llama_cpp`; `vllm`
+backend's own native mechanism (`ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp`; `vllm`
 pulls from Hugging Face on demand at server start instead, matching
 upstream). Progress is a raw log tail, not a byte-level progress bar — the
 underlying `hf` CLI has no machine-readable progress output to drive one.
 
-**Prerequisite — the Hugging Face CLI.** `ds4`/`halogen`/`r9v`/`llama_cpp`
+**Prerequisite — the Hugging Face CLI.** `ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp`
 downloads run the `hf` CLI on the host, so it must be installed and
 resolvable on the brainrouter **service's** PATH. Install it with:
 
@@ -551,7 +610,7 @@ integration for Server Mode containers is unshipped (see
 - **No CLI parity.** `brainrouter cli toolboxes`/`upgrade toolbox` remain
   llama.cpp-only; the new backends are dashboard/API-only.
 - **No request routing to Server Mode containers.** Starting a ds4/halogen/
-  vllm/r9v server makes it visible and manageable, not dispatchable as live
+  vllm/r9v/gufo server makes it visible and manageable, not dispatchable as live
   LLM traffic.
 
 ## Model observability and regression alerts
@@ -630,14 +689,14 @@ Draft-artifact references must exist.
 `vulkan`); `migrations/0003_toolbox_serving_dimension.sql` adds
 `serving_runtimes` and `toolbox_catalog_snapshot` — nullable, additive
 columns/tables recording which toolbox backend (`ds4`/`halogen`/`vllm`/`r9v`/
-`llama_cpp`) and compute engine (`vulkan`/`rocm`/etc.) produced a run, without
+`gufo`/`llama_cpp`) and compute engine (`vulkan`/`rocm`/etc.) produced a run, without
 requiring older rows to be backfilled. `/api/benchmarks/filters` and
 `/api/benchmarks/runs` both accept `backend`/`engine` alongside the existing
 `family`/`workload`/`quant_name` filters.
 
 A new **spider/radar chart** lets you pick two or more axes from **models,
 harnesses, engine, backend, toolbox, speed, and TEPR** and plot one polygon
-per selected series (e.g. compare `r9v` vs. `llama_cpp` across three models).
+per selected series (e.g. compare `r9v` or `gufo` vs. `llama_cpp` across three models).
 Backed by `GET /api/benchmarks/spider`.
 
 > **TEPR ("token efficiency to positive result")**: `TEPR =
@@ -973,8 +1032,9 @@ The review tool is exposed over MCP so any harness can call it after completing 
 1. Your harness calls `mcp_brainrouter_request_review` with a task ID and summary.
 2. brainrouter gathers context: your project's PRD (auto-detected from `docs/PRD.md`, `PRD.md`, or `README.md`), the current `git diff HEAD`, and any `AGENTS.md`.
 3. The new session snapshots its Reviewer choice and iteration settings. Main and Subagent changes do not change that reviewer.
-4. The loop requests JSON `{status, feedback}` from the selected reviewer, with bounded rounds and parsing/error handling.
-5. Agents can act on feedback, request a new review, or continue the existing session through the CLI/API. Continuation reuses its initial reviewer and prior in-memory turns.
+4. The loop builds a token-budgeted prompt for the admitted reviewer (local defaults to an 8K conservative window, cloud to 128K), reserves output tokens, and escalates instead of approving when required diff/design evidence is truncated.
+5. The loop requests JSON `{status, feedback}` from the selected reviewer, with bounded rounds and parsing/error handling.
+6. Agents can act on feedback, request a new review, or continue the existing session through the CLI/API. Continuation reuses its initial reviewer and prior in-memory turns.
 6. Exhausted iterations or LLM errors escalate to human review. `/review/` redirects to the dashboard; session pages and JSON/CLI session listing remain available. Sessions/turns do not survive daemon restart.
 
 ### Tool parameters
@@ -1172,6 +1232,8 @@ terminates the sandboxed daemon instead of leaving an account-locking orphan.
 |---|---|
 | Selected YAML | `serve --config`, else `$XDG_CONFIG_HOME/brainrouter/brainrouter.yaml` or `~/.config/brainrouter/brainrouter.yaml` |
 | Role preferences | Per-user `routing_state.json` in the default config directory, even with a different `--config`; overrides YAML role defaults |
+| Per-project model pins | Per-user `project_pins.json` in the default config directory; canonical absolute Git-root keys, owner-only atomic writes |
+| Managed toolbox ownership | Selected config path with file name `managed_toolboxes.json`; records brainrouter-created/adopted podman container IDs, owner-only |
 | Legacy review overrides | Sibling `review_state.json`, read once if no new routing state exists, then normalized/persisted; source left unchanged |
 | Benchmark records | `benchmarks.database_path`, default `$XDG_DATA_HOME/brainrouter/benchmarks.sqlite3` or `~/.local/share/brainrouter/benchmarks.sqlite3` |
 | Observation policy/mappings | Selected YAML path with extension replaced by `.observability.json`; no live request history |
@@ -1243,8 +1305,13 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `POST` | `/api/bonsai/toggle` | Stop/start the Bonsai classifier to free/reclaim VRAM |
 | `GET/POST` | `/api/nudge` | Thinking-budget nudge state / update `{enabled, tier}` |
 | `GET/POST` | `/api/prompt-rewrite` | Prompt-rewrite state / update `{enabled}` |
+| `GET/POST` | `/api/review/enabled` | Runtime code-review master switch |
+| `GET/POST` | `/api/review/pr-guidelines` | Runtime PR-structuring guideline injection toggle |
+| `GET/POST` | `/api/review/hankndory` | Runtime design-aware review toggle |
+| `GET` | `/api/review/status` | HankNDory/review verdict ledger status |
 | `GET/POST` | `/api/routing-mode` | Routing override / set `{mode}` |
 | `GET/POST` | `/api/routing-profile` | Independent role profile; POST `{preset,main,reviewer,subagent_model}` |
+| `GET/POST/DELETE` | `/api/project-pin` | Per-project role pins; `?path=` resolves an absolute path to a canonical Git-root key |
 | `GET` | `/api/routing-models` | Local/cloud catalog with explicit per-provider discovery errors; no inference |
 | `POST` | `/api/bridges/toggle` | Toggle `{bridge, enabled}`; read state from `/api/bridge-status` |
 | `GET` | `/api/toolboxes` | List llama-* toolbox containers |
@@ -1256,23 +1323,23 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 
 #### Toolbox backend management
 
-Native Rust management for `ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp` toolboxes,
+Native Rust management for `ds4`/`halogen`/`vllm`/`r9v`/`gufo`/`llama_cpp` toolboxes,
 models, and detached servers — brainrouter as a webui for `ai-toolbox-cockpit`,
 without needing cockpit installed or running. `comfyui` is never exposed.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/toolbox-catalog` | Typed `toolboxes.json` catalog (all 5 backends) |
+| `GET` | `/api/toolbox-catalog` | Effective typed catalog: vendored cockpit catalog plus gufo overlay (all 6 backends) |
 | `GET` | `/api/toolbox-models` | Typed `models.json` catalog |
-| `GET` | `/api/toolbox-containers` | Podman containers across all 5 backends, with ownership/adoption status |
+| `GET` | `/api/toolbox-containers` | Podman containers across all 6 backends, with ownership/adoption status |
 | `POST` | `/api/toolbox-containers` | Create a container from a catalog entry |
-| `POST` | `/api/toolbox-containers/:name/update`\|`/delete`\|`/adopt` | Pull+recreate / remove / adopt-as-managed |
-| `GET/POST` | `/api/model-downloads` | List / start a download job (ds4/halogen/r9v/llama_cpp; not vllm, which pulls from HF on demand) |
+| `POST` | `/api/toolbox-containers/:name/update`\|`/delete`\|`/adopt` | Pull+recreate / remove / record live container ID as managed |
+| `GET/POST` | `/api/model-downloads` | List / start a download job (ds4/halogen/r9v/gufo/llama_cpp; not vllm, which pulls from HF on demand) |
 | `GET` | `/api/model-downloads/:id` | Job detail — raw-log-tail progress, no byte-level bar |
 | `POST` | `/api/model-downloads/:id/cancel` | Cancel a download job |
 | `POST` | `/api/model-downloads/verify` | Verify a downloaded model's integrity |
 | `POST` | `/api/model-downloads/r9v/prepare-ple` | R9V's second readiness gate |
-| `GET/POST` | `/api/server-mode/{ds4,halogen,vllm,r9v}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
+| `GET/POST` | `/api/server-mode/{ds4,halogen,vllm,r9v,gufo}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
 | `POST` | `/api/server-mode/vllm/cache-paths` / `/api/server-mode/r9v/paths` | Per-backend path configuration |
 | `GET` | `/api/serving-identities` | Read-only registry of running Server Mode containers; **bookkeeping only, not routing** |
 | `GET` | `/api/cockpit-config` | Read cockpit's own `~/.config/ai-toolbox-cockpit/config.json` |
@@ -1427,9 +1494,9 @@ plans found in the separate Quant Lab / Model Compare notes:
   parsing, and per-token distributions.
 - **Model Compare:** complete common-suite execution for unrelated model
   families, compatible token-space/KLD checks, and blind human evaluation.
-- Persistent request/review history, cloud cost/budget enforcement, per-project
-  profiles, optional strict cloud fallback consent, reviewer-diversity policies,
-  or review escalation ladders.
+- Persistent request/review history, cloud cost/budget enforcement, non-model
+  per-project settings, optional strict cloud fallback consent, reviewer-diversity
+  policies, or review escalation ladders.
 - Automatic benchmark scheduling, controlled regression campaigns, model
   switching, outbound alerts, Parquet export, or runtime-loaded-asset attestation.
 - A working `/api/context` control/automatic runtime context selection; the
@@ -1442,7 +1509,7 @@ not imply that these execution or verification pipelines exist.
 **ai-toolbox-cockpit integration gaps** (see
 `docs/design/ai-toolbox-cockpit-integration.md` for full rationale):
 
-- No `brainrouter cli` parity for ds4/halogen/vllm/r9v toolbox, model, or
+- No `brainrouter cli` parity for ds4/halogen/vllm/r9v/gufo toolbox, model, or
   Server Mode management — dashboard/API-only today.
 - No request routing to Server Mode containers; they're visible and
   manageable, not dispatchable as live LLM traffic (`status_only` in the
@@ -1454,5 +1521,4 @@ not imply that these execution or verification pipelines exist.
 - config.json sharing is single-write "apply," not continuous bidirectional
   sync — concurrent edits from cockpit and brainrouter are not merged live.
 - No automatic ROCm/ROCm-vs-Vulkan hardware detection; engine selection is
-  driven by the catalog and user choice, not host GPU introspection.
-
+  driven by the catalog/gufo overlay and user choice, not host GPU introspection.

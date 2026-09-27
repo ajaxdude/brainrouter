@@ -1,9 +1,9 @@
 # brainrouter PRD
 
-**Status:** Shipped proxy/control plane, benchmark explorer, model observability, and native multi-backend toolbox management (ds4/halogen/vllm/r9v/llama_cpp); future work is explicitly separated below
+**Status:** Shipped proxy/control plane, benchmark explorer, model observability, per-project model pins, review hardening, and native multi-backend toolbox management (ds4/halogen/vllm/r9v/gufo/llama_cpp); future work is explicitly separated below
 **Language:** Rust
 **Binary:** `target/release/brainrouter`
-**Implementation baseline:** `3691dcc9ee7dee98f8355328d7e2e75f99faafdb` (2026-09-07); extended through `5bd04d37757802ad522d311732ca772c6447afdd` (2025-09-19) by the ai-toolbox-cockpit integration rollout — see [Toolbox Backend Management](#toolbox-backend-management) and `docs/design/ai-toolbox-cockpit-integration.md`
+**Implementation baseline:** `3691dcc9ee7dee98f8355328d7e2e75f99faafdb` (2026-09-07); extended through `32935d1` by the ai-toolbox-cockpit integration rollout, gufo overlay backend, dashboard navigation redesign, per-project pins, and review hardening — see [Toolbox Backend Management](#toolbox-backend-management) and `docs/design/ai-toolbox-cockpit-integration.md`
 **Config:** `$XDG_CONFIG_HOME/brainrouter/brainrouter.yaml` or `~/.config/brainrouter/brainrouter.yaml`; `serve --config` overrides it. Service environment files supply credentials; the daemon resolves configured environment-variable names.
 **Repository:** https://github.com/ajaxdude/brainrouter
 **Validation:** 391 Rust tests and 38 Node browser-logic tests passed at this baseline; see [Validation](#validation)
@@ -52,19 +52,20 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 
 A single Rust daemon that:
 
-1. **Separates routing roles.** The persisted Main choice handles `auto`, `brainrouter/auto`, and empty model selections; Reviewer has its own local/cloud/default choice; only `subs` or `brainrouter/subs` uses the separately selected local pool. Named presets configure compatible combinations without merging these roles.
+1. **Separates routing roles.** The persisted Main choice handles `auto`, `brainrouter/auto`, and empty model selections; Reviewer has its own local/cloud/default choice; only `subs` or `brainrouter/subs` uses the separately selected local pool. Named presets configure compatible combinations without merging these roles. A per-project pin store can override Main, Reviewer, and Subagent for one canonical Git repository root while unpinned projects inherit the global profile.
 2. **Preserves explicit choices and fallback semantics.** Bare model IDs and `brainrouter/<id>` select that local model with no rewrite or model substitution on failure. `cloud/<id>` sends the exact ID to Manifest. Explicit `local`/`cloud` aliases select backend defaults, not the Main override. Cloud requests retain the existing local fallback policy on disabled/unavailable Manifest; errors after streaming begins surface to the client rather than replaying output.
-3. **Reviews code locally by default**, with explicit local or cloud reviewer IDs, requested-versus-actual reporting, and a reviewer snapshot retained for the lifetime of each review and its continuations.
-4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/halogen/vllm/r9v toolboxes, models, and detached servers** — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
+3. **Reviews code with runtime policy controls**, with explicit local or cloud reviewer IDs, requested-versus-actual reporting, and a reviewer snapshot retained for the lifetime of each review and its continuations. Runtime state can disable review, enable PR-generation guidance injection, and enable HankNDory design-aware review. Review prompts are token-budgeted before dispatch and escalate instead of approving when required evidence is truncated.
+4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/halogen/vllm/r9v/gufo toolboxes, models, and detached servers** — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
 5. **Keeps opt-ins explicit.** Bonsai and Manifest are disabled by default. A role set to Auto consults the classifier only when enabled; otherwise it selects local. Applying a cloud or hybrid preset does not enable Manifest.
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
-8. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
-9. **Tracks in-flight requests live.** A registry records every request at handler entry (before routing, so the dashboard sees it during model load) and holds it until the stream ends or the user cancels it. The dashboard shows one row per active request — elapsed time, model, user agent, address, session, bytes received, PP progress, and an activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button.
-10. **Measures completed requests by unique event ID.** Actual first-output timing and provider-reported token counts support bounded recent measurements across both wire protocols. Concurrent turns in the same conversation cannot overwrite each other's samples. Missing prompt-processing speed is not inferred from TTFT.
-11. **Explores imported benchmarks.** A normalized SQLite registry, strict Rust boundary models, immutable identities, transactional previews/imports, deterministic matrix expansion, structured inspector, telemetry plots, and bounded CSV/JSONL exports are exposed at `/benchmarks`.
-12. **Observes model activity without running benchmarks.** `/models` combines exact local model keys, read-only backend metadata, active requests, recent completed measurements, indicative regression warnings, and explicit benchmark references.
-13. **Isolates optional work.** Unavailable benchmark storage disables only explorer routes. Bounded blocking workers and response budgets keep benchmark work off the async routing executor. No benchmark runner, scheduler, automatic model switching, or outbound alerts are part of these additions.
+8. **Presents a simplified dashboard IA.** The primary dashboard destinations are Overview, Models, Benchmarks, and Config; an always-visible command strip exposes model scope/role controls, flush/restart/sync actions, health, and quality posture.
+9. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
+10. **Tracks in-flight requests live.** A registry records every request at handler entry (before routing, so the dashboard sees it during model load) and holds it until the stream ends or the user cancels it. The dashboard shows one row per active request — elapsed time, model, user agent, address, session, bytes received, PP progress, and an activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button.
+11. **Measures completed requests by unique event ID.** Actual first-output timing and provider-reported token counts support bounded recent measurements across both wire protocols. Concurrent turns in the same conversation cannot overwrite each other's samples. Missing prompt-processing speed is not inferred from TTFT.
+12. **Explores imported benchmarks.** A normalized SQLite registry, strict Rust boundary models, immutable identities, transactional previews/imports, deterministic matrix expansion, structured inspector, telemetry plots, and bounded CSV/JSONL exports are exposed at `/benchmarks`.
+13. **Observes model activity without running benchmarks.** `/models` combines exact local model keys, read-only backend metadata, active requests, recent completed measurements, indicative regression warnings, and explicit benchmark references.
+14. **Isolates optional work.** Unavailable benchmark storage disables only explorer routes. Bounded blocking workers and response budgets keep benchmark work off the async routing executor. No benchmark runner, scheduler, automatic model switching, or outbound alerts are part of these additions.
 
 ---
 
@@ -108,6 +109,12 @@ When an agent requests a review, the service snapshots its Reviewer choice and i
 - The same provider clients, circuit breakers, and streaming protections are reused.
 - Changing global preferences affects new reviews, not the reviewer of an existing session or continuation.
 
+### Per-project model pins
+
+`src/project_pins.rs` persists optional `{main, reviewer, subagent}` overrides keyed by the canonical absolute Git repository root of a request `cwd`. The store is loaded from `project_pins.json` beside the default config state, writes with owner-only atomic replacement, and treats missing/corrupt/unreadable files as empty so every project inherits the global profile by default. A lock-free `has_pins` flag keeps the proxy hot path from doing filesystem work when the store is empty or when the client sent a selector that never consults a pin.
+
+Role precedence is deliberately role-specific: Main uses **explicit request model > project pin > global profile > auto** for `auto`/empty selectors; Reviewer injects a reviewer pin into a fresh review's config snapshot before admission; Subagent consults the pin only for `subs`/`brainrouter/subs`. `GET /api/project-pin?path=...` normalizes a raw path for the dashboard, while `POST` is a strict full replacement (`path`, `main`, `reviewer`, and `subagent` all present; `null` means inherit) and `DELETE` removes by normalized key.
+
 ### Circuit breaker
 
 Two independent circuit breakers: one for `manifest`, one for `llama-swap`. Three failures within a window open the breaker; 60-second cooldown before retry. This prevents hammering a degraded provider while allowing automatic recovery.
@@ -134,6 +141,10 @@ Discord and Signal transports do not call LLMs directly. They shell out to the `
 
 The MCP server needs to know the caller's working directory. On Linux, brainrouter resolves this by mapping the peer's socket connection (TCP or UDS) back to a PID via `/proc`, then reading `/proc/<pid>/cwd`. This is a Linux-native approach that avoids requiring the caller to pass CWD explicitly, though callers may override it.
 
+### Dashboard navigation and command strip
+
+`src/escalation/templates/main_dashboard.html` organizes the main dashboard as four primary destinations: **Overview**, **Models**, **Benchmarks**, and **Config**. Models has internal tabs for Local models, Downloads, and Serving plus a link to `/models`. The command bar contains the frequent controls: project/global scope selector, Main model controls, reviewer/subagent expander, Flush Models, Restart Local Stack, Sync Models → OMP, a `/api/service-health` health pill, and a read-only posture line for nudge/review/HankNDory/PR state. Set-and-forget quality toggles, bridges, toolbox inventory, service status/restarts, and raw config editors live in Config.
+
 ### In-flight request registry (src/inflight.rs)
 
 The registry gives the dashboard a live view of every in-flight request — the "monitor LLM activity without opening llama-swap" goal. Each request registers an entry at handler entry, before `route_tagged`, so the row is visible during model load (when the registry is otherwise idle). The entry's identity (`InflightHandle`) is an `Arc` carried by the spawned routing task and, once routing resolves, by a `SniffStream` that wraps the provider's SSE stream. The row is removed when the last handle drops — i.e. at stream end, on a routing error (no stream is created, so the task-side handle is the last one), or on an explicit dashboard Cancel (a `watch` channel flips a flag; the `SniffStream` ends the stream immediately and the handles drop). Stale entries (older than a grace window) are swept on read.
@@ -158,6 +169,7 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | Bonsai server lifecycle | `src/bonsai_server.rs` | `BonsaiServer`: spawn, 60s health poll, SIGTERM→SIGKILL stop. `BonsaiControl`: runtime start/stop from the dashboard, shared enabled flag for the classifier |
 | Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
 | Routing preferences | `src/routing_profile.rs` | Typed role choices/presets, strict writes, atomic per-user state, legacy migration |
+| Project pins | `src/project_pins.rs` | Per-Git-repository role pins, canonical key resolution, atomic owner-only `project_pins.json` |
 | Prompt rewriter | `src/prompt_rewriter.rs` | System prompt rewriting for local mode (strips OMP bloat, injects anti-loop prompt) |
 | Anthropic shim | `src/anthropic.rs` | `/v1/messages` to `/v1/chat/completions` translation; strict SSE state machine |
 | MCP server | `src/mcp_server.rs` | JSON-RPC stdio; forwards to daemon over UDS |
@@ -171,22 +183,23 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | Benchmark store/domain | `src/benchmark.rs` | Validation, canonical identities, SQLite ingestion/query/detail/export, shared admission, `SpiderQuery`/`spider_chart()` for the radar chart |
 | Benchmark HTTP/imports | `src/benchmark/http.rs`, `src/benchmark/imports.rs` | Bounded workers/bodies/responses, rollback previews, reusable templates and examples |
 | Benchmark schema | `migrations/0001_benchmark_explorer.sql`, `migrations/0002_benchmark_lab.sql`, `migrations/0003_toolbox_serving_dimension.sql` | Versioned normalized STRICT tables, indexes, summary view; `serving_runtimes`/`toolbox_catalog_snapshot` for backend/engine dimensions |
-| Toolbox catalog | `src/toolbox_catalog.rs`, `src/toolbox_catalog/{types,models,schema_validate}.rs` | Typed, vendored `ai-toolbox-cockpit` catalog (`CatalogBackendId`/`SupportedServingBackend`/`ModelPayload`) + structural validator |
+| Toolbox catalog | `src/toolbox_catalog.rs`, `src/toolbox_catalog/{types,models,schema_validate,gufo_overlay}.rs` | Typed, vendored `ai-toolbox-cockpit` catalog plus gufo overlay (`CatalogBackendId`/`SupportedServingBackend`/`ModelPayload`) + structural validator |
 | Vendored catalog data | `assets/cockpit-catalog/{toolboxes,models}.json`, `SOURCE` | Pinned upstream catalog snapshot, refreshed by weekly CI sync |
 | Catalog sync tooling | `scripts/sync-toolbox-catalog.sh`, `.github/workflows/sync-toolbox-catalog.yml`, `src/bin/toolbox_catalog_check.rs` | Weekly PR-based catalog refresh + standalone structural-validation binary |
 | Cockpit config bridge | `src/cockpit_config.rs` | Read (and explicit single-write "apply") of cockpit's own `~/.config/ai-toolbox-cockpit/config.json` |
-| Model downloads | `src/model_downloads.rs` | Native download job registry for ds4/halogen/r9v/llama_cpp catalog models |
-| Server Mode | `src/server_mode.rs` | Headless detached `podman run` servers for ds4/halogen/vllm/r9v: create/start/stop/status |
+| Toolbox ownership sidecar | `src/managed_toolboxes.rs` | Owner-only `managed_toolboxes.json` with podman container IDs for brainrouter-created/adopted toolboxes |
+| Model downloads | `src/model_downloads.rs` | Native download job registry for ds4/halogen/r9v/gufo/llama_cpp catalog models plus HF CLI preflight |
+| Server Mode | `src/server_mode.rs` | Headless detached `podman run` servers for ds4/halogen/vllm/r9v/gufo: create/start/stop/status |
 | Serving-identity registry | `src/serving_identity.rs` | Read-only `{toolbox_backend, compute_api, runtime_profile_id, endpoint}` bookkeeping for running Server Mode containers |
 | Model observability | `src/observability.rs` | Read-only polling, completed measurements, rolling alerts, explicit reference settings |
 | Explorer pages | `src/escalation/templates/benchmarks.html`, `src/escalation/templates/model_observability.html` | Embedded benchmark workflows and local model activity |
 | Inference state | `src/inference_state.rs` | Track active inference status per provider |
 | Peer CWD | `src/peer_cwd.rs` | Linux-native PID/inode mapping for directory discovery (IPv4/IPv6/UDS) |
 | Lib | `src/lib.rs` | Crate-level re-exports |
-| Review service | `src/review/mod.rs` | `start_review`, `resolve_session` |
-| Review loop | `src/review/review_loop.rs` | Iterative LLM review, robust JSON parsing |
+| Review service | `src/review/mod.rs` | `start_review`, per-project reviewer-pin injection, runtime enable/disable, `resolve_session` |
+| Review loop | `src/review/review_loop.rs` | Iterative LLM review, admission, token budget, design-aware review, robust JSON parsing |
 | Context gatherer | `src/review/context.rs` | PRD auto-detect, `git diff HEAD`, safe UTF-8 truncation |
-| Prompt builder | `src/review/prompt.rs` | Review prompt template |
+| Prompt builder | `src/review/prompt.rs`, `src/review/tokens.rs` | Review prompt template and conservative token-aware budget planner |
 | Escalation UI | `src/escalation/mod.rs` | `/review/*` HTTP handlers + embedded HTML templates; CWD sanitization |
 | Escalation templates | `src/escalation/templates/` | Embedded HTML for review session UI |
 | In-flight registry | `src/inflight.rs` | `InflightRegistry` + `InflightHandle` + `SniffStream`: per-request live rows (elapsed, model, UA, address, session, bytes, PP, activity) with dashboard cancel; sticky head-window activity sniff |
@@ -273,6 +286,8 @@ When installed via `install.sh` on a shared Fedora machine:
 | `max_iterations` | `u32` | `5` | Positive maximum LLM review iterations before escalation to human |
 | `forced_mode` | `String` | `"local"` | Legacy YAML/default reviewer choice: `auto`, `cloud`, or `local`. Role profiles and saved preferences can override it |
 | `forced_model` | `String?` | `None` | Exact local OR cloud provider ID; null selects that backend's default. New auto+model combinations are invalid |
+| `hankndory_integration` | `bool` | `false` | YAML seed for design-aware review. Runtime `/api/review/hankndory` can override it without editing YAML |
+| `design_doc_path` | `String?` | `None` | Repo-relative design doc under `docs/design/` used when design-aware review is enabled |
 
 #### routing.*
 
@@ -465,8 +480,9 @@ Incoming request (OpenAI or Anthropic format)
   |           x-conv-id / x-conversation-id / x-client-session / x-request-conv)
   |           so the dashboard can group events per conversation
   |
-  v router.rs: default/auto aliases select the Main profile first
-  |           review calls instead use the session's Reviewer snapshot
+  v router.rs: default/auto aliases resolve Main with explicit > project pin > global > auto
+  |           review calls instead use the session's Reviewer snapshot; fresh reviews
+  |           first inject a project reviewer pin when one exists
   |
   v match on the resolved selector — only managed routing tokens get
   |           Bonsai/nudge/subs treatment; every other key is a DIRECT model
@@ -482,8 +498,9 @@ Incoming request (OpenAI or Anthropic format)
   +-- model="cloud" --> manifest (if enabled + healthy) --> llama-swap fallback
   +-- model="cloud/<id>" --> exact Manifest model --> same cloud fallback policy
   |
-  +-- model="subs" / "brainrouter/subs" --> current local pool, bypassing Bonsai;
-  |     unconfigured -> classifier/auto, NOT the Main profile override
+  +-- model="subs" / "brainrouter/subs" --> project subagent pin if present, else
+  |     current local pool, bypassing Bonsai; unconfigured -> classifier/auto,
+  |     NOT the Main profile override
   |
   +-- model="brainrouter/<key>" or any bare key --> llama-swap (that key), no rewrite,
   |     no classifier hop; works even when Bonsai is off
@@ -533,7 +550,8 @@ Agent calls mcp_brainrouter_request_review (or: brainrouter cli review request <
   |
   v review/review_loop.rs:
       for i in 1..max_iterations (default 5):
-        review/prompt.rs: build review prompt
+        review/prompt.rs + review/tokens.rs: build a token-budgeted prompt
+        if protected content overflows or required evidence is truncated, escalate safely
         router.route_with_choice(snapshot) --> selected local/cloud/default reviewer
         parse JSON response (STATUS: approved | needs_revision)
         update session + llm_turns in the in-memory session store
@@ -550,7 +568,7 @@ Agent calls mcp_brainrouter_request_review (or: brainrouter cli review request <
     human resolution if the continuation escalates; seeds from llm_turns
 ```
 
-`/review/api/*` POST routes pass the same `is_destructive` gate as the other
+Runtime switches are `GET/POST /api/review/enabled`, `/api/review/pr-guidelines`, and `/api/review/hankndory`; `GET /api/review/status` exposes the HankNDory/review ledger. `/review/api/*` POST routes pass the same `is_destructive` gate as the other
 management endpoints (loopback-only + Origin check), closing the browser-CSRF
 hole. The legacy blocking `POST /review/api/request` endpoint is still routed
 but no client uses it; CLI/MCP use `request-async` + polling.
@@ -570,7 +588,7 @@ phased rollout are recorded in
 
 **Backends covered:** `llama_cpp` (Vulkan/ROCm), `ds4` (DeepSeek4 GGUF),
 `halogen` ("HGN" Flash bundles), `vllm` (HF-repo serving), `r9v` (ROCm on AMD
-R9700). **`comfyui` is explicitly excluded** from every user-facing surface
+R9700), and `gufo` (Strix Halo ROCm/OpenAI-compatible GGUF serving). **`comfyui` is explicitly excluded** from every user-facing surface
 (image-gen, not coding-relevant) — the catalog parser still tolerates it
 structurally so a shared upstream catalog file never fails to load.
 
@@ -589,29 +607,39 @@ catalog if cockpit adds a new backend before brainrouter has code for it.
 
 Two backend-identity types exist deliberately (`src/toolbox_catalog/types.rs`):
 `CatalogBackendId` is open and lossless (parses every id the catalog can ever
-contain, including `comfyui`); `SupportedServingBackend` is the closed enum
-(`ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp`) that every user-facing surface
+contain, including `comfyui` and the brainrouter-owned `gufo` overlay); `SupportedServingBackend` is the closed enum
+(`ds4`/`halogen`/`vllm`/`r9v`/`gufo`/`llama_cpp`) that every user-facing surface
 actually switches on. `ModelPayload` is a per-backend enum, not one generic
-struct, because the five backends' model entries are structurally
+struct, because the six backends' model entries are structurally
 incompatible with each other.
+
+`gufo` is not in the vendored upstream cockpit catalog. `src/toolbox_catalog/gufo_overlay.rs` embeds `assets/gufo-catalog/{toolboxes,models}.json`, merges it into clones of the vendored JSON, validates the merged whole with the normal structural validator plus gufo-specific checks, and fails closed if the overlay is malformed or conflicts with upstream IDs. `GUFO_BACKEND_ID` is `"gufo"`; the runtime image is `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest`, and the injected runtime is a Strix Halo ROCm engine.
 
 ### Toolboxes tab (list/create/update/delete/adopt)
 
-`GET /api/toolbox-catalog` and `/api/toolbox-models` expose the typed catalog;
-`GET /api/toolbox-containers` lists podman containers across all five
+`GET /api/toolbox-catalog` and `/api/toolbox-models` expose the effective typed catalog;
+`GET /api/toolbox-containers` lists podman containers across all six
 backends (generalizing the old llama-only `/api/toolboxes`, which remains for
 compatibility). `POST /api/toolbox-containers` creates a new toolbox
 container from a catalog entry; `/{name}/update`, `/{name}/delete`, and
 `/{name}/adopt` cover the rest of the lifecycle, each serialized by a
 per-container operation lock so concurrent create/update/delete against the
-same container can't race. Brainrouter-managed containers carry an ownership
-label so adopted (pre-existing, cockpit- or manually-created) containers are
-distinguishable from ones brainrouter itself created.
+same container can't race.
+
+Fedora Toolbx has no `toolbox create --label`, so brainrouter now tracks
+ownership in `managed_toolboxes.json`: a local sidecar mapping container name
+to the exact live podman container ID, image, catalog ID/revision and timestamp.
+A container is managed only if it has the legacy label **or** its sidecar ID
+matches the live inspect ID. Create pulls the image first and writes the
+sidecar after inspect; adopt records the current ID without recreating;
+delete/update/legacy toolbox upgrade are ownership-gated and remove by ID, not
+by name. The sidecar is atomic-written with mode `0600`; corrupt/unreadable
+state fails safe toward "unmanaged."
 
 ### Models tab (catalog browsing + downloads)
 
 `src/model_downloads.rs` implements native download orchestration for
-`ds4`/`halogen`/`r9v`/`llama_cpp` (mirroring each backend's own upstream
+`ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp` (mirroring each backend's own upstream
 mechanism) via a job-registry pattern (queued/downloading/verifying/complete/
 failed/cancelled), with OS-level cancel and a global download concurrency
 limit of 1. `vllm` is deliberately excluded — its server pulls from Hugging
@@ -626,7 +654,7 @@ machine-readable progress output to consume.
 **`GET /api/model-downloads/status` response schema.** Returns `{ "models":
 [ModelPresence…], "hf": { "found_on_path": bool, "binary": string,
 "message": string|null, "install_command": string|null } }`. The `hf` object
-is an advisory preflight: the `ds4`/`halogen`/`r9v`/`llama_cpp` download path
+is an advisory preflight: the `ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp` download path
 runs the `hf` (Hugging Face) CLI on the host, so `found_on_path` reports
 whether an executable `hf` is visible on the brainrouter service's PATH (a
 best-effort scan; the authoritative check is still the per-job download
@@ -637,19 +665,28 @@ panels; when true they are `null`. Install `hf` on the service PATH as a
 prerequisite for model downloads (`vllm` pulls at server start and needs no
 host `hf`).
 
-### Server Mode (ds4/halogen/vllm/r9v detached servers)
+### Server Mode (ds4/halogen/vllm/r9v/gufo detached servers)
 
 `src/server_mode.rs` starts/stops/checks-status of headless, detached
-`podman run` servers for `ds4`, `halogen`, and `vllm` — distinct from the
-Toolboxes tab's interactive dev-shell containers. `GET/POST
-/api/server-mode/{ds4,halogen,vllm,r9v}/{status,start,stop}` cover the
+`podman run` servers for `ds4`, `halogen`, `vllm`, `r9v`, and `gufo` — distinct
+from the Toolboxes tab's interactive dev-shell containers. `GET/POST
+/api/server-mode/{ds4,halogen,vllm,r9v,gufo}/{status,start,stop}` cover the
 lifecycle; `vllm` additionally exposes `POST
 /api/server-mode/vllm/cache-paths` (HF cache path configuration, applied
 separately from server start — an upstream behavioral difference, not an
-oversight). R9V server mode is native Rust but **shipped with an explicit
-"unverified" badge**: no 2×AMD R9700 hardware was reachable from this
-environment to functionally validate ROCm/HSA device passthrough end-to-end
-(see Open Questions).
+oversight), and R9V has a `paths` configuration endpoint. R9V server mode is
+native Rust but **shipped with an explicit "unverified" badge**: no 2×AMD
+R9700 hardware was reachable from this environment to functionally validate
+ROCm/HSA device passthrough end-to-end (see Open Questions).
+
+Gufo is a Strix Halo OpenAI-compatible ROCm engine. Its server command is
+`podman run ... ghcr.io/gufo-org/toolboxes/gufo-runtime:latest gufo serve
+--host 0.0.0.0 --port <port> --sessions <n> llm --model /models/<main>.gguf
+--served-model-name <model_id> --context <ctx>`, with optional DFlash2
+speculative decoding appended as `--speculative dflash2 --dflash-model
+/models/<draft>.gguf`. `src/serving_identity.rs` reports
+`openai_compatible=true` for gufo and derives `compute_api="rocm"`, but this
+remains bookkeeping only — the request router still does not dispatch to gufo.
 
 ### Shared config (`~/.config/ai-toolbox-cockpit/config.json`)
 
@@ -684,7 +721,7 @@ Sankey/benchmark dashboards below, never faked as routed traffic. Making
 
 The dashboard's routing Sankey (`GET /dashboard`, described under
 [Dashboard](#dashboard) above) gains two additional columns: **toolbox
-backend** (which of the five families served the request) and **compute
+backend** (which of the six families served the request) and **compute
 API** (`vulkan`/`rocm`/etc.). Both are nullable/additive on `RouteEvent`; the
 existing 4-column behavior is a strict subset of the extended layout, and
 click-to-filter works identically on the new columns. Traffic from backends
@@ -1062,10 +1099,17 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `GET` | `/api/review-config` | Current review configuration (mode, model) |
 | `POST` | `/api/review-config` | Update review configuration |
 | `GET/POST` | `/api/routing-profile` | Read/replace `{preset,main,reviewer,subagent_model}`; strict role/preset validation, 16 KiB JSON body limit |
+| `GET/POST/DELETE` | `/api/project-pin` | Per-project role pins; `?path=` resolves an absolute path to a canonical Git-root key |
 | `GET` | `/api/routing-models` | Authenticated local/cloud metadata catalogs, visible per-provider errors; disabled cloud skips discovery |
 | `GET` | `/api/models/llama-swap` | List models available in llama-swap |
 | `GET` | `/api/bridge-status` | Bridge transport status (Discord/Signal) |
 | `GET` | `/api/bonsai` | Bonsai classifier server state (`enabled`, `healthy`, `url`) |
+| `GET/POST` | `/api/nudge` | Thinking-budget nudge state/tier |
+| `GET/POST` | `/api/prompt-rewrite` | Local prompt rewrite state |
+| `GET/POST` | `/api/review/enabled` | Runtime code-review master switch |
+| `GET/POST` | `/api/review/pr-guidelines` | Runtime PR-structuring guideline injection toggle |
+| `GET/POST` | `/api/review/hankndory` | Runtime design-aware review toggle |
+| `GET` | `/api/review/status` | Design-aware review state and recent verdict ledger |
 
 ### Destructive Management Endpoints (localhost + CSRF only)
 
@@ -1084,25 +1128,25 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 ### Toolbox Backend Management API
 
 Most POST routes require the loopback/CSRF gate (see Security Model). Covers
-`ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp` — never `comfyui`.
+`ds4`/`halogen`/`vllm`/`r9v`/`gufo`/`llama_cpp` — never `comfyui`.
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/toolboxes` | Legacy llama-only container listing (kept for compatibility) |
-| `GET` | `/api/toolbox-catalog` | Typed `toolboxes.json` catalog for all 5 backends |
+| `GET` | `/api/toolbox-catalog` | Effective typed catalog for all 6 backends (vendored cockpit catalog plus gufo overlay) |
 | `GET` | `/api/toolbox-models` | Typed `models.json` catalog (per-backend `ModelPayload`) |
-| `GET` | `/api/toolbox-containers` | List podman containers across all 5 backends, with ownership/adoption status |
+| `GET` | `/api/toolbox-containers` | List podman containers across all 6 backends, with ownership/adoption status |
 | `POST` | `/api/toolbox-containers` | Create a toolbox container from a catalog entry |
 | `POST` | `/api/toolbox-containers/:name/update` | Pull + recreate a toolbox container |
 | `POST` | `/api/toolbox-containers/:name/delete` | Remove a toolbox container |
-| `POST` | `/api/toolbox-containers/:name/adopt` | Label a pre-existing container as brainrouter-managed |
-| `GET` | `/api/model-downloads` / `/status` | List/summarize download jobs (ds4/halogen/r9v/llama_cpp) |
+| `POST` | `/api/toolbox-containers/:name/adopt` | Record a pre-existing container's live podman ID as brainrouter-managed |
+| `GET` | `/api/model-downloads` / `/status` | List/summarize download jobs (ds4/halogen/r9v/gufo/llama_cpp) |
 | `POST` | `/api/model-downloads` | Start a model download job |
 | `GET` | `/api/model-downloads/:id` | Job detail (raw-log-tail progress, no byte-level progress) |
 | `POST` | `/api/model-downloads/:id/cancel` | Cancel a download job |
 | `POST` | `/api/model-downloads/verify` | Verify a downloaded model's integrity |
 | `POST` | `/api/model-downloads/r9v/prepare-ple` | R9V's second readiness gate (PLE preparation) |
-| `GET`/`POST` | `/api/server-mode/{ds4,halogen,vllm}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
+| `GET`/`POST` | `/api/server-mode/{ds4,halogen,vllm,gufo}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
 | `GET`/`POST` | `/api/server-mode/r9v/status`\|`start`\|`stop`\|`paths` | Same, plus R9V toolbox/package path config |
 | `POST` | `/api/server-mode/vllm/cache-paths` | Configure vllm's HF cache paths (applied separately from server start) |
 | `GET` | `/api/serving-identities` | Read-only registry of currently-running Server Mode containers' `{toolbox_backend, compute_api, runtime_profile_id, endpoint}` |
@@ -1237,6 +1281,9 @@ Resolve a review session with feedback.
 | Daemon not running when MCP connects | UDS connect error | `brainrouter mcp` exits with a clear error message |
 | Review LLM returns unparseable JSON | JSON parse failure in review_loop | Retry within iteration; count as iteration attempt |
 | Review hits max iterations | Iteration counter | Escalate to human via dashboard UI |
+| Review disabled | `review_runtime_state.json` / `/api/review/enabled` | New review requests return `disabled` without contacting a model |
+| Review prompt would exceed safe budget or required evidence is truncated | `review/tokens.rs` budget planner | Terminal escalation rather than a confident approval |
+| Project pin path is non-absolute or not in a Git repo | `ProjectPinStore::set` / resolver | Reject pin write or inherit global profile |
 | Peer CWD resolution fails | `/proc` read failure | Use a valid explicit review CWD; invalid/absent resolved review directories are rejected, not silently substituted |
 | Config validation failure at startup | Missing required fields, invalid URLs, missing GGUF | Daemon refuses to start with descriptive error |
 | Legacy auto reviewer retains an ignored model | YAML/legacy-state read normalization | Discard only that ignored field, warn with source/action, persist state migration once; keep new API writes strict |
@@ -1244,6 +1291,8 @@ Resolve a review session with feedback.
 | Corrupt/unwritable/future benchmark database | Store initialization | Log cause; benchmark routes 503; core routing/listeners/Bonsai continue |
 | Benchmark workers saturated or SQLite busy | Shared admission/lock timeout | 503 and Retry-After; no unbounded job queue |
 | Benchmark result/export exceeds budget | Row/count/serialization checks | Explicit 413; narrow request or read offline, never silent truncation |
+| Missing `hf` CLI for toolbox downloads | `/api/model-downloads/status.hf` advisory preflight | Dashboard banner shows `python3 -m pip install --user -U "huggingface_hub[cli]"`; download spawn remains authoritative |
+| Toolbox sidecar missing/corrupt or ID mismatch | `managed_toolboxes.json` + podman inspect | Treat as unmanaged and refuse destructive operations |
 | Missing measurements or insufficient retained history | Source validation and sample minima | Unknown/insufficient-data state, no fabricated metric or recovery |
 | Observability settings/reference unavailable | File read/CAS/reference validation | Visible error or reference status; core routing/live page remain available |
 | Bridge OMP subprocess timeout | Configurable timeout (default 600s) | Kill subprocess, return timeout error to chat |
@@ -1323,12 +1372,12 @@ normalization, not weakened validation for new writes.
 ## What This Is Not
 
 - **Not a multi-provider cloud backend.** Brainrouter implements OpenAI-compatible proxying and an Anthropic wire shim; Manifest handles downstream cloud providers and pricing.
-- **Not a model runner.** brainrouter does not serve chat models -- it only spawns the single classifier llama-server for Bonsai. llama-swap handles local model serving.
+- **Not a general request-time model runner.** brainrouter proxies chat traffic to Manifest/llama-swap and manages detached Server Mode containers for status/operations; the request router does not dispatch to Server Mode containers. It only spawns the single classifier llama-server for Bonsai.
 - **Not an auth layer.** Loopback is the default trust boundary, not user authentication. Credentials live in provider configuration/environment.
 - **Not a conversation store.** Chat history is managed by the harness. brainrouter is stateless for proxy calls; review sessions are in-memory and lost on daemon restart.
 - **Not a chat application.** The Discord/Signal bridges are thin wrappers around the `omp` CLI, not standalone chat bots with their own reasoning.
 - **Not a benchmark executor or runtime attestation service.** Registered capabilities/hashes and imported metrics do not prove artifact integrity, runtime feature support, or controlled comparability.
-- **Not a persistent live-traffic monitor.** Samples and alert latches reset on restart; only role preferences, benchmark records and explicit observation settings persist.
+- **Not a persistent live-traffic monitor.** Samples and alert latches reset on restart; role preferences, project pins, benchmark records, toolbox ownership sidecars and explicit observation settings persist.
 
 ---
 
@@ -1350,10 +1399,10 @@ extended this to 391 Rust tests and 38 Node browser-logic tests, covering
 catalog structural validation (including deliberately-permissive handling of
 unrecognized/`comfyui` backend ids), the toolbox-container lifecycle,
 cockpit-config read/apply, model-download job state machines, Server Mode
-command construction for ds4/halogen/vllm/r9v, the migration-runner's version-3
+command construction for ds4/halogen/vllm/r9v/gufo, the migration-runner's version-3
 gate (`serving_runtimes`/`toolbox_catalog_snapshot`), and the spider chart's
 TEPR formula/cohort-pinning/insufficient-data behavior. **None of ds4/halogen/
-vllm/r9v's command builders have been run against real target hardware from
+vllm/r9v/gufo's command builders have been run against real target hardware from
 this environment** — they are verified against upstream documentation/catalog
 data and unit-tested in isolation, not integration-tested end-to-end on a real
 podman/GPU host. Ship behind an explicit "unverified" badge until a real host
@@ -1379,15 +1428,16 @@ These are ideas requiring separate approval, not acceptance claims for this rele
 - Interrupt-and-redirect: user types a correction mid-stream; brainrouter cancels and re-prompts
 - Persistent review sessions (SQLite) so they survive daemon restarts
 - Persistent request history, per-request token costs and budget enforcement
-- Per-project profiles, optional strict cloud fallback consent, reviewer diversity rules, and escalation ladders
+- Non-model per-project settings, optional strict cloud fallback consent, reviewer diversity rules, and escalation ladders
 - **Quant Lab:** actual llama-perplexity/PPL/KLD execution, compatible same-family reference checking, queued/sequential runs with cancellation/progress, per-token distributions and GGUF parsing
 - **Model Compare:** complete common-suite execution across unrelated families, token-space compatibility checks, and blind human evaluation
 - Automated benchmark scheduling, controlled regression campaigns, outbound notifications, or automatic model switching
 - Parquet export and an integrated analytical warehouse
 - Runtime-loaded component attestation (PLE/n-gram tables, adapters, caches, retrieval assets), beyond declared registry provenance
 - Runtime context-selection controls: the retained `cli context` command has no implemented `/api/context` server route
-- **`brainrouter cli` parity for ds4/halogen/vllm/r9v.** The new toolbox backends are dashboard/API-only; `cli toolboxes`/`cli upgrade toolbox` remain llama.cpp-only.
-- **Router integration for Server Mode backends ("PR 11b").** Server Mode containers are not dispatchable as real request traffic; `Router`/`route()` still only knows Manifest + llama-swap. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
+- **`brainrouter cli` parity for ds4/halogen/vllm/r9v/gufo.** The new toolbox backends are dashboard/API-only; `cli toolboxes`/`cli upgrade toolbox` remain llama.cpp-only.
+- **Register downloaded GGUFs into llama-swap.** Designed in `docs/design/llama-swap-register-downloaded-gguf.md`, not implemented.
+- **Router integration for Server Mode backends ("PR 11b" / Feature B).** Server Mode containers are not dispatchable as real request traffic; `Router`/`route()` still only knows Manifest + llama-swap. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
 - **R9V functional validation on real 2×AMD R9700 hardware.** ROCm/HSA device-passthrough (`--device /dev/kfd`/`/dev/dri`, `--group-add render`/`video`, `--ipc=host`, `--runtime crun`) has not been exercised end-to-end; ships behind an "unverified" badge.
 - **Bidirectional/continuous config.json sync with ai-toolbox-cockpit.** Only an explicit, user-triggered single-write "apply" path exists; no locking/conflict protocol is defined for concurrent brainrouter+cockpit writes.
 - **ROCm/AMD-GPU auto-detection.** brainrouter has no `rocminfo`/sysfs-based hardware detection; R9V is offered as a selectable option and fails loudly on unsupported hardware rather than being auto-hidden.
@@ -1396,4 +1446,3 @@ The notes motivating Quant Lab/Model Compare are not fully implemented by the
 current explorer. Ember/Flash environment, cache-building, or provisioning work
 is not a shipped Brainrouter feature. Existing tables, chart labels, and imported
 measurements must not be presented as an execution pipeline or attestation.
-
