@@ -20,13 +20,16 @@ use crate::{
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{CompletedStreamMeasurement, RouteEvent, RoutingEvents, Stage},
     routing_profile::{ModelChoice, ProfileStore},
+    serving_identity::{ServingIdentity, ServingIdentityRegistry},
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
 use anyhow::{anyhow, Result};
 use futures_util::{stream as fstream, StreamExt};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{sync::Arc, time::{Duration, Instant}};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Maximum time to wait for the first SSE byte from a provider.
@@ -113,6 +116,10 @@ pub struct Router {
     /// Per-project model pins (Phase 2). `None` or an empty store ⇒ every
     /// project inherits the global profile (no routing change).
     project_pins: Option<Arc<ProjectPinStore>>,
+    /// Optional in-memory registry of running OpenAI-compatible Server-Mode
+    /// backends. `None` preserves the pre-Feature-B llama-swap-only path.
+    serving_identities: Option<Arc<ServingIdentityRegistry>>,
+    serving_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
 }
 
 pub struct RouterArgs {
@@ -136,6 +143,7 @@ pub struct RouterArgs {
     pub nudge_enabled: Arc<AtomicBool>,
     pub nudge_tier: Arc<AtomicU8>,
     pub prompt_rewrite: Arc<AtomicBool>,
+    pub serving_identities: Option<Arc<ServingIdentityRegistry>>,
 }
 
 impl Router {
@@ -158,6 +166,8 @@ impl Router {
             prompt_rewrite: args.prompt_rewrite,
             profiles: None,
             project_pins: None,
+            serving_identities: args.serving_identities,
+            serving_providers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -651,6 +661,30 @@ impl Router {
         allow_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let requested = request.model.clone();
+        if let Some(identity) = self.find_server_mode_identity(&requested).await {
+            let provider_name = server_mode_provider_name(&identity);
+            let provider = self.server_mode_provider(&identity).await;
+            match provider.chat_completion(request).await {
+                Ok(ProviderResponse::Stream(stream)) => {
+                    info!(
+                        provider = %provider_name,
+                        model = %requested,
+                        endpoint = %identity.endpoint,
+                        "Server-Mode provider accepted request"
+                    );
+                    return Ok((
+                        wrap_with_timeout(stream),
+                        RouteInfo {
+                            bonsai_decision: "local",
+                            effective_provider: Some(provider_name),
+                            model_key: requested,
+                            failed_attempts: Vec::new(),
+                        },
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         match self.try_llama_swap(request.clone(), Stage::LocalPrimary).await {
             Ok((resp, model_key)) => Ok((
                 resp,
@@ -690,6 +724,24 @@ impl Router {
                 ))
             }
         }
+    }
+
+    async fn find_server_mode_identity(&self, model: &str) -> Option<ServingIdentity> {
+        self.serving_identities.as_ref()?.find_by_served_model(model).await
+    }
+
+    async fn server_mode_provider(&self, identity: &ServingIdentity) -> Arc<OpenAiProvider> {
+        let mut providers = self.serving_providers.lock().await;
+        if let Some(provider) = providers.get(&identity.endpoint) {
+            return Arc::clone(provider);
+        }
+        let provider = Arc::new(OpenAiProvider::new(
+            server_mode_provider_name(identity),
+            server_mode_provider_base_url(identity),
+            None,
+        ));
+        providers.insert(identity.endpoint.clone(), Arc::clone(&provider));
+        provider
     }
 
     /// Attempt a llama-swap call. Returns the response and the model key used.
@@ -752,6 +804,14 @@ impl Router {
             }
         }
     }
+}
+
+fn server_mode_provider_name(identity: &ServingIdentity) -> String {
+    format!("server-mode:{}", identity.toolbox_backend)
+}
+
+fn server_mode_provider_base_url(identity: &ServingIdentity) -> String {
+    format!("{}/v1", identity.endpoint.trim_end_matches('/'))
 }
 
 /// Collapse multiple system messages into a single one by concatenating their
@@ -1322,6 +1382,7 @@ fn extract_prompt_excerpt(request: &ChatCompletionRequest) -> String {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use chrono::Utc;
 
     fn user(content: &str) -> ChatMessage {
         ChatMessage {
@@ -1397,6 +1458,22 @@ mod tests {
             peek_manifest_model(stream).await,
             ManifestPeek::PseudoError
         ));
+    }
+
+    #[test]
+    fn server_mode_provider_metadata_uses_backend_name_and_v1_base_url() {
+        let identity = ServingIdentity {
+            toolbox_backend: "gufo",
+            compute_api: "rocm".to_string(),
+            runtime_profile_id: "strix-gufo".to_string(),
+            served_model: "gufo-qwen38-27b-q4kxl".to_string(),
+            endpoint: "http://127.0.0.1:8001/".to_string(),
+            openai_compatible: true,
+            registered_at: Utc::now(),
+        };
+
+        assert_eq!(server_mode_provider_name(&identity), "server-mode:gufo");
+        assert_eq!(server_mode_provider_base_url(&identity), "http://127.0.0.1:8001/v1");
     }
 
     #[test]

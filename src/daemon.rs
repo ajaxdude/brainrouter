@@ -363,6 +363,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     // Inference state tracker — shared between Router (writes) and HTTP API (reads)
     let inference_tracker = Arc::new(InferenceTracker::new());
+    let serving_identities = Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new());
 
     // Router — shared between the proxy and the review service
     let router = Arc::new(
@@ -382,6 +383,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             nudge_enabled: Arc::clone(&nudge_enabled),
             nudge_tier: Arc::clone(&nudge_tier),
             prompt_rewrite: Arc::clone(&prompt_rewrite),
+            serving_identities: Some(Arc::clone(&serving_identities)),
         })
         .with_profiles(profiles)
         .with_project_pins(project_pins),
@@ -478,7 +480,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         managed_toolboxes_path,
         toolbox_container_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         model_downloads: Arc::new(brainrouter::model_downloads::ModelDownloadRegistry::new()),
-        serving_identities: Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new()),
+        serving_identities,
     });
 
     brainrouter::observability::start(&state);

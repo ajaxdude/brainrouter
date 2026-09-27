@@ -185,6 +185,7 @@ fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> 
         nudge_enabled: Arc::new(AtomicBool::new(false)),
         nudge_tier: Arc::new(AtomicU8::new(0)),
         prompt_rewrite: Arc::new(AtomicBool::new(false)),
+        serving_identities: None,
     }
 }
 

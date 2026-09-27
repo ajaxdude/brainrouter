@@ -56,6 +56,7 @@ use hyper::service::service_fn;
 use hyper::{body::Incoming, body::Frame, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
@@ -379,7 +380,8 @@ async fn handle_request(
                 ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
             ];
             // Fetch llama-swap models and append them
-            let ls_url = format!("{}/v1/models", &state.llama_swap_url);
+            let mut seen: HashSet<String> = data.iter().map(|m| m.id.clone()).collect();
+            let ls_url = format!("{}/v1/models", state.llama_swap_url);
             if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
                 .timeout(std::time::Duration::from_secs(2))
                 .send().await
@@ -389,7 +391,7 @@ async fn handle_request(
                         let skip = ["auto", "local", "cloud"];
                         for m in arr {
                             if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                                if !skip.contains(&id) {
+                                if !skip.contains(&id) && seen.insert(id.to_string()) {
                                     data.push(ModelObject {
                                         id: id.to_string(),
                                         object: "model",
@@ -400,6 +402,16 @@ async fn handle_request(
                             }
                         }
                     }
+                }
+            }
+            for id in state.serving_identities.openai_compatible_served_models().await {
+                if seen.insert(id.clone()) {
+                    data.push(ModelObject {
+                        id,
+                        object: "model",
+                        created: 0,
+                        owned_by: "server-mode".to_string(),
+                    });
                 }
             }
             let models = ModelListResponse { object: "list", data };
@@ -3816,12 +3828,14 @@ async fn register_serving_identity(
     container_name: &str,
     toolbox_id: String,
     profile: &crate::toolbox_catalog::RuntimeProfile,
+    served_model: String,
     endpoint: String,
 ) {
     let identity = crate::serving_identity::ServingIdentity {
         toolbox_backend: backend.as_str(),
         compute_api: crate::server_mode::compute_api_for_runtime_profile(profile).to_string(),
         runtime_profile_id: toolbox_id,
+        served_model,
         endpoint,
         openai_compatible: crate::serving_identity::openai_compatible_for_backend(backend),
         registered_at: chrono::Utc::now(),
@@ -3865,6 +3879,7 @@ pub async fn server_mode_ds4_start_response(state: &AppState, body: &Bytes) -> R
                     crate::server_mode::DS4_SERVER_CONTAINER_NAME,
                     request.toolbox_id.clone(),
                     &profile,
+                    request.model_id.clone(),
                     serving_identity_endpoint(&request.host, request.port),
                 )
                 .await;
@@ -3923,6 +3938,7 @@ pub async fn server_mode_gufo_start_response(state: &AppState, body: &Bytes) -> 
                     crate::server_mode::GUFO_SERVER_CONTAINER_NAME,
                     request.toolbox_id.clone(),
                     &profile,
+                    request.model_id.clone(),
                     serving_identity_endpoint(&request.host, request.port),
                 )
                 .await;
@@ -3983,6 +3999,7 @@ pub async fn server_mode_halogen_start_response(state: &AppState, body: &Bytes) 
                     crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME,
                     request.toolbox_id.clone(),
                     &profile,
+                    request.bundle_id.clone(),
                     serving_identity_endpoint(&request.host, request.port),
                 )
                 .await;
@@ -4040,13 +4057,17 @@ pub async fn server_mode_vllm_start_response(state: &AppState, body: &Bytes) -> 
     };
     match crate::server_mode::start_vllm_server(&request).await {
         Ok(()) => {
-            if let Ok((_, profile)) = crate::server_mode::resolve_vllm_toolbox(&request.toolbox_id) {
+            if let (Ok((_, profile)), Ok((served_model, _))) = (
+                crate::server_mode::resolve_vllm_toolbox(&request.toolbox_id),
+                crate::server_mode::resolve_vllm_model_and_base_policy(&request),
+            ) {
                 register_serving_identity(
                     state,
                     crate::toolbox_catalog::SupportedServingBackend::Vllm,
                     crate::server_mode::VLLM_SERVER_CONTAINER_NAME,
                     request.toolbox_id.clone(),
                     &profile,
+                    served_model,
                     serving_identity_endpoint(&request.host, request.port),
                 )
                 .await;
@@ -4138,6 +4159,7 @@ pub async fn server_mode_r9v_start_response(state: &AppState, body: &Bytes) -> R
                     crate::server_mode::R9V_SERVER_CONTAINER_NAME,
                     request.toolbox_id.clone(),
                     &profile,
+                    request.package_id.clone(),
                     serving_identity_endpoint(host, port),
                 )
                 .await;

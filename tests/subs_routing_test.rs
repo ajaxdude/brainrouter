@@ -133,6 +133,7 @@ fn make_router(
         nudge_enabled: Arc::new(AtomicBool::new(false)),
         nudge_tier: Arc::new(AtomicU8::new(0)),
         prompt_rewrite: Arc::new(AtomicBool::new(true)),
+        serving_identities: None,
     })
 }
 

@@ -1218,7 +1218,7 @@ pub(crate) fn resolve_vllm_toolbox(toolbox_id: &str) -> Result<(ToolboxDefinitio
 /// policy map)` — either a vendored vllm catalog entry (`model_id`) or a
 /// custom free-form repo (`custom_repo`, generic default policy). Exactly
 /// one of the two request fields must be given.
-fn resolve_vllm_model_and_base_policy(req: &StartVllmServerRequest) -> Result<(String, Map<String, Value>), ServerModeError> {
+pub(crate) fn resolve_vllm_model_and_base_policy(req: &StartVllmServerRequest) -> Result<(String, Map<String, Value>), ServerModeError> {
     let model_id = req.model_id.as_deref().filter(|s| !s.trim().is_empty());
     let custom_repo = req.custom_repo.as_deref().filter(|s| !s.trim().is_empty());
     match (model_id, custom_repo) {
@@ -3195,4 +3195,3 @@ mod tests {
         assert_eq!(err.status(), 400);
     }
 }
-

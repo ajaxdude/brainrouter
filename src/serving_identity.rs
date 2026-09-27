@@ -20,7 +20,7 @@
 //! (§16, resolving §747's "request-time vs. container-start-time" open
 //! item in favor of the latter).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -41,6 +41,10 @@ pub struct ServingIdentity {
     /// several toolbox ids can share one backend, e.g. ds4's rocm/therock
     /// variants).
     pub runtime_profile_id: String,
+    /// The exact OpenAI `model` string served by this backend endpoint.
+    /// Matching is exact and in-memory only; no live podman inspection is
+    /// performed on the request routing hot path.
+    pub served_model: String,
     /// `"http://host:port"`, from the start request (falling back to each
     /// backend's own documented default host/port when the request omitted
     /// them, e.g. r9v's optional `host`/`port` fields).
@@ -121,6 +125,37 @@ impl ServingIdentityRegistry {
         self.inner.write().await.remove(container_name);
     }
 
+    /// Hot-path lookup for Feature B routing. This reads only the in-memory
+    /// registry and only returns OpenAI-compatible identities whose served
+    /// model exactly matches the requested model.
+    pub async fn find_by_served_model(&self, model: &str) -> Option<ServingIdentity> {
+        self.inner
+            .read()
+            .await
+            .values()
+            .find(|identity| identity.openai_compatible && identity.served_model == model)
+            .cloned()
+    }
+
+    /// In-memory served-model list for `GET /v1/models`; intentionally does
+    /// not call [`Self::snapshot`] because that shells out to podman.
+    pub async fn openai_compatible_served_models(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut models: Vec<String> = self
+            .inner
+            .read()
+            .await
+            .values()
+            .filter(|identity| identity.openai_compatible)
+            .filter_map(|identity| {
+                let model = identity.served_model.clone();
+                seen.insert(model.clone()).then_some(model)
+            })
+            .collect();
+        models.sort();
+        models
+    }
+
     /// Read-only snapshot for `GET /api/serving-identities` and the
     /// dashboard panel. Cross-checks each entry's container against live
     /// podman state via `container_running`, so a container that died
@@ -166,6 +201,7 @@ mod tests {
             toolbox_backend: "vllm",
             compute_api: "rocm".to_string(),
             runtime_profile_id: "strix-vllm-latest".to_string(),
+            served_model: "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
             endpoint: "http://127.0.0.1:8002".to_string(),
             openai_compatible: true,
             registered_at: Utc::now(),
@@ -211,5 +247,48 @@ mod tests {
         let registry = ServingIdentityRegistry::default();
         registry.deregister("brainrouter-does-not-exist").await;
         assert!(registry.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_by_served_model_matches_openai_compatible_exactly() {
+        let registry = ServingIdentityRegistry::default();
+        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        let found = registry
+            .find_by_served_model("meta-llama/Meta-Llama-3.1-8B-Instruct")
+            .await
+            .expect("expected exact compatible match");
+        assert_eq!(found.toolbox_backend, "vllm");
+        assert!(registry.find_by_served_model("meta-llama/meta-llama-3.1-8b-instruct").await.is_none());
+        assert!(registry.find_by_served_model("Meta-Llama-3.1-8B").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_served_model_ignores_non_openai_compatible_identity() {
+        let registry = ServingIdentityRegistry::default();
+        let mut identity = sample_identity();
+        identity.toolbox_backend = "ds4";
+        identity.openai_compatible = false;
+        registry.register("brainrouter-ds4-server", identity).await;
+        assert!(registry.find_by_served_model("meta-llama/Meta-Llama-3.1-8B-Instruct").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_served_models_dedups_and_excludes_incompatible() {
+        let registry = ServingIdentityRegistry::default();
+        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        let mut duplicate = sample_identity();
+        duplicate.toolbox_backend = "gufo";
+        duplicate.endpoint = "http://127.0.0.1:8003".to_string();
+        registry.register("brainrouter-gufo-server", duplicate).await;
+        let mut incompatible = sample_identity();
+        incompatible.toolbox_backend = "r9v";
+        incompatible.openai_compatible = false;
+        incompatible.served_model = "qwen3.8-flash-next".to_string();
+        registry.register("brainrouter-r9v-server", incompatible).await;
+
+        assert_eq!(
+            registry.openai_compatible_served_models().await,
+            vec!["meta-llama/Meta-Llama-3.1-8B-Instruct".to_string()]
+        );
     }
 }
