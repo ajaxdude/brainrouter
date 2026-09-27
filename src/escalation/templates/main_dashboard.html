@@ -260,6 +260,13 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
 
     <div id="command-control-strip" style="display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px">
       <div id="routing-strip" style="display:grid;grid-template-columns:auto minmax(120px,160px) minmax(130px,190px) minmax(160px,240px) auto;align-items:end;gap:6px;font-size:11px;min-width:520px;flex:1">
+        <div style="grid-column:1/-1;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <label for="pin-scope" style="color:var(--textMute)">Scope</label>
+          <select id="pin-scope" class="config-input" onchange="onPinScopeChange()" style="max-width:300px"><option value="__global__">Global profile (all projects)</option></select>
+          <input id="pin-scope-add" class="config-input" aria-label="Project path to pin" placeholder="/abs/path to a git project" style="display:none;flex:1;min-width:180px">
+          <button id="pin-scope-add-btn" class="br-btn" style="display:none" onclick="loadPinScopeByPath()">Load project</button>
+          <span id="pin-scope-state" role="status" aria-live="polite" style="color:var(--textDim)"></span>
+        </div>
         <label for="routing-preset" style="color:var(--textMute)">Preset</label>
         <label for="main-backend" style="color:var(--textMute)">Main backend</label>
         <label for="main-model" style="color:var(--textMute)">Main model</label>
@@ -279,7 +286,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         </select>
         <input id="main-model" class="config-input" aria-label="Main model ID" placeholder="Backend default (optional ID)">
         <select id="main-model-select" class="config-input" aria-label="Main local model" style="display:none" onchange="routingLocalModelChanged('main')"></select>
-        <button id="save-routing-profile" class="br-btn" onclick="saveRoutingProfile()" disabled>Save roles</button>
+        <div style="display:flex;align-items:center;gap:6px">
+          <button id="save-routing-profile" class="br-btn" onclick="saveRoutingProfile()" disabled>Save roles</button>
+          <label id="main-inherit-wrap" style="display:none;align-items:center;gap:3px;color:var(--textMute)"><input type="checkbox" id="main-inherit" onchange="onRoleInherit('main')">inherit</label>
+        </div>
       </div>
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         <button class="sidebar-btn" onclick="flushModels()" title="Unload all models from memory (frees VRAM)" style="width:auto;white-space:nowrap">⏏ Flush Models</button>
@@ -306,11 +316,17 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
             <label for="subagent-model-select">Subagent pool (local, subs alias only)
               <select id="subagent-model-select" class="config-input" aria-label="Subagent local model pool" onchange="routingLocalModelChanged('subagent')"></select>
             </label>
-            <input id="subagent-model" class="config-input" aria-label="Subagent model ID" list="routing-local-models" placeholder="Enter exact local model ID" style="display:none">
+            <input id="subagent-model" class="config-input" aria-label="Subagent model ID" list="routing-local-models" placeholder="Enter exact local model ID" style="display:none" oninput="updateSaveState()">
+            <label id="reviewer-inherit-wrap" style="display:none;align-items:center;gap:3px;color:var(--textMute)"><input type="checkbox" id="reviewer-inherit" onchange="onRoleInherit('reviewer')">inherit reviewer</label>
+            <label id="subagent-inherit-wrap" style="display:none;align-items:center;gap:3px;color:var(--textMute)"><input type="checkbox" id="subagent-inherit" onchange="onRoleInherit('subagent')">inherit subagent</label>
             <div><button class="br-btn" onclick="loadRoutingModels()">Refresh lists</button></div>
           </div>
           <datalist id="routing-local-models"></datalist>
           <datalist id="routing-cloud-models"></datalist>
+          <details id="project-pins-list-wrap" class="br-detail" style="margin-top:6px">
+            <summary>Pinned projects</summary>
+            <div id="project-pins-list" style="font-size:11px">No project pins.</div>
+          </details>
           <div id="routing-profile-message" role="status" style="color:var(--amber);overflow-wrap:anywhere;margin-top:6px">Loading preferences...</div>
           <div id="routing-model-errors" role="status" style="color:var(--amber);overflow-wrap:anywhere"></div>
           <div id="routing-saved" style="color:var(--textDim);overflow-wrap:anywhere"></div>
@@ -2808,6 +2824,9 @@ function routingLocalModelChanged(role) {
   } else {
     input.style.display = 'none';
   }
+  // Re-run the Save predicate: at project scope a pinned subagent is model-gated,
+  // so picking a model here must re-enable Save (harmless in global scope).
+  if (typeof updateSaveState === 'function') updateSaveState();
 }
 
 // Effective model string for a role, reading whichever control is active.
@@ -2883,7 +2902,7 @@ async function loadRoutingProfile() {
     const data = await routingFetch('/api/routing-profile');
     routingCloudEnabled = data.cloud_enabled;
     renderRoutingProfile(data.profile);
-    document.getElementById('save-routing-profile').disabled = false;
+    updateSaveState();
     document.getElementById('routing-profile-message').textContent = '';
   } catch (error) {
     document.getElementById('routing-profile-message').textContent = 'Cannot load preferences: ' + error.message;
@@ -2927,7 +2946,9 @@ async function loadRoutingModels() {
 }
 
 async function saveRoutingProfile() {
-  if (!routingProfile || routingProfileBusy) return;
+  if (routingProfileBusy) return;
+  if (isProjectScope()) return saveProjectPin();
+  if (!routingProfile) return;
   const message = document.getElementById('routing-profile-message');
   const choice = role => {
     const backend = document.getElementById(role + '-backend').value;
@@ -2939,7 +2960,7 @@ async function saveRoutingProfile() {
     subagent_model: routingModelValue('subagent'),
   };
   routingProfileBusy = true;
-  document.getElementById('save-routing-profile').disabled = true;
+  updateSaveState();
   try {
     const data = await routingFetch('/api/routing-profile', profile);
     renderRoutingProfile(data.profile);
@@ -2948,7 +2969,241 @@ async function saveRoutingProfile() {
     message.textContent = 'Not saved: ' + error.message;
   } finally {
     routingProfileBusy = false;
-    document.getElementById('save-routing-profile').disabled = false;
+    updateSaveState();
+  }
+}
+
+// ─── Per-project model pins (Phase 2) ────────────────────────────────────────
+const PIN_GLOBAL = '__global__';
+let pinScopeKey = PIN_GLOBAL;            // '__global__' or a canonical repo-root key
+let pinGlobalProfile = null;            // last-known global profile (inherited display)
+let pinResolveGen = 0;                  // monotonic token: only the latest resolve applies
+let pinScopeResolved = true;            // false while resolving / on error / unpinnable
+let pinEntry = null;                    // the resolved project's pin (null = unpinned)
+const pinRoleInherit = { main: true, reviewer: true, subagent: true };
+
+function isProjectScope() { return pinScopeKey !== PIN_GLOBAL; }
+function pinBasename(p) { const parts = String(p == null ? '' : p).split('/').filter(Boolean); return parts.length ? parts[parts.length - 1] : String(p); }
+function setPinScopeState(text) { const el = document.getElementById('pin-scope-state'); if (el) el.textContent = text; }
+
+// The single authoritative Save-enabled predicate (R5-I2): the existing global
+// load/save completions call this too, so no path can enable Save unconditionally.
+function updateSaveState() {
+  const btn = document.getElementById('save-routing-profile');
+  if (!btn) return;
+  if (!isProjectScope()) {
+    btn.disabled = routingProfileBusy || !routingProfile;
+    return;
+  }
+  let ok = pinScopeResolved && !routingProfileBusy && pinScopeKey !== PIN_GLOBAL;
+  // A pinned (non-inherited) subagent needs a concrete local model id.
+  if (ok && !pinRoleInherit.subagent && !routingModelValue('subagent')) ok = false;
+  btn.disabled = !ok;
+}
+
+async function loadPinScopes() {
+  try {
+    const data = await routingFetch('/api/project-pin');
+    pinGlobalProfile = data.global;
+    renderPinScopeOptions(Object.keys(data.pins || {}));
+    renderProjectPinsList(data.pins || {});
+  } catch (e) { /* keep the selector's Global default */ }
+}
+
+function renderPinScopeOptions(pinKeys) {
+  const sel = document.getElementById('pin-scope');
+  if (!sel) return;
+  const current = pinScopeKey;
+  sel.replaceChildren();
+  const add = (value, label) => { const o = document.createElement('option'); o.value = value; o.textContent = label; sel.appendChild(o); };
+  add(PIN_GLOBAL, 'Global profile (all projects)');
+  const seen = new Set();
+  (pinKeys || []).forEach(k => { if (!seen.has(k)) { seen.add(k); add(k, pinBasename(k) + ' — pinned'); } });
+  add('__add__', 'Add by path…');
+  sel.value = (current === PIN_GLOBAL || seen.has(current)) ? current : PIN_GLOBAL;
+}
+
+async function onPinScopeChange() {
+  const sel = document.getElementById('pin-scope');
+  const addInput = document.getElementById('pin-scope-add');
+  const addBtn = document.getElementById('pin-scope-add-btn');
+  const val = sel.value;
+  if (val === '__add__') { addInput.style.display = ''; addBtn.style.display = ''; addInput.focus(); return; }
+  addInput.style.display = 'none'; addBtn.style.display = 'none';
+  if (val === PIN_GLOBAL) {
+    pinScopeKey = PIN_GLOBAL; pinScopeResolved = true; pinEntry = null;
+    setProjectScopeUI(false); setPinScopeState('');
+    await loadRoutingProfile();               // restore the global form + Save state
+    return;
+  }
+  await resolvePinScope(val);                 // an existing canonical key round-trips
+}
+
+async function loadPinScopeByPath() {
+  const raw = document.getElementById('pin-scope-add').value.trim();
+  if (raw) await resolvePinScope(raw);
+}
+
+// Resolve a raw/subdir/symlinked path to its canonical key + current pin, and
+// apply the response only if it is still the latest selection (R4-I1).
+async function resolvePinScope(rawPath) {
+  const gen = ++pinResolveGen;
+  pinScopeResolved = false; pinEntry = null;
+  setPinScopeState('resolving…'); updateSaveState();
+  let data;
+  try {
+    data = await routingFetch('/api/project-pin?' + new URLSearchParams({ path: rawPath }).toString());
+  } catch (e) {
+    if (gen !== pinResolveGen) return;
+    setPinScopeState('error: ' + e.message); updateSaveState(); return;
+  }
+  if (gen !== pinResolveGen) return;          // superseded by a newer selection
+  pinGlobalProfile = data.global;
+  if (!data.key) { setPinScopeState('not a pinnable git project'); pinScopeResolved = false; updateSaveState(); return; }
+  pinScopeKey = data.key; pinEntry = data.pin || null; pinScopeResolved = true;
+  setProjectScopeUI(true); renderProjectScope();
+  setPinScopeState(pinEntry ? 'pinned project — editing ' + pinBasename(data.key) : 'unpinned project — inherits global');
+  updateSaveState();
+}
+
+function setProjectScopeUI(isProject) {
+  const preset = document.getElementById('routing-preset');
+  if (preset) preset.style.display = isProject ? 'none' : '';
+  ['main', 'reviewer', 'subagent'].forEach(role => {
+    const wrap = document.getElementById(role + '-inherit-wrap');
+    if (wrap) wrap.style.display = isProject ? 'inline-flex' : 'none';
+  });
+  const btn = document.getElementById('save-routing-profile');
+  if (btn) btn.textContent = isProject ? 'Save project pin' : 'Save roles';
+}
+
+function globalRoleChoice(role) {
+  const g = pinGlobalProfile || {};
+  if (role === 'main') return g.main || { backend: 'auto' };
+  if (role === 'reviewer') return g.reviewer || { backend: 'auto' };
+  return { backend: 'local', model: g.subagent_model || '' };
+}
+
+function renderProjectScope() {
+  ['main', 'reviewer', 'subagent'].forEach(role => {
+    const pinned = pinEntry ? pinEntry[role] : null;
+    const inherit = pinned == null;
+    pinRoleInherit[role] = inherit;
+    const cb = document.getElementById(role + '-inherit');
+    if (cb) cb.checked = inherit;
+    if (role === 'subagent') {
+      const model = inherit ? (globalRoleChoice('subagent').model || '') : pinned;
+      buildLocalModelSelect('subagent', model || '', 'Unconfigured (auto)');
+    } else {
+      renderRoutingChoice(role, inherit ? globalRoleChoice(role) : pinned);
+    }
+    applyRoleInherit(role, inherit);
+  });
+}
+
+function onRoleInherit(role) {
+  const inherit = document.getElementById(role + '-inherit').checked;
+  pinRoleInherit[role] = inherit;
+  if (!inherit) {
+    // Entering Pin seeds from the effective global value.
+    if (role === 'subagent') buildLocalModelSelect('subagent', globalRoleChoice('subagent').model || '', 'Unconfigured (auto)');
+    else renderRoutingChoice(role, globalRoleChoice(role));
+  }
+  applyRoleInherit(role, inherit);
+  updateSaveState();
+}
+
+function applyRoleInherit(role, inherit) {
+  [role + '-backend', role + '-model', role + '-model-select'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = inherit;
+  });
+  const backend = document.getElementById(role + '-backend');
+  if (backend) backend.style.opacity = inherit ? '0.5' : '1';
+}
+
+async function saveProjectPin() {
+  if (!pinScopeResolved || pinScopeKey === PIN_GLOBAL) return;
+  const message = document.getElementById('routing-profile-message');
+  const choice = role => {
+    const backend = document.getElementById(role + '-backend').value;
+    return backend === 'auto' ? { backend } : { backend, model: routingModelValue(role) };
+  };
+  const body = {
+    path: pinScopeKey,
+    main: pinRoleInherit.main ? null : choice('main'),
+    reviewer: pinRoleInherit.reviewer ? null : choice('reviewer'),
+    subagent: pinRoleInherit.subagent ? null : routingModelValue('subagent'),
+  };
+  routingProfileBusy = true; updateSaveState();
+  try {
+    const data = await routingFetch('/api/project-pin', body);
+    pinEntry = (data.pins && data.pins[data.key]) || null;
+    message.textContent = 'Saved pin for ' + pinBasename(data.key) + '.';
+    await loadPinScopes();
+  } catch (error) {
+    message.textContent = 'Not saved: ' + error.message;
+  } finally {
+    routingProfileBusy = false; updateSaveState();
+  }
+}
+
+function describePin(pin) {
+  const parts = [];
+  ['main', 'reviewer'].forEach(role => {
+    const c = pin[role];
+    parts.push(c ? role + ' ' + c.backend + (c.model ? '/' + c.model : '') : role + ' inherited');
+  });
+  parts.push(pin.subagent ? 'subagent ' + pin.subagent : 'subagent inherited');
+  return parts.join(' · ');
+}
+
+// Render the pins overview list with textContent only (no innerHTML): project
+// paths and model ids are untrusted and can contain HTML-significant characters.
+function renderProjectPinsList(pins) {
+  const el = document.getElementById('project-pins-list');
+  if (!el) return;
+  el.replaceChildren();
+  const keys = Object.keys(pins || {}).sort();
+  if (!keys.length) {
+    const empty = document.createElement('div');
+    empty.style.color = 'var(--textMute)';
+    empty.textContent = 'No project pins. All projects inherit the global profile.';
+    el.appendChild(empty);
+    return;
+  }
+  keys.forEach(key => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)';
+    const name = document.createElement('span');
+    name.textContent = pinBasename(key);
+    name.title = key;
+    name.style.fontWeight = '600';
+    const desc = document.createElement('span');
+    desc.style.color = 'var(--textDim)';
+    desc.style.overflowWrap = 'anywhere';
+    desc.textContent = describePin(pins[key]);
+    const remove = document.createElement('button');
+    remove.className = 'br-btn';
+    remove.style.marginLeft = 'auto';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => removeProjectPin(key));
+    row.append(name, desc, remove);
+    el.appendChild(row);
+  });
+}
+
+async function removeProjectPin(key) {
+  try {
+    const response = await fetch('/api/project-pin', {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+    if (pinScopeKey === key) { document.getElementById('pin-scope').value = PIN_GLOBAL; await onPinScopeChange(); }
+    await loadPinScopes();
+  } catch (error) {
+    document.getElementById('routing-profile-message').textContent = 'Remove failed: ' + error.message;
   }
 }
 
@@ -4697,6 +4952,7 @@ refreshSlow();
 refreshBonsai();
 loadRoutingProfile();
 loadRoutingModels();
+loadPinScopes();
 loadReviewStatus();
 
 // Poll intervals

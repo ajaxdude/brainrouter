@@ -120,7 +120,8 @@ impl ReviewService {
     ) -> Result<RequestReviewResult> {
         // Create the session first — the agent gets the ID in the response regardless
         // of whether the review loop succeeds or fails.
-        let config_snapshot = self.get_config();
+        let mut config_snapshot = self.get_config();
+        self.apply_reviewer_pin(&mut config_snapshot, &cwd);
         let session = self.sessions.create_session_with_config(
             task_id.clone(),
             summary.clone(),
@@ -238,6 +239,22 @@ impl ReviewService {
     /// Get a copy of the current review configuration.
     pub fn get_config(&self) -> ReviewConfig {
         self.preferences.review_config()
+    }
+
+    /// Apply a project's reviewer pin (if any) into a fresh review's config
+    /// snapshot — before the session persists it and before admission runs. A
+    /// pin is a *configured* choice: admission still governs the final route,
+    /// and continuations reuse the stored snapshot (they never re-resolve).
+    /// Normalization here is synchronous (off the proxy hot path) and skipped
+    /// entirely when no pin exists (the store's `has_pins` gate).
+    fn apply_reviewer_pin(&self, config: &mut ReviewConfig, cwd: &str) {
+        let Some(store) = self.router.project_pins() else {
+            return;
+        };
+        if let Some(reviewer) = store.resolve(cwd).and_then(|pin| pin.reviewer) {
+            config.forced_mode = reviewer.backend().to_string();
+            config.forced_model = reviewer.model().map(str::to_owned);
+        }
     }
 
     pub fn preferences(&self) -> &Arc<ProfileStore> { &self.preferences }
@@ -446,7 +463,8 @@ impl ReviewService {
         cwd: String,
     ) -> String {
         // Create the session synchronously so the caller has an ID to poll.
-        let config_snapshot = self.get_config();
+        let mut config_snapshot = self.get_config();
+        self.apply_reviewer_pin(&mut config_snapshot, &cwd);
         let session = self.sessions.create_session_with_config(
             task_id.clone(),
             summary.clone(),

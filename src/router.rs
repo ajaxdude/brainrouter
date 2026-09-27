@@ -15,6 +15,7 @@ use crate::{
     config::NudgeBudgets,
     health::HealthTracker,
     inference_state::{InferenceTracker, Phase},
+    project_pins::{ProjectPin, ProjectPinStore},
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
     routing_events::{CompletedStreamMeasurement, RouteEvent, RoutingEvents, Stage},
@@ -109,6 +110,9 @@ pub struct Router {
     /// incoming messages untouched (no system-prompt rewrite).
     prompt_rewrite: Arc<AtomicBool>,
     profiles: Option<Arc<ProfileStore>>,
+    /// Per-project model pins (Phase 2). `None` or an empty store ⇒ every
+    /// project inherits the global profile (no routing change).
+    project_pins: Option<Arc<ProjectPinStore>>,
 }
 
 pub struct RouterArgs {
@@ -153,6 +157,7 @@ impl Router {
             nudge_tier: args.nudge_tier,
             prompt_rewrite: args.prompt_rewrite,
             profiles: None,
+            project_pins: None,
         }
     }
 
@@ -162,6 +167,13 @@ impl Router {
     }
 
     pub fn profiles(&self) -> Option<&Arc<ProfileStore>> { self.profiles.as_ref() }
+
+    pub fn with_project_pins(mut self, project_pins: Arc<ProjectPinStore>) -> Self {
+        self.project_pins = Some(project_pins);
+        self
+    }
+
+    pub fn project_pins(&self) -> Option<&Arc<ProjectPinStore>> { self.project_pins.as_ref() }
 
     /// Catalog discovery is metadata-only; never invokes inference or starts a model.
     pub async fn model_catalog(&self) -> serde_json::Value {
@@ -233,6 +245,25 @@ impl Router {
         }
     }
 
+    /// Resolve a per-project pin for this request, or `None`. Runs at most one
+    /// normalization, in `spawn_blocking`, and only when a pin store is present,
+    /// non-empty (`has_pins`), and the original selector consults a pin
+    /// (empty/auto/subs). Named/`local`/`cloud` selectors and an empty store do
+    /// zero filesystem work (R9).
+    async fn resolve_project_pin(&self, model: &str, cwd: &str) -> Option<ProjectPin> {
+        let store = self.project_pins.as_ref()?;
+        if !store.has_pins()
+            || !matches!(model, "" | "auto" | "brainrouter/auto" | "subs" | "brainrouter/subs")
+        {
+            return None;
+        }
+        let store = Arc::clone(store);
+        let cwd = cwd.to_owned();
+        tokio::task::spawn_blocking(move || store.resolve(&cwd))
+            .await
+            .unwrap_or(None)
+    }
+
     /// Route a request, returning the response and metadata about the routing decision.
     /// `session_id` tags the emitted RouteEvent (used by the review loop so events are
     /// linkable to review sessions).
@@ -243,14 +274,18 @@ impl Router {
         cwd: String,
         user_agent: String,
     ) -> Result<(ProviderResponse, RouteInfo)> {
-        // Only default/auto requests use the main choice. Explicit client
-        // aliases and model IDs remain authoritative in both proxy protocols.
+        // Resolve a per-project pin once (gated: non-empty store + a pin-consulting
+        // selector). Precedence for the main role: explicit request model >
+        // project pin > global profile > auto — the explicit case is the
+        // `matches!` guard below, which leaves a client-supplied model untouched.
+        let pin = self.resolve_project_pin(&request.model, &cwd).await;
         if matches!(request.model.as_str(), "" | "auto" | "brainrouter/auto") {
-            request.model = self.profiles.as_ref()
-                .map(|store| store.profile().main.selector())
+            request.model = pin.as_ref().and_then(|p| p.main.clone())
+                .or_else(|| self.profiles.as_ref().map(|store| store.profile().main))
+                .map(|choice| choice.selector())
                 .unwrap_or_else(|| "auto".into());
         }
-        self.route_resolved(request, session_id, cwd, user_agent, true, true).await
+        self.route_resolved(request, session_id, cwd, user_agent, true, true, pin).await
     }
 
     /// Review calls use their session snapshot, never the live main or subs choice.
@@ -267,10 +302,15 @@ impl Router {
         request.model = choice.selector();
         // Reviewer path: never rewrite the local prompt (apply_local_rewrite=false)
         // so the review criteria survive; never fall back to local on a cloud
-        // failure (allow_local_fallback threaded from the caller).
-        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false).await
+        // failure (allow_local_fallback threaded from the caller). A reviewer pin
+        // is applied upstream into the per-run snapshot, so no pin is passed here.
+        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false, None).await
     }
 
+    // One extra parameter (the resolved project pin) beyond clippy's arg
+    // threshold; the alternative is a params struct that would obscure the
+    // reviewer-vs-proxy call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn route_resolved(
         &self,
         mut request: ChatCompletionRequest,
@@ -279,6 +319,7 @@ impl Router {
         user_agent: String,
         allow_local_fallback: bool,
         apply_local_rewrite: bool,
+        pin: Option<ProjectPin>,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
@@ -324,8 +365,13 @@ impl Router {
                 // Subs pool: `subs` or `brainrouter/subs` → subs_model, bypassing
                 // Bonsai. Unconfigured → warn and fall back to auto below.
                 if requested_model == "subs" || requested_model == "brainrouter/subs" {
-                    let subs = self.profiles.as_ref().map(|store| store.profile().subagent_model)
-                        .unwrap_or_else(|| self.subs_model.clone());
+                    // Subagent precedence: project pin > global subagent_model
+                    // (authoritative, including `None`) > config subs_model. The
+                    // fallback expression is preserved byte-for-byte from Phase 1,
+                    // so an unpinned request is unchanged (R9/B2).
+                    let subs = pin.as_ref().and_then(|p| p.subagent.clone())
+                        .or_else(|| self.profiles.as_ref().map(|store| store.profile().subagent_model)
+                            .unwrap_or_else(|| self.subs_model.clone()));
                     if let Some(subs) = subs {
                         info!(model = %subs, "Subs pool routing — direct to llama-swap");
                         tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);

@@ -178,6 +178,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         "local" => 2,
         _ => 0,
     };
+    // Per-project model pins (Phase 2): colocated with routing_state.json. An
+    // absent/corrupt file loads empty, so every project inherits the global
+    // profile — identical to pre-Phase-2 behavior.
+    let project_pins = Arc::new(brainrouter::project_pins::ProjectPinStore::load(
+        config::default_config_path().with_file_name("project_pins.json"),
+    ));
     let benchmark_store = BenchmarkStore::open(config.benchmarks.database_path.clone())
         .map(Arc::new)
         .map_err(|error| {
@@ -377,7 +383,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             nudge_tier: Arc::clone(&nudge_tier),
             prompt_rewrite: Arc::clone(&prompt_rewrite),
         })
-        .with_profiles(profiles),
+        .with_profiles(profiles)
+        .with_project_pins(project_pins),
     );
 
     // Session manager (in-memory; ephemeral per process lifetime)

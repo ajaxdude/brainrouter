@@ -5,6 +5,7 @@ use brainrouter::{
     config::{self, NudgeBudgets, ReviewConfig},
     health::HealthTracker,
     inference_state::InferenceTracker,
+    project_pins::{ProjectPin, ProjectPinStore},
     provider::{openai::OpenAiProvider, ProviderResponse},
     review::ReviewService,
     router::{Router, RouterArgs},
@@ -153,46 +154,47 @@ fn profile() -> RoutingProfile {
     }
 }
 
+fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> RouterArgs {
+    RouterArgs {
+        classifier: Arc::new(Classifier::new(
+            format!("{}/classifier", upstream.url),
+            "default-local".into(),
+            Arc::new(AtomicBool::new(classify)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )),
+        manifest: Arc::new(OpenAiProvider::new(
+            "manifest".into(),
+            format!("{}/cloud/v1", upstream.url),
+            Some("synthetic-test-key".into()),
+        )),
+        manifest_enabled: enabled,
+        llama_swap: Arc::new(OpenAiProvider::new(
+            "llama-swap".into(),
+            format!("{}/local/v1", upstream.url),
+            None,
+        )),
+        fallback_model: "default-local".into(),
+        local_models: vec!["known-local".into()],
+        subs_model: Some("legacy-pool".into()),
+        health: Arc::new(HealthTracker::new()),
+        routing_events: Arc::new(RoutingEvents::new()),
+        local_system_prompt: None,
+        inference_tracker: Arc::new(InferenceTracker::new()),
+        nudge_budgets: NudgeBudgets::default(),
+        nudge_enabled: Arc::new(AtomicBool::new(false)),
+        nudge_tier: Arc::new(AtomicU8::new(0)),
+        prompt_rewrite: Arc::new(AtomicBool::new(false)),
+    }
+}
+
 fn router(
     upstream: &SyntheticProviders,
     store: Arc<ProfileStore>,
     enabled: bool,
     classify: bool,
 ) -> Arc<Router> {
-    Arc::new(
-        Router::new(RouterArgs {
-            classifier: Arc::new(Classifier::new(
-                format!("{}/classifier", upstream.url),
-                "default-local".into(),
-                Arc::new(AtomicBool::new(classify)),
-                Arc::new(AtomicBool::new(false)),
-                None,
-            )),
-            manifest: Arc::new(OpenAiProvider::new(
-                "manifest".into(),
-                format!("{}/cloud/v1", upstream.url),
-                Some("synthetic-test-key".into()),
-            )),
-            manifest_enabled: enabled,
-            llama_swap: Arc::new(OpenAiProvider::new(
-                "llama-swap".into(),
-                format!("{}/local/v1", upstream.url),
-                None,
-            )),
-            fallback_model: "default-local".into(),
-            local_models: vec!["known-local".into()],
-            subs_model: Some("legacy-pool".into()),
-            health: Arc::new(HealthTracker::new()),
-            routing_events: Arc::new(RoutingEvents::new()),
-            local_system_prompt: None,
-            inference_tracker: Arc::new(InferenceTracker::new()),
-            nudge_budgets: NudgeBudgets::default(),
-            nudge_enabled: Arc::new(AtomicBool::new(false)),
-            nudge_tier: Arc::new(AtomicU8::new(0)),
-            prompt_rewrite: Arc::new(AtomicBool::new(false)),
-        })
-        .with_profiles(store),
-    )
+    Arc::new(Router::new(router_args(upstream, enabled, classify)).with_profiles(store))
 }
 
 fn request(model: &str) -> ChatCompletionRequest {
@@ -264,6 +266,121 @@ async fn role_choices_and_client_models_are_independent() {
         store.profile().subagent_model.as_deref(),
         Some("subagent-pool")
     );
+}
+
+#[tokio::test]
+async fn project_main_pin_overrides_global_and_unpinned_follows_global() {
+    // R10 main precedence with a real global profile: a pinned project overrides
+    // the global main; an unpinned cwd follows the live global profile.
+    let upstream = SyntheticProviders::start().await;
+    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap()); // global main = main-local
+    let repo = std::env::temp_dir().join(format!("br-profile-pin-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { main: Some(local("project-pinned-main")), ..Default::default() },
+    )
+    .unwrap();
+    let router = Arc::new(
+        Router::new(router_args(&upstream, true, false))
+            .with_profiles(store)
+            .with_project_pins(Arc::new(pins)),
+    );
+
+    // auto from the pinned repo → the project's main pin (overrides the global).
+    let (response, info) = router
+        .route_tagged(request("auto"), None, repo.to_string_lossy().into_owned(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, "project-pinned-main");
+    drain(response).await;
+
+    // auto from an unpinned cwd → the live global profile main.
+    let (response, info) = router
+        .route_tagged(request("auto"), None, String::new(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, "main-local");
+    drain(response).await;
+
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[tokio::test]
+async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
+    // R10 reviewer: a project reviewer pin becomes the configured choice in the
+    // fresh-review snapshot (then admission still governs); an unpinned cwd uses
+    // the global reviewer; a continuation reuses the stored (pinned) snapshot
+    // even after the global reviewer changes.
+    let upstream = SyntheticProviders::start().await;
+    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap()); // global reviewer = cloud vendor/reviewer-2026
+    let repo = std::env::temp_dir().join(format!("br-review-pin-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { reviewer: Some(cloud("project-reviewer")), ..Default::default() },
+    )
+    .unwrap();
+    let router = Arc::new(
+        Router::new(router_args(&upstream, true, false))
+            .with_profiles(store.clone())
+            .with_project_pins(Arc::new(pins)),
+    );
+    let sessions = Arc::new(SessionManager::new());
+    let service = Arc::new(ReviewService::new(
+        router,
+        sessions.clone(),
+        ReviewConfig::default(),
+        Default::default(),
+        true,
+        "default-local".to_string(),
+    ));
+
+    // Fresh review from the pinned repo → the reviewer uses the PROJECT pin.
+    let pinned = service
+        .start_review("t".into(), "pinned review".into(), None, vec![], repo.to_str().unwrap().into())
+        .await
+        .unwrap();
+    assert_eq!(pinned.status, ReviewStatus::Approved);
+    assert_eq!(
+        upstream.calls().last().unwrap(),
+        &("/cloud/v1/chat/completions".into(), "project-reviewer".into())
+    );
+    // The stored snapshot carries the pinned reviewer, so continuations keep it.
+    let snapshot = sessions.get_session(&pinned.session_id).unwrap().review_config.unwrap();
+    assert_eq!(snapshot.forced_mode, "cloud");
+    assert_eq!(snapshot.forced_model.as_deref(), Some("project-reviewer"));
+
+    // Fresh review from an UNPINNED cwd → the global reviewer.
+    let global = service
+        .start_review("t2".into(), "global review".into(), None, vec![], String::new())
+        .await
+        .unwrap();
+    assert_eq!(global.status, ReviewStatus::Approved);
+    assert_eq!(
+        upstream.calls().last().unwrap(),
+        &("/cloud/v1/chat/completions".into(), "vendor/reviewer-2026".into())
+    );
+
+    // Continuation of the pinned review keeps its snapshot even after the global
+    // reviewer changes underneath it.
+    store
+        .update_review(ReviewConfig {
+            max_iterations: 1,
+            forced_mode: "cloud".into(),
+            forced_model: Some("changed-global".into()),
+            ..ReviewConfig::default()
+        })
+        .unwrap();
+    service.continue_review(&pinned.session_id, 1).await.unwrap();
+    assert_eq!(
+        upstream.calls().last().unwrap(),
+        &("/cloud/v1/chat/completions".into(), "project-reviewer".into())
+    );
+
+    fs::remove_dir_all(&repo).ok();
 }
 
 #[tokio::test]

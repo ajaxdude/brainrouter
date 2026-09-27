@@ -237,23 +237,12 @@ fn is_loopback_http_url(value: &str) -> bool {
     }
 }
 
-
-/// Handle incoming HTTP requests
-async fn handle_request(
-    req: Request<Incoming>,
-    state: Arc<AppState>,
-    cwd: String,
-    peer_addr: SocketAddr,
-) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
-    let method = req.method().as_str();
-    let path = req.uri().path();
-
-    debug!("Request: {} {}", method, path);
-
-    // Security: Only allow localhost (127.0.0.1 or ::1) for destructive APIs.
-    // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
-    let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
-    let is_destructive = path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
+/// Classify a request as destructive (loopback + CSRF gated). Pure so the
+/// security boundary is unit-tested. `has_query` is `req.uri().query().is_some()`
+/// — used only to gate the per-project-pin `?path=` resolver while leaving the
+/// plain no-query GET ungated.
+fn request_is_destructive(method: &str, path: &str, has_query: bool) -> bool {
+    path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
         // Generalized toolbox container management (create/update/delete/adopt,
         // PR2 §5c) — prefix-gated like /api/upgrade/ so a future sub-path under
         // this same prefix is never accidentally left ungated.
@@ -271,6 +260,12 @@ async fn handle_request(
         // FR-A: code-review master switch write path — prefix-gated like the
         // other local-only mutating APIs.
         || (method == "POST" && path.starts_with("/api/review/"))
+        // Phase 2 per-project model pins: POST/DELETE mutate persisted state; the
+        // `?path=` GET resolver canonicalizes an arbitrary caller-supplied path
+        // (a filesystem path-oracle + blocking-pool vector), so gate it too. The
+        // plain no-query GET stays ungated, like GET /api/routing-profile.
+        || (matches!(method, "POST" | "DELETE") && path == "/api/project-pin")
+        || (method == "GET" && path == "/api/project-pin" && has_query)
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
@@ -286,7 +281,25 @@ async fn handle_request(
             || path.starts_with("/api/benchmarks/")
             || path == "/api/inflight/cancel"
             || path.starts_with("/api/observability/")
-        ));
+        ))
+}
+
+/// Handle incoming HTTP requests
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+    cwd: String,
+    peer_addr: SocketAddr,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
+    let method = req.method().as_str();
+    let path = req.uri().path();
+
+    debug!("Request: {} {}", method, path);
+
+    // Security: Only allow localhost (127.0.0.1 or ::1) for destructive APIs.
+    // UDS connections (peer_addr = 0.0.0.0:0) are always allowed as they are local.
+    let is_local = peer_addr.ip().is_loopback() || peer_addr.port() == 0;
+    let is_destructive = request_is_destructive(method, path, req.uri().query().is_some());
 
     if is_destructive {
         if !is_local {
@@ -753,6 +766,93 @@ async fn handle_request(
 
         ("GET", "/api/routing-models") => {
             into_unsync(json_response(StatusCode::OK, &state.router.model_catalog().await))
+        }
+
+        // ── Per-project model pins (Phase 2) ────────────────────────────────
+        ("GET", "/api/project-pin") => {
+            let global = state.review_service.preferences().profile();
+            let store = match state.router.project_pins().map(Arc::clone) {
+                Some(store) => store,
+                None => return Ok(into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "pins": serde_json::Map::new(), "global": global, "cloud_enabled": state.manifest_enabled,
+                })))),
+            };
+            if let Some(query) = req.uri().query() {
+                // Loopback-gated resolver: normalize a raw/subdir/symlinked path
+                // to its canonical key + current pin. Canonicalization is
+                // filesystem work, so run it off the async worker.
+                let raw = match single_path_query(query) {
+                    Ok(raw) => raw,
+                    Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+                };
+                let (key, pin) = tokio::task::spawn_blocking(move || {
+                    let key = store.resolve_key(&raw);
+                    let pin = key.as_ref().and_then(|k| store.get(k));
+                    (key, pin)
+                })
+                .await
+                .unwrap_or((None, None));
+                into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "key": key, "pin": pin, "global": global,
+                })))
+            } else {
+                into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "pins": store.snapshot(), "global": global, "cloud_enabled": state.manifest_enabled,
+                })))
+            }
+        }
+
+        ("POST", "/api/project-pin") => {
+            let Some(store) = state.router.project_pins().map(Arc::clone) else {
+                return Ok(routing_error(StatusCode::SERVICE_UNAVAILABLE, "project pins are not configured"));
+            };
+            let body: ProjectPinBody = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let path = match body.path {
+                serde_json::Value::String(path) if !path.is_empty() => path,
+                _ => return Ok(routing_error(StatusCode::BAD_REQUEST, "path must be a non-empty string")),
+            };
+            let main = match project_pin_role(body.main, "main") {
+                Ok(main) => main,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let reviewer = match project_pin_role(body.reviewer, "reviewer") {
+                Ok(reviewer) => reviewer,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let subagent = match project_pin_subagent(body.subagent) {
+                Ok(subagent) => subagent,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let pin = crate::project_pins::ProjectPin { main, reviewer, subagent };
+            match tokio::task::spawn_blocking(move || store.set(&path, pin).map(|key| (store.snapshot(), key)))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                Ok((pins, key)) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "pins": pins, "key": key }))),
+                Err(error) => routing_error(StatusCode::BAD_REQUEST, error),
+            }
+        }
+
+        ("DELETE", "/api/project-pin") => {
+            let Some(store) = state.router.project_pins().map(Arc::clone) else {
+                return Ok(routing_error(StatusCode::SERVICE_UNAVAILABLE, "project pins are not configured"));
+            };
+            let body: ProjectPinDelete = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            match tokio::task::spawn_blocking(move || store.remove(&body.key).map(|()| store.snapshot()))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                Ok(pins) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "pins": pins }))),
+                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
         }
 
         // ── Bonsai classifier server API ────────────────────────────────────
@@ -4043,6 +4143,58 @@ async fn read_routing_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// `POST /api/project-pin` body. Every role key is **required and present**
+/// (missing ⇒ serde error ⇒ 400; unknown ⇒ 400): serde cannot distinguish an
+/// omitted field from an explicit `null` on a plain `Option`, so the fields are
+/// required `Value`s and `null` is interpreted as "inherit" (B3′).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectPinBody {
+    path: serde_json::Value,
+    main: serde_json::Value,
+    reviewer: serde_json::Value,
+    subagent: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectPinDelete {
+    key: String,
+}
+
+/// A POST role value: `null` ⇒ inherit; otherwise a validated `ModelChoice`.
+fn project_pin_role(
+    value: serde_json::Value,
+    role: &str,
+) -> Result<Option<crate::routing_profile::ModelChoice>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some).map_err(|error| format!("{role}: {error}"))
+}
+
+/// The subagent value: `null` ⇒ inherit; otherwise a non-empty local model key
+/// (validity is enforced by `ProjectPinStore::set`).
+fn project_pin_subagent(value: serde_json::Value) -> Result<Option<String>, String> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(id) if !id.is_empty() => Ok(Some(id)),
+        _ => Err("subagent must be a non-empty string or null".to_string()),
+    }
+}
+
+/// Extract exactly one `path` query parameter from the resolver GET (R5-I1):
+/// a missing, duplicate, or unexpected parameter is a `400`.
+fn single_path_query(query: &str) -> Result<String, String> {
+    let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    match params.as_slice() {
+        [(key, value)] if key == "path" => Ok(value.clone()),
+        _ => Err("expected exactly one `path` query parameter".to_string()),
+    }
+}
+
 async fn handle_llama_swap_models(
     llama_swap_url: &str,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
@@ -4482,6 +4634,57 @@ mod tests {
         assert_eq!(found["hf"]["found_on_path"], serde_json::json!(true));
         assert!(found["hf"]["message"].is_null());
         assert!(found["hf"]["install_command"].is_null());
+    }
+
+    // ── Per-project model pins: gate + POST decoder (Phase 2) ────────────────
+
+    #[test]
+    fn project_pin_gate_covers_mutations_and_the_resolver() {
+        assert!(request_is_destructive("POST", "/api/project-pin", false));
+        assert!(request_is_destructive("DELETE", "/api/project-pin", false));
+        assert!(request_is_destructive("GET", "/api/project-pin", true), "?path= resolver is gated");
+        assert!(!request_is_destructive("GET", "/api/project-pin", false), "plain GET is ungated");
+        // Unrelated classifications are unchanged.
+        assert!(!request_is_destructive("GET", "/api/routing-profile", false));
+        assert!(request_is_destructive("POST", "/api/routing-profile", false));
+    }
+
+    #[test]
+    fn project_pin_body_requires_every_role_key_and_rejects_unknown() {
+        let ok: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
+            "path": "/r", "main": null, "reviewer": null, "subagent": null
+        }));
+        assert!(ok.is_ok());
+        let missing: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
+            "path": "/r", "main": null, "reviewer": null
+        }));
+        assert!(missing.is_err(), "a missing role key is rejected");
+        let unknown: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
+            "path": "/r", "main": null, "reviewer": null, "subagent": null, "extra": 1
+        }));
+        assert!(unknown.is_err(), "an unknown key is rejected");
+    }
+
+    #[test]
+    fn project_pin_role_and_subagent_parsing() {
+        assert!(project_pin_role(serde_json::Value::Null, "main").unwrap().is_none());
+        let choice = project_pin_role(serde_json::json!({"backend":"local","model":"m"}), "main").unwrap();
+        assert!(matches!(choice, Some(crate::routing_profile::ModelChoice::Local { model: Some(_) })));
+        assert!(project_pin_role(serde_json::json!({"backend":"bogus"}), "main").is_err());
+
+        assert!(project_pin_subagent(serde_json::Value::Null).unwrap().is_none());
+        assert_eq!(project_pin_subagent(serde_json::json!("pool-x")).unwrap().as_deref(), Some("pool-x"));
+        assert!(project_pin_subagent(serde_json::json!("")).is_err(), "empty subagent rejected");
+        assert!(project_pin_subagent(serde_json::json!(3)).is_err(), "non-string subagent rejected");
+    }
+
+    #[test]
+    fn single_path_query_requires_exactly_one_path() {
+        assert_eq!(single_path_query("path=%2Fusr%2Frepo").unwrap(), "/usr/repo");
+        assert!(single_path_query("").is_err(), "missing path");
+        assert!(single_path_query("path=/a&path=/b").is_err(), "duplicate path");
+        assert!(single_path_query("other=/a").is_err(), "unexpected key");
+        assert!(single_path_query("path=/a&x=1").is_err(), "extra key");
     }
 
     // ── FR-D: maybe_inject_pr_guidelines ─────────────────────────────────────

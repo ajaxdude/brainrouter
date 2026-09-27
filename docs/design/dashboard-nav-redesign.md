@@ -66,7 +66,7 @@ All line references are `src/escalation/templates/main_dashboard.html` unless no
 **Phase 1b — HankNDory runtime toggle (small backend increment; enables R5's "set" half).**
 - **R8b** Add `GET/POST /api/review/hankndory {enabled}` mirroring FR-A/FR-D (persisted in `review_runtime_state.json`, loopback-guarded POST) and a Config-Quality toggle. This is **not** UI-only and ships as its own slice with unit tests + a `code-review` pass. *AC:* toggling persists across restart and never clobbers the sibling flags (reuses the FR-D locked full-snapshot writer).
 
-**Phase 2 — per-project model pin (deferred; additive).**
+**Phase 2 — per-project model pin (IMPLEMENTED — see `docs/design/per-project-model-pin.md`; additive).**
 - **R9** A project **inherits the global model profile by default** (zero per-project setup). *AC:* a never-configured project behaves exactly as today.
 - **R10** The user may **pin a model (role) for a specific project**, keyed by project/`cwd`; resolution precedence: **explicit request model > project pin > global profile > auto**. *AC:* unit tests for each precedence rung; a pinned project overrides global, an unpinned one follows global live.
 - **R11** The model quick-switch shows **inherited vs pinned** state and which scope a change affects. *AC:* changing the global vs pinning the project are visibly distinct actions.

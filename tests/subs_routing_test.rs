@@ -12,16 +12,31 @@ use brainrouter::classifier::Classifier;
 use brainrouter::config::NudgeBudgets;
 use brainrouter::health::HealthTracker;
 use brainrouter::inference_state::InferenceTracker;
+use brainrouter::project_pins::{ProjectPin, ProjectPinStore};
 use brainrouter::provider::openai::OpenAiProvider;
 use brainrouter::routing_events::RoutingEvents;
 use brainrouter::router::{Router, RouterArgs};
+use brainrouter::routing_profile::ModelChoice;
 use brainrouter::types::{ChatCompletionRequest, ChatMessage};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const SUBS_KEY: &str = "dirk-qwen3.8-27b-q6-subs";
 const FALLBACK_KEY: &str = "fallback-model";
+const PINNED_MAIN_KEY: &str = "project-pinned-main-model";
+const PINNED_SUBS_KEY: &str = "project-pinned-subs-model";
+
+/// A throwaway directory that looks like a git repo (has a `.git` entry), so
+/// `project_key` normalizes a request `cwd` under it to a stable pin key.
+fn temp_git_repo() -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("br-pin-it-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    dir
+}
 
 /// Spawn a raw-TCP mock llama-swap: returns a URL and a shared list of every
 /// `model` field it saw in request bodies. Responds with a minimal OpenAI SSE.
@@ -298,4 +313,110 @@ async fn auto_local_still_falls_back_on_failure() {
     // That fails → retry with fallback_model (same key here) → also fails.
     assert!(result.is_err());
     drop(result);
+}
+
+// ── Per-project model pin precedence (Phase 2, R10) ──────────────────────────
+
+#[tokio::test]
+async fn auto_request_honors_project_main_pin() {
+    // Precedence rung: no explicit client model + a project pin ⇒ the pin's
+    // main model wins (over the global default / auto).
+    let (url, captured) = spawn_mock_llama_swap().await;
+    let repo = temp_git_repo();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
+    )
+    .unwrap();
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+
+    let (resp, info) = router
+        .route_tagged(chat_request("auto"), None, repo.to_string_lossy().into_owned(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, PINNED_MAIN_KEY, "auto + pinned cwd routes to the project's main pin");
+    drop(resp);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(captured.lock().clone(), vec![PINNED_MAIN_KEY.to_string()]);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[tokio::test]
+async fn explicit_model_ignores_project_main_pin() {
+    // Precedence rung: an explicit client model beats a project pin, even from a
+    // pinned cwd — the pin is never consulted for a non-default selector.
+    let (url, captured) = spawn_mock_llama_swap().await;
+    let repo = temp_git_repo();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
+    )
+    .unwrap();
+    let router = make_router(&url, None, vec![]).with_project_pins(Arc::new(pins));
+
+    let (resp, info) = router
+        .route_tagged(chat_request("brainrouter/client-chosen-model"), None, repo.to_string_lossy().into_owned(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, "client-chosen-model", "explicit request model wins over the project pin");
+    drop(resp);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(captured.lock().clone(), vec!["client-chosen-model".to_string()]);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[tokio::test]
+async fn subs_request_honors_project_subagent_pin() {
+    // Precedence rung: a `subs` request from a pinned cwd uses the project's
+    // subagent pin instead of the global subs pool.
+    let (url, captured) = spawn_mock_llama_swap().await;
+    let repo = temp_git_repo();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { subagent: Some(PINNED_SUBS_KEY.into()), ..Default::default() },
+    )
+    .unwrap();
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+
+    let (resp, info) = router
+        .route_tagged(chat_request("subs"), None, repo.to_string_lossy().into_owned(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, PINNED_SUBS_KEY, "subs + pinned cwd uses the project's subagent pin");
+    drop(resp);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(captured.lock().clone(), vec![PINNED_SUBS_KEY.to_string()]);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[tokio::test]
+async fn subs_from_pinned_repo_without_subagent_pin_inherits_global() {
+    // A project pinned for `main` only leaves the subagent inherited: a `subs`
+    // request from that repo still uses the global subs pool (B2 no-regression).
+    let (url, captured) = spawn_mock_llama_swap().await;
+    let repo = temp_git_repo();
+    let pins = ProjectPinStore::memory();
+    pins.set(
+        repo.to_str().unwrap(),
+        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
+    )
+    .unwrap();
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+
+    let (resp, info) = router
+        .route_tagged(chat_request("subs"), None, repo.to_string_lossy().into_owned(), String::new())
+        .await
+        .unwrap();
+    assert_eq!(info.model_key, SUBS_KEY, "an unpinned subagent inherits the global subs pool");
+    drop(resp);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(captured.lock().clone(), vec![SUBS_KEY.to_string()]);
+    std::fs::remove_dir_all(&repo).ok();
 }

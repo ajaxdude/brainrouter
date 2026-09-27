@@ -13,6 +13,7 @@ pub mod health;
 pub mod managed_toolboxes;
 pub mod peer_cwd;
 pub mod prompt_rewriter;
+pub mod project_pins;
 pub mod provider;
 pub mod review;
 pub mod router;
