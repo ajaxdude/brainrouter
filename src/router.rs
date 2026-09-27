@@ -408,7 +408,7 @@ impl Router {
                     // Model is explicitly listed as a local model — route directly
                     // to llama-swap without consulting Bonsai. The user's model
                     // choice is authoritative.
-                    info!(model = %requested_model, "Known local model — routing directly to llama-swap");
+                    info!(model = %requested_model, "Known local model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
                     // request.model is already correct (it's the llama-swap model key)
                     ("local-specific", "local · selected model", self.route_local(request, false).await)
@@ -417,7 +417,7 @@ impl Router {
                     // cloud/subs). The user picked it explicitly — route Local directly
                     // to that model in llama-swap. Lets you select any llama-swap model
                     // without a classifier hop; works even when Bonsai is off.
-                    info!(model = %requested_model, "Named model — routing directly to llama-swap");
+                    info!(model = %requested_model, "Named model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
                     tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
                     ("local-specific", "local · selected model", self.route_local(request, false).await)
                 }
