@@ -111,7 +111,7 @@ Credentials: 0600 file, masked in every API/log/preview; write paths loopback+CS
 
 ## Rollout, migration, and rollback
 
-Leg order above; each leg = one PR to `master` via `v2-p<N>-<name>` branch, brainrouter review gate (Step 9) before merge, phase tag `v2.0-pN`; `git revert -m 1 <merge>` is the per-phase rollback; `v1-classic` is the global rollback. Config auto-migration per touching leg with `--dry-run`. Per-user systemd service stays the deployment unit.
+Leg order per the leg list in "Detailed implementation"; each leg = one PR to `master` via `v2-p<N>-<name>` branch, brainrouter review gate (Step 9) before merge, phase tag `v2.0-pN`; `git revert -m 1 <merge>` is the per-phase rollback; `v1-classic` is the global rollback. Config auto-migration per touching leg with `--dry-run`. Per-user systemd service stays the deployment unit.
 
 ## Risks and mitigations
 
