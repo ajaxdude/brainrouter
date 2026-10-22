@@ -2,10 +2,11 @@
 
 ## Status
 
-State: `drafting` → `critic-revisions-required` applied → `v2 revision for scoped critic round (round 2 of 3)`; submitted for review. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~1.5 h (Hank phases 1–2). Critic rounds used: 1.
+State: `critic-revisions-required` (batch 1) → scoped round 2 closed Step 6 (0 blocking) → `v3 revision; submitted for Step 7 readiness`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~3 h (Hank phases + 2 batches). Critic rounds used: 2 of 3.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
-v2 — 2026-10-22 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
+v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
+v3 — 2026-10-21 — round-2 residuals: R7 page-timing contradiction (F1); grep-gate keeper/parent doc-comment exceptions (F2); `src/daemon.rs` referenced (F3); credentials-staging Decision log entry (F4); F5–F8 nits (pointer, duplication, baseline citation, date/type).
 
 ## Problem
 
@@ -28,24 +29,24 @@ Non-goals: cross-host federation beyond bearer-token LAN endpoints; OS-sandboxed
 ## Current system
 
 - Single Rust daemon (`src/main.rs`→`src/daemon.rs`), OpenAI + Anthropic wire on `:9099` (`src/server.rs`), routing in `src/router.rs` (Manifest | llama-swap | server-mode identities; `route()` dispatch at the `served_model` string match, `router.rs` `find_server_mode_identity`).
-- Model selection is eight layers: (1) role profiles Main/Reviewer/Subagent (`src/routing_profile.rs`); (2) per-role backend choices auto|local|cloud; (3) explicit local/cloud model-id choices; (4) six presets (`src/routing_profile.rs` Preset); (5) per-project pins (`src/project_pins.rs`); (6) proxy selector strings (`auto/local/cloud/cloud/<id>/subs/bare`); (7) dashboard command-strip model controls; (8) CLI `routing-profile` plus harness model lists (`src/cli.rs`, `src/install.rs` templates, `sync-omp`).
+- Model selection is eight layers: (1) role profiles Main/Reviewer/Subagent (`src/routing_profile.rs`); (2) per-role backend choices auto|local|cloud; (3) explicit local/cloud model-id choices; (4) six presets (`src/routing_profile.rs` `RoutingPreset`, six presets + `Custom` sentinel); (5) per-project pins (`src/project_pins.rs`); (6) proxy selector strings (`auto/local/cloud/cloud/<id>/subs/bare`); (7) dashboard command-strip model controls; (8) CLI `routing-profile` plus harness model lists (`src/cli.rs`, `src/install.rs` templates, `sync-omp`).
 - Classifier: Bonsai external llama-server (`src/classifier.rs`, `src/bonsai_server.rs`), YAML `bonsai.*`, invariant "rewrite ⇒ bonsai" enforced at the `POST /api/prompt-rewrite` handler (`src/server.rs`; refuses enable while Bonsai is down), with the bootstrap default in `src/daemon.rs`.
 - Toolbox/server-mode management: `src/server_mode.rs` (ds4/halogen/vllm/r9v/gufo detached podman servers; ds4+gufo are the kept set), `src/serving_identity.rs` registry, `src/model_downloads.rs` (halogen/r9v download + Prepare-PLE jobs), `src/toolbox_catalog/*` (vendored cockpit feed + gufo overlay; `SupportedServingBackend` enum, `CatalogBackendId` feed vocabulary), `src/llama_swap_register.rs` (GGUF→llama-swap config).
 - Platform hardcoding: `src/server.rs` toolbox image default `strix-halo`; dashboard `CURRENT_PLATFORM_ID = 'strix-halo'` (`src/escalation/templates/main_dashboard.html`); no hardware detection.
 - Credentials today: env-var names in YAML (`manifest.api_key_env`), `/etc/brainrouter/env`, plaintext `bridge.discord.token` (`src/config.rs`).
 - Bridges: `src/bridge/*` (Discord/Signal cargo features); LLM path is `omp` subprocess → proxy; no in-process daemon coupling.
 - Keepers: Sankey + conversation cards (`main_dashboard.html`), in-flight registry (`src/inflight.rs`), routing events (`src/routing_events.rs`), observability (`src/observability.rs`), review loop (`src/review/*`), MCP (`src/mcp_server.rs`).
-- Tests: 391 Rust tests + 38 Node browser-logic tests (`scripts/test-benchmark-ui.cjs`); baseline green at `790fd9b`.
+- Tests: 391 Rust tests + 38 Node browser-logic tests (`scripts/test-benchmark-ui.cjs`); baseline verified green at `a6e39f7` (full workspace suite, 2026-10-21).
 
 ## Requirements and acceptance criteria
 
 R1 (P0-Purge). Removing halogen/vllm/r9v leaves a daemon that builds, passes all tests, routes llama-swap/Manifest/gufo/ds4 traffic identically; catalog feed entries for halogen/vllm/r9v parse as browse-only. Test: full `cargo test` + `toolbox_catalog_check` + dashboard loads.
-R2 (Benchmarks gate). Default build excludes the explorer behind a `benchmarks` cargo feature; explorer routes return 503-when-off as today's unavailable-storage path. Test: build without feature, request `/benchmarks` → documented degradation; with feature, all explorer tests pass. The feature name is `benchmarks` (non-default) in `Cargo.toml`; with it off, `/benchmarks` and explorer routes degrade exactly as the unavailable-storage path does today.
-R3 (P1-Plugins). Sidecar plugins over UDS JSON-RPC with manifest, supervisor, namespaced config/kv, grant-scoped secrets; bridge plugin (Discord+Signal) moves out of the core binary, behavior unchanged. Test: bridge plugin round-trip against a live daemon; `cargo tree` core shows no serenity. The minimal credentials store ships in L2 (see B1-resolved ordering): Discord/Signal tokens migrate out of v1 YAML into the store via the migration framework and reach the plugin ONLY through grant-scoped `secrets.get`; acceptance includes a token round-trip store→plugin with the value absent from plugin config files.
+R2 (Benchmarks gate). Default build excludes the explorer behind a `benchmarks` cargo feature (non-default, in `Cargo.toml`); explorer routes return 503-when-off as today's unavailable-storage path. Test: build without feature, request `/benchmarks` → documented degradation; with feature, all explorer tests pass.
+R3 (P1-Plugins). Sidecar plugins over UDS JSON-RPC with manifest, supervisor, namespaced config/kv, grant-scoped secrets; bridge plugin (Discord+Signal) moves out of the core binary, behavior unchanged. Test: bridge plugin round-trip against a live daemon; `cargo tree` core shows no serenity. The minimal credentials store ships in L2 (see the Credentials ownership contract): Discord/Signal tokens migrate out of v1 YAML into the store via the migration framework and reach the plugin ONLY through grant-scoped `secrets.get`; acceptance includes a token round-trip store→plugin with the value absent from plugin config files.
 R4 (P2-Roles). One harness model entry (`auto`) + `x-brainrouter-role: main|subagent|review` headers; role cards (Main/Reviewer/Subagent, global + per-project, Auto|pinned) replace presets/choosers/role-grammar; decision-model slot with kinds `heuristic` (default), `openai-compatible`, `structured-schema`, `webhook`, `plugin`. The `heuristic` kind is fully specified: inputs = resolved selector string, role header, project scope, request feature flags (tool definitions present, message count, prompt token estimate, code-block presence); outputs = the shared {route, tier} vocabulary; parity anchor = today's classifier-off routing (`route_auto` with Bonsai disabled, `src/router.rs`/`src/daemon.rs`) for existing selectors. Acceptance adds: heuristic outputs pinned for the full v1 selector matrix (auto/local/cloud/cloud-id/subs/bare). ≤2GB local budget; `bonsai.*` config auto-migrates. Test: role header routing matrix; migration boots v1 config with logged notice; sanitizer: explicit model ID preserved; heuristic matrix table.
 R5 (P3-Swap). `src/swap/` supervisor: model lifecycle states, launch specs, VRAM budget, in-flight-aware LRU, load queue, stem assertion, start-ownership; `EngineAdapter` trait; llama-swap remains an adapter (shim) during migration. Test: scripted fake-engine adapter suite (spawn/health/evict/queue).
 R6 (P4-Engines). strixite adapter (conf registry, drain-gated cutover, self-provider pin) + hipfire adapter (card files, MTP stem, single port owner) on gfx1151/gfx1100; platform probe feeds the engine-compatibility matrix; icon fleets retired. Test: live swap on both hosts with stem assertion; negative probe test (no strixite offered on gfx1100).
-R7 (P5-Credentials+Cloud). (store exists since L2; this leg adds the Credentials page UI, provider binding, and rotation) Credentials store (`credentials.json` 0600, masked APIs) + Credentials page (add/test/bind/audit); provider adapters (OpenAI-compat, Anthropic) with per-provider breakers; manifest→deepinfra(deepseek) reviewer binding as reference deployment; federation-lite: LAN provider endpoints + bearer token + `GET /api/peer-info`; role flow plan→fedora1/hipfire, dev→strixite, review→cloud verified end-to-end. Test: masked-value audit (no secret in any API/log/config-show); cross-host review session with Sankey LAN hop; store values exportable on owner command to env-line form so a reverted v1 can consume them (ops escape, 0600 file).
+R7 (P5-Credentials+Cloud). (store exists since L2; the page UI shipped in L3 — this leg adds provider binding, rotation, and the cloud adapters) Credentials store (`credentials.json` 0600, masked APIs) + Credentials page (add/test/bind/audit); provider adapters (OpenAI-compat, Anthropic) with per-provider breakers; manifest→deepinfra(deepseek) reviewer binding as reference deployment; federation-lite: LAN provider endpoints + bearer token + `GET /api/peer-info`; role flow plan→fedora1/hipfire, dev→strixite, review→cloud verified end-to-end. Test: masked-value audit (no secret in any API/log/config-show); cross-host review session with Sankey LAN hop; store values exportable on owner command to env-line form so a reverted v1 can consume them (ops escape, 0600 file).
 R8 (P6-P7). llama-swap removed at parity; mac (aarch64-apple-darwin) daemon + ds4-on-mac evaluated (Metal verified or llama.cpp-Metal fallback documented); distributed-role acceptance suite green.
 R9 (Continuity). At all times: `v1-classic` tag + `v1` branch on origin; v1 YAML boots every v2 phase via auto-migration with `--dry-run` preview; CHANGELOG + per-phase PRD/README updates.
 
@@ -101,7 +102,7 @@ Components: `src/server_mode.rs` (halogen/vllm/r9v server builders/requests/cont
 Contracts kept: R1 (byte-identical behavior for kept backends — ds4/gufo/llama_cpp/Manifest paths untouched), `toolbox_backend` historical rows stay (text column, no migration), vendored catalog feed parses unchanged, `/api/server-mode/{ds4,gufo}/*` unchanged. The frozen CHECK list omits `gufo` (pre-existing); no serving-runtime rows for gufo are written by current code — record in PRD notes, out of v2 patch scope.
 Error behavior: requests to removed routes → 404 (they already 404 for unknown backend paths); catalog entries for removed backends show browse-only "not supported by this host" (matrix, L4 generalizes).
 Build order: catalog types → server_mode → routes/downloads → dashboard → fixtures/tests → docs. Checkpoint: `cargo test` green between steps 1–2 is not required (single PR, Step 9 reviews whole). Pre-merge: enumerate running containers by the `io.brainrouter.server_backend` label and active download jobs; the PR upgrade notes must require stopping/removing any halogen/vllm/r9v server and finishing/quitting Prepare-PLE jobs before deploying the purge.
-Acceptance: R1 + R2 tests; grep gate: no `halogen|vllm|r9v` outside `CatalogBackendId` parsing, applied migrations (frozen schema vocabulary — `migrations/0003_toolbox_serving_dimension.sql` is a DO-NOT-EDIT artifact), DB snapshots, historical docs, and the feed asset.
+Acceptance: R1 + R2 tests; grep gate: no `halogen|vllm|r9v` outside `CatalogBackendId` parsing, applied migrations (frozen schema vocabulary — `migrations/0003_toolbox_serving_dimension.sql` is a DO-NOT-EDIT artifact), DB snapshots, historical docs, the feed asset, and doc-comments of keeper/parent modules recording backend names as history (`src/routing_events.rs`, `src/toolbox_catalog.rs`, `src/toolbox_catalog/schema_validate.rs`).
 
 ## Testing and evaluation
 
@@ -137,6 +138,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - Federation-lite (bearer LAN providers), no control plane — approved (owner distributed-role use case; scope control) — 2026-10-21.
 - v2 in-place on master with v1 tag, phase-per-PR — approved (owner revert requirement) — 2026-10-21.
 - Credentials UI-first, `env/file` refs as ops escape — approved (owner: Manifest-style UI, nothing in code) — 2026-10-21.
+- Credentials delivery staged store L2 / page L3 / binding+rotation L6 — from batch-1 critic B1 (store ships with its first consumer, the bridge plugin) — 2026-10-21.
 
 ## Referenced files
 
@@ -148,6 +150,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `src/model_downloads.rs`, `src/serving_identity.rs`, `src/toolbox_catalog/types.rs` (+ `gufo_overlay.rs`) — L1 removal surface; feed-vocabulary split.
 - `src/routing_profile.rs`, `src/project_pins.rs` — role/pin store shapes migrated in L3.
 - `src/classifier.rs`, `src/bonsai_server.rs`, `src/prompt_rewriter.rs` — decision-slot replacement target; rewrite invariant.
+- `src/daemon.rs` — bonsai bootstrap default; classifier-off routing context for the R4 heuristic parity anchor.
 - `src/install.rs`, `src/config.rs` — harness templates (one entry), credential keys.
 - `src/bridge/*` — L2 extraction subject.
 - `src/escalation/templates/main_dashboard.html` — Sankey/cards (keep), `CURRENT_PLATFORM_ID` (L4), server-mode panels (L1).
@@ -164,6 +167,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 
 comprehension (Step 5 PASS / Step 5b PASS) — v1 @ a6e39f7 — batch 1
 critic — v1 @ a6e39f7 — 2 blocking, 5 important, 2 nits — revisions required (v2)
+critic (scoped round 2) — v2 @ 20de00e — 0 blocking, 4 important, 4 nits — Step 6 closed; all fixed in v3
 
 ## Human approval
 
