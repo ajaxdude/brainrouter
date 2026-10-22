@@ -2,13 +2,14 @@
 
 ## Status
 
-State: L1 DONE (merged `e90bffe`, tag `v2.0-p1`, all gates). L2 leg section drafted — under leg-scoped review, build on `v2-p2-plugins`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~5 h. Critic rounds used: 2 of 3 (Map); L2 has its own leg-scoped limit.
+State: L1 DONE (`v2.0-p1`), L2 DONE (merged `b9319d2`, tag `v2.0-p2`). L3 leg spec drafted — leg-scoped critic running; build on `v2-p3-roles` after round. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h (spent ~7.5 h — over budget, escalated to owner in digests; owner continued). Critic rounds used: 2 of 3 (Map); per-leg scoped rounds tracked in history.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
 v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
 v3 — 2026-10-21 — round-2 residuals: R7 page-timing contradiction (F1); grep-gate keeper/parent doc-comment exceptions (F2); `src/daemon.rs` referenced (F3); credentials-staging Decision log entry (F4); F5–F8 nits (pointer, duplication, baseline citation, date/type).
 v3.1 — 2026-10-21 — diff-check residual: grep-gate exception extended to feed-vocabulary CODE constants (`schema_validate::KNOWN_BACKEND_IDS`, kept so the vendored feed parses); dedup nit in layer enumeration.
 v4 — 2026-10-22 — L1 marked complete; L2 leg section added in full (plugins + bridge pilot + minimal credentials store); L1 full spec moved to history (record lives in the L1 log + git).
+v5 — 2026-10-22 — L2 marked done; L3 leg spec file added (`v2-streamlining.L3.md`) with key contracts in the leg entry.
 
 ## Problem
 
@@ -91,7 +92,7 @@ Cross-leg contracts (do not break without a design revision):
 Legs (door type; demo):
 - L0 v1 snapshot — done (tag `v1-classic` + branch `v1` pushed). Reversible.
 - L1 Purge — **done** (merged `e90bffe`, tag `v2.0-p1`; Ray 6/6, Bruce GO 0 blocking, net −3,579 lines).
-- L2 Plugins + bridge pilot + minimal credentials store (no page) — one-way (core build change). Demo: Discord + Signal via plugin binary, same commands.
+- L2 Plugins + bridge pilot + credentials store — **done** (merged `b9319d2`, tag `v2.0-p2`; Ray 14/14 load-verified, Bruce NO-GO→fixed→GO, 7 P3 follow-ups in history).
 - L3 One entry + role cards + decision slot + Credentials page — one-way (UI/config contracts). Demo: omp with single model, role header matrix, credentials page managing DeepInfra.
 - L4 Swap supervisor + platform probe — one-way. Demo: scripted fake engine swapped by API; probe output on all three Linux hosts.
 - L5 strixite + hipfire adapters — one-way. Demo: swap strixite models from dashboard, no GUI icons; hipfire launch on fedora1 with stem assertion.
@@ -102,6 +103,8 @@ Legs (door type; demo):
 **Leg L1 — complete** (full spec + review disposition: `docs/design/v2-streamlining.L1.log.md`; merged `e90bffe`, tag `v2.0-p1`).
 
 **Leg L2 in full** — spec (post-review, I1–I7 folded): `docs/design/v2-streamlining.L2.md` (per-leg spec files; the Map keeps contracts + leg list). Key contracts: `initialize` handshake (token/peer-uid/grants), crash-loop terminal `failed` state, credentials migration = Discord token only (Signal has no YAML secret), bridge config schema MINUS the token key, Signal keeps v1 direct llama-swap listing (parity), plugin state dir under `$XDG_STATE_HOME`, per-transport pause survives as plugin config, `bridges` verb + bridge endpoints removed.
+
+**Leg L3 in full** — spec: `docs/design/v2-streamlining.L3.md` (leg-scoped review in progress). Key contracts: role resolution (explicit selectors bypass cards; project>global>default; header + `subs` alias), decision slot with guardrail clamps + low-confidence fallback, Bonsai auto-migrates to `openai-compatible` with behavior continuity at the migration boundary, credentials page on the unchanged L2 store, one-entry install templates, events additive with decision fields.
 
 ## Testing and evaluation
 
@@ -160,6 +163,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `migrations/0003_toolbox_serving_dimension.sql` — frozen schema vocabulary; grep-gate exception, DO NOT EDIT.
 - `src/cli.rs` — `routing-profile` CLI surface (L1 route removals, L3 replacement).
 - `src/llama_swap_register.rs` — GGUF→llama-swap import; L7 catalog source.
+- `docs/design/v2-streamlining.L3.md` — leg L3 full spec (roles, decision slot, credentials page, one-entry).
 - `docs/design/v2-streamlining.L2.md` — leg L2 full spec (per-leg detail files keep this Map under the length limit).
 - keeper modules read-only for regression: `src/inflight.rs`, `src/routing_events.rs`, `src/observability.rs`.
 
