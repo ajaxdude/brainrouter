@@ -58,7 +58,7 @@ A single Rust daemon that:
 4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/gufo toolboxes, models, and detached servers** (halogen/vllm/r9v were v1 scope, removed by the v2 L1 purge; their catalog feed ids parse as browse-only data) — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
 5. **Keeps opt-ins explicit.** Bonsai and Manifest are disabled by default. A role set to Auto consults the classifier only when enabled; otherwise it selects local. Applying a cloud or hybrid preset does not enable Manifest.
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
-7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
+7. **Bridges chat platforms** -- Discord and Signal ship as the `bridge` sidecar plugin (v2 L2), shelling out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Presents a simplified dashboard IA.** The primary dashboard destinations are Overview, Models, Benchmarks, and Config; an always-visible command strip exposes model scope/role controls, flush/restart/sync actions, health, and quality posture.
 9. **Installs itself into harnesses** via an idempotent `install` subcommand that configures 7 harnesses (omp, vibe, opencode, codex, droid, claude, pi) in a single command.
 10. **Tracks in-flight requests live.** A registry records every request at handler entry (before routing, so the dashboard sees it during model load) and holds it until the stream ends or the user cancels it. The dashboard shows one row per active request — elapsed time, model, user agent, address, session, bytes received, PP progress, and an activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button.
@@ -135,7 +135,7 @@ The rewrite is coupled to the classifier **server-side**, not just in the UI: tu
 
 ### Bridge as OMP subprocess
 
-Discord and Signal transports do not call LLMs directly. They shell out to the `omp` CLI as a subprocess, which connects back to brainrouter through the normal proxy path. This means bridge conversations get the same routing, fallback, and review capabilities as direct harness usage. Session state, working directories, and model aliases are persisted to disk per-transport.
+The Discord and Signal transports ship as the `bridge` plugin (v2 L2): a sidecar binary (`brainrouter-bridge`) supervised by the daemon and spoken to over a per-plugin Unix-domain socket (newline-delimited JSON-RPC 2.0). They do not call LLMs directly. They shell out to the `omp` CLI as a subprocess, which connects back to brainrouter through the normal proxy path. This means bridge conversations get the same routing, fallback, and review capabilities as direct harness usage. Session state, working directories, and model aliases are persisted to disk per-transport in the plugin state dir.
 
 ### Peer CWD resolution
 
@@ -143,7 +143,7 @@ The MCP server needs to know the caller's working directory. On Linux, brainrout
 
 ### Dashboard navigation and command strip
 
-`src/escalation/templates/main_dashboard.html` organizes the main dashboard as four primary destinations: **Overview**, **Models**, **Benchmarks**, and **Config**. Models has internal tabs for Local models, Downloads, and Serving plus a link to `/models`. The command bar contains the frequent controls: project/global scope selector, Main model controls, reviewer/subagent expander, Flush Models, Restart Local Stack, Sync Models → OMP, a `/api/service-health` health pill, and a read-only posture line for nudge/review/HankNDory/PR state. Set-and-forget quality toggles, bridges, toolbox inventory, service status/restarts, and raw config editors live in Config.
+`src/escalation/templates/main_dashboard.html` organizes the main dashboard as four primary destinations: **Overview**, **Models**, **Benchmarks**, and **Config**. Models has internal tabs for Local models, Downloads, and Serving plus a link to `/models`. The command bar contains the frequent controls: project/global scope selector, Main model controls, reviewer/subagent expander, Flush Models, Restart Local Stack, Sync Models → OMP, a `/api/service-health` health pill, and a read-only posture line for nudge/review/HankNDory/PR state. Set-and-forget quality toggles, plugins (status, config, logs), toolbox inventory, service status/restarts, and raw config editors live in Config. The Plugins destination (v2 L2) lists installed plugins with state and `set_status` lines, enables/disables them, edits plugin config, and shows HTML-escaped plugin logs.
 
 ### In-flight request registry (src/inflight.rs)
 
@@ -205,11 +205,13 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | In-flight registry | `src/inflight.rs` | `InflightRegistry` + `InflightHandle` + `SniffStream`: per-request live rows (elapsed, model, UA, address, session, bytes, PP, activity) with dashboard cancel; sticky head-window activity sniff |
 | Provider adapter | `src/provider/mod.rs` | Provider trait and common types |
 | OpenAI provider | `src/provider/openai.rs` | OpenAI-compatible HTTP client with fault-aware circuit breaking (429/5xx) |
-| Bridge core | `src/bridge/core.rs` | Shared transport logic: OMP subprocess management, message chunking, aliases |
-| Bridge persistence | `src/bridge/persist.rs` | Session, model alias, and working directory persistence to JSON files |
-| Bridge module | `src/bridge/mod.rs` | Bridge initialization and transport dispatch |
-| Discord transport | `src/bridge/discord/mod.rs` | Serenity-based Discord bot with channel-scoped sessions |
-| Signal transport | `src/bridge/signal/mod.rs` | Signal CLI polling-based transport with group support |
+| Plugin core | `src/plugins/` | Manifest, registry, supervisor, per-plugin UDS JSON-RPC (v2 L2) |
+| Credentials store | `src/credentials.rs` | `credentials.json` (0600), `resolve()`, grant model (v2 L2) |
+| Migration framework | `src/migration.rs` | Snapshot-first boot migrations + named restore (v2 L2) |
+| Bridge plugin core | `plugins/bridge/src/core.rs` | Shared transport logic: OMP subprocess management, message chunking, aliases |
+| Bridge plugin persistence | `plugins/bridge/src/persist.rs` | Session, model alias, and working directory persistence to JSON files |
+| Discord transport | `plugins/bridge/src/discord/mod.rs` | Serenity-based Discord bot with channel-scoped sessions |
+| Signal transport | `plugins/bridge/src/signal/mod.rs` | Signal CLI polling-based transport with group support |
 | Integration tests | `tests/anthropic_shim_test.rs` | Anthropic protocol compliance tests |
 | Integration tests | `tests/failover_test.rs` | Circuit breaker and fallback behavior tests |
 | Integration tests | `tests/install_test.rs` | Harness installer tests |
@@ -335,35 +337,24 @@ settings expose errors and disable saves until repaired/restarted, but leave
 core routing and live observations available. Revision counters reset on restart;
 clients must reload settings before writing.
 
-#### bridge.*
+#### Plugins and the bridge (v2 L2)
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `omp_path` | `String?` | `"omp"` | Path to the `omp` CLI binary |
-| `work_dir` | `String?` | `$HOME` | Default working directory for bridge sessions |
-| `aliases_config` | `String?` | `~/.config/omp-bridge/config.yaml` | Path to model alias configuration |
-| `timeout_secs` | `u64?` | `600` | OMP subprocess timeout in seconds |
-| `default_model` | `String?` | `"brainrouter/auto"` | Default model string passed to OMP |
-
-#### bridge.discord.*
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | `bool?` | `false` | Enable the Discord transport |
-| `token` | `String?` | `None` | Discord bot token. Required when `enabled=true` |
-| `prefix` | `String?` | `"!"` | Command prefix for bot commands |
-| `channel_id` | `String?` | `None` | Reserved, currently unused |
-
-#### bridge.signal.*
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | `bool?` | `false` | Enable the Signal transport |
-| `account` | `String?` | `None` | E.164 phone number. Required when `enabled=true` |
-| `group_id` | `String?` | `None` | Signal group ID to listen on |
-| `prefix` | `String?` | `"!"` | Command prefix for bot commands |
-| `storage_path` | `String?` | `None` | Path for Signal CLI data storage |
-| `llama_swap_url` | `String?` | `"http://localhost:8081"` | llama-swap URL for model listing |
+The v1 `bridge.*` YAML keys are gone. Discord/Signal run as the `bridge`
+plugin: install it with `brainrouter plugin install plugins/bridge` (from a
+built dist: `plugin.toml` + `brainrouter-bridge`), enable with
+`brainrouter plugin enable bridge`. The plugin reads its config — the v1
+`bridge.*` keys minus the Discord token — via the `config.get` RPC
+(namespaced per plugin, edited with `brainrouter plugin config set bridge
+<key>=<value>` or the dashboard Plugins tab; the per-transport pause is
+`discord.enabled` / `signal.enabled`). The Discord token lives only in the
+credentials store (migrated from v1 YAML at boot; id `discord_token`,
+granted to plugin `bridge`) and reaches the plugin exclusively through the
+grant-enforced `secrets.get` RPC. Signal keeps its direct llama-swap
+listing via the live `llama_swap_url` config key (v1 parity). Persistence:
+on first start the six v1 JSON files under `~/.local/share/omp-bridge/`
+are copied into the plugin state dir (`$XDG_STATE_HOME/brainrouter/plugins/
+bridge/`, 0700); v1 originals are kept for revert. Restore the v1 config
+state with `brainrouter migration restore v2.0-p2`.
 
 ### CLI Arguments
 
@@ -399,7 +390,9 @@ Thin client for core management, roles, and reviews. `--socket <path>` selects t
 | `context status` / `set <tokens\|auto>` | Legacy CLI only: validates 2048..262144 (auto = 131072), but `/api/context` has no server handler at this baseline and returns 404 |
 | `routing-mode status` / `set <auto\|cloud\|local>` | Routing-mode override |
 | `routing-profile status` / `models` / `preset` / `choose` / `pool` / `set` | Inspect/replace typed preferences, choose exact Main/Reviewer models, and configure the independent local pool |
-| `bridges status` / `enable` / `disable` / `toggle <discord\|signal>` | Bridge control (toggle flips the current state) |
+| `plugin install <dir>` / `list` / `enable` / `disable` / `remove` / `status [id]` | Sidecar plugin management (v2 L2) |
+| `plugin config set <id> k=v [...]` / `plugin config show <id>` | Plugin-namespaced config (v2 L2) |
+| `migration restore <phase>` | Restore a leg snapshot (e.g. `v2.0-p2`) |
 | `toolboxes` | List llama-* toolbox containers |
 | `restart <llama-swap\|llama-cpp\|manifest\|brainrouter>` | Restart a service. `llama-cpp` is the dashboard's `llama.cpp` row; `toolbox` is the `toolboxes` image |
 | `upgrade <llama-swap\|manifest\|toolbox>` | Upgrade a component |
@@ -464,9 +457,11 @@ Thin client for core management, roles, and reviews. `--socket <path>` selects t
 
 | Feature | Dependencies | Description |
 |---|---|---|
-| `default` | `bridge-discord`, `bridge-signal` | Both bridge transports enabled by default |
-| `bridge-discord` | `serenity`, `async-trait`, `serde_yml` | Discord bot transport |
-| `bridge-signal` | `serde_yml` | Signal CLI transport |
+| `default` | — | Core proxy + plugin subsystem only (v2 L2; the bridges left the core binary) |
+| `benchmarks` | — | Benchmark explorer + native lab (v2 R2) |
+
+The bridge-only dependencies (serenity, async-trait, serde_yml) now live in
+the standalone `plugins/bridge` workspace, not the core.
 
 ---
 
@@ -1005,7 +1000,7 @@ are persisted or performed by this subsystem.
 
 ### Overview
 
-Discord and Signal transports bring LLM access to messaging apps. They do not call LLMs directly -- they shell out to the `omp` CLI as a subprocess, which connects back to brainrouter through the normal proxy path. This means bridge conversations get the same routing, fallback, and review capabilities as direct harness usage.
+The Bridge Architecture below ships as the `bridge` sidecar plugin (v2 L2): the daemon supervises the `brainrouter-bridge` binary and serves it a grant-gated JSON-RPC surface over a per-plugin Unix socket. Discord and Signal transports bring LLM access to messaging apps. They do not call LLMs directly -- they shell out to the `omp` CLI as a subprocess, which connects back to brainrouter through the normal proxy path. This means bridge conversations get the same routing, fallback, and review capabilities as direct harness usage.
 
 ### OMP Subprocess Model
 
@@ -1019,7 +1014,10 @@ Each user message triggers an `omp` subprocess invocation:
 
 ### Persistence
 
-All bridge state is persisted to `~/.local/share/omp-bridge/`:
+Runtime persistence moved to the plugin state dir
+`$XDG_STATE_HOME/brainrouter/plugins/bridge/` (0700). On the plugin's first
+start, the six v1 files are copied from `~/.local/share/omp-bridge/` if
+absent; v1 originals are left in place for revert:
 
 | File | Contents |
 |---|---|
@@ -1116,7 +1114,9 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `GET/POST/DELETE` | `/api/project-pin` | Per-project role pins; `?path=` resolves an absolute path to a canonical Git-root key |
 | `GET` | `/api/routing-models` | Authenticated local/cloud metadata catalogs, visible per-provider errors; disabled cloud skips discovery |
 | `GET` | `/api/models/llama-swap` | List models available in llama-swap |
-| `GET` | `/api/bridge-status` | Bridge transport status (Discord/Signal) |
+| `GET` | `/api/plugins` | Plugin registry + live status + notification toasts (v2 L2) |
+| `POST` | `/api/plugins/install\|enable\|disable\|remove\|config` | Plugin management (v2 L2) |
+| `GET` | `/api/plugins/logs?id=<id>&tail=<n>` | Captured plugin log (rendered HTML-escaped by the dashboard) |
 | `GET` | `/api/bonsai` | Bonsai classifier server state (`enabled`, `healthy`, `url`) |
 | `GET/POST` | `/api/nudge` | Thinking-budget nudge state/tier |
 | `GET/POST` | `/api/prompt-rewrite` | Local prompt rewrite state |

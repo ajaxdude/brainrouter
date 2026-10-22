@@ -8,8 +8,11 @@ pub mod benchmark;
 #[cfg(feature = "benchmarks")]
 pub mod benchmark_lab;
 pub mod daemon_client;
-pub mod bridge;
 pub mod classifier;
+pub mod paths;
+pub mod credentials;
+pub mod migration;
+pub mod plugins;
 pub mod cockpit_config;
 pub mod config;
 pub mod escalation;

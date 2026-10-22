@@ -157,6 +157,11 @@ pub struct ServeArgs {
     /// Defaults to $XDG_RUNTIME_DIR/brainrouter.sock (or /run/brainrouter.sock).
     #[arg(long)]
     pub socket: Option<PathBuf>,
+
+    /// v2 L2: preview the config migrations (v1 bridge.discord.token ->
+    /// credentials store) and exit 0 without touching any state.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Entry point for `brainrouter serve`.
@@ -164,6 +169,45 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(config::default_socket_path);
     let config_path = args.config.unwrap_or_else(config::default_config_path);
     let managed_toolboxes_path = config_path.with_file_name("managed_toolboxes.json");
+
+    // v2 L2: config migrations run BEFORE validation so v1 YAML boots.
+    // `--dry-run` prints the migration preview and exits without touching
+    // state (snapshot layout, credentials store, YAML key removal).
+    let credentials_path = brainrouter::credentials::CredentialStore::default_path();
+    if args.dry_run {
+        for line in brainrouter::migration::preview_v2_p2(
+            &config_path,
+            &credentials_path,
+            &brainrouter::paths::brainrouter_state(),
+        )? {
+            println!("{line}");
+        }
+        println!("dry-run complete: no state written");
+        return Ok(());
+    }
+    // I3: a corrupt credentials.json must not brick the daemon — rename the
+    // unreadable vault aside and boot with an empty store (resolve then
+    // fails cleanly per consumer).
+    let credentials_store = Arc::new(
+        match brainrouter::credentials::CredentialStore::load_quarantining(credentials_path.clone()) {
+            (Ok(store), _) => store,
+            (Err(e), _) => {
+                tracing::error!(error = %e,
+                    "credentials store is unreadable and could not be quarantined;                      starting with an in-memory empty vault");
+                brainrouter::credentials::CredentialStore::load(
+                    credentials_path.with_file_name("credentials.disabled.json"),
+                )
+                .context("creating the empty fallback credentials store")?
+            }
+        },
+    );
+    for action in brainrouter::migration::run_v2_p2(
+        &config_path,
+        &credentials_store,
+        &brainrouter::paths::brainrouter_state(),
+    )? {
+        info!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P2);
+    }
 
     // Config
     let config = config::load(&config_path)
@@ -450,8 +494,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .unwrap_or(&config.manifest.base_url)
         .to_string();
 
-    // Bridge manager (status tracking for Discord/Signal transports)
-    let bridge_manager = Arc::new(brainrouter::bridge::BridgeManager::new());
+    // v2 L2 plugin subsystem (registry + supervisor + per-plugin UDS RPC).
+    let plugins = Arc::new(
+        brainrouter::plugins::PluginManager::new(Arc::clone(&credentials_store))
+            .context("loading the plugin registry")?,
+    );
 
     // Seed with an empty object, not null: /api/versions and `brainrouter cli
     // versions` read this before the first compute completes (up to ~15 s).
@@ -465,7 +512,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         routing_events,
         llama_swap_url,
         manifest_url,
-        bridge_manager: Arc::clone(&bridge_manager),
+        plugins: Arc::clone(&plugins),
         bonsai: Arc::new(bonsai_control),
         config_path: std::fs::canonicalize(&config_path).unwrap_or(config_path.clone()),
         llama_swap_config_path: {
@@ -497,6 +544,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     });
 
     brainrouter::observability::start(&state);
+
+    // v2 L2: wire the plugin subsystem to the live state, bind per-plugin
+    // UDS sockets, and spawn the enabled plugins (supervisor).
+    plugins.attach(Arc::clone(&state));
+    plugins.start_at_boot().await;
 
     // Background task: compute versions once, then refresh every 30 minutes.
     {
@@ -530,15 +582,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
                     progress.max_tokens,
                 );
             }
-        });
-    }
-
-    // Start bridge transports if configured
-    if let Some(ref bridge_config) = config.bridge {
-        let bm = Arc::clone(&bridge_manager);
-        let bc = bridge_config.clone();
-        tokio::spawn(async move {
-            brainrouter::bridge::start(bc, bm).await;
         });
     }
 

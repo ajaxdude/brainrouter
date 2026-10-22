@@ -32,6 +32,11 @@ enum Command {
     Mcp(mcp_server::McpArgs),
     /// Headless CLI: control the running daemon (total dashboard parity)
     Cli(cli::CliArgs),
+    /// Manage sidecar plugins (v2 L2). Thin client of the running daemon;
+    /// falls back to direct state management when the daemon is not running.
+    Plugin(cli::PluginCliArgs),
+    /// Config migration controls (`migration restore <phase>`).
+    Migration(cli::MigrationArgs),
     /// Install brainrouter into a coding harness config
     Install(install::InstallArgs),
     /// Internal inference-only proxy used inside Benchmark Lab sandboxes.
@@ -65,6 +70,8 @@ async fn main() -> Result<()> {
         Command::Serve(args) => daemon::run(args).await,
         Command::Mcp(args) => mcp_server::run(args).await,
         Command::Cli(args) => cli::run(args).await,
+        Command::Plugin(args) => cli::run_plugin_standalone(args).await,
+        Command::Migration(args) => cli::run_migration_standalone(args),
         Command::Install(args) => {
             install::run(args)?;
             Ok(())

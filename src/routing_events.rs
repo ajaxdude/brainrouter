@@ -65,6 +65,11 @@ pub struct RouteEvent {
     /// User-Agent header of the calling harness ("" when internal/unknown).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_agent: String,
+    /// v2 L2 additive source tag: which subsystem originated the request
+    /// when it is not the plain HTTP proxy surface — `"plugin <id>"` for
+    /// plugin RPC `chat.completions`. Absent for normal harness traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Stable conversation fingerprint (hash of system prompt + first user
     /// message). Lets the dashboard group every turn of one harness
     /// conversation into a single card when the client sends no session id.
@@ -373,6 +378,7 @@ mod tests {
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
+            source: None,
             conv_id: "same-conversation".into(),
             pp_tps: 0.0,
             tg_tps: 0.0,

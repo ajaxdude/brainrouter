@@ -295,7 +295,7 @@ impl Router {
                 .map(|choice| choice.selector())
                 .unwrap_or_else(|| "auto".into());
         }
-        self.route_resolved(request, session_id, cwd, user_agent, true, true, pin).await
+        self.route_resolved(request, session_id, cwd, user_agent, true, true, pin, None).await
     }
 
     /// Review calls use their session snapshot, never the live main or subs choice.
@@ -314,12 +314,24 @@ impl Router {
         // so the review criteria survive; never fall back to local on a cloud
         // failure (allow_local_fallback threaded from the caller). A reviewer pin
         // is applied upstream into the per-run snapshot, so no pin is passed here.
-        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false, None).await
+        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false, None, None).await
     }
 
-    // One extra parameter (the resolved project pin) beyond clippy's arg
-    // threshold; the alternative is a params struct that would obscure the
-    // reviewer-vs-proxy call sites.
+    /// v2 L2 plugin RPC entry point. Full router path (classification,
+    /// fallbacks, health) identical to the proxy; events carry the additive
+    /// `source: "plugin <id>"` tag so the dashboard attributes the hop.
+    pub async fn route_plugin(
+        &self,
+        request: ChatCompletionRequest,
+        source: String,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let ua = source.clone();
+        self.route_resolved(request, None, String::new(), ua, true, true, None, Some(source)).await
+    }
+
+    // Two extra parameters (the resolved project pin, the L2 source tag)
+    // beyond clippy's arg threshold; the alternative is a params struct that
+    // would obscure the reviewer-vs-proxy call sites.
     #[allow(clippy::too_many_arguments)]
     async fn route_resolved(
         &self,
@@ -330,6 +342,7 @@ impl Router {
         allow_local_fallback: bool,
         apply_local_rewrite: bool,
         pin: Option<ProjectPin>,
+        source: Option<String>,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
         let requested_model = request.model.clone();
@@ -458,6 +471,7 @@ impl Router {
                         cwd: cwd.clone(),
                         session_id: session_id.clone(),
                         user_agent: user_agent.clone(),
+                        source: source.clone(),
                         conv_id: conv_id.clone(),
                         pp_tps: 0.0,
                         tg_tps: 0.0,
@@ -483,6 +497,7 @@ impl Router {
                     cwd: cwd.clone(),
                     session_id: session_id.clone(),
                     user_agent: user_agent.clone(),
+                    source: source.clone(),
                     conv_id: conv_id.clone(),
                     pp_tps: 0.0,
                     tg_tps: 0.0,
@@ -518,6 +533,7 @@ impl Router {
                     cwd,
                     session_id: session_id.clone(),
                     user_agent,
+                    source,
                     conv_id,
                     pp_tps: 0.0,
                     tg_tps: 0.0,
@@ -1642,6 +1658,7 @@ mod tests {
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
+            source: None,
             conv_id: "abc123".to_string(),
             pp_tps: 0.0,
             tg_tps: 0.0,
@@ -1674,6 +1691,7 @@ mod tests {
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
+            source: None,
             conv_id: "same-conversation".to_string(),
             pp_tps: 0.0,
             tg_tps: 0.0,

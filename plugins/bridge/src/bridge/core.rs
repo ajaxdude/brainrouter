@@ -540,7 +540,10 @@ mod tests {
             None,
             "hello",
             None,
-            5,
+            // Generous inactivity budget: the v1 value (5 s) is a flake source
+            // when CI oversubscription delays process start; the test measures
+            // stderr draining, not timeout behavior.
+            120,
         )
         .await
         .unwrap();
@@ -560,7 +563,10 @@ mod tests {
             None,
             "hello",
             None,
-            5,
+            // Generous inactivity budget (see drains_stderr test note): 5 s is
+            // not enough to start /bin/sh under heavy oversubscription, which
+            // surfaced as a spurious "timed out" bail in v1 CI runs.
+            120,
         )
         .await
         .unwrap_err();

@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use tracing::debug;
 
 use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
+use brainrouter::plugins::PluginManager;
+use std::net::TcpStream;
+use std::sync::Arc;
 use brainrouter::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
 
 /// Arguments for the `cli` subcommand.
@@ -83,10 +86,17 @@ pub enum CliCommand {
         #[command(subcommand)]
         action: RoutingProfileAction,
     },
-    /// Discord/Signal bridge status / toggle
-    Bridges {
+    /// Manage sidecar plugins (v2 L2): install/list/enable/disable/remove/
+    /// status/config. Talks to the running daemon; falls back to direct
+    /// state-dir management when no daemon is running.
+    Plugin {
         #[command(subcommand)]
-        action: BridgesAction,
+        action: PluginAction,
+    },
+    /// Config migration controls (per-leg snapshots + named restore).
+    Migration {
+        #[command(subcommand)]
+        action: MigrationAction,
     },
     /// List llama-* toolbox containers
     Toolboxes,
@@ -229,29 +239,59 @@ pub enum RoutingProfileAction {
 }
 
 #[derive(Subcommand)]
-pub enum BridgesAction {
-    /// Current bridge status
-    Status,
-    /// Enable a bridge
+pub enum PluginAction {
+    /// Install a plugin from a directory containing plugin.toml + binary
+    Install {
+        /// Path to the plugin directory
+        dir: String,
+    },
+    /// List installed plugins
+    List,
+    /// Enable (and start) a plugin
     Enable {
-        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
-            ["discord", "signal"]
-        ))]
-        bridge: String,
+        id: String,
     },
-    /// Disable a bridge
+    /// Disable (and stop) a plugin
     Disable {
-        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
-            ["discord", "signal"]
-        ))]
-        bridge: String,
+        id: String,
     },
-    /// Start if stopped, stop if running
-    Toggle {
-        #[arg(value_parser = clap::builder::PossibleValuesParser::new(
-            ["discord", "signal"]
-        ))]
-        bridge: String,
+    /// Remove a plugin (cleans state, drops credential grants naming it)
+    Remove {
+        id: String,
+    },
+    /// Show plugin status (all, or one by id)
+    Status {
+        id: Option<String>,
+    },
+    /// Plugin config (namespaced per plugin)
+    #[command(name = "config")]
+    Config {
+        #[command(subcommand)]
+        action: PluginConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PluginConfigAction {
+    /// Set config keys: `plugin config set <id> key=value [key=value ...]`
+    Set {
+        id: String,
+        /// `key=value` pairs (value parsed as JSON, falling back to string)
+        assignments: Vec<String>,
+    },
+    /// Show a plugin's config
+    Show {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MigrationAction {
+    /// Restore a leg snapshot (`v2.0-p2` restores config YAML + credentials
+    /// from the newest migration snapshot for that phase)
+    Restore {
+        /// Phase tag, e.g. v2.0-p2
+        phase: String,
     },
 }
 
@@ -496,33 +536,8 @@ pub async fn run(args: CliArgs) -> Result<()> {
                 }
             }
         }
-        CliCommand::Bridges { action } => match action {
-            BridgesAction::Status => {
-                print_json(&client.get_json("/api/bridge-status").await?);
-            }
-            BridgesAction::Enable { bridge } => {
-                print_json(&client
-                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": true }))
-                    .await?);
-            }
-            BridgesAction::Disable { bridge } => {
-                print_json(&client
-                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": false }))
-                    .await?);
-            }
-            BridgesAction::Toggle { bridge } => {
-                // Read current state so toggle flips it, not just enables it.
-                let current = client.get_json("/api/bridge-status").await?;
-                let enabled = current
-                    .get(&bridge)
-                    .and_then(|b| b.get("enabled"))
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false);
-                print_json(&client
-                    .post_json("/api/bridges/toggle", json!({ "bridge": bridge, "enabled": !enabled }))
-                    .await?);
-            }
-        },
+        CliCommand::Plugin { action } => run_plugin(&client, action).await?,
+        CliCommand::Migration { action } => run_migration(action)?,
         CliCommand::Toolboxes => {
             print_json(&client.get_json("/api/toolboxes").await?);
         }
@@ -706,6 +721,246 @@ fn validate_session_id(session_id: &str) -> Result<()> {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         bail!("Invalid sessionId: must be alphanumeric, dashes, or underscores");
+    }
+    Ok(())
+}
+
+/// v2 L2 `plugin` verbs. Thin client over the daemon; when the daemon is
+/// unreachable, install/list/enable/disable/remove operate directly on the
+/// plugin state (the supervisor picks enabled plugins up at next boot).
+async fn run_plugin(client: &DaemonClient, action: PluginAction) -> Result<()> {
+    use PluginAction::*;
+    let daemon_live = client.get_json("/health").await.is_ok();
+    if daemon_live {
+        match action {
+            Install { dir } => {
+                print_json(&client.post_json("/api/plugins/install", json!({ "dir": dir })).await?);
+            }
+            List => print_json(&client.get_json("/api/plugins").await?),
+            Enable { id } => {
+                print_json(&client.post_json("/api/plugins/enable", json!({ "id": id })).await?)
+            }
+            Disable { id } => {
+                print_json(&client.post_json("/api/plugins/disable", json!({ "id": id })).await?)
+            }
+            Remove { id } => {
+                print_json(&client.post_json("/api/plugins/remove", json!({ "id": id })).await?)
+            }
+            Status { id } => {
+                let all = client.get_json("/api/plugins").await?;
+                print_plugin_status(&all, id.as_deref())?;
+            }
+            Config { action } => match action {
+                PluginConfigAction::Set { id, assignments } => {
+                    for pair in assignments {
+                        let (key, value) = parse_kv(&pair)?;
+                        print_json(
+                            &client
+                                .post_json("/api/plugins/config", json!({ "id": id, "key": key, "value": value }))
+                                .await?,
+                        );
+                    }
+                }
+                PluginConfigAction::Show { id } => {
+                    let all = client.get_json("/api/plugins").await?;
+                    print_json(&plugin_field(&all, &id, "config"));
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Unreachable socket mid-call: direct-state management.
+    drop(client);
+    run_plugin_direct(action).await
+}
+
+fn parse_kv(pair: &str) -> Result<(String, Value)> {
+    let (key, raw) = pair
+        .split_once('=')
+        .with_context(|| format!("expected key=value, got {pair:?}"))?;
+    if key.trim().is_empty() {
+        bail!("empty config key in {pair:?}");
+    }
+    let value = serde_json::from_str(raw).unwrap_or_else(|_| json!(raw));
+    Ok((key.to_string(), value))
+}
+
+fn plugin_field(all: &Value, id: &str, field: &str) -> Value {
+    all.get("plugins")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.iter().find(|p| p.get("id").and_then(Value::as_str) == Some(id)))
+        .and_then(|p| p.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn print_plugin_status(all: &Value, id: Option<&str>) -> Result<()> {
+    let plugins = all.get("plugins").and_then(Value::as_array).cloned().unwrap_or_default();
+    match id {
+        Some(id) => {
+            let entry = plugins
+                .iter()
+                .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
+                .with_context(|| format!("plugin '{id}' is not installed"))?;
+            let state = entry.get("state").and_then(Value::as_str).unwrap_or("stopped");
+            println!(
+                "{id}: state={state} enabled={} version={} grants={} pid={} status={}",
+                entry.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                entry.get("version").and_then(Value::as_str).unwrap_or("?"),
+                entry.get("grants").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+                entry.get("pid").and_then(Value::as_u64).map(|p| p.to_string()).unwrap_or("-".into()),
+                entry.get("status_line").and_then(Value::as_str).unwrap_or(""),
+            );
+        }
+        None => {
+            if plugins.is_empty() {
+                println!("no plugins installed");
+            }
+            for p in &plugins {
+                println!(
+                    "{:<16} {:<9} enabled={:<5} v{}",
+                    p.get("id").and_then(Value::as_str).unwrap_or("?"),
+                    p.get("state").and_then(Value::as_str).unwrap_or("stopped"),
+                    p.get("enabled").and_then(Value::as_bool).unwrap_or(false).to_string(),
+                    p.get("version").and_then(Value::as_str).unwrap_or("?"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Top-level `brainrouter plugin ...` (Hank ruling #4: the plugin verbs ship
+/// at the top level; `brainrouter cli plugin ...` remains the daemon-client
+/// spelling). Same handling as the `cli plugin` subcommand.
+#[derive(Args)]
+pub struct PluginCliArgs {
+    /// Path to the daemon's Unix domain socket.
+    #[arg(long, global = true)]
+    pub socket: Option<PathBuf>,
+    /// Talk to the daemon over TCP instead of the Unix socket.
+    #[arg(long, global = true)]
+    pub url: Option<String>,
+    /// Config file (accepted for symmetry with `serve`; used for the
+    /// daemon-less path).
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub action: PluginAction,
+}
+
+/// Top-level `brainrouter migration ...`.
+#[derive(Args)]
+pub struct MigrationArgs {
+    /// Path to the YAML config file (restore target).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub action: MigrationAction,
+}
+
+pub async fn run_plugin_standalone(args: PluginCliArgs) -> Result<()> {
+    // The daemon-client path requires a live socket; when the daemon is not
+    // running (socket absent / unconnectable), operate directly on the plugin
+    // state (install/list/status/config + registry-only enable/disable).
+    if daemon_reachable(args.socket.as_deref(), args.url.as_deref()) {
+        let cli_args = CliArgs {
+            socket: args.socket,
+            url: args.url,
+            command: CliCommand::Plugin { action: args.action },
+        };
+        return run(cli_args).await;
+    }
+    run_plugin_direct(args.action).await
+}
+
+/// Probe: is a daemon accepting at the endpoint (default socket when none
+/// given)? A UDS connect on a live listener succeeds instantly.
+fn daemon_reachable(socket: Option<&std::path::Path>, url: Option<&str>) -> bool {
+    use std::os::unix::net::UnixStream;
+    if let Some(u) = url {
+        return TcpStream::connect(u.trim_start_matches("http://").trim_end_matches('/'))
+            .is_ok();
+    }
+    let path = socket
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(brainrouter::config::default_socket_path);
+    std::thread::spawn(move || UnixStream::connect(&path).is_ok())
+        .join()
+        .unwrap_or(false)
+}
+
+/// The daemon-less `plugin` verbs: direct state management. Enable/disable
+/// persist the registry flag ONLY (I1: the supervisor is the daemon's job).
+async fn run_plugin_direct(action: PluginAction) -> Result<()> {
+    use PluginAction::*;
+    let creds = Arc::new(
+        brainrouter::credentials::CredentialStore::load(
+            brainrouter::credentials::CredentialStore::default_path(),
+        )
+        .context("loading credentials store")?,
+    );
+    let manager = PluginManager::new(creds).context("opening the plugin registry")?;
+    match action {
+        Install { dir } => print_json(&manager.install(std::path::Path::new(&dir))?),
+        List => print_json(&json!({ "plugins": manager.list()? })),
+        Enable { id } => print_json(&manager.set_enabled_registry_only(&id, true)?),
+        Disable { id } => print_json(&manager.set_enabled_registry_only(&id, false)?),
+        Remove { id } => print_json(&manager.remove(&id).await?),
+        Status { id } => print_plugin_status(&json!({ "plugins": manager.list()? }), id.as_deref())?,
+        Config { action } => match action {
+            PluginConfigAction::Set { id, assignments } => {
+                for pair in assignments {
+                    let (key, value) = parse_kv(&pair)?;
+                    print_json(&manager.config_set(&id, &key, value)?);
+                }
+            }
+            PluginConfigAction::Show { id } => print_json(&manager.config_get_full(&id)?),
+        },
+    }
+    Ok(())
+}
+
+pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {
+    match &args.action {
+        MigrationAction::Restore { phase } => {
+            let config_path = args
+                .config
+                .clone()
+                .unwrap_or_else(brainrouter::config::default_config_path);
+            let store = brainrouter::credentials::CredentialStore::load(
+                brainrouter::credentials::CredentialStore::default_path(),
+            )
+            .context("loading credentials store")?;
+            let msg = brainrouter::migration::restore(
+                phase,
+                &config_path,
+                &store,
+                &brainrouter::paths::brainrouter_state(),
+            )?;
+            println!("{msg}");
+            Ok(())
+        }
+    }
+}
+
+/// v2 L2 `migration` verbs (always direct state operations).
+fn run_migration(action: MigrationAction) -> Result<()> {
+    match action {
+        MigrationAction::Restore { phase } => {
+            let config_path = brainrouter::config::default_config_path();
+            let store = brainrouter::credentials::CredentialStore::load(
+                brainrouter::credentials::CredentialStore::default_path(),
+            )
+            .context("loading credentials store")?;
+            let msg = brainrouter::migration::restore(
+                &phase,
+                &config_path,
+                &store,
+                &brainrouter::paths::brainrouter_state(),
+            )?;
+            println!("{msg}");
+        }
     }
     Ok(())
 }

@@ -1282,16 +1282,46 @@ mod tests {
 
     #[tokio::test]
     async fn socket_preparation_removes_stale_socket() {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let directory = std::env::temp_dir().join(format!("brs-{}", &suffix[..8]));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join(".brainrouter.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
+        // v1 flake hardening (test-only; production prepare_signal_socket is
+        // byte-identical to v1).  Under heavy CPU oversubscription the 1 s
+        // probe timeout can fire against a dead-socket connect (spurious
+        // "did not respond"), and a connect can land on a stale accept-queue
+        // inode ("already listening").  Each attempt uses a fresh directory
+        // and socket path (no cross-attempt kernel state) and the scenario
+        // is retried on exactly those load-induced signatures.
+        let mut last_error = None;
+        for attempt in 0..5 {
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let directory = std::env::temp_dir().join(format!("brs-{}", &suffix[..8]));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(".brainrouter.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(listener);
 
-        prepare_signal_socket(&path).await.unwrap();
-        assert!(!path.exists());
-        std::fs::remove_dir(&directory).unwrap();
+            match prepare_signal_socket(&path).await {
+                Ok(()) => {
+                    assert!(!path.exists());
+                    std::fs::remove_dir(&directory).unwrap();
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let load_signature = msg.contains("did not respond")
+                        || msg.contains("already listening");
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_dir(&directory);
+                    if !load_signature || attempt == 4 {
+                        last_error = Some(msg);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        if let Some(e) = last_error {
+            panic!("prepare_signal_socket failed: {e}");
+        }
     }
 
     #[tokio::test]

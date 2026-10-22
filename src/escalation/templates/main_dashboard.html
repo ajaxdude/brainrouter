@@ -230,6 +230,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⚙</span>
       <span>Config</span>
     </button>
+    <button class="nav-item" id="nav-plugins" onclick="switchView('plugins')">
+      <span class="nav-icon">▦</span>
+      <span>Plugins</span>
+    </button>
   </nav>
   <!-- v2 R2 (docs/design/v2-streamlining.md): the server replaces the token
        below with true/false according to whether this build compiled the
@@ -412,6 +416,12 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
     </div>
 
     <!-- Config View -->
+    <div id="plugins-view" style="display:none;max-width:900px">
+      <div id="plugins-list" style="display:flex;flex-direction:column;gap:14px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:22px 0 8px">Recent notifications</div>
+      <div id="plugins-toasts" style="font-size:12px;color:var(--textDim);display:flex;flex-direction:column;gap:4px"></div>
+    </div>
+
     <div id="config-view" style="display:none;max-width:900px">
       <div id="quality-settings" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:20px;display:flex;flex-direction:column;gap:12px">
         <div style="font-size:13px;font-weight:600">Quality</div>
@@ -467,28 +477,6 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
 
       <div id="integrations-settings" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:20px">
         <div style="font-size:13px;font-weight:600;margin-bottom:10px">Integrations</div>
-  <!-- Bridges -->
-  <div style="padding:4px 18px 6px;font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase">Bridges</div>
-  <div style="padding:0 12px;display:flex;flex-direction:column;gap:4px">
-    <div id="bridge-discord-row" style="display:none;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px">
-      <span id="dot-discord" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">discord</span>
-      <span id="bridge-discord-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px"></span>
-      <button id="toggle-discord" onclick="toggleBridge('discord')" title="Enable / disable Discord bridge"
-        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
-        <span id="toggle-discord-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
-      </button>
-    </div>
-    <div id="bridge-signal-row" style="display:none;align-items:center;gap:8px;padding:5px 10px;font-size:12px;border-radius:6px">
-      <span id="dot-signal" style="width:6px;height:6px;border-radius:99px;background:var(--textMute);flex-shrink:0"></span>
-      <span style="color:var(--textDim);flex:1">signal</span>
-      <span id="bridge-signal-meta" style="font-family:'JetBrains Mono',monospace;color:var(--textMute);font-size:10px"></span>
-      <button id="toggle-signal" onclick="toggleBridge('signal')" title="Enable / disable Signal bridge"
-        style="all:unset;cursor:pointer;width:30px;height:16px;border-radius:99px;background:var(--textMute);position:relative;flex-shrink:0;transition:background .2s">
-        <span id="toggle-signal-thumb" style="position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;background:#fff;transition:left .2s"></span>
-      </button>
-    </div>
-  </div>
 
 
       </div>
@@ -811,7 +799,7 @@ let facetFilters = readStoredJson(localStorage, CARD_STORAGE.facets, { harness:'
 let pinnedKeys = readStoredSet(localStorage, CARD_STORAGE.pins);
 let dismissedKeys = readStoredSet(sessionStorage, CARD_STORAGE.hidden);
 let promptPrivate = readStoredValue(localStorage, CARD_STORAGE.privacy, 'false') === 'true';
-let inferenceStatus = null, healthData = {}, versionsData = {}, bridgeData = {}, statsData = {};
+let inferenceStatus = null, healthData = {}, versionsData = {}, statsData = {};
 let bonsaiData = null, bonsaiBusy = false;
 let searchQuery = '', currentRoutingMode = 'auto';
 let inflightList = [], ompSessions = null, ompHome = '', pollTick = 0;
@@ -961,9 +949,10 @@ function switchView(view) {
   document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
   document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
   document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
+  document.getElementById('plugins-view').style.display   = view === 'plugins' ? 'block' : 'none';
 
   const modelsActive = isModelsView(view);
-  ['stream','config','models'].forEach(v => {
+  ['stream','config','models','plugins'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (!btn) return;
     const active = v === 'models' ? modelsActive : v === view;
@@ -982,7 +971,7 @@ function switchView(view) {
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
   });
 
-  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models' };
+  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
@@ -991,6 +980,7 @@ function switchView(view) {
     models: 'Local models available through llama-swap',
     'toolbox-models': 'Catalog models for ds4 / llama.cpp / gufo — browse, download, verify',
     'server-mode': 'Launch/stop headless inference servers — ds4 and gufo',
+    plugins: 'Sidecar plugins over UDS JSON-RPC — status, config, and logs (v2 L2)',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -998,6 +988,7 @@ function switchView(view) {
   filterDiv.style.display = view === 'stream' ? 'flex' : 'none';
 
   if (view === 'config') loadConfig();
+  if (view === 'plugins') loadPlugins();
   if (view === 'models') loadModels();
   if (view === 'toolbox-models') loadToolboxModels();
   if (view === 'server-mode') loadServerMode();
@@ -2443,78 +2434,164 @@ function updateVersions() {
   applyBonsaiUI(bonsaiData);
 }
 
-async function toggleBridge(name) {
-  const btn = document.getElementById('toggle-' + name);
-  if (!btn) return;
-  // Derive new state from current visual (thumb position is source of truth during optimistic update).
-  const thumb = document.getElementById('toggle-' + name + '-thumb');
-  const currentlyEnabled = thumb && thumb.style.left === '14px';
-  const newEnabled = !currentlyEnabled;
-  // Optimistic UI update.
-  applyToggle(name, newEnabled);
+// ── v2 L2 Plugins tab ────────────────────────────────────────────────────
+// Status, enable/disable, config view/edit, HTML-escaped logs. All plugin
+// log/status/config text is UNTRUSTED chat text: rendered via textContent
+// only (never innerHTML).
+async function loadPlugins() {
+  const d = await safeFetch('/api/plugins');
+  if (d) renderPlugins(d);
+}
+
+function renderPlugins(d) {
+  const list = document.getElementById('plugins-list');
+  list.innerHTML = '';
+  const plugins = (d && d.plugins) || [];
+  if (!plugins.length) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'font-size:12px;color:var(--textMute);padding:14px;border:1px dashed var(--border);border-radius:10px';
+    empty.textContent = 'No plugins installed. Install one with `brainrouter plugin install <dir>`.';
+    list.appendChild(empty);
+  }
+  plugins.forEach(p => list.appendChild(pluginCard(p)));
+  const toasts = document.getElementById('plugins-toasts');
+  toasts.innerHTML = '';
+  ((d && d.toasts) || []).slice(0, 10).forEach(t => {
+    const row = document.createElement('div');
+    row.textContent = `[${t.ts || ''}] ${t.plugin || ''}: ${t.text || ''}`;
+    toasts.appendChild(row);
+  });
+}
+
+function pluginCard(p) {
+  const card = document.createElement('div');
+  card.style.cssText = 'background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px';
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex;align-items:center;gap:10px';
+  const dot = document.createElement('span');
+  dot.style.cssText = 'width:8px;height:8px;border-radius:99px;flex-shrink:0;background:' +
+    (p.state === 'running' ? 'var(--green)' : p.state === 'failed' ? 'var(--red, #e5534b)' : 'var(--textMute)');
+  head.appendChild(dot);
+  const name = document.createElement('span');
+  name.style.cssText = 'font-size:13px;font-weight:600';
+  name.textContent = `${p.id} v${p.version}`;
+  head.appendChild(name);
+  const state = document.createElement('span');
+  state.style.cssText = 'font-size:11px;color:var(--textMute);font-family:"JetBrains Mono",monospace';
+  state.textContent = `state=${p.state}${p.enabled ? '' : ' (disabled)'} pid=${p.pid == null ? '-' : p.pid}`;
+  head.appendChild(state);
+  const spacer = document.createElement('span');
+  spacer.style.flex = '1';
+  head.appendChild(spacer);
+  const btn = document.createElement('button');
+  btn.className = 'filter-btn';
+  btn.textContent = p.enabled ? 'Disable' : 'Enable';
+  btn.onclick = () => pluginAction(p.id, p.enabled ? 'disable' : 'enable');
+  head.appendChild(btn);
+  card.appendChild(head);
+  const status = document.createElement('div');
+  status.style.cssText = 'font-size:11px;color:var(--textDim);margin-top:6px;font-family:"JetBrains Mono",monospace;white-space:pre-wrap';
+  status.textContent = p.status_line || '';
+  card.appendChild(status);
+  const grants = document.createElement('div');
+  grants.style.cssText = 'font-size:10px;color:var(--textMute);margin-top:4px';
+  grants.textContent = 'grants: ' + ((p.grants || []).join(', ') || 'none');
+  card.appendChild(grants);
+
+  const cfgToggle = document.createElement('button');
+  cfgToggle.className = 'filter-btn';
+  cfgToggle.style.marginTop = '8px';
+  cfgToggle.textContent = 'Config';
+  const cfgBox = document.createElement('div');
+  cfgBox.style.display = 'none';
+  cfgBox.style.marginTop = '8px';
+  const cfgArea = document.createElement('textarea');
+  cfgArea.spellcheck = false;
+  cfgArea.style.cssText = 'width:100%;min-height:110px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:"JetBrains Mono",monospace;font-size:11px;padding:8px';
+  cfgArea.value = JSON.stringify(p.config || {}, null, 2);
+  cfgBox.appendChild(cfgArea);
+  const cfgApply = document.createElement('button');
+  cfgApply.className = 'filter-btn';
+  cfgApply.textContent = 'Apply';
+  cfgApply.onclick = () => pluginConfigApply(p.id, cfgArea, cfgStatus);
+  cfgBox.appendChild(cfgApply);
+  const cfgStatus = document.createElement('span');
+  cfgStatus.style.cssText = 'font-size:11px;color:var(--textMute);margin-left:8px';
+  cfgBox.appendChild(cfgStatus);
+  cfgToggle.onclick = () => { cfgBox.style.display = cfgBox.style.display === 'none' ? 'block' : 'none'; };
+  card.appendChild(cfgToggle);
+  card.appendChild(cfgBox);
+
+  const logToggle = document.createElement('button');
+  logToggle.className = 'filter-btn';
+  logToggle.style.marginTop = '8px';
+  logToggle.textContent = 'Logs';
+  const logBox = document.createElement('pre');
+  logBox.style.cssText = 'display:none;margin-top:8px;max-height:260px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:10px;white-space:pre-wrap';
+  logToggle.onclick = async () => {
+    if (logBox.style.display === 'none') {
+      logBox.textContent = 'loading…';
+      logBox.style.display = 'block';
+      try {
+        const r = await fetch('/api/plugins/logs?id=' + encodeURIComponent(p.id) + '&tail=400');
+        logBox.textContent = r.ok ? await r.text() : '(no logs)';
+      } catch (e) { logBox.textContent = '(log fetch failed)'; }
+    } else {
+      logBox.style.display = 'none';
+    }
+  };
+  card.appendChild(logToggle);
+  card.appendChild(logBox);
+  return card;
+}
+
+async function pluginAction(id, verb) {
   try {
-    const r = await fetch('/api/bridges/toggle', {
+    await fetch('/api/plugins/' + verb, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bridge: name, enabled: newEnabled }),
+      body: JSON.stringify({ id }),
     });
-    if (!r.ok) {
-      // Revert on failure.
-      applyToggle(name, currentlyEnabled);
-      console.warn('Bridge toggle failed', await r.text());
-    }
-  } catch (e) {
-    applyToggle(name, currentlyEnabled);
-    console.warn('Bridge toggle error', e);
-  }
+  } catch (e) { console.warn('plugin action failed', e); }
+  loadPlugins();
 }
 
-function updateBridges() {
-  const b = bridgeData;
-  if (!b) return;
-
-  const disc = b.discord;
-  const discRow = document.getElementById('bridge-discord-row');
-  if (disc) {
-    updateDot('discord', disc.connected);
-    applyToggle('discord', disc.enabled !== false);
-    const meta = document.getElementById('bridge-discord-meta');
-    if (meta) {
-      const msgs = disc.messages_handled > 0 ? disc.messages_handled + ' msg' : '';
-      const err = disc.last_error ? '⚠' : '';
-      meta.textContent = [msgs, err].filter(Boolean).join(' ');
-      meta.title = disc.last_error || '';
-    }
-    if (discRow) discRow.style.display = 'flex';
-  } else {
-    if (discRow) discRow.style.display = 'none';
-  }
-
-  const sig = b.signal;
-  const sigRow = document.getElementById('bridge-signal-row');
-  if (sig) {
-    updateDot('signal', sig.connected);
-    applyToggle('signal', sig.enabled !== false);
-    const meta = document.getElementById('bridge-signal-meta');
-    if (meta) {
-      const msgs = sig.messages_handled > 0 ? sig.messages_handled + ' msg' : '';
-      const err = sig.last_error ? '⚠' : '';
-      meta.textContent = [msgs, err].filter(Boolean).join(' ');
-      meta.title = sig.last_error || '';
-    }
-    if (sigRow) sigRow.style.display = 'flex';
-  } else {
-    if (sigRow) sigRow.style.display = 'none';
-  }
+function parsePluginScalar(v) {
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  const n = Number(v);
+  if (v !== '' && !Number.isNaN(n)) return n;
+  return v;
 }
 
-let routingProfile = null;
-let routingCloudEnabled = false;
-let routingProfileBusy = false;
-// Local model IDs as seen by llama-swap (from /api/routing-models). Drives the
-// constrained local-model dropdowns for the main/reviewer roles.
-let routingLocalModelIds = [];
-const LOCAL_CUSTOM = '__custom__';
+async function pluginConfigApply(id, area, statusEl) {
+  const pairs = [];
+  let keys = null;
+  try { keys = JSON.parse(area.value); } catch (e) { keys = null; }
+  if (keys && typeof keys === 'object') {
+    const flat = (obj, pre) => Object.entries(obj).forEach(([k, v]) => {
+      const key = pre ? pre + '.' + k : k;
+      if (v && typeof v === 'object' && !Array.isArray(v)) flat(v, key);
+      else pairs.push([key, v]);
+    });
+    flat(keys, '');
+  } else {
+    area.value.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('//'))
+      .forEach(l => { const i = l.indexOf('='); if (i > 0) pairs.push([l.slice(0, i).trim(), parsePluginScalar(l.slice(i + 1).trim())]); });
+  }
+  statusEl.textContent = `applying ${pairs.length} key(s)…`;
+  let fails = 0;
+  for (const [key, value] of pairs) {
+    const r = await fetch('/api/plugins/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, key, value }),
+    });
+    if (!r.ok) fails++;
+  }
+  statusEl.textContent = fails ? `applied with ${fails} failure(s)` : 'applied';
+  loadPlugins();
+}
 
 async function routingFetch(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
@@ -4082,9 +4159,8 @@ async function refreshHealth() {
 }
 
 async function refreshSlow() {
-  const [verRes, bridgeRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes, prGuidelinesRes, hankndoryRes] = await Promise.all([
+  const [verRes, nudgeRes, rewriteRes, catalogRes, containersRes, cockpitConfigRes, reviewRes, prGuidelinesRes, hankndoryRes] = await Promise.all([
     safeFetch('/api/versions'),
-    safeFetch('/api/bridge-status'),
     safeFetch('/api/nudge'),
     safeFetch('/api/prompt-rewrite'),
     safeFetch('/api/toolbox-catalog'),
@@ -4095,7 +4171,6 @@ async function refreshSlow() {
     safeFetch('/api/review/hankndory'),
   ]);
   if (verRes) { versionsData = verRes; updateVersions(); }
-  if (bridgeRes) { bridgeData = bridgeRes; updateBridges(); }
   if (nudgeRes) { nudgeData = nudgeRes; applyNudgeUI(nudgeRes); }
   if (rewriteRes) { rewriteData = rewriteRes; applyRewriteUI(rewriteRes); }
   if (catalogRes) { toolboxCatalogData = catalogRes; }
