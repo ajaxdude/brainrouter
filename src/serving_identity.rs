@@ -1,5 +1,5 @@
 //! PR11a (design doc §5b/§16): serving-identity registration for toolbox
-//! Server Mode backends (ds4/halogen/vllm/r9v).
+//! Server Mode backends (v2 L1: ds4/gufo).
 //!
 //! **Scope, precisely (see §16 for the full reasoning — do not extend this
 //! module to route real traffic without re-reading it first):** this is a
@@ -47,7 +47,7 @@ pub struct ServingIdentity {
     pub served_model: String,
     /// `"http://host:port"`, from the start request (falling back to each
     /// backend's own documented default host/port when the request omitted
-    /// them, e.g. r9v's optional `host`/`port` fields).
+    /// them).
     pub endpoint: String,
     /// Static, per-backend fact recorded by §16's research — **not** a live
     /// protocol probe, and registering an identity confers no routing
@@ -75,30 +75,22 @@ pub fn openai_compatible_for_backend(backend: SupportedServingBackend) -> bool {
     match backend {
         // Already the router's one real local provider today.
         SupportedServingBackend::LlamaCpp => true,
-        // Confirmed via `server_mode.rs`'s own `served-model-name` /
-        // OpenAI-compatible-API doc comment plus vLLM's well-established
-        // wire protocol (§16).
-        SupportedServingBackend::Vllm => true,
         // gufo is genuinely OpenAI-compatible (`/v1/chat/completions`,
         // `/v1/completions`, `/v1/responses`, `/v1/models`, `/health` —
         // github.com/gufo-org/gufo). This is accurate bookkeeping only; it
         // does not make gufo a routable upstream (design doc D5, same as the
         // other backends). A strong future routing candidate (Feature B).
         SupportedServingBackend::Gufo => true,
-        // Plausible (vLLM-lineage env-var surface) but not verified against
-        // a live deployment — §16 deliberately does not upgrade this to
-        // `true` without real evidence.
-        SupportedServingBackend::R9v => false,
-        // No new evidence surfaced beyond §12a/§13a's original "unverified"
-        // findings.
+        // No new evidence surfaced beyond §12a's original "unverified"
+        // findings; §16 deliberately does not upgrade this to `true`
+        // without real evidence.
         SupportedServingBackend::Ds4 => false,
-        SupportedServingBackend::Halogen => false,
     }
 }
 
 /// In-memory registry, keyed by the backend's fixed container name (each
-/// of ds4/halogen/vllm/r9v is single-instance-per-host in v1, per
-/// §12/§13/§14/§15 — one entry per backend is therefore sufficient, but the
+/// kept backend — ds4/gufo — is single-instance-per-host in v1, per
+/// §12 — one entry per backend is therefore sufficient, but the
 /// registry is keyed generically so a future multi-instance backend needs
 /// no shape change).
 #[derive(Default)]
@@ -189,19 +181,16 @@ mod tests {
     #[test]
     fn openai_compatible_for_backend_matches_16_research() {
         assert!(openai_compatible_for_backend(SupportedServingBackend::LlamaCpp));
-        assert!(openai_compatible_for_backend(SupportedServingBackend::Vllm));
         assert!(openai_compatible_for_backend(SupportedServingBackend::Gufo));
         assert!(!openai_compatible_for_backend(SupportedServingBackend::Ds4));
-        assert!(!openai_compatible_for_backend(SupportedServingBackend::Halogen));
-        assert!(!openai_compatible_for_backend(SupportedServingBackend::R9v));
     }
 
     fn sample_identity() -> ServingIdentity {
         ServingIdentity {
-            toolbox_backend: "vllm",
+            toolbox_backend: "gufo",
             compute_api: "rocm".to_string(),
-            runtime_profile_id: "strix-vllm-latest".to_string(),
-            served_model: "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
+            runtime_profile_id: "strix-halo-gufo-runtime".to_string(),
+            served_model: "gufo-org/Qwen3.8-27B-Q4_K_XL".to_string(),
             endpoint: "http://127.0.0.1:8002".to_string(),
             openai_compatible: true,
             registered_at: Utc::now(),
@@ -211,11 +200,11 @@ mod tests {
     #[tokio::test]
     async fn register_then_snapshot_returns_the_entry() {
         let registry = ServingIdentityRegistry::default();
-        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        registry.register("brainrouter-gufo-server", sample_identity()).await;
         let snap = registry.snapshot().await;
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].container_name, "brainrouter-vllm-server");
-        assert_eq!(snap[0].identity.toolbox_backend, "vllm");
+        assert_eq!(snap[0].container_name, "brainrouter-gufo-server");
+        assert_eq!(snap[0].identity.toolbox_backend, "gufo");
         // No real podman on this host, so container_running is always
         // false here — asserting it's present, not asserting a specific
         // podman-dependent value.
@@ -225,10 +214,10 @@ mod tests {
     #[tokio::test]
     async fn register_overwrites_same_container_name() {
         let registry = ServingIdentityRegistry::default();
-        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        registry.register("brainrouter-gufo-server", sample_identity()).await;
         let mut second = sample_identity();
         second.endpoint = "http://127.0.0.1:9999".to_string();
-        registry.register("brainrouter-vllm-server", second).await;
+        registry.register("brainrouter-gufo-server", second).await;
         let snap = registry.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].identity.endpoint, "http://127.0.0.1:9999");
@@ -237,8 +226,8 @@ mod tests {
     #[tokio::test]
     async fn deregister_removes_the_entry() {
         let registry = ServingIdentityRegistry::default();
-        registry.register("brainrouter-vllm-server", sample_identity()).await;
-        registry.deregister("brainrouter-vllm-server").await;
+        registry.register("brainrouter-gufo-server", sample_identity()).await;
+        registry.deregister("brainrouter-gufo-server").await;
         assert!(registry.snapshot().await.is_empty());
     }
 
@@ -252,14 +241,14 @@ mod tests {
     #[tokio::test]
     async fn find_by_served_model_matches_openai_compatible_exactly() {
         let registry = ServingIdentityRegistry::default();
-        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        registry.register("brainrouter-gufo-server", sample_identity()).await;
         let found = registry
-            .find_by_served_model("meta-llama/Meta-Llama-3.1-8B-Instruct")
+            .find_by_served_model("gufo-org/Qwen3.8-27B-Q4_K_XL")
             .await
             .expect("expected exact compatible match");
-        assert_eq!(found.toolbox_backend, "vllm");
-        assert!(registry.find_by_served_model("meta-llama/meta-llama-3.1-8b-instruct").await.is_none());
-        assert!(registry.find_by_served_model("Meta-Llama-3.1-8B").await.is_none());
+        assert_eq!(found.toolbox_backend, "gufo");
+        assert!(registry.find_by_served_model("gufo-org/qwen3.8-27b-q4_k_xl").await.is_none());
+        assert!(registry.find_by_served_model("Qwen3.8-27B").await.is_none());
     }
 
     #[tokio::test]
@@ -269,26 +258,26 @@ mod tests {
         identity.toolbox_backend = "ds4";
         identity.openai_compatible = false;
         registry.register("brainrouter-ds4-server", identity).await;
-        assert!(registry.find_by_served_model("meta-llama/Meta-Llama-3.1-8B-Instruct").await.is_none());
+        assert!(registry.find_by_served_model("gufo-org/Qwen3.8-27B-Q4_K_XL").await.is_none());
     }
 
     #[tokio::test]
     async fn openai_compatible_served_models_dedups_and_excludes_incompatible() {
         let registry = ServingIdentityRegistry::default();
-        registry.register("brainrouter-vllm-server", sample_identity()).await;
+        registry.register("brainrouter-gufo-server", sample_identity()).await;
         let mut duplicate = sample_identity();
-        duplicate.toolbox_backend = "gufo";
+        duplicate.toolbox_backend = "llama_cpp";
         duplicate.endpoint = "http://127.0.0.1:8003".to_string();
-        registry.register("brainrouter-gufo-server", duplicate).await;
+        registry.register("brainrouter-llama-server", duplicate).await;
         let mut incompatible = sample_identity();
-        incompatible.toolbox_backend = "r9v";
+        incompatible.toolbox_backend = "ds4";
         incompatible.openai_compatible = false;
-        incompatible.served_model = "qwen3.8-flash-next".to_string();
-        registry.register("brainrouter-r9v-server", incompatible).await;
+        incompatible.served_model = "deepseek-v4-flash".to_string();
+        registry.register("brainrouter-ds4-server", incompatible).await;
 
         assert_eq!(
             registry.openai_compatible_served_models().await,
-            vec!["meta-llama/Meta-Llama-3.1-8B-Instruct".to_string()]
+            vec!["gufo-org/Qwen3.8-27B-Q4_K_XL".to_string()]
         );
     }
 }

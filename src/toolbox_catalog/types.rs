@@ -33,6 +33,10 @@ use serde_json::Value;
 pub enum CatalogBackendId {
     LlamaCpp,
     Ds4,
+    /// Feed-vocabulary ids only after the v2 L1 purge
+    /// (`docs/design/v2-streamlining.md` R1): `halogen`, `vllm` and `r9v`
+    /// keep parsing losslessly so the vendored cockpit feed loads unchanged,
+    /// but convert to no [`SupportedServingBackend`] — browse-only entries.
     Halogen,
     Vllm,
     R9v,
@@ -110,14 +114,13 @@ impl<'de> Deserialize<'de> for CatalogBackendId {
 
 /// The narrower, closed set of backends brainrouter can actually *execute*
 /// actions for. `Comfyui` and `Other` are excluded — they can still be
-/// *listed* (via [`CatalogBackendId`]) but never acted on.
+/// *listed* (via [`CatalogBackendId`]) but never acted on. `halogen`, `vllm`
+/// and `r9v` join them as browse-only feed ids after the v2 L1 purge
+/// (`docs/design/v2-streamlining.md` R1): server-mode ships ds4+gufo only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SupportedServingBackend {
     LlamaCpp,
     Ds4,
-    Halogen,
-    Vllm,
-    R9v,
     Gufo,
 }
 
@@ -126,21 +129,15 @@ impl SupportedServingBackend {
         match self {
             Self::LlamaCpp => "llama_cpp",
             Self::Ds4 => "ds4",
-            Self::Halogen => "halogen",
-            Self::Vllm => "vllm",
-            Self::R9v => "r9v",
             Self::Gufo => "gufo",
         }
     }
 
-    /// All six supported backends, in a stable display order (matches the
+    /// All supported backends, in a stable display order (matches the
     /// order they're introduced in the design doc / user requirements).
-    pub const ALL: [SupportedServingBackend; 6] = [
+    pub const ALL: [SupportedServingBackend; 3] = [
         SupportedServingBackend::LlamaCpp,
         SupportedServingBackend::Ds4,
-        SupportedServingBackend::Halogen,
-        SupportedServingBackend::Vllm,
-        SupportedServingBackend::R9v,
         SupportedServingBackend::Gufo,
     ];
 }
@@ -152,7 +149,7 @@ impl std::fmt::Display for SupportedServingBackend {
 }
 
 /// Error returned when a [`CatalogBackendId`] isn't one brainrouter can act
-/// on (currently `Comfyui` or `Other`).
+/// on (`halogen`/`vllm`/`r9v` after the v2 L1 purge, `Comfyui`, or `Other`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsupportedBackend(pub CatalogBackendId);
 
@@ -161,6 +158,7 @@ impl std::fmt::Display for UnsupportedBackend {
         write!(
             f,
             "backend {:?} is not a supported serving backend (comfyui is out of scope; \
+             halogen/vllm/r9v are feed-only ids after the v2 L1 purge; \
              unrecognized ids need a brainrouter code change first)",
             self.0.as_str()
         )
@@ -176,13 +174,14 @@ impl TryFrom<&CatalogBackendId> for SupportedServingBackend {
         match value {
             CatalogBackendId::LlamaCpp => Ok(Self::LlamaCpp),
             CatalogBackendId::Ds4 => Ok(Self::Ds4),
-            CatalogBackendId::Halogen => Ok(Self::Halogen),
-            CatalogBackendId::Vllm => Ok(Self::Vllm),
-            CatalogBackendId::R9v => Ok(Self::R9v),
             CatalogBackendId::Gufo => Ok(Self::Gufo),
-            CatalogBackendId::Comfyui | CatalogBackendId::Other(_) => {
-                Err(UnsupportedBackend(value.clone()))
-            }
+            // Feed vocabulary without an executable backend (v2 L1 purge):
+            // these ids parse losslessly and surface as browse-only.
+            CatalogBackendId::Halogen
+            | CatalogBackendId::Vllm
+            | CatalogBackendId::R9v
+            | CatalogBackendId::Comfyui
+            | CatalogBackendId::Other(_) => Err(UnsupportedBackend(value.clone())),
         }
     }
 }
@@ -192,9 +191,6 @@ impl From<SupportedServingBackend> for CatalogBackendId {
         match value {
             SupportedServingBackend::LlamaCpp => CatalogBackendId::LlamaCpp,
             SupportedServingBackend::Ds4 => CatalogBackendId::Ds4,
-            SupportedServingBackend::Halogen => CatalogBackendId::Halogen,
-            SupportedServingBackend::Vllm => CatalogBackendId::Vllm,
-            SupportedServingBackend::R9v => CatalogBackendId::R9v,
             SupportedServingBackend::Gufo => CatalogBackendId::Gufo,
         }
     }
@@ -505,18 +501,21 @@ mod tests {
     }
 
     #[test]
-    fn supported_serving_backend_excludes_comfyui_and_other() {
+    fn supported_serving_backend_excludes_purged_feed_ids_comfyui_and_other() {
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::LlamaCpp).is_ok());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Ds4).is_ok());
-        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Halogen).is_ok());
-        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Vllm).is_ok());
-        assert!(SupportedServingBackend::try_from(&CatalogBackendId::R9v).is_ok());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Gufo).is_ok());
+        // v2 L1 purge: feed vocabulary that parses losslessly but is browse-only.
+        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Halogen).is_err());
+        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Vllm).is_err());
+        assert!(SupportedServingBackend::try_from(&CatalogBackendId::R9v).is_err());
         assert!(SupportedServingBackend::try_from(&CatalogBackendId::Comfyui).is_err());
-        assert!(SupportedServingBackend::try_from(&CatalogBackendId::Other(
-            "brand_new_future_backend".to_string()
-        ))
-        .is_err());
+        assert!(
+            SupportedServingBackend::try_from(&CatalogBackendId::Other(
+                "brand_new_future_backend".to_string()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -543,15 +542,24 @@ mod tests {
         // excluded here: it is a brainrouter-owned overlay backend (see
         // `gufo_overlay`), not part of the vendored cockpit feed, and is
         // asserted against the *effective* catalog instead.
-        for backend in [
-            SupportedServingBackend::LlamaCpp,
-            SupportedServingBackend::Ds4,
-            SupportedServingBackend::Halogen,
-            SupportedServingBackend::Vllm,
-            SupportedServingBackend::R9v,
-        ] {
+        for backend in [SupportedServingBackend::LlamaCpp, SupportedServingBackend::Ds4] {
             let count = catalog.toolboxes_for(backend).count();
             assert!(count > 0, "expected at least one toolbox for {backend}");
+        }
+
+        // v2 L1 purge: halogen/vllm/r9v feed entries parse (the feed stays
+        // intact) but are browse-only — no supported serving backend.
+        for raw in ["halogen", "vllm", "r9v"] {
+            let purged: Vec<_> = catalog
+                .toolboxes
+                .iter()
+                .filter(|t| t.backend.as_str() == raw)
+                .collect();
+            assert!(
+                !purged.is_empty(),
+                "fixture must keep {raw} toolbox entries in the feed"
+            );
+            assert!(purged.iter().all(|t| t.supported_backend().is_none()));
         }
     }
 

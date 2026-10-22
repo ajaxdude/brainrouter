@@ -1,6 +1,6 @@
 # brainrouter PRD
 
-**Status:** Shipped proxy/control plane, benchmark explorer, model observability, per-project model pins, review hardening, and native multi-backend toolbox management (ds4/halogen/vllm/r9v/gufo/llama_cpp); future work is explicitly separated below
+**Status:** Shipped proxy/control plane, model observability, per-project model pins, review hardening, and native toolbox management for the kept serving backends (ds4/gufo/llama_cpp; v2 L1 purge — see [Toolbox Backend Management](#toolbox-backend-management)); the benchmark explorer ships behind the non-default `benchmarks` cargo feature (v2 R2); future work is explicitly separated below
 **Language:** Rust
 **Binary:** `target/release/brainrouter`
 **Implementation baseline:** `3691dcc9ee7dee98f8355328d7e2e75f99faafdb` (2026-09-07); extended through `32935d1` by the ai-toolbox-cockpit integration rollout, gufo overlay backend, dashboard navigation redesign, per-project pins, and review hardening — see [Toolbox Backend Management](#toolbox-backend-management) and `docs/design/ai-toolbox-cockpit-integration.md`
@@ -55,7 +55,7 @@ A single Rust daemon that:
 1. **Separates routing roles.** The persisted Main choice handles `auto`, `brainrouter/auto`, and empty model selections; Reviewer has its own local/cloud/default choice; only `subs` or `brainrouter/subs` uses the separately selected local pool. Named presets configure compatible combinations without merging these roles. A per-project pin store can override Main, Reviewer, and Subagent for one canonical Git repository root while unpinned projects inherit the global profile.
 2. **Preserves explicit choices and fallback semantics.** Bare model IDs and `brainrouter/<id>` select that local model with no rewrite or model substitution on failure. `cloud/<id>` sends the exact ID to Manifest. Explicit `local`/`cloud` aliases select backend defaults, not the Main override. Cloud requests retain the existing local fallback policy on disabled/unavailable Manifest; errors after streaming begins surface to the client rather than replaying output.
 3. **Reviews code with runtime policy controls**, with explicit local or cloud reviewer IDs, requested-versus-actual reporting, and a reviewer snapshot retained for the lifetime of each review and its continuations. Runtime state can disable review, enable PR-generation guidance injection, and enable HankNDory design-aware review. Review prompts are token-budgeted before dispatch and escalate instead of approving when required evidence is truncated.
-4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/halogen/vllm/r9v/gufo toolboxes, models, and detached servers** — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
+4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/gufo toolboxes, models, and detached servers** (halogen/vllm/r9v were v1 scope, removed by the v2 L1 purge; their catalog feed ids parse as browse-only data) — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
 5. **Keeps opt-ins explicit.** Bonsai and Manifest are disabled by default. A role set to Auto consults the classifier only when enabled; otherwise it selects local. Applying a cloud or hybrid preset does not enable Manifest.
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal transports shell out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
@@ -182,14 +182,14 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | Routing events | `src/routing_events.rs` | In-memory event buffer for dashboard live feed |
 | Benchmark store/domain | `src/benchmark.rs` | Validation, canonical identities, SQLite ingestion/query/detail/export, shared admission, `SpiderQuery`/`spider_chart()` for the radar chart |
 | Benchmark HTTP/imports | `src/benchmark/http.rs`, `src/benchmark/imports.rs` | Bounded workers/bodies/responses, rollback previews, reusable templates and examples |
-| Benchmark schema | `migrations/0001_benchmark_explorer.sql`, `migrations/0002_benchmark_lab.sql`, `migrations/0003_toolbox_serving_dimension.sql` | Versioned normalized STRICT tables, indexes, summary view; `serving_runtimes`/`toolbox_catalog_snapshot` for backend/engine dimensions |
+| Benchmark schema | `migrations/0001_benchmark_explorer.sql`, `migrations/0002_benchmark_lab.sql`, `migrations/0003_toolbox_serving_dimension.sql` | Versioned normalized STRICT tables, indexes, summary view; `serving_runtimes`/`toolbox_catalog_snapshot` for backend/engine dimensions. Pre-existing gap (recorded, out of patch scope): the frozen 0003 serving-runtime CHECK list omits `gufo`; no gufo serving-runtime rows are written by current code |
 | Toolbox catalog | `src/toolbox_catalog.rs`, `src/toolbox_catalog/{types,models,schema_validate,gufo_overlay}.rs` | Typed, vendored `ai-toolbox-cockpit` catalog plus gufo overlay (`CatalogBackendId`/`SupportedServingBackend`/`ModelPayload`) + structural validator |
 | Vendored catalog data | `assets/cockpit-catalog/{toolboxes,models}.json`, `SOURCE` | Pinned upstream catalog snapshot, refreshed by weekly CI sync |
 | Catalog sync tooling | `scripts/sync-toolbox-catalog.sh`, `.github/workflows/sync-toolbox-catalog.yml`, `src/bin/toolbox_catalog_check.rs` | Weekly PR-based catalog refresh + standalone structural-validation binary |
 | Cockpit config bridge | `src/cockpit_config.rs` | Read (and explicit single-write "apply") of cockpit's own `~/.config/ai-toolbox-cockpit/config.json` |
 | Toolbox ownership sidecar | `src/managed_toolboxes.rs` | Owner-only `managed_toolboxes.json` with podman container IDs for brainrouter-created/adopted toolboxes |
-| Model downloads | `src/model_downloads.rs` | Native download job registry for ds4/halogen/r9v/gufo/llama_cpp catalog models plus HF CLI preflight |
-| Server Mode | `src/server_mode.rs` | Headless detached `podman run` servers for ds4/halogen/vllm/r9v/gufo: create/start/stop/status |
+| Model downloads | `src/model_downloads.rs` | Native download job registry for ds4/gufo/llama_cpp catalog models plus HF CLI preflight (v2 L1: halogen/r9v payload assembly and the Prepare-PLE job kind removed) |
+| Server Mode | `src/server_mode.rs` | Headless detached `podman run` servers for ds4/gufo: create/start/stop/status (v2 L1 purge: halogen/vllm/r9v builders/routes removed) |
 | Serving-identity registry | `src/serving_identity.rs` | Read-only `{toolbox_backend, compute_api, runtime_profile_id, endpoint}` bookkeeping for running Server Mode containers |
 | Model observability | `src/observability.rs` | Read-only polling, completed measurements, rolling alerts, explicit reference settings |
 | Explorer pages | `src/escalation/templates/benchmarks.html`, `src/escalation/templates/model_observability.html` | Embedded benchmark workflows and local model activity |
@@ -586,9 +586,12 @@ to be installed or running. Design rationale, alternatives, and the full
 phased rollout are recorded in
 `docs/design/ai-toolbox-cockpit-integration.md`.
 
-**Backends covered:** `llama_cpp` (Vulkan/ROCm), `ds4` (DeepSeek4 GGUF),
-`halogen` ("HGN" Flash bundles), `vllm` (HF-repo serving), `r9v` (ROCm on AMD
-R9700), and `gufo` (Strix Halo ROCm/OpenAI-compatible GGUF serving). **`comfyui` is explicitly excluded** from every user-facing surface
+**Backends covered:** `llama_cpp` (Vulkan/ROCm), `ds4` (DeepSeek4 GGUF), and
+`gufo` (Strix Halo ROCm/OpenAI-compatible GGUF serving). v2 L1 purge:
+`halogen`, `vllm`, and `r9v` were v1-scope serving backends; their code
+(builders, routes, downloads, panels) is removed and their catalog feed ids
+now parse as browse-only data (no actionable payload) so the vendored
+cockpit feed keeps loading unchanged. **`comfyui` is explicitly excluded** from every user-facing surface
 (image-gen, not coding-relevant) — the catalog parser still tolerates it
 structurally so a shared upstream catalog file never fails to load.
 
@@ -608,8 +611,10 @@ catalog if cockpit adds a new backend before brainrouter has code for it.
 Two backend-identity types exist deliberately (`src/toolbox_catalog/types.rs`):
 `CatalogBackendId` is open and lossless (parses every id the catalog can ever
 contain, including `comfyui` and the brainrouter-owned `gufo` overlay); `SupportedServingBackend` is the closed enum
-(`ds4`/`halogen`/`vllm`/`r9v`/`gufo`/`llama_cpp`) that every user-facing surface
-actually switches on. `ModelPayload` is a per-backend enum, not one generic
+(`ds4`/`gufo`/`llama_cpp` after the v2 L1 purge) that every user-facing surface
+actually switches on. `CatalogBackendId` deliberately keeps parsing the
+removed backends' feed strings (`halogen`/`vllm`/`r9v`) — feed vocabulary,
+not actionable backends. `ModelPayload` is a per-backend enum, not one generic
 struct, because the six backends' model entries are structurally
 incompatible with each other.
 
@@ -639,17 +644,18 @@ state fails safe toward "unmanaged."
 ### Models tab (catalog browsing + downloads)
 
 `src/model_downloads.rs` implements native download orchestration for
-`ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp` (mirroring each backend's own upstream
-mechanism) via a job-registry pattern (queued/downloading/verifying/complete/
+`ds4`/`gufo`/`llama_cpp` (mirroring each backend's own upstream
+mechanism; the v2 L1 purge removed the halogen/r9v payload assembly and
+the R9V Prepare-PLE job kind) via a job-registry pattern (queued/downloading/verifying/complete/
 failed/cancelled), with OS-level cancel and a global download concurrency
 limit of 1. `vllm` is deliberately excluded — its server pulls from Hugging
 Face on demand at container start, so there is no separate download step to
 orchestrate, matching upstream's own design. Progress is raw-log-tail only
 (no byte-level progress bar) because the underlying `hf` CLI has no
 machine-readable progress output to consume.
-`GET/POST /api/model-downloads*` exposes this; R9V additionally needs a
-`POST /api/model-downloads/r9v/prepare-ple` step (a second readiness gate,
-`ModelPresence.ple_ready`) before a package is usable.
+`GET/POST /api/model-downloads*` exposes this. (v1 also carried
+`POST /api/model-downloads/r9v/prepare-ple` + `ModelPresence.ple_ready` as
+R9V's second readiness gate; removed with the backend by the v2 L1 purge.)
 
 **`GET /api/model-downloads/status` response schema.** Returns `{ "models":
 [ModelPresence…], "hf": { "found_on_path": bool, "binary": string,
@@ -665,16 +671,15 @@ panels; when true they are `null`. Install `hf` on the service PATH as a
 prerequisite for model downloads (`vllm` pulls at server start and needs no
 host `hf`).
 
-### Server Mode (ds4/halogen/vllm/r9v/gufo detached servers)
+### Server Mode (ds4/gufo detached servers)
 
 `src/server_mode.rs` starts/stops/checks-status of headless, detached
-`podman run` servers for `ds4`, `halogen`, `vllm`, `r9v`, and `gufo` — distinct
+`podman run` servers for `ds4` and `gufo` — distinct
 from the Toolboxes tab's interactive dev-shell containers. `GET/POST
-/api/server-mode/{ds4,halogen,vllm,r9v,gufo}/{status,start,stop}` cover the
-lifecycle; `vllm` additionally exposes `POST
-/api/server-mode/vllm/cache-paths` (HF cache path configuration, applied
-separately from server start — an upstream behavioral difference, not an
-oversight), and R9V has a `paths` configuration endpoint. R9V server mode is
+/api/server-mode/{ds4,gufo}/{status,start,stop}` cover the
+lifecycle. v1 also shipped `halogen`, `vllm` (with a `cache-paths` action),
+and `r9v` (with a `paths` action); the v2 L1 purge removed those builders,
+their routes, and their panels — requests to the removed paths answer 404. R9V server mode is
 native Rust but **shipped with an explicit "unverified" badge**: no 2×AMD
 R9700 hardware was reachable from this environment to functionally validate
 ROCm/HSA device passthrough end-to-end (see Open Questions).
@@ -743,6 +748,14 @@ faked as routed.
 ---
 
 ## Benchmark Explorer
+
+> **v2 R2 feature gate:** the explorer (`/benchmarks`, `/api/benchmarks/*`,
+> the native lab) compiles only with `--features benchmarks`; default builds
+> answer the documented 503 degradation envelope
+> (`"Benchmark explorer unavailable: … Core routing is still available."`)
+> from the same routes, and the dashboard hides the explorer nav link via a
+> server-injected flag. The registry core (store schema, ingestion types,
+> degradation contract) is always compiled.
 
 ### Shipped scope
 
@@ -888,8 +901,9 @@ internal consumers must reuse `BenchmarkStore::run_blocking`.
 `runtimes.backend` (`CHECK(backend IN ('cpu','cuda','rocm','vulkan','metal','sycl','rpc','other'))`)
 already existed and is the "engine" axis surfaced as **Engine** everywhere in
 the UI. Migration `0003_toolbox_serving_dimension.sql` adds the genuinely new
-dimension: which **toolbox family** (`ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp`)
-served a run, via a new `serving_runtimes` table plus a
+dimension: which **toolbox family** (`ds4`/`halogen`/`vllm`/`r9v`/`llama_cpp`
+in the frozen migration vocabulary) served a run, via a new `serving_runtimes`
+table plus a
 `toolbox_catalog_snapshot` table (both nullable/additive; existing
 llama.cpp-only rows are unaffected). `GET /api/benchmarks/filters` and
 `GET /api/benchmarks/runs` gained `toolbox_backend`/`compute_api` as
@@ -1083,7 +1097,7 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 |---|---|---|
 | `GET` | `/` | Redirect to `/dashboard` |
 | `GET` | `/dashboard` | Embedded HTML dashboard: live routing feed grouped **per conversation** (client session header, or a stable hash of the conversation prefix when no header is present — each conversation renders as one card), hop-chain rendering for multi-hop fallbacks, in-flight request tracker (with cancel), a four-column Sankey flow diagram — **HARNESS** (Pi / OMP / Opencode / Claude / Droid, from User-Agent) → **SESSION** (OMP session title) → **ROUTING** (auto / cloud / local / fallback chain) → **MODEL** (resolved llama-swap key) — where clicking any node highlights its start-to-end path and clicking a card highlights the matching Sankey path, version display, one-click upgrades, review sessions |
-| `GET` | `/benchmarks` | Imported benchmark explorer, inspector and import/planning workflows; 503 when storage initialization failed |
+| `GET` | `/benchmarks` | Imported benchmark explorer, inspector and import/planning workflows; 503 when storage initialization failed, and in default builds — the explorer ships behind the non-default `benchmarks` cargo feature (v2 R2) and answers the same 503 degradation envelope when the feature is off |
 | `GET` | `/models` | Read-only local model activity, measurements, rolling alerts and reference controls |
 | `GET` | *(favicon/logo assets)* | Static assets for dashboard UI |
 
@@ -1128,7 +1142,8 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 ### Toolbox Backend Management API
 
 Most POST routes require the loopback/CSRF gate (see Security Model). Covers
-`ds4`/`halogen`/`vllm`/`r9v`/`gufo`/`llama_cpp` — never `comfyui`.
+`ds4`/`gufo`/`llama_cpp` after the v2 L1 purge — never `comfyui`, and never
+the browse-only feed ids (`halogen`/`vllm`/`r9v`).
 
 | Method | Path | Description |
 |---|---|---|
@@ -1140,15 +1155,12 @@ Most POST routes require the loopback/CSRF gate (see Security Model). Covers
 | `POST` | `/api/toolbox-containers/:name/update` | Pull + recreate a toolbox container |
 | `POST` | `/api/toolbox-containers/:name/delete` | Remove a toolbox container |
 | `POST` | `/api/toolbox-containers/:name/adopt` | Record a pre-existing container's live podman ID as brainrouter-managed |
-| `GET` | `/api/model-downloads` / `/status` | List/summarize download jobs (ds4/halogen/r9v/gufo/llama_cpp) |
+| `GET` | `/api/model-downloads` / `/status` | List/summarize download jobs (ds4/gufo/llama_cpp) |
 | `POST` | `/api/model-downloads` | Start a model download job |
 | `GET` | `/api/model-downloads/:id` | Job detail (raw-log-tail progress, no byte-level progress) |
 | `POST` | `/api/model-downloads/:id/cancel` | Cancel a download job |
 | `POST` | `/api/model-downloads/verify` | Verify a downloaded model's integrity |
-| `POST` | `/api/model-downloads/r9v/prepare-ple` | R9V's second readiness gate (PLE preparation) |
-| `GET`/`POST` | `/api/server-mode/{ds4,halogen,vllm,gufo}/status`\|`start`\|`stop` | Detached Server Mode lifecycle |
-| `GET`/`POST` | `/api/server-mode/r9v/status`\|`start`\|`stop`\|`paths` | Same, plus R9V toolbox/package path config |
-| `POST` | `/api/server-mode/vllm/cache-paths` | Configure vllm's HF cache paths (applied separately from server start) |
+| `GET`/`POST` | `/api/server-mode/{ds4,gufo}/status`\|`start`\|`stop` | Detached Server Mode lifecycle (v2 L1: the removed halogen/vllm/r9v paths, incl. `vllm/cache-paths` and `r9v/paths`, answer 404) |
 | `GET` | `/api/serving-identities` | Read-only registry of currently-running Server Mode containers' `{toolbox_backend, compute_api, runtime_profile_id, endpoint}` |
 | `GET` | `/api/cockpit-config` | Read cockpit's `~/.config/ai-toolbox-cockpit/config.json` |
 | `POST` | `/api/cockpit-config/default-toolbox` | Write the default-toolbox-per-platform key back to cockpit's config |
@@ -1399,10 +1411,12 @@ extended this to 391 Rust tests and 38 Node browser-logic tests, covering
 catalog structural validation (including deliberately-permissive handling of
 unrecognized/`comfyui` backend ids), the toolbox-container lifecycle,
 cockpit-config read/apply, model-download job state machines, Server Mode
-command construction for ds4/halogen/vllm/r9v/gufo, the migration-runner's version-3
+command construction for ds4/gufo, the migration-runner's version-3
 gate (`serving_runtimes`/`toolbox_catalog_snapshot`), and the spider chart's
-TEPR formula/cohort-pinning/insufficient-data behavior. **None of ds4/halogen/
-vllm/r9v/gufo's command builders have been run against real target hardware from
+TEPR formula/cohort-pinning/insufficient-data behavior (v2 L1 purge: the
+halogen/vllm/r9v Server Mode suites were deleted with their backends; the
+explorer suites additionally run under `--features benchmarks`). **None of ds4/
+gufo's command builders have been run against real target hardware from
 this environment** — they are verified against upstream documentation/catalog
 data and unit-tested in isolation, not integration-tested end-to-end on a real
 podman/GPU host. Ship behind an explicit "unverified" badge until a real host
@@ -1435,10 +1449,10 @@ These are ideas requiring separate approval, not acceptance claims for this rele
 - Parquet export and an integrated analytical warehouse
 - Runtime-loaded component attestation (PLE/n-gram tables, adapters, caches, retrieval assets), beyond declared registry provenance
 - Runtime context-selection controls: the retained `cli context` command has no implemented `/api/context` server route
-- **`brainrouter cli` parity for ds4/halogen/vllm/r9v/gufo.** The new toolbox backends are dashboard/API-only; `cli toolboxes`/`cli upgrade toolbox` remain llama.cpp-only.
+- **`brainrouter cli` parity for ds4/gufo.** The toolbox backends are dashboard/API-only; `cli toolboxes`/`cli upgrade toolbox` remain llama.cpp-only. (v1's halogen/vllm/r9v scope in this item was removed by the v2 L1 purge.)
 - **Register downloaded GGUFs into llama-swap.** Designed in `docs/design/llama-swap-register-downloaded-gguf.md`, not implemented.
 - **Router integration for Server Mode backends ("PR 11b" / Feature B).** Server Mode containers are not dispatchable as real request traffic; `Router`/`route()` still only knows Manifest + llama-swap. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
-- **R9V functional validation on real 2×AMD R9700 hardware.** ROCm/HSA device-passthrough (`--device /dev/kfd`/`/dev/dri`, `--group-add render`/`video`, `--ipc=host`, `--runtime crun`) has not been exercised end-to-end; ships behind an "unverified" badge.
+- ~~R9V functional validation on real 2×AMD R9700 hardware.~~ v1 scope; the r9v backend was removed by the v2 L1 purge (see `docs/design/v2-streamlining.md` L1) — re-validating this hardware path requires a new backend per the v2 engine-adapters plan (R6), not a revival of v1 code.
 - **Bidirectional/continuous config.json sync with ai-toolbox-cockpit.** Only an explicit, user-triggered single-write "apply" path exists; no locking/conflict protocol is defined for concurrent brainrouter+cockpit writes.
 - **ROCm/AMD-GPU auto-detection.** brainrouter has no `rocminfo`/sysfs-based hardware detection; R9V is offered as a selectable option and fails loudly on unsupported hardware rather than being auto-hidden.
 

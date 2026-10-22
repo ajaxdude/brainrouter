@@ -1,14 +1,14 @@
 //! Exercise the real daemon with isolated storage and a synthetic SSE upstream.
 //! No model servers, user configuration, or external network access are needed.
 
-use brainrouter::{
-    benchmark::BenchmarkStore,
-    daemon_client::{DaemonClient, DaemonEndpoint},
-};
+use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
+#[cfg(feature = "benchmarks")]
+use brainrouter::benchmark::BenchmarkStore;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn, Request, Response};
 use hyper_util::rt::TokioIo;
+#[cfg(feature = "benchmarks")]
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{
@@ -38,7 +38,7 @@ impl Drop for TestDirectory {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "benchmarks"))]
 fn write_fake_bwrap(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -214,6 +214,7 @@ impl TestDaemon {
         Self::start_with_review_and_lab(directory, database, upstream, cloud_enabled, review, None)
     }
 
+    #[cfg(feature = "benchmarks")]
     fn start_with_lab(directory: &Path, database: &Path, upstream: &str, lab: Value) -> Self {
         Self::start_with_review_and_lab(directory, database, upstream, false, json!({}), Some(lab))
     }
@@ -334,6 +335,7 @@ impl TestDaemon {
             .unwrap()
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn post_json(&self, path: &str, body: &Value) -> Value {
         self.client
             .post(format!("{}{path}", self.url))
@@ -349,6 +351,7 @@ impl TestDaemon {
             .unwrap()
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn synthetic_chat(&self, model: &str) {
         let response = self
             .client
@@ -369,6 +372,7 @@ impl TestDaemon {
         assert!(response.contains("[DONE]"), "{response}");
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn synthetic_anthropic_chat(&self, model: &str) {
         let response = self
             .client
@@ -389,6 +393,7 @@ impl TestDaemon {
         assert!(response.contains("message_stop"), "{response}");
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn synthetic_review(&self, directory: &Path) {
         let created = self
             .post_json(
@@ -416,6 +421,7 @@ impl TestDaemon {
         }
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn assert_completed_observations(&self, model_key: &str, expected_count: usize) {
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
@@ -487,6 +493,7 @@ impl TestDaemon {
         assert_eq!(requests[0]["model"], "test-only-model");
     }
 
+    #[cfg(feature = "benchmarks")]
     async fn assert_explorer_unavailable(&self) {
         for (method, path) in [
             ("GET", "/benchmarks"),
@@ -540,6 +547,10 @@ impl Drop for TestDaemon {
     }
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn corrupt_benchmark_database_does_not_stop_core_routing() {
     let directory = TestDirectory::new();
@@ -554,6 +565,10 @@ async fn corrupt_benchmark_database_does_not_stop_core_routing() {
     assert_eq!(fs::read(&database).unwrap(), b"not a SQLite database");
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn forward_benchmark_schema_does_not_stop_core_routing() {
     let directory = TestDirectory::new();
@@ -585,6 +600,10 @@ async fn forward_benchmark_schema_does_not_stop_core_routing() {
     );
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn native_riddllr_job_routes_grades_persists_and_preserves_sources() {
     let directory = TestDirectory::new();
@@ -753,6 +772,10 @@ async fn native_riddllr_job_routes_grades_persists_and_preserves_sources() {
 }
 
 #[cfg(unix)]
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn native_plumebench_job_hides_tests_runs_tools_and_persists_quality() {
     use std::os::unix::fs::PermissionsExt;
@@ -869,6 +892,10 @@ async fn native_plumebench_job_hides_tests_runs_tools_and_persists_quality() {
 }
 
 #[cfg(unix)]
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn native_plumebench_cancellation_terminates_the_active_process_group() {
     use std::os::unix::fs::PermissionsExt;
@@ -993,6 +1020,10 @@ async fn native_plumebench_cancellation_terminates_the_active_process_group() {
     assert_eq!(completed["result"]["passed"], Value::Null);
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn uncreatable_benchmark_path_does_not_stop_core_routing() {
     let directory = TestDirectory::new();
@@ -1073,20 +1104,29 @@ async fn remapped_loopback_origins_and_referers_can_mutate_but_untrusted_origins
         nudge["enabled"], true,
         "rejected mutations must not change state"
     );
-    let page = daemon
-        .client
-        .get(format!("{}/api/benchmarks/runs", daemon.url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
-    assert_eq!(page["total"], 0, "healthy benchmark storage still works");
+    // The healthy-storage probe needs the explorer (v2 R2 feature gate);
+    // the CSRF assertions above are the core-routing coverage that stays.
+    #[cfg(feature = "benchmarks")]
+    {
+        let page = daemon
+            .client
+            .get(format!("{}/api/benchmarks/runs", daemon.url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(page["total"], 0, "healthy benchmark storage still works");
+    }
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn profile_and_model_page_remain_available_without_benchmark_storage() {
     let directory = TestDirectory::new();
@@ -1188,6 +1228,10 @@ async fn benchmark_previews_check_csrf_before_storage_availability() {
     daemon.assert_core_routing(&upstream).await;
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
     let directory = TestDirectory::new();
@@ -1260,6 +1304,10 @@ async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
     );
 }
 
+// Explorer/lab behavior requires the `benchmarks` cargo feature (v2 R2);
+// without it these routes answer the degradation envelope, tested by
+// tests/v2_l1_acceptance.rs.
+#[cfg(feature = "benchmarks")]
 #[tokio::test]
 async fn synthetic_example_can_be_prepared_validated_and_imported_without_inference() {
     let directory = TestDirectory::new();

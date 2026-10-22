@@ -1,7 +1,9 @@
 //! HTTP admission, blocking work, and response buffers share the same budget.
 
 use super::*;
+#[cfg(feature = "benchmarks")]
 use hyper::body::{Body, Frame, SizeHint};
+#[cfg(feature = "benchmarks")]
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -9,6 +11,7 @@ use std::{
 };
 use tokio::sync::OwnedSemaphorePermit;
 
+#[cfg(feature = "benchmarks")]
 type HttpResponse = Response<UnsyncBoxBody<Bytes, anyhow::Error>>;
 
 impl BenchmarkStore {
@@ -75,25 +78,31 @@ impl BenchmarkStore {
                 )))
             })?
     }
+
 }
 
+/// Explorer HTTP surface — compiled only with the `benchmarks` feature.
+#[cfg(feature = "benchmarks")]
 struct AdmittedBody {
     inner: UnsyncBoxBody<Bytes, anyhow::Error>,
     pending: Bytes,
     permit: Arc<OwnedSemaphorePermit>,
 }
 
+#[cfg(feature = "benchmarks")]
 struct AdmittedBytes {
     bytes: Bytes,
     _permit: Arc<OwnedSemaphorePermit>,
 }
 
+#[cfg(feature = "benchmarks")]
 impl AsRef<[u8]> for AdmittedBytes {
     fn as_ref(&self) -> &[u8] {
         self.bytes.as_ref()
     }
 }
 
+#[cfg(feature = "benchmarks")]
 impl AdmittedBody {
     fn new(inner: UnsyncBoxBody<Bytes, anyhow::Error>, permit: OwnedSemaphorePermit) -> Self {
         Self {
@@ -110,6 +119,7 @@ impl AdmittedBody {
     }
 }
 
+#[cfg(feature = "benchmarks")]
 impl Body for AdmittedBody {
     type Data = Bytes;
     type Error = anyhow::Error;
@@ -153,6 +163,7 @@ impl Body for AdmittedBody {
     }
 }
 
+#[cfg(feature = "benchmarks")]
 pub async fn handle_request(
     req: Request<Incoming>,
     store: &BenchmarkStore,
@@ -216,11 +227,13 @@ pub async fn handle_request(
     Ok(response.unwrap_or_else(error_response))
 }
 
+#[cfg(feature = "benchmarks")]
 fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> BenchmarkResult<T> {
     serde_json::from_slice(bytes)
         .map_err(|error| BenchmarkError::Validation(format!("invalid benchmark payload: {error}")))
 }
 
+#[cfg(feature = "benchmarks")]
 fn dispatch(
     store: &BenchmarkStore,
     method: &str,
@@ -313,6 +326,7 @@ fn dispatch(
     }
 }
 
+#[cfg(feature = "benchmarks")]
 fn preview_response(store: &BenchmarkStore, bundle: IngestBundle) -> BenchmarkResult<HttpResponse> {
     store.ingest_checked(&bundle, false)?;
     Ok(json_response(
@@ -330,6 +344,6 @@ fn preview_response(store: &BenchmarkStore, bundle: IngestBundle) -> BenchmarkRe
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "benchmarks"))]
 #[path = "http_tests.rs"]
 mod tests;

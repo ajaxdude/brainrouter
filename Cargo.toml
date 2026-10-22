@@ -1,6 +1,6 @@
 [package]
 name = "brainrouter"
-version = "1.1.7"
+version = "1.1.8"
 edition = "2021"
 
 [dependencies]
@@ -64,6 +64,11 @@ serde_yml = { version = "0.0.12", optional = true }
 default = ["bridge-discord", "bridge-signal"]
 bridge-discord = ["dep:serenity", "dep:async-trait", "dep:serde_yml"]
 bridge-signal = ["dep:serde_yml"]
+# v2 R2 (docs/design/v2-streamlining.md): the benchmark explorer (HTTP
+# routes + native lab) is opt-in. NOT part of `default`: stock builds
+# answer the documented 503 degradation envelope on /benchmarks and
+# /api/benchmarks/*; core routing is unaffected.
+benchmarks = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

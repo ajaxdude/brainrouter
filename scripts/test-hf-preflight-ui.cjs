@@ -6,7 +6,7 @@
 // Extracts the REAL escHtml plus the marker-delimited pure-helper block from
 // main_dashboard.html and exercises them in a node:vm sandbox — no server,
 // model, or network. Also runs static source assertions so the test fails if
-// the banner mounts, loader wiring, or ds4/halogen branches are missing.
+// the banner mounts, loader wiring, or ds4/gufo branches are missing.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -74,7 +74,7 @@ test('hfBannerHtml: shown only when missing, escapes untrusted content', () => {
 
 test('serverModeEmptyModelHint / emptyModelOption switch on hf state', () => {
   const s = makeSandbox();
-  for (const kind of ['ds4 models', 'halogen bundles']) {
+  for (const kind of ['ds4 models', 'gufo models']) {
     assert.match(s.serverModeEmptyModelHint(kind, { found_on_path: false }), /Hugging Face CLI/);
     assert.equal(
       s.serverModeEmptyModelHint(kind, { found_on_path: true }),
@@ -99,7 +99,7 @@ test('renderHfBanner sets banner when missing and clears it when found', () => {
   s.renderHfBanner('does-not-exist');
 });
 
-test('static wiring: mounts, banner calls, loader assignment, ds4/halogen branches', () => {
+test('static wiring: mounts, banner calls, loader assignment, ds4/gufo branches', () => {
   assert.ok(html.includes('<div id="toolbox-hf-banner"'), 'toolbox banner mount missing');
   assert.ok(html.includes('<div id="server-mode-hf-banner"'), 'server-mode banner mount missing');
   assert.ok(html.includes("renderHfBanner('toolbox-hf-banner')"), 'toolbox renderHfBanner call missing');
@@ -110,5 +110,5 @@ test('static wiring: mounts, banner calls, loader assignment, ds4/halogen branch
     'both loaders must assign via hfFromStatus',
   );
   assert.ok(html.includes("emptyModelOption('ds4 models', toolboxHfPreflight)"), 'ds4 empty branch not wired');
-  assert.ok(html.includes("emptyModelOption('halogen bundles', toolboxHfPreflight)"), 'halogen empty branch not wired');
+  assert.ok(html.includes("emptyModelOption('gufo models', toolboxHfPreflight)"), 'gufo empty branch not wired');
 });

@@ -9,8 +9,10 @@
 //!   §2 for the design rationale.
 //!
 //! Per-backend command-builder submodules (the actual `toolbox`/`podman`
-//! invocation sequences for ds4/halogen/vllm/r9v) are Wave 2 territory
-//! (PR7-PR11) and don't exist yet — this module is catalog data only.
+//! invocation sequences, v1 for ds4/halogen/vllm/r9v) live in
+//! `crate::server_mode`; the v2 L1 purge kept only ds4+gufo — halogen, vllm
+//! and r9v are recorded here as removed v1 scope, parsed feed vocabulary
+//! only (browse-only catalog entries).
 
 pub mod gufo_overlay;
 pub mod models;
@@ -23,8 +25,7 @@ use schema_validate::ValidationReport;
 
 pub use models::{
     CatalogModelEntry, CatalogModelFile, Ds4Model, GufoModel, GufoRole, GufoSpeculative,
-    GufoSpeculativeMode, HalogenModel, LlamaCppModel, ModelBackendCatalog, ModelCatalog,
-    ModelPayload, R9vModel, R9vPleFile, VllmModel,
+    GufoSpeculativeMode, LlamaCppModel, ModelBackendCatalog, ModelCatalog, ModelPayload,
 };
 pub use types::{
     CatalogBackendId, CatalogParseError, Channel, FeatureState, Maturity, Platform,
@@ -275,14 +276,18 @@ mod tests {
         let (toolboxes, models) = catalog.typed().expect("typed parse must succeed");
         assert!(!toolboxes.toolboxes.is_empty());
         // Gufo is a brainrouter overlay backend, not in the vendored feed.
-        for backend in [
-            SupportedServingBackend::LlamaCpp,
-            SupportedServingBackend::Ds4,
-            SupportedServingBackend::Halogen,
-            SupportedServingBackend::Vllm,
-            SupportedServingBackend::R9v,
-        ] {
+        for backend in [SupportedServingBackend::LlamaCpp, SupportedServingBackend::Ds4] {
             assert!(models.backend(backend).is_some(), "expected a {backend} models section");
+        }
+        // v2 L1: purged backends keep feed sections (browse-only), typed-parseable.
+        for raw in ["halogen", "vllm", "r9v"] {
+            assert!(
+                models
+                    .backends
+                    .iter()
+                    .any(|b| b.backend.as_str() == raw && !b.entries.is_empty()),
+                "expected a {raw} models section in the feed"
+            );
         }
     }
 
