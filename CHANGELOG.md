@@ -68,6 +68,17 @@ through grant-scoped `secrets.get`.
   owns them), the `bridges` CLI verb, `GET /api/bridge-status`,
   `POST /api/bridges/toggle`, and the dashboard bridge config panel.
 
+### Step 9 review pass (pre-merge fixes)
+
+Restore no longer touches an unreadable-shaped credential set (map/object
+form handled; corrupt shapes bail instead of wiping); every `/api/plugins*`
+and plugin-state entry point validates the plugin id before touching the
+filesystem; the daemon-less `plugin enable` persists state only (no
+unsupervised child); corrupt `plugins.json`/`credentials.json` boot
+quarantined (`.corrupt-<ts>`, daemon stays up); CI covers the
+`plugins/bridge` workspace; plugin log/status text is scrubbed of control
+characters; snapshot files and the migration snapshot set are written 0600.
+
 ### Restoring v2.0-p2
 
 `brainrouter migration restore v2.0-p2` restores the newest snapshot

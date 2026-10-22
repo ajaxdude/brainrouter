@@ -21,3 +21,7 @@ learning.md
 brainrouter.yaml.bak-*
 brainrouter-headless.yaml.bak-*
 brainrouter-headless.yaml*
+
+# Machine-local runtime state (written by the daemon on this box; N8).
+managed_toolboxes.json
+brainrouter-headless.yaml

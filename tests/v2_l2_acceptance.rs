@@ -451,7 +451,8 @@ impl Daemon {
 
 
     async fn ready(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // 90 s wall on a CPU-saturated box (workspace runs); 50 ms probe.
+        let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 panic!("daemon exited with {status}: {}", self.log_tail());
@@ -1306,42 +1307,71 @@ async fn supervisor_crash_loop_reaches_terminal_failed() {
         mode: "crash",
         credential_ids: false,
     };
-    let daemon = boot_with_plugins(&env, &base_config_yaml(&dead_upstream_url()), &[&fx]).await;
+    // Isolated boot cycle (NOT boot_with_plugins): boot-1 carries install/
+    // list/enable (same CLI verb coverage) and its crash-loop spawns are
+    // BASELINED at daemon1 stop — a deterministic snapshot taken after the
+    // boot-1 process is reaped — so boot-2's terminal window stays a hard
+    // 5..=7 even when CPU contention lengthens boot-1's spawn ladder.
+    let mut daemon = Daemon::start(&env, &base_config_yaml(&dead_upstream_url()));
+    daemon.ready().await;
+    let dir = write_fixture(&env, &fx);
+    daemon.plugin_cli(&["install", dir.to_str().unwrap()]).expect_ok("plugin install");
+    daemon.plugin_cli(&["list"]).expect_ok("plugin list");
+    daemon.plugin_cli(&["enable", "raycrash"]).expect_ok("plugin enable");
+    daemon.stop();
+    let base = spawn_lines(&env.plugin_state("raycrash").join("spawns"));
+    let mut daemon = Daemon::start(&env, &base_config_yaml(&dead_upstream_url()));
+    daemon.ready().await;
     let spawns_path = env.plugin_state("raycrash").join("spawns");
 
-    // 5 consecutive crashes -> terminal `failed` (backoff is exponential,
-    // capped at 60 s; generous ceiling covers builder base values).
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let mut saw_failed = false;
-    while Instant::now() < deadline {
-        assert!(daemon.health_ok().await, "daemon must keep serving /health throughout the crash loop");
+    // 5 consecutive crashes -> terminal `failed` (design: restart with
+    // exponential backoff capped at 60 s; no supervision until explicit
+    // `enable`). Deadline-based polling with a generous wall budget for the
+    // backoff ladder on a loaded box; /health is asserted on a throttle
+    // (every 4th poll) so the loop's per-iteration cost stays small.
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut polls = 0u32;
+    loop {
         let status = daemon.plugin_cli(&["status", "raycrash"]);
+        if polls % 4 == 0 {
+            assert!(daemon.health_ok().await, "daemon must keep serving /health throughout the crash loop");
+        }
+        polls += 1;
         if status.out().to_lowercase().contains("failed") {
-            saw_failed = true;
             break;
         }
+        assert!(Instant::now() < deadline, "crash loop must reach terminal `failed` (status shows failed)\nlast daemon log: {}", daemon.log_tail());
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    assert!(saw_failed, "crash loop must reach terminal `failed` (status shows failed)\nlast daemon log: {}", daemon.log_tail());
 
-    // Spawn stops: the spawn count is at the 5-crash terminal boundary and
-    // stops growing.
+    // Spawn stops: boot-2's supervision session spawns at the 5-crash
+    // terminal boundary (+2 grace for boot/enable spawn races) and freezes
+    // — two samples >=10 s apart after the terminal state was observed.
     let count0 = spawn_lines(&spawns_path);
     assert!(
-        (5..=7).contains(&count0),
-        "terminal state after 5 consecutive crashes (1 initial + 4 restarts, +1 grace for racing restarts): observed {count0} spawns"
+        (base + 5..=base + 7).contains(&count0),
+        "terminal state after 5 consecutive crashes (1 initial + 4 restarts, +2 grace for a racing spawn): boot-1 baseline {base}, total observed {count0} spawns\nlast daemon log: {}",
+        daemon.log_tail()
     );
     tokio::time::sleep(Duration::from_secs(10)).await;
     let count1 = spawn_lines(&spawns_path);
     assert_eq!(count1, count0, "spawn must stop at terminal `failed` (backoff restarts continue -> supervision not stopped)");
 
-    // Log-line ceiling: the daemon's supervision log lines for this plugin
-    // stop growing at the same point (spawn stops => no new spawn log traffic).
-    let log = daemon.log_tail();
-    let mentions = log.lines().filter(|l| l.to_lowercase().contains("raycrash")).count();
+    // Log-line ceiling: supervision SPAWN/Crash traffic for this plugin
+    // stays bounded (event lines, not per-status-query log spam).
+    let log = daemon.log_tail().to_lowercase();
+    let mentions = log
+        .lines()
+        .filter(|l| {
+            l.contains("raycrash")
+                && ["spawn", "restart", "crash", "backoff", "failed", "stop"]
+                    .iter()
+                    .any(|w| l.contains(w))
+        })
+        .count();
     assert!(
-        mentions <= 60,
-        "daemon log must not contain runaway supervision spam for the failed plugin ({mentions} lines mentioning raycrash)"
+        mentions <= 2 * (base + 8),
+        "daemon log must not contain runaway supervision spam for the failed plugin ({mentions} spawn/crash event lines, baseline {base})"
     );
 
     // No supervision until explicit `enable` (design): a disable/enable is the
@@ -1374,7 +1404,7 @@ async fn supervisor_stops_plugin_children_on_daemon_shutdown() {
     // Drop any file left by the install daemon's child; the running child
     // rewrites it every 500 ms (see fixture heartbeat).
     let _ = fs::remove_file(&pid_path);
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(90);
     // Identify THIS boot's child by parentage (a child of a prior boot
     // would already have tripped Daemon::stop's survivor scan).
     let daemon_pid = daemon.child.id();

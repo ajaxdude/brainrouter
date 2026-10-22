@@ -6,7 +6,7 @@ name: CI
 # is what keeps the feature gate honest.
 on:
   push:
-    branches: [master, v2-streamlining, v2-p1-purge]
+    branches: [master, v2-streamlining, v2-p1-purge, v2-p2-plugins]
   pull_request:
     branches: [master]
 
@@ -38,6 +38,15 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace ${{ matrix.features }}
+
+      # I2: plugins/bridge is a standalone nested workspace (the core lockfile
+      # must stay free of bridge-only deps) and is therefore invisible to
+      # --workspace. Build + test it explicitly, feature-independent.
+      - name: Check bridge plugin (all targets, 0 warnings)
+        run: cargo check --manifest-path plugins/bridge/Cargo.toml --all-targets
+
+      - name: Test bridge plugin
+        run: cargo test --manifest-path plugins/bridge/Cargo.toml
 
       - name: Toolbox catalog structural check
         run: cargo run --bin toolbox_catalog_check

@@ -185,9 +185,21 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         println!("dry-run complete: no state written");
         return Ok(());
     }
+    // I3: a corrupt credentials.json must not brick the daemon — rename the
+    // unreadable vault aside and boot with an empty store (resolve then
+    // fails cleanly per consumer).
     let credentials_store = Arc::new(
-        brainrouter::credentials::CredentialStore::load(credentials_path)
-            .context("loading credentials store")?,
+        match brainrouter::credentials::CredentialStore::load_quarantining(credentials_path.clone()) {
+            (Ok(store), _) => store,
+            (Err(e), _) => {
+                tracing::error!(error = %e,
+                    "credentials store is unreadable and could not be quarantined;                      starting with an in-memory empty vault");
+                brainrouter::credentials::CredentialStore::load(
+                    credentials_path.with_file_name("credentials.disabled.json"),
+                )
+                .context("creating the empty fallback credentials store")?
+            }
+        },
     );
     for action in brainrouter::migration::run_v2_p2(
         &config_path,

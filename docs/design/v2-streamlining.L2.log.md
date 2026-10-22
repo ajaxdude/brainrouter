@@ -47,3 +47,23 @@ verbs + snapshot layout, peer-uid code-only, limit code −32005) folded in.
   request/response; SSE deltas are aggregated into the final
   `chat.completion`. Streaming RPC is an additive L-future method.
 - macOS peer-cred: Linux `SO_PEERCRED` only (L8 confirm item, per spec).
+
+## Step 9 disposition (review fix pass)
+
+| Finding | Disposition |
+|---|---|
+| B1 restore wiped the vault | Fixed in `src/migration.rs::extract_records`: the vault serializes `credentials` as a map OBJECT — restore now reads Object (values), Array (legacy), Null (empty); any other shape bails (a restore must never wipe). Tests: `restore_roundtrip_preserves_a_nonempty_vault` (pre-existing vault snapshot → every credential + grant survives, post-migration additions are replaced by the snapshot set) and `restore_rejects_unreadable_credential_shape` (scalar `credentials` → error, vault untouched). |
+| B2 plugin id traversal | `PluginManager::check_plugin_id` (letters/digits/-/_, <=64) gates EVERY filesystem-touching entry point: `remove` (BEFORE `remove_dir_all`), `enable`, `disable`, `config_get/set`, `kv_get/set`, `set_status_line`, and `log_path_checked` (the HTTP log endpoint). The daemon HTTP layer maps every rejection to 400. Tests: `plugin_id_validation_blocks_traversal` (unit) + `b2_http_plugin_endpoints_reject_traversal_ids` (live daemon: `..`, `a/b`, absolute, empty across enable/disable/remove/config/logs -> 4xx; registry + vault byte-identical after). |
+| I1 daemon-less enable spawned an orphan | The daemon-less CLI path (`run_plugin_direct`) now calls `set_enabled_registry_only` — persists the enabled flag, never spawns (the supervisor is the daemon's boot job; response carries `spawn_deferred: true`). `run_plugin_standalone` probes the socket first so the top-level verbs work with the daemon down. Test: `i1_daemonless_enable_persists_without_spawning` (no matching process after enable; registry `enabled=true`, `state=stopped`). |
+| I2 CI never touches plugins/bridge | `.github/workflows/ci.yml`: `cargo check --manifest-path plugins/bridge/Cargo.toml --all-targets` + `cargo test --manifest-path plugins/bridge/Cargo.toml` on both matrix arms; branch list includes `v2-p2-plugins`. |
+| I3 corrupt state bricked boot | `Registry::load_quarantining` (project-pins precedent) renames an unreadable `plugins.json` to `.corrupt-<ts>` and boots with an empty registry; `CredentialStore::load_quarantining` does the same for the vault (rename kept for forensics, daemon boots empty, every `resolve` fails cleanly). Test: `i3_corrupt_registry_and_vault_boot_quarantined` (boot green, `/health` 200, list empty, quarantine files present, install works). |
+| N1 stop_supervisor burned 8 s idle | Early-exit poll on the supervisors map (the supervisor self-removes when the child is reaped) — returns as soon as the task is gone. |
+| N2 snapshot files 0644 | Snapshot config + credentials now go through `store::atomic_write_0600` (they contain the pre-migration plaintext token). |
+| N3 dotted_set panic on mid-path scalar | Returns `Err` (JSON-RPC error via `config_set`); unit-covered in `dotted_paths`. |
+| N4 is_shutting_down unwired | `start_supervisor` refuses to spawn while the daemon is shutting down (log + return). |
+| N5 bridge persistence manifest | `migrate_v1_state` records every copied v1 file (name, bytes, source) as `bridge-persistence.json` in the newest `migrations/<phase>/<ts>/` snapshot dir (created when no migration ran that boot). |
+| N6 hostile SSE index | `collect_completion` clamps `choices[].index` to 64 — `index: 1e9` cannot drive a giant allocation. |
+| N7 plugin text in journals | `scrub_text` strips control chars + ANSI escape sequences from `notify`/`set_status` before the journal/status surfaces (a plugin line cannot forge daemon logs); covered by `scrub_text_strips_control_chars_and_ansi`. |
+| N8 machine-local files tracked | `git rm --cached managed_toolboxes.json brainrouter-headless.yaml`; both added to `.gitignore`; files stay on disk. |
+
+Regression file: `tests/v2_l2_fixpass.rs` (B2/I1/I3, live-daemon; separate from Ray's ratified suite, which stays untouched at 14/14).

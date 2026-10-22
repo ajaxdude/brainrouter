@@ -506,7 +506,7 @@ fn migrate_v1_state(state_dir: &Path) {
     if v1 == state_dir {
         return; // standalone run pointed at the v1 dir: nothing to do
     }
-    let mut copied = 0usize;
+    let mut copied: Vec<serde_json::Value> = Vec::new();
     for name in V1_STATE_FILES {
         let src = v1.join(name);
         let dst = state_dir.join(name);
@@ -516,12 +516,118 @@ fn migrate_v1_state(state_dir: &Path) {
         match std::fs::copy(&src, &dst) {
             Ok(n) => {
                 info!("migrated v1 bridge state file {name} ({n} bytes)");
-                copied += 1;
+                copied.push(serde_json::json!({
+                    "file": name,
+                    "bytes": n,
+                    "source": src.display().to_string(),
+                }));
             }
             Err(e) => warn!("could not copy v1 bridge state file {name}: {e}"),
         }
     }
-    if copied > 0 {
-        info!("persisted bridge state migrated ({copied} files copied, originals kept)");
+    if !copied.is_empty() {
+        // N5: the copy is recorded as a manifest in the migration snapshot
+        // dir (the newest snapshot under the state root; created fresh when
+        // this boot ran no migration).
+        record_persistence_manifest(&copied);
+        info!(
+            "persisted bridge state migrated ({} files copied, originals kept)",
+            copied.len()
+        );
+    }
+}
+
+/// Minimal UTC clock helpers (the plugin crate deliberately has no chrono).
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn utc_compact() -> String {
+    format!("{:014}Z", civil_datetime(epoch_secs()))
+}
+
+fn utc_iso8601() -> String {
+    let n = civil_datetime(epoch_secs());
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        n / 10000000000,
+        n / 100000000 % 100,
+        n / 1000000 % 100,
+        n / 10000 % 100,
+        n / 100 % 100,
+        n % 100
+    )
+}
+
+/// Days-since-epoch → YYYYMMDDHHMMSS (civil_from_days algorithm).
+fn civil_datetime(secs: u64) -> u64 {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097).max(0);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    y as u64 * 100_000_000_000
+        + (m as u64) * 100_000_000
+        + d as u64 * 1_000_000
+        + rem / 3600 * 10_000
+        + rem % 3600 / 60 * 100
+        + rem % 60
+}
+
+/// N5: write `bridge-persistence.json` (the six-file copy manifest) into the
+/// newest `migrations/<phase>/<ts>/` snapshot directory.
+fn record_persistence_manifest(entries: &[serde_json::Value]) {
+    let state_root = std::path::Path::new(
+        &std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| "/tmp".to_string()),
+    )
+    .join("brainrouter");
+    let migrations = state_root.join("migrations");
+    let newest = std::fs::read_dir(&migrations)
+        .ok()
+        .and_then(|phases| {
+            let mut best: Option<std::path::PathBuf> = None;
+            for phase in phases.flatten() {
+                let Ok(dir) = phase.path().read_dir() else { continue };
+                for ts in dir.flatten() {
+                    let p = ts.path();
+                    if p.is_dir() && best.as_ref().is_none_or(|b: &std::path::PathBuf| p > *b) {
+                        best = Some(p);
+                    }
+                }
+            }
+            best
+        })
+        .unwrap_or_else(|| {
+            let dir = migrations.join("v2.0-p2").join(utc_compact());
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+    let manifest = serde_json::json!({
+        "phase": "v2.0-p2",
+        "plugin": "bridge",
+        "copied_at": utc_iso8601(),
+        "v1_dir": persist::v1_data_dir().display().to_string(),
+        "files": entries,
+    });
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(text) => {
+            let path = newest.join("bridge-persistence.json");
+            if let Err(e) = std::fs::write(&path, text) {
+                warn!("could not write persistence manifest {path:?}: {e}");
+            } else {
+                info!(path = %path.display(), "recorded bridge persistence manifest");
+            }
+        }
+        Err(e) => warn!("could not serialize persistence manifest: {e}"),
     }
 }

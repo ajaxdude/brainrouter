@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use tracing::debug;
 
 use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
+use brainrouter::plugins::PluginManager;
+use std::net::TcpStream;
 use std::sync::Arc;
 use brainrouter::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
 
@@ -767,35 +769,9 @@ async fn run_plugin(client: &DaemonClient, action: PluginAction) -> Result<()> {
         }
         return Ok(());
     }
-    // Direct-state path (no running daemon).
-    use brainrouter::plugins::PluginManager;
-    let creds = Arc::new(
-        brainrouter::credentials::CredentialStore::load(
-            brainrouter::credentials::CredentialStore::default_path(),
-        )
-        .context("loading credentials store")?,
-    );
-    let manager = PluginManager::new(creds).context("opening the plugin registry")?;
-    match action {
-        Install { dir } => print_json(&manager.install(std::path::Path::new(&dir))?),
-        List => print_json(&json!({ "plugins": manager.list()? })),
-        Enable { id } => print_json(&manager.enable(&id).await?),
-        Disable { id } => print_json(&manager.disable(&id).await?),
-        Remove { id } => print_json(&manager.remove(&id).await?),
-        Status { id } => print_plugin_status(&json!({ "plugins": manager.list()? }), id.as_deref())?,
-        Config { action } => match action {
-            PluginConfigAction::Set { id, assignments } => {
-                for pair in assignments {
-                    let (key, value) = parse_kv(&pair)?;
-                    print_json(&manager.config_set(&id, &key, value)?);
-                }
-            }
-            PluginConfigAction::Show { id } => {
-                print_json(&manager.config_get_full(&id)?)
-            }
-        }
-    }
-    Ok(())
+    // Unreachable socket mid-call: direct-state management.
+    drop(client);
+    run_plugin_direct(action).await
 }
 
 fn parse_kv(pair: &str) -> Result<(String, Value)> {
@@ -884,12 +860,65 @@ pub struct MigrationArgs {
 }
 
 pub async fn run_plugin_standalone(args: PluginCliArgs) -> Result<()> {
-    let cli_args = CliArgs {
-        socket: args.socket,
-        url: args.url,
-        command: CliCommand::Plugin { action: args.action },
-    };
-    run(cli_args).await
+    // The daemon-client path requires a live socket; when the daemon is not
+    // running (socket absent / unconnectable), operate directly on the plugin
+    // state (install/list/status/config + registry-only enable/disable).
+    if daemon_reachable(args.socket.as_deref(), args.url.as_deref()) {
+        let cli_args = CliArgs {
+            socket: args.socket,
+            url: args.url,
+            command: CliCommand::Plugin { action: args.action },
+        };
+        return run(cli_args).await;
+    }
+    run_plugin_direct(args.action).await
+}
+
+/// Probe: is a daemon accepting at the endpoint (default socket when none
+/// given)? A UDS connect on a live listener succeeds instantly.
+fn daemon_reachable(socket: Option<&std::path::Path>, url: Option<&str>) -> bool {
+    use std::os::unix::net::UnixStream;
+    if let Some(u) = url {
+        return TcpStream::connect(u.trim_start_matches("http://").trim_end_matches('/'))
+            .is_ok();
+    }
+    let path = socket
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(brainrouter::config::default_socket_path);
+    std::thread::spawn(move || UnixStream::connect(&path).is_ok())
+        .join()
+        .unwrap_or(false)
+}
+
+/// The daemon-less `plugin` verbs: direct state management. Enable/disable
+/// persist the registry flag ONLY (I1: the supervisor is the daemon's job).
+async fn run_plugin_direct(action: PluginAction) -> Result<()> {
+    use PluginAction::*;
+    let creds = Arc::new(
+        brainrouter::credentials::CredentialStore::load(
+            brainrouter::credentials::CredentialStore::default_path(),
+        )
+        .context("loading credentials store")?,
+    );
+    let manager = PluginManager::new(creds).context("opening the plugin registry")?;
+    match action {
+        Install { dir } => print_json(&manager.install(std::path::Path::new(&dir))?),
+        List => print_json(&json!({ "plugins": manager.list()? })),
+        Enable { id } => print_json(&manager.set_enabled_registry_only(&id, true)?),
+        Disable { id } => print_json(&manager.set_enabled_registry_only(&id, false)?),
+        Remove { id } => print_json(&manager.remove(&id).await?),
+        Status { id } => print_plugin_status(&json!({ "plugins": manager.list()? }), id.as_deref())?,
+        Config { action } => match action {
+            PluginConfigAction::Set { id, assignments } => {
+                for pair in assignments {
+                    let (key, value) = parse_kv(&pair)?;
+                    print_json(&manager.config_set(&id, &key, value)?);
+                }
+            }
+            PluginConfigAction::Show { id } => print_json(&manager.config_get_full(&id)?),
+        },
+    }
+    Ok(())
 }
 
 pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {

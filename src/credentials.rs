@@ -187,6 +187,39 @@ impl CredentialStore {
         })
     }
 
+    /// Boot-tolerant load (I3): a corrupt vault is renamed aside
+    /// (`.corrupt-<UTC ts>`, kept for forensics — never overwritten) and the
+    /// daemon boots with an empty store; every `resolve` then fails cleanly.
+    /// The original file is preserved byte-for-byte under the new name.
+    pub fn load_quarantining(path: PathBuf) -> (Result<Self>, Option<PathBuf>) {
+        match Self::load(path.clone()) {
+            Ok(store) => (Ok(store), None),
+            Err(e) => {
+                let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+                let mut name = path.as_os_str().to_os_string();
+                name.push(format!(".corrupt-{ts}"));
+                let moved = PathBuf::from(name);
+                match std::fs::rename(&path, &moved) {
+                    Ok(()) => {
+                        tracing::warn!(path = %path.display(), quarantined = %moved.display(),
+                            error = %e,
+                            "credentials store was corrupt; quarantined, booting with an empty store");
+                        (Self::load(path).map(|mut s| {
+                            // fresh empty store at the ORIGINAL path
+                            s
+                        }), Some(moved))
+                    }
+                    Err(ren) => (
+                        Err(e.context(format!(
+                            "credentials store unreadable and quarantine rename failed: {ren}"
+                        ))),
+                        None,
+                    ),
+                }
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -341,11 +341,12 @@ async fn dispatch(
             .map_err(plain),
         "secrets.get" => secrets_get(&inner, plugin_id, &params).map_err(plain),
         "notify" => {
-            let text = params
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let text = scrub_text(
+                params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
             let toast = json!({
                 "plugin": plugin_id,
                 "text": text,
@@ -357,11 +358,12 @@ async fn dispatch(
             Ok(json!({ "ok": true, "toast": toast }))
         }
         "set_status" => {
-            let text = params
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let text = scrub_text(
+                params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
             manager
                 .set_status_line(plugin_id, &text)
                 .map(|()| json!({ "ok": true, "status_line": text }))
@@ -423,6 +425,34 @@ fn is_rpc_method(method: &str) -> bool {
             | "notify"
             | "set_status"
     )
+}
+
+/// N7: scrub control characters (newlines, CR, tabs, ANSI escapes) from
+/// plugin-supplied text before it lands in the journal/CLI surfaces — a
+/// plugin log line must not forge daemon log lines.
+fn scrub_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Drop a full ANSI escape sequence (ESC [ ... final-byte).
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c.is_control() {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out.chars().take(2000).collect()
 }
 
 fn param_key(params: &Value) -> &str {
@@ -572,7 +602,9 @@ pub(crate) async fn collect_completion(mut stream: crate::provider::SseStream) -
             }
             if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
                 for c in choices {
-                    let idx = c.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    // N6: clamp a hostile index (SSE is untrusted upstream
+                    // data) so `index: 1e9` cannot drive a giant allocation.
+                    let idx = (c.get("index").and_then(Value::as_u64).unwrap_or(0) as usize).min(64);
                     while contents.len() <= idx {
                         contents.push(String::new());
                         roles.push("assistant".to_string());
@@ -661,6 +693,14 @@ mod tests {
         assert_eq!(parsed["result"]["ok"], json!(true));
         assert!(store::ct_eq("abc", "abc"));
         assert!(!store::ct_eq("abc", "abd"));
+    }
+
+    #[test]
+    fn scrub_text_strips_control_chars_and_ansi() {
+        assert_eq!(scrub_text("a\nb\tc"), "a b c");
+        assert_eq!(scrub_text("red\u{1b}[31malert\u{1b}[0m"), "redalert");
+        assert_eq!(scrub_text("plain"), "plain");
+        assert_eq!(scrub_text(&"x".repeat(5000)).len(), 2000);
     }
 
     #[test]

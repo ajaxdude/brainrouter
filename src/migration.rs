@@ -158,13 +158,25 @@ pub fn restore(
 fn extract_records(creds_json: &str) -> Result<Vec<CredentialRecord>> {
     let v: serde_json::Value =
         serde_json::from_str(creds_json).context("parsing snapshot credentials.json")?;
-    let creds = v
-        .get("credentials")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let creds = v.get("credentials").cloned().unwrap_or(serde_json::Value::Null);
+    // The vault's `credentials` field serializes as a map (BTreeMap keyed by
+    // id); an array is the legacy shape; null/missing is an empty vault. Any
+    // other shape is corrupt input: bail rather than restore an empty set
+    // (a restore that silently wipes the vault is the worst outcome).
+    let items: Vec<serde_json::Value> = match &creds {
+        serde_json::Value::Object(map) => map.values().cloned().collect(),
+        serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Null => Vec::new(),
+        other => {
+            let rendered = other.to_string();
+            anyhow::bail!(
+                "snapshot credentials.json has an unreadable credentials shape ({})",
+                &rendered[..rendered.len().min(80)]
+            )
+        }
+    };
     let mut out = Vec::new();
-    for c in creds {
+    for c in items {
         out.push(serde_json::from_value(c).context("decoding snapshot credential")?);
     }
     Ok(out)
@@ -210,15 +222,17 @@ pub fn snapshot(
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
+    // Secret-bearing files: atomic 0600 writes (the config snapshot holds
+    // the pre-migration plaintext token).
     if config_path.exists() {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {} for snapshot", config_path.display()))?;
-        std::fs::write(dir.join(SNAPSHOT_CONFIG_FILE), text)?;
+        crate::plugins::store::atomic_write_0600(&dir.join(SNAPSHOT_CONFIG_FILE), text.as_bytes())?;
     }
     if store.path().exists() {
         let text = std::fs::read_to_string(store.path())
             .with_context(|| format!("reading {} for snapshot", store.path().display()))?;
-        std::fs::write(dir.join(SNAPSHOT_CREDENTIALS_FILE), text)?;
+        crate::plugins::store::atomic_write_0600(&dir.join(SNAPSHOT_CREDENTIALS_FILE), text.as_bytes())?;
     }
     Ok(dir)
 }
@@ -324,6 +338,107 @@ mod tests {
         assert!(msg.contains("restored v2.0-p2"));
         assert!(std::fs::read_to_string(&config).unwrap().contains("PLAINTEXT-TOK-1234"));
         assert!(store.exists("discord_token").unwrap());
+    }
+
+    #[test]
+    fn restore_roundtrip_preserves_a_nonempty_vault() {
+        // Step 9 B1: the snapshot's credentials file is the vault's own
+        // serialization (map-shaped `credentials`); a restore with the vault
+        // pre-populated must survive every credential and every grant.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, v1_yaml("TOK-B1")).unwrap();
+        let store = CredentialStore::load(dir.path().join("credentials.json")).unwrap();
+        store
+            .put(CredentialRecord {
+                id: "api_key".into(),
+                description: "pre-existing".into(),
+                kind: CredentialKind::Store {
+                    value: crate::credentials::SecretString::new("pre-vault-secret"),
+                },
+                grants: vec!["other".into(), "bridge".into()],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        store
+            .put(CredentialRecord {
+                id: "signal_key".into(),
+                description: String::new(),
+                kind: CredentialKind::Env { var: "SIG_KEY".into() },
+                grants: vec!["bridge".into()],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+
+        run_v2_p2(&config, &store, &state).unwrap();
+        assert!(store.exists("discord_token").unwrap());
+
+        // Wipe a marker credential added after the migration, then restore.
+        store
+            .put(CredentialRecord {
+                id: "post_migration".into(),
+                description: String::new(),
+                kind: CredentialKind::Store {
+                    value: crate::credentials::SecretString::new("x"),
+                },
+                grants: vec![],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let msg = restore(PHASE_V2_P2, &config, &store, &state).unwrap();
+        assert!(msg.contains("credentials store"), "{msg}");
+
+        // Every pre-migration credential + grant survives.
+        let ids: Vec<String> = store
+            .list_masked()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&"api_key".to_string()), "{ids:?}");
+        assert!(ids.contains(&"signal_key".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"discord_token".to_string()), "pre-migration vault had none");
+        assert!(!ids.contains(&"post_migration".to_string()), "restore is the snapshot set");
+        assert_eq!(store.resolve("api_key").unwrap().expose(), "pre-vault-secret");
+        let masked = store.get_masked("api_key").unwrap();
+        assert_eq!(masked["grants"], serde_json::json!(["other", "bridge"]));
+        assert!(std::fs::read_to_string(&config).unwrap().contains("TOK-B1"));
+    }
+
+    #[test]
+    fn restore_rejects_unreadable_credential_shape() {
+        // Corrupt (scalar) credentials shape must bail, not wipe the vault.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let snap_dir = snapshot_root(&state, PHASE_V2_P2).join("20260101T000000Z");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join(SNAPSHOT_CREDENTIALS_FILE),
+            r#"{"credentials": 12345}"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, v1_yaml("TOK")).unwrap();
+        let store = CredentialStore::load(dir.path().join("credentials.json")).unwrap();
+        store
+            .put(CredentialRecord {
+                id: "keep".into(),
+                description: String::new(),
+                kind: CredentialKind::Store {
+                    value: crate::credentials::SecretString::new("v"),
+                },
+                grants: vec![],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let err = restore(PHASE_V2_P2, &config, &store, &state).unwrap_err();
+        assert!(err.to_string().contains("shape"), "{err}");
+        assert!(store.exists("keep").unwrap(), "vault untouched after a failed restore");
     }
 
     #[test]

@@ -681,7 +681,13 @@ async fn handle_request(
                 return Ok(into_unsync(resp));
             }
             let tail: usize = query_param(query, "tail").parse().unwrap_or(400);
-            let path = state.plugins.log_path(&id);
+            let path = match state.plugins.log_path_checked(&id) {
+                Ok(p) => p,
+                Err(e) => {
+                    let resp = json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: e.to_string() });
+                    return Ok(into_unsync(resp));
+                }
+            };
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     let lines: Vec<&str> = text.lines().collect();

@@ -133,7 +133,8 @@ impl PluginManager {
         state_root: PathBuf,
         runtime_root: PathBuf,
     ) -> Result<Self> {
-        let registry = Registry::load(&state_root)?;
+        // I3: corrupt registry → quarantine + boot empty, never brick.
+        let (registry, _) = Registry::load_quarantining(&state_root);
         Ok(Self {
             inner: Arc::new(Inner {
                 state_root,
@@ -276,6 +277,7 @@ impl PluginManager {
     }
 
     pub fn entry_json(&self, id: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         let reg = self.inner.registry.lock().unwrap();
         reg.plugins
             .get(id)
@@ -284,6 +286,7 @@ impl PluginManager {
     }
 
     pub fn set_status_line(&self, id: &str, text: &str) -> Result<()> {
+        check_plugin_id(id)?;
         let mut reg = self.inner.registry.lock().unwrap();
         let entry = reg
             .plugins
@@ -377,6 +380,7 @@ impl PluginManager {
     /// Remove a plugin: stop it, delete its state dir, drop credential grants
     /// naming it, remove the registry entry.
     pub async fn remove(&self, id: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         self.stop_supervisor(id).await;
         self.close_listener(id);
         let state_dir = store::plugin_state_dir(&self.inner.state_root, id);
@@ -405,6 +409,7 @@ impl PluginManager {
     // ── Enable / disable ──────────────────────────────────────────────────
 
     pub async fn enable(&self, id: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         let mut reg = self.inner.registry.lock().unwrap();
         let entry = reg
             .plugins
@@ -429,6 +434,7 @@ impl PluginManager {
     }
 
     pub async fn disable(&self, id: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         {
             let mut reg = self.inner.registry.lock().unwrap();
             let entry = reg
@@ -452,6 +458,33 @@ impl PluginManager {
         Ok(json!({ "ok": true, "id": id, "enabled": false }))
     }
 
+    /// I1: daemon-less `plugin enable/disable` persists the enabled flag
+    /// ONLY. The supervisor is the daemon's job; spawning from the CLI would
+    /// create an unsupervised orphan (the daemon spawns a second copy at the
+    /// next boot — double transports).
+    pub fn set_enabled_registry_only(&self, id: &str, enabled: bool) -> Result<Value> {
+        check_plugin_id(id)?;
+        let mut reg = self.inner.registry.lock().unwrap();
+        let entry = reg
+            .plugins
+            .get_mut(id)
+            .with_context(|| format!("plugin '{id}' is not installed"))?;
+        entry.enabled = enabled;
+        if enabled && entry.state == registry::PluginState::Failed {
+            entry.state = registry::PluginState::Stopped;
+            entry.consecutive_crashes = 0;
+            entry.last_exit = None;
+        }
+        if !enabled {
+            entry.state = registry::PluginState::Stopped;
+            entry.consecutive_crashes = 0;
+            entry.pid = None;
+        }
+        reg.save(&self.inner.state_root)?;
+        info!(plugin = %id, enabled, "plugin enablement persisted (spawn deferred to daemon boot)");
+        Ok(json!({ "ok": true, "id": id, "enabled": enabled, "spawn_deferred": true }))
+    }
+
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<Value> {
         if enabled {
             self.enable(id).await
@@ -461,6 +494,13 @@ impl PluginManager {
     }
 
     // ── Plugin config / kv (shared by RPC and the dashboard/CLI) ─────────
+
+    /// Log path for the dashboard/CLI; id-validated (B2: the HTTP layer
+    /// joins the id straight into a read path).
+    pub fn log_path_checked(&self, id: &str) -> Result<PathBuf> {
+        check_plugin_id(id)?;
+        Ok(self.log_path(id))
+    }
 
     pub fn config_path(&self, id: &str) -> PathBuf {
         store::plugin_state_dir(&self.inner.state_root, id).join("config.json")
@@ -476,6 +516,7 @@ impl PluginManager {
 
     /// Read a (dotted) config key. `*` returns the whole object.
     pub fn config_get(&self, id: &str, key: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         let path = self.config_path(id);
         let obj = store::read_json(&path)?.unwrap_or_else(|| json!({}));
         if key == "*" {
@@ -485,29 +526,33 @@ impl PluginManager {
     }
 
     pub fn config_get_full(&self, id: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         self.config_get(id, "*")
     }
 
     /// Set a (dotted) config key and push `config.changed` to live sessions.
     pub fn config_set(&self, id: &str, key: &str, value: Value) -> Result<Value> {
+        check_plugin_id(id)?;
         if key == "*" || key.is_empty() {
             bail!("config key must name a field, not the whole object");
         }
         let path = self.config_path(id);
         let mut obj = store::read_json(&path)?.unwrap_or_else(|| json!({}));
-        dotted_set(&mut obj, key, value.clone());
+        dotted_set(&mut obj, key, value.clone())?;
         store::write_json_0600(&path, &obj)?;
         self.push_config_changed(id, key);
         Ok(json!({ "ok": true, "key": key, "value": obj }))
     }
 
     pub fn kv_get(&self, id: &str, key: &str) -> Result<Value> {
+        check_plugin_id(id)?;
         let path = self.kv_path(id);
         let obj = store::read_json(&path)?.unwrap_or_else(|| json!({}));
         Ok(obj.get(key).cloned().unwrap_or(Value::Null))
     }
 
     pub fn kv_set(&self, id: &str, key: &str, value: Value) -> Result<Value> {
+        check_plugin_id(id)?;
         if key.is_empty() {
             bail!("kv key must not be empty");
         }
@@ -554,6 +599,7 @@ impl PluginManager {
     /// Bind the plugin's UDS server: dir 0700, socket 0600, stale socket
     /// unlinked (repo precedent `prepare_uds_path` in `src/server.rs`).
     pub fn bind_plugin_socket(&self, id: &str) -> Result<()> {
+        check_plugin_id(id)?;
         let sock = store::plugin_socket_path(&self.inner.runtime_root, id);
         {
             let listeners = self.inner.listeners.lock().unwrap();
@@ -592,6 +638,12 @@ impl PluginManager {
     // ── Supervisors ───────────────────────────────────────────────────────
 
     fn start_supervisor(&self, id: &str) {
+        // N4: a stop/enable race with daemon shutdown must not spawn a child
+        // the daemon is about to stop (and whose socket is being unlinked).
+        if self.is_shutting_down() {
+            warn!(plugin = %id, "daemon is shutting down; not spawning plugin");
+            return;
+        }
         let mut sup = self.inner.supervisors.lock().unwrap();
         if let Some(tx) = sup.get(id) {
             let _ = tx.send(SupCmd::Start);
@@ -611,14 +663,17 @@ impl PluginManager {
         let tx = self.inner.supervisors.lock().unwrap().remove(id);
         if let Some(tx) = tx {
             let _ = tx.send(SupCmd::Stop);
-            // The supervisor removes itself from the map when it exits; give
-            // the SIGTERM grace window room to finish.
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
+            // N1: the supervisor removes itself from the map when the child
+            // is reaped — poll for that (returns instantly when there was no
+            // child), bounded by the SIGTERM grace + kill window.
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(12);
             loop {
-                if tokio::time::Instant::now() >= deadline {
+                if !self.inner.supervisors.lock().unwrap().contains_key(id)
+                    || tokio::time::Instant::now() >= deadline
+                {
                     break;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
             }
         }
     }
@@ -633,6 +688,64 @@ fn entry_version(inner: &Inner, id: &str) -> String {
 /// core compares the bare semver.
 pub fn daemon_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Validate a plugin id used as a filesystem path component. Every API
+/// surface that takes an `id` from the wire (HTTP, CLI, RPC) must run it
+/// through this BEFORE touching the registry, the state dir, or the
+/// runtime dir: ids name directories and sockets, so a traversal id
+/// ("..", "a/b", absolute) must be a 4xx, never a `remove_dir_all` target.
+pub fn check_plugin_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("plugin id must not be empty");
+    }
+    if id.len() > 64 {
+        bail!("plugin id too long ({})", id.len());
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("plugin id {id:?} is invalid: use letters, digits, '-' and '_'");
+    }
+    Ok(())
+}
+
+/// I3: a corrupt registry must never brick the daemon. Rename the unreadable
+/// file aside (`.corrupt-<UTC ts>`, kept for forensics) and boot with an
+/// empty registry (precedent: the project-pins store).
+impl Registry {
+    pub fn load_quarantining(state_root: &Path) -> (Registry, Option<PathBuf>) {
+        match Registry::load(state_root) {
+            Ok(reg) => (reg, None),
+            Err(e) => {
+                let path = Registry::path(state_root);
+                match quarantine_file(&path) {
+                    Ok(moved) => {
+                        warn!(path = %path.display(), quarantined = %moved.display(), error = %e,
+                            "plugin registry was unreadable; quarantined and continuing with an empty registry");
+                        (Registry::default(), Some(moved))
+                    }
+                    Err(qe) => {
+                        warn!(path = %path.display(), error = %e, quarantine_error = %qe,
+                            "plugin registry unreadable and could not be quarantined; booting with an empty registry");
+                        (Registry::default(), None)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rename `path` to `<path>.corrupt-<UTC ts>`; returns the new path.
+pub fn quarantine_file(path: &Path) -> Result<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".corrupt-{ts}"));
+    let moved = PathBuf::from(name);
+    std::fs::rename(path, &moved)
+        .with_context(|| format!("renaming {} for quarantine", path.display()))?;
+    Ok(moved)
 }
 
 /// Copy a plugin directory into the state dir, skipping dot/temp files.
@@ -670,20 +783,27 @@ pub(crate) fn dotted_get<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-pub(crate) fn dotted_set(root: &mut Value, key: &str, value: Value) {
+pub(crate) fn dotted_set(root: &mut Value, key: &str, value: Value) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();
     let mut cur = root;
     for (i, part) in parts.iter().enumerate() {
         if cur.is_null() {
             *cur = json!({});
         }
-        let map = cur.as_object_mut().expect("dotted_set works on objects");
+        // N3: a mid-path scalar (config.json `{"a": 1}` then set "a.b") is a
+        // caller error, reported as a JSON-RPC error — never a panic.
+        let Some(map) = cur.as_object_mut() else {
+            bail!(
+                "config key {key:?} descends through non-object value at {part:?}"
+            );
+        };
         if i == parts.len() - 1 {
             map.insert((*part).to_string(), value);
-            return;
+            return Ok(());
         }
         cur = map.entry(*part).or_insert_with(|| json!({}));
     }
+    Ok(())
 }
 
 /// Unlink a stale (unconnectable) socket; refuse to clobber a live one.
@@ -728,11 +848,37 @@ mod tests {
     #[test]
     fn dotted_paths() {
         let mut v = json!({ "a": { "b": 1 } });
-        dotted_set(&mut v, "a.b", json!(2));
-        dotted_set(&mut v, "c.d", json!("x"));
+        dotted_set(&mut v, "a.b", json!(2)).unwrap();
+        dotted_set(&mut v, "c.d", json!("x")).unwrap();
         assert_eq!(dotted_get(&v, "a.b"), Some(&json!(2)));
         assert_eq!(dotted_get(&v, "c.d"), Some(&json!("x")));
         assert_eq!(dotted_get(&v, "zz"), None);
+        // N3: descending through a scalar is an error, not a panic.
+        let mut w = json!({ "a": 1 });
+        assert!(dotted_set(&mut w, "a.b", json!(2)).is_err());
+        assert_eq!(w, json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn plugin_id_validation_blocks_traversal() {
+        assert!(check_plugin_id("bridge").is_ok());
+        assert!(check_plugin_id("rayA").is_ok());
+        assert!(check_plugin_id("a-b_c9").is_ok());
+        for bad in ["", "..", ".", "a/b", "/etc/passwd", "../evil", "a\\b", "id;rm", &"x".repeat(65)] {
+            assert!(check_plugin_id(bad).is_err(), "must reject {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_rejects_traversal_id_before_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager(dir.path());
+        // B2: an id-validating entry point must refuse BEFORE any state touch.
+        let err = m.remove("..").await.unwrap_err().to_string();
+        assert!(err.contains("invalid"), "{err}");
+        // The state tree was never created (install never ran).
+        assert!(!store::plugins_state_root(&dir.path().join("state")).join("bridge").exists());
+        assert!(m.list().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
