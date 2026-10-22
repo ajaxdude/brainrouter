@@ -12,10 +12,10 @@ Branch `v2-p1-purge`, built from design `docs/design/v2-streamlining.md` v3.1
 | R1: catalog feed entries for removed backends parse as browse-only | `CatalogBackendId` keeps the `Halogen`/`Vllm`/`R9v` feed-vocabulary variants + string parsing (`types.rs`, grep-gate exception); `SupportedServingBackend` = {LlamaCpp, Ds4, Gufo}, `ALL` length 3; `TryFrom` maps the three ids to `UnsupportedBackend` → `ToolboxDefinition::supported_backend()` = `None`, `parse_payload` returns `None` (entries keep `id`/`name`/`raw`) |
 | R2 (Benchmarks gate) | `Cargo.toml` `[features] benchmarks = []`, NOT in `default`. Explorer gated: `benchmark::http::handle_request` + its dispatch/body helpers + `EXPLORER_HTML` + `MAX_INGEST_BYTES` behind `cfg(feature)`; `benchmark_lab` module, `AppState.benchmark_lab`, daemon lab construction, and the `/api/benchmarks/lab` dispatch behind `cfg(feature)`. Core `benchmark` module (store schema, ingestion types, `unavailable_response`) stays compiled: it is the degradation contract + `observability` dependency. OFF build: daemon never opens the store (`benchmark_store = Err("the \`benchmarks\` cargo feature is not compiled into this build …")`), so `/benchmarks` and `/api/benchmarks/*` answer the same documented 503 envelope as the unavailable-storage path (Ray test 6 contract). Dashboard: server injects `window.BENCHMARKS_FEATURE_ENABLED` (token replace in `main_dashboard_html()`); the nav Benchmarks link hides when false |
 | L1 Components: `src/server_mode.rs` | halogen/vllm/r9v builders, request types, container-name consts, cache/paths savers, and their 431-token-line unit tests deleted (module census confirmed); module docs rewritten as history note (file is not a grep-gate exception, so it carries no backend names); dead `From<ApplyError>` conversion removed (its only consumers were the purged savers); shared helpers (`clean_engine_args_for_server`, `upgrade_groups_for_podman`, `resolve_toolbox_for_server`, `compute_api_for_runtime_profile`) untouched |
-| L1 Components: `src/server.rs` | 11 removed route registrations (`{halogen,vllm,r9v}/{status,start,stop}` + `vllm/cache-paths` + `r9v/paths` + `model-downloads/r9v/prepare-ple`) → dispatch falls through to the generic 404 JSON `{"error": …}` envelope (Ray tests 3, 11 routes); handler fns `server_mode_{halogen,vllm,r9v}_*` + `model_downloads_prepare_ple_response` deleted; llama-swap register error message retargeted to ds4/gufo |
+| L1 Components: `src/server.rs` | 12 route registrations deleted (`{halogen,vllm,r9v}/{status,start,stop}` + `vllm/cache-paths` + `r9v/paths` + `model-downloads/r9v/prepare-ple`) → dispatch falls through to the generic 404 JSON `{"error": …}` envelope (Ray test 3 asserts 11 of the 12; `…/prepare-ple` 404 verified code-level by review — the `…/cancel` prefix arm cannot capture it, suffix requirement); handler fns `server_mode_{halogen,vllm,r9v}_*` + `model_downloads_prepare_ple_response` deleted; llama-swap register error message retargeted to ds4/gufo |
 | L1 Components: `src/model_downloads.rs` | halogen/r9v `build_download` arms, `ResolvedHalogenBundle`, `R9vPaths`/`effective_r9v_paths`/`r9v_ple_ready`, `ResolvedR9vPackage`, `resolve_r9v_toolbox_image`, `StartPreparePleRequest`, `JobKind::PreparePle`, `DownloadStatus::Running`, `start_prepare_ple`, `execute_prepare_ple`, and `ModelPresence::ple_ready` removed; `JobKind`/`DownloadStatus` wire vocabulary documented as history (single-kind enum kept — serialized job records unchanged); `vllm` special-case in `resolve_catalog_entry` deleted; llama_cpp/ds4/gufo download paths byte-identical |
 | L1 Components: `src/serving_identity.rs` | three backend arms removed from `openai_compatible_for_backend`; doc comments retargeted; all vllm/r9v test fixtures retargeted to gufo/ds4/llama_cpp (registry mechanics — exact-match lookup, overwrite, dedup, incompatibility exclusion — preserved) |
-| L1 Components: `main_dashboard.html` | halogen/vllm/r9v server-mode panels + cache/paths panels, server-mode state/fetch/render wiring, halogen/vllm/r9v JS function blocks, downloads-tab PLE status (`ple_ready` badge), the r9v-only Verify/Prepare-PLE row actions (+ now-dead `verifyModelChecksums`), backend label/color entries, `SERVER_MODE_CAPABLE_BACKENDS`/`DOWNLOAD_CAPABLE_BACKENDS` lists, and the `running` job-status vocabulary removed; Sankey/cards/other tabs untouched; `scripts/check-html-js.sh` passes (5 blocks) |
+| L1 Components: `main_dashboard.html` | halogen/vllm/r9v server-mode panels + cache/paths panels, server-mode state/fetch/render wiring, halogen/vllm/r9v JS function blocks, downloads-tab PLE status (`ple_ready` badge), the r9v-only Verify/Prepare-PLE row actions (+ now-dead `verifyModelChecksums`), backend label/color entries, `SERVER_MODE_CAPABLE_BACKENDS`/`DOWNLOAD_CAPABLE_BACKENDS` lists, and the `running` job-status vocabulary removed; Sankey/cards/other tabs untouched; `scripts/check-html-js.sh` passes (6 blocks after the nav-flag script) |
 | L1 Components: fixtures | `src/benchmark.rs` serving-runtime test rows: unrelated-filter `vllm`→`gufo`; missing-id row → gufo (asserts the same Validation gate); bad-snapshot row → ds4 (preserves the Conflict/Database schema mechanics — gufo rows are validation-rejected pre-SQL, so ds4 carries the FK test); `src/cockpit_config.rs` halogen round-trip cases → gufo/ds4; `scripts/test-hf-preflight-ui.cjs` halogen-bundle wiring assertions → ds4/gufo equivalents |
 | Contracts kept: `CatalogBackendId` + `schema_validate::KNOWN_BACKEND_IDS` | parsing + the feed-vocabulary constant kept verbatim (`schema_validate.rs` untouched) so the vendored feed parses with no new warnings; `toolbox_backend` historical DB rows untouched (text column, no migration); `migrations/` and `assets/cockpit-catalog/` NOT edited (DO-NOT-EDIT) |
 | Contracts kept: `/api/server-mode/{ds4,gufo}/*` | route registrations + handlers + panels unchanged (Ray test 4 keeper assertions) |
@@ -43,9 +43,12 @@ Before deploying the purge on any host:
 
 1. Enumerate brainrouter-managed serving containers:
    `podman ps -a --filter label=io.brainrouter.server_backend`
-2. Stop and remove any container labeled `…server_backend=halogen|vllm|r9v`
-   (their start/stop routes no longer exist after the purge; leftovers keep
-   occupying VRAM/ports and are invisible to the dashboard panels).
+   **and** dev-shell toolbox containers: `podman ps -a --filter label=io.brainrouter.managed`
+2. Stop and remove any serving container labeled `…server_backend=halogen|vllm|r9v`
+   AND any dev-shell container whose model/backend stem is halogen/vllm/r9v —
+   after the purge their routes 404 and the dashboard hides them, so a leftover
+   keeps occupying VRAM/ports invisibly (review finding 3: the server_backend
+   filter alone misses dev-shell leaks).
 3. Finish or quit any active Prepare-PLE download job
    (Dashboard → Downloads, or `GET /api/model-downloads` to list; the
    `prepare-ple` route and job kind are removed; running jobs are lost on
@@ -56,8 +59,8 @@ Before deploying the purge on any host:
 ## Verification results (builder, final tree)
 
 - `cargo test --test v2_l1_acceptance` — 6/6 green (grep gate, browse-only
-  feed, 404 on all 11 removed routes, keeper routes, feature declared
-  non-default, degradation contract).
+  feed, 404 on the 11 routes the suite asserts, keeper routes, feature
+  declared non-default, degradation contract).
 - `cargo test --workspace` (default, features OFF) — green: 390 lib tests +
   all integration targets (477 Rust tests total, includes acceptance).
 - `cargo test --workspace --features benchmarks` — green: 407 lib tests
@@ -74,3 +77,20 @@ Before deploying the purge on any host:
   `benchmark_previews_check_csrf_before_storage_availability` stays ungated
   and passes in default builds, proving the degradation envelope from the
   daemon side.
+
+## Step 9 review disposition (Bruce @ dfad853: GO, 0 blocking)
+
+- F1 (important): CHANGELOG claimed a dual-config CI that didn't exist →
+  `.github/workflows/ci.yml` added (dual matrix: check+test OFF/ON, catalog
+  check, JS gates); claim now true.
+- F2 (important): L1 "browse-only caption" display not implemented at L1 —
+  entries drop from actionable listings via the pre-existing
+  UnsupportedBackend filter; the visible caption is the L4 matrix's scope.
+  Design Error-behavior sentence tightened to record this reading; code
+  unchanged.
+- F3 (important): upgrade checkpoint missed `io.brainrouter.managed`
+  dev-shell containers (invisible post-purge, hold VRAM) → checkpoint step
+  1–2 extended (above).
+- F4 (nit): route-count wording 11 vs 12 clarified (above).
+- F5 (nits): block count 5→6 (above); PRD "six backends" → "the feed's six
+  backends".

@@ -1,0 +1,49 @@
+name: CI
+
+# Every push/PR runs both feature configurations: default (explorer OFF —
+# the shipped daemon) and `--features benchmarks` (explorer ON). The OFF
+# build is what R2 of docs/design/v2-streamlining.md ships; the dual matrix
+# is what keeps the feature gate honest.
+on:
+  push:
+    branches: [master, v2-streamlining, v2-p1-purge]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features benchmarks"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo${{ matrix.features }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+
+      - name: Check all targets (0 warnings)
+        run: cargo check --workspace --all-targets ${{ matrix.features }}
+
+      - name: Test workspace
+        run: cargo test --workspace ${{ matrix.features }}
+
+      - name: Toolbox catalog structural check
+        run: cargo run --bin toolbox_catalog_check
+
+      - name: Dashboard JS syntax gate
+        run: bash scripts/check-html-js.sh
+
+      - name: Node browser-logic tests
+        run: node --test scripts/test-*.cjs

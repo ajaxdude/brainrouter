@@ -615,7 +615,7 @@ contain, including `comfyui` and the brainrouter-owned `gufo` overlay); `Support
 actually switches on. `CatalogBackendId` deliberately keeps parsing the
 removed backends' feed strings (`halogen`/`vllm`/`r9v`) — feed vocabulary,
 not actionable backends. `ModelPayload` is a per-backend enum, not one generic
-struct, because the six backends' model entries are structurally
+struct, because the feed's backends' model entries are structurally
 incompatible with each other.
 
 `gufo` is not in the vendored upstream cockpit catalog. `src/toolbox_catalog/gufo_overlay.rs` embeds `assets/gufo-catalog/{toolboxes,models}.json`, merges it into clones of the vendored JSON, validates the merged whole with the normal structural validator plus gufo-specific checks, and fails closed if the overlay is malformed or conflicts with upstream IDs. `GUFO_BACKEND_ID` is `"gufo"`; the runtime image is `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest`, and the injected runtime is a Strix Halo ROCm engine.

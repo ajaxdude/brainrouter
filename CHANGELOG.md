@@ -49,7 +49,8 @@ untouched.
   503 envelope as the unavailable-storage path
   (`"Benchmark explorer unavailable: … Core routing is still available."`).
   The dashboard hides its Benchmarks nav link via a server-injected flag.
-  CI builds/tests both configurations.
+  CI (`.github/workflows/ci.yml`, dual matrix) builds and tests both
+  configurations.
 - Acceptance suite `tests/v2_l1_acceptance.rs` (grep gate, browse-only feed
   parse, 404-on-removed-routes, keeper-route registration, feature
   declaration, degradation contract).
@@ -57,9 +58,10 @@ untouched.
 ### Upgrade notes (pre-merge checkpoint)
 
 1. `podman ps -a --filter label=io.brainrouter.server_backend` — enumerate
-   brainrouter-managed serving containers.
-2. Stop and remove any `halogen`/`vllm`/`r9v` server (their routes are gone;
-   leftovers keep occupying VRAM/ports outside the dashboard).
+   brainrouter-managed serving containers; `podman ps -a --filter label=io.brainrouter.managed` — enumerate dev-shell toolbox containers too (post-purge they are invisible in the dashboard and keep holding VRAM/ports).
+2. Stop and remove any `halogen`/`vllm`/`r9v` server **and dev-shell**
+   container (their routes are gone; leftovers keep occupying VRAM/ports
+   outside the dashboard).
 3. Finish or quit any active Prepare-PLE job (`GET /api/model-downloads`).
 4. Deploy. `git revert -m 1 <merge>` is the phase rollback; `v1-classic` is
    the global rollback. No L1 state-file migrations.
