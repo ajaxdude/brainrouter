@@ -151,7 +151,6 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `src/bridge/*` — L2 extraction subject.
 - `src/escalation/templates/main_dashboard.html` — Sankey/cards (keep), `CURRENT_PLATFORM_ID` (L4), server-mode panels (L1).
 - `scripts/test-benchmark-ui.cjs`, `tests/` — suite gates.
-- `~/ai/projects/brainrouter/phase0-findings.md` — baseline measurements (if present).
 
 ## Dory validation record
 
