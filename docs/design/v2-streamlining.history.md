@@ -15,3 +15,4 @@ This file is a record, not a rule.
 
 ## Hank handoffs
 - (none yet)
+- Batch L2 — leg-scoped critic round 1 (fresh session, v4 @ 617422b): 0 blocking, 7 important, 6 nits — round closes. I1 phantom signal token (Signal has no YAML secret); I2 token key must leave plugin config schema; I3 bridges verb + /api/bridge-status + /api/bridges/toggle + BridgeManager removal + per-transport pause successor; I4 initialize handshake + token custody chain; I5 backoff cap + terminal failed + resolve() Result; I6 plugin state dir + persistence COPY + snapshot/restore v2.0-p2; I7 Signal listing parity via llama_swap_url, models.list for future plugins. All folded into new per-leg spec file v2-streamlining.L2.md (Map now ~2.6k words). Ray + builder authorized.
