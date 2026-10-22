@@ -9,7 +9,7 @@ This file is a record, not a rule.
 - v1 snapshot: tag `v1-classic` + branch `v1` pushed to origin, 2026-10-21. Branch `v2-streamlining` created.
 
 ## Gate history
-- (pending) Batch 1: Step 5/5b + Step 6 on v1.
+- Batch 1 — Step 5/5b reviewer (fresh session, commit a6e39f7): PASS/PASS, isolation certified, non-blocking notes: 8-vs-7 enumeration (fixed v2), Referenced files tightening (fixed v2), 391-test claim (verified live: full workspace suite green at a6e39f7, 98 s). Step 6 critic (fresh session, a6e39f7): 2 blocking (B1 credentials leg ordering; B2 no state rollback contract), 5 important (I1 grep gate vs frozen migration CHECK; I2 live containers/jobs on upgrade; I3 Referenced files; I4 LAN token mechanism thin; I5 heuristic undefined), 2 nits (N1 invariant citation; N2 selector contract range). All findings addressed in v2; scoped critic round 2 + diff check to follow.
 
 ## Hank handoffs
 - (none yet)
