@@ -2,11 +2,12 @@
 
 ## Status
 
-State: `critic-revisions-required` (batch 1) → scoped round 2 closed Step 6 (0 blocking) → `v3 revision; submitted for Step 7 readiness`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~3 h (Hank phases + 2 batches). Critic rounds used: 2 of 3.
+State: `approved-for-implementation` — building L1 on branch `v2-p1-purge`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~4 h. Critic rounds used: 2 of 3.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
 v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
 v3 — 2026-10-21 — round-2 residuals: R7 page-timing contradiction (F1); grep-gate keeper/parent doc-comment exceptions (F2); `src/daemon.rs` referenced (F3); credentials-staging Decision log entry (F4); F5–F8 nits (pointer, duplication, baseline citation, date/type).
+v3.1 — 2026-10-21 — diff-check residual: grep-gate exception extended to feed-vocabulary CODE constants (`schema_validate::KNOWN_BACKEND_IDS`, kept so the vendored feed parses); dedup nit in layer enumeration.
 
 ## Problem
 
@@ -29,7 +30,7 @@ Non-goals: cross-host federation beyond bearer-token LAN endpoints; OS-sandboxed
 ## Current system
 
 - Single Rust daemon (`src/main.rs`→`src/daemon.rs`), OpenAI + Anthropic wire on `:9099` (`src/server.rs`), routing in `src/router.rs` (Manifest | llama-swap | server-mode identities; `route()` dispatch at the `served_model` string match, `router.rs` `find_server_mode_identity`).
-- Model selection is eight layers: (1) role profiles Main/Reviewer/Subagent (`src/routing_profile.rs`); (2) per-role backend choices auto|local|cloud; (3) explicit local/cloud model-id choices; (4) six presets (`src/routing_profile.rs` `RoutingPreset`, six presets + `Custom` sentinel); (5) per-project pins (`src/project_pins.rs`); (6) proxy selector strings (`auto/local/cloud/cloud/<id>/subs/bare`); (7) dashboard command-strip model controls; (8) CLI `routing-profile` plus harness model lists (`src/cli.rs`, `src/install.rs` templates, `sync-omp`).
+- Model selection is eight layers: (1) role profiles Main/Reviewer/Subagent (`src/routing_profile.rs`); (2) per-role backend choices auto|local|cloud; (3) explicit local/cloud model-id choices; (4) the presets (`src/routing_profile.rs` `RoutingPreset`: six + `Custom` sentinel); (5) per-project pins (`src/project_pins.rs`); (6) proxy selector strings (`auto/local/cloud/cloud/<id>/subs/bare`); (7) dashboard command-strip model controls; (8) CLI `routing-profile` plus harness model lists (`src/cli.rs`, `src/install.rs` templates, `sync-omp`).
 - Classifier: Bonsai external llama-server (`src/classifier.rs`, `src/bonsai_server.rs`), YAML `bonsai.*`, invariant "rewrite ⇒ bonsai" enforced at the `POST /api/prompt-rewrite` handler (`src/server.rs`; refuses enable while Bonsai is down), with the bootstrap default in `src/daemon.rs`.
 - Toolbox/server-mode management: `src/server_mode.rs` (ds4/halogen/vllm/r9v/gufo detached podman servers; ds4+gufo are the kept set), `src/serving_identity.rs` registry, `src/model_downloads.rs` (halogen/r9v download + Prepare-PLE jobs), `src/toolbox_catalog/*` (vendored cockpit feed + gufo overlay; `SupportedServingBackend` enum, `CatalogBackendId` feed vocabulary), `src/llama_swap_register.rs` (GGUF→llama-swap config).
 - Platform hardcoding: `src/server.rs` toolbox image default `strix-halo`; dashboard `CURRENT_PLATFORM_ID = 'strix-halo'` (`src/escalation/templates/main_dashboard.html`); no hardware detection.
@@ -102,7 +103,7 @@ Components: `src/server_mode.rs` (halogen/vllm/r9v server builders/requests/cont
 Contracts kept: R1 (byte-identical behavior for kept backends — ds4/gufo/llama_cpp/Manifest paths untouched), `toolbox_backend` historical rows stay (text column, no migration), vendored catalog feed parses unchanged, `/api/server-mode/{ds4,gufo}/*` unchanged. The frozen CHECK list omits `gufo` (pre-existing); no serving-runtime rows for gufo are written by current code — record in PRD notes, out of v2 patch scope.
 Error behavior: requests to removed routes → 404 (they already 404 for unknown backend paths); catalog entries for removed backends show browse-only "not supported by this host" (matrix, L4 generalizes).
 Build order: catalog types → server_mode → routes/downloads → dashboard → fixtures/tests → docs. Checkpoint: `cargo test` green between steps 1–2 is not required (single PR, Step 9 reviews whole). Pre-merge: enumerate running containers by the `io.brainrouter.server_backend` label and active download jobs; the PR upgrade notes must require stopping/removing any halogen/vllm/r9v server and finishing/quitting Prepare-PLE jobs before deploying the purge.
-Acceptance: R1 + R2 tests; grep gate: no `halogen|vllm|r9v` outside `CatalogBackendId` parsing, applied migrations (frozen schema vocabulary — `migrations/0003_toolbox_serving_dimension.sql` is a DO-NOT-EDIT artifact), DB snapshots, historical docs, the feed asset, and doc-comments of keeper/parent modules recording backend names as history (`src/routing_events.rs`, `src/toolbox_catalog.rs`, `src/toolbox_catalog/schema_validate.rs`).
+Acceptance: R1 + R2 tests; grep gate: no `halogen|vllm|r9v` outside `CatalogBackendId` parsing, feed-vocabulary CODE constants kept so the vendored feed parses unchanged (`src/toolbox_catalog/schema_validate.rs` `KNOWN_BACKEND_IDS`), applied migrations (frozen schema vocabulary — `migrations/0003_toolbox_serving_dimension.sql` is a DO-NOT-EDIT artifact), DB snapshots, historical docs, the feed asset, and doc-comments of keeper/parent modules recording backend names as history (`src/routing_events.rs`, `src/toolbox_catalog.rs`).
 
 ## Testing and evaluation
 
@@ -168,7 +169,9 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 comprehension (Step 5 PASS / Step 5b PASS) — v1 @ a6e39f7 — batch 1
 critic — v1 @ a6e39f7 — 2 blocking, 5 important, 2 nits — revisions required (v2)
 critic (scoped round 2) — v2 @ 20de00e — 0 blocking, 4 important, 4 nits — Step 6 closed; all fixed in v3
+readiness (Step 7) — v3 @ fa6ddf4 — **READY**, zero blockers; grep census confirms acceptance-gate completeness; builder notes in history
+diff check v3 — 20de00e..fa6ddf4 — all 8 findings fixed; 1 important residual (code-constant gate gap, fixed v3.1), 1 nit (fixed)
 
 ## Human approval
 
-(pending)
+Approved by the owner (chat, 2026-10-21): design v3 @ `fa6ddf4`, all Dory gates passed (comprehension PASS/PASS; critic round 1 blocking fixed in v2; scoped round 2 closed Step 6, 0 blocking; readiness READY; diff check v3 clean after v3.1). Build L1 authorized on `v2-p1-purge`; merges to `master` remain owner-reserved per charter v0.
