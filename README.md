@@ -59,8 +59,12 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 12. [Planned, not shipped](#planned-not-shipped)
 
 This documents the implemented source through `3691dcc` (2026-09-07), extended
-through `32935d1` by the native ds4/halogen/vllm/r9v/gufo toolbox
-backend integration, dashboard navigation redesign, per-project model pins, and review hardening — see [Toolbox backend management](#toolbox-backend-management)
+through `32935d1` by the native toolbox backend integration, dashboard
+navigation redesign, per-project model pins, and review hardening; the v2 L1
+purge (`docs/design/v2-streamlining.md`) reduced the shipped serving backends
+to **ds4 + gufo** (halogen/vllm/r9v removed; their catalog feed ids parse as
+browse-only data) and moved the benchmark explorer behind the non-default
+`benchmarks` cargo feature — see [Toolbox backend management](#toolbox-backend-management)
 and `docs/design/ai-toolbox-cockpit-integration.md`. Source transfer or a Git
 update is not a binary rollout: building, installing, and restarting a running
 service are separate operations. See [PRD.md](PRD.md) for requirements and the
@@ -520,9 +524,10 @@ diff/design evidence had to be truncated.
 ## Toolbox backend management
 
 brainrouter is a native Rust webui for [kyuz0's `ai-toolbox-cockpit`](https://github.com/kyuz0/ai-toolbox-cockpit) —
-a Python Textual TUI with no CLI/API mode. It covers **`ds4`, `halogen`,
-`vllm`, `r9v`, `gufo`, and `llama_cpp`** toolboxes/models/servers; **`comfyui`
-(image-gen) is never surfaced.** Everything below works whether or not
+a Python Textual TUI with no CLI/API mode. It covers **`ds4`, `gufo`, and
+`llama_cpp`** toolboxes/models/servers (v2 L1 purge: the v1 halogen/vllm/r9v
+support was removed; those feed ids parse as browse-only catalog data);
+**`comfyui` (image-gen) is never surfaced.** Everything below works whether or not
 cockpit itself is installed on the host. Full design rationale lives in
 `docs/design/ai-toolbox-cockpit-integration.md`.
 
@@ -544,12 +549,13 @@ ID matches the live container ID; update/delete use ID-bound `podman rm
 
 ### Server Mode panel
 
-Starts/stops/checks status of headless, detached servers for `ds4`,
-`halogen`, `vllm`, `r9v`, and `gufo` — separate from the interactive
+Starts/stops/checks status of headless, detached servers for `ds4`
+and `gufo` — separate from the interactive
 Toolboxes-tab containers. Each backend's own defaults (batch size, GPU
-layers, KV cache type, etc.) come straight from the effective catalog. **R9V
-ships behind an explicit "unverified" badge** — no real 2×AMD R9700 hardware
-was reachable to validate ROCm/HSA device passthrough end-to-end; command
+layers, KV cache type, etc.) come straight from the effective catalog. (v1
+also shipped halogen/vllm/r9v server panels, including an "unverified" R9V
+badge; the v2 L1 purge removed those builders, routes, and panels — requests
+to the removed paths answer 404; command
 construction is verified against upstream source, not live hardware.
 
 **gufo** is a brainrouter-owned overlay backend, not part of the vendored
@@ -566,12 +572,13 @@ upstream.
 ### Models panel
 
 Browse the catalog's models per backend and trigger downloads through each
-backend's own native mechanism (`ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp`; `vllm`
-pulls from Hugging Face on demand at server start instead, matching
-upstream). Progress is a raw log tail, not a byte-level progress bar — the
+backend's own native mechanism (`ds4`/`gufo`/`llama_cpp` after the v2 L1
+purge, which also removed the halogen/r9v download payloads and the R9V
+Prepare-PLE job; backends that pull from Hugging Face on demand at server
+start have no download step, matching upstream). Progress is a raw log tail, not a byte-level progress bar — the
 underlying `hf` CLI has no machine-readable progress output to drive one.
 
-**Prerequisite — the Hugging Face CLI.** `ds4`/`halogen`/`r9v`/`gufo`/`llama_cpp`
+**Prerequisite — the Hugging Face CLI.** `ds4`/`gufo`/`llama_cpp`
 downloads run the `hf` CLI on the host, so it must be installed and
 resolvable on the brainrouter **service's** PATH. Install it with:
 
@@ -609,8 +616,8 @@ integration for Server Mode containers is unshipped (see
 
 - **No CLI parity.** `brainrouter cli toolboxes`/`upgrade toolbox` remain
   llama.cpp-only; the new backends are dashboard/API-only.
-- **No request routing to Server Mode containers.** Starting a ds4/halogen/
-  vllm/r9v/gufo server makes it visible and manageable, not dispatchable as live
+- **No request routing to Server Mode containers.** Starting a ds4/gufo
+  server makes it visible and manageable, not dispatchable as live
   LLM traffic.
 
 ## Model observability and regression alerts
@@ -650,6 +657,12 @@ curl --fail-with-body -sS --get "$API/api/observability/reference" \
 ```
 
 ## Benchmark explorer
+
+> **Feature gate (v2 R2):** the explorer — `/benchmarks`, `/api/benchmarks/*`,
+> and the native lab — compiles only with `cargo build --features benchmarks`.
+> Default builds answer the documented degradation envelope on those routes
+> (`503 {"error": "Benchmark explorer unavailable: … Core routing is still
+> available."}`) and the dashboard hides its Benchmarks nav entry.
 
 Open **`http://127.0.0.1:9099/benchmarks`** or select **Benchmarks** in the dashboard navigation. Brainrouter initializes a normalized SQLite database at `~/.local/share/brainrouter/benchmarks.sqlite3` by default. The explorer only imports and analyzes completed or externally managed benchmark runs; it never starts a model or benchmark process.
 
@@ -1361,7 +1374,7 @@ without needing cockpit installed or running. `comfyui` is never exposed.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/benchmarks` | Native Benchmark Lab plus interactive benchmark explorer/import workflow |
+| `GET` | `/benchmarks` | Native Benchmark Lab plus interactive benchmark explorer/import workflow; feature-gated (503 degradation envelope in builds without `--features benchmarks` or when storage init failed) |
 | `GET` | `/api/benchmarks/lab/suites` | Configured Riddllr/Plumebench availability, cases and source manifest hashes |
 | `GET` | `/api/benchmarks/lab/jobs` | Recent persisted native jobs; optional `limit` 1-100 |
 | `GET` | `/api/benchmarks/lab/jobs/:id` | Current or persisted job detail |

@@ -98,6 +98,16 @@ use crate::toolbox_catalog::{
 
 // Unified dashboard — embedded at compile time so the binary is self-contained.
 const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashboard.html");
+/// v2 R2: token the dashboard's nav script reads to hide the Benchmarks
+/// explorer link in builds without the `benchmarks` feature.
+const BENCHMARKS_FEATURE_TOKEN: &str = "__BENCHMARKS_FEATURE_ENABLED__";
+
+fn main_dashboard_html() -> String {
+    MAIN_DASHBOARD_HTML.replace(
+        BENCHMARKS_FEATURE_TOKEN,
+        if cfg!(feature = "benchmarks") { "true" } else { "false" },
+    )
+}
 const FAVICON_SVG: &[u8] = include_bytes!("escalation/templates/favicon.svg");
 const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
 
@@ -158,7 +168,9 @@ pub struct AppState {
     /// Optional benchmark storage; an initialization error disables only the explorer.
     pub benchmark_store: Result<Arc<BenchmarkStore>, String>,
     /// Optional native benchmark execution; disabled or invalid configuration
-    /// does not affect the proxy or imported benchmark explorer.
+    /// does not affect the proxy or imported benchmark explorer. Compiled
+    /// only with the `benchmarks` feature (v2 R2).
+    #[cfg(feature = "benchmarks")]
     pub benchmark_lab: Result<Arc<crate::benchmark_lab::BenchmarkLab>, String>,
     /// Read-only model observations and separately persisted operator settings.
     pub observability: Arc<crate::observability::Observability>,
@@ -171,8 +183,8 @@ pub struct AppState {
     pub toolbox_container_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Model-download job registry (PR6, §10): single-flight `hf download`
     /// orchestration for the download-capable catalog backends
-    /// (ds4/halogen/llama_cpp/r9v; vllm is out of scope, see
-    /// `model_downloads.rs` module docs).
+    /// (ds4/llama_cpp/gufo after the v2 L1 purge; the HF-pulling server
+    /// backends have no download step, see `model_downloads.rs` module docs).
     pub model_downloads: Arc<crate::model_downloads::ModelDownloadRegistry>,
     /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
     /// of currently-running toolbox Server Mode containers'
@@ -349,6 +361,7 @@ async fn handle_request(
         return result;
     }
 
+    #[cfg(feature = "benchmarks")]
     if path.starts_with("/api/benchmarks/lab/") || path == "/api/benchmarks/lab" {
         return match &state.benchmark_lab {
             Ok(lab) => crate::benchmark_lab::handle_request(req, Arc::clone(lab)).await,
@@ -358,8 +371,18 @@ async fn handle_request(
 
     if path == "/benchmarks" || path == "/benchmarks/" || path.starts_with("/api/benchmarks/") {
         return match &state.benchmark_store {
+            // v2 R2: with the `benchmarks` feature off the daemon never
+            // opens the store, so the `Err` arm below answers the same
+            // documented 503 degradation envelope as unavailable storage;
+            // core routing is untouched.
+            #[cfg(feature = "benchmarks")]
             Ok(store) => benchmark::handle_request(req, store).await,
             Err(reason) => Ok(benchmark::unavailable_response(reason)),
+            #[cfg(not(feature = "benchmarks"))]
+            Ok(_) => Ok(benchmark::unavailable_response(
+                "the `benchmarks` cargo feature is not compiled into this build \
+                 (rebuild with --features benchmarks to enable the explorer)",
+            )),
         };
     }
 
@@ -467,7 +490,7 @@ async fn handle_request(
                 .status(StatusCode::OK)
                 .header("content-type", "text/html; charset=utf-8")
                 .header("cache-control", "no-store")
-                .body(Full::new(Bytes::from_static(MAIN_DASHBOARD_HTML.as_bytes())))
+                .body(Full::new(Bytes::from(main_dashboard_html().into_bytes())))
                 .expect("Failed to build HTML response");
             into_unsync(resp)
         }
@@ -1151,8 +1174,8 @@ async fn handle_request(
             into_unsync(resp)
         }
 
-        // ── Generalized toolbox catalog/container API (PR2, all 5 supported
-        // backends: llama_cpp/ds4/halogen/vllm/r9v — see design doc §5c) ────
+        // ── Generalized toolbox catalog/container API (PR2, the supported
+        // serving backends — see design doc §5c + the v2 L1 purge) ────
         ("GET", "/api/toolbox-catalog") => {
             let resp = toolbox_catalog_response().await;
             into_unsync(resp)
@@ -1264,75 +1287,6 @@ async fn handle_request(
 
         ("POST", "/api/server-mode/gufo/stop") => {
             let resp = server_mode_gufo_stop_response(&state).await;
-            into_unsync(resp)
-        }
-
-        // ── PR8: halogen Server Mode (§13) ────────────────────────────────────
-        ("GET", "/api/server-mode/halogen/status") => {
-            let resp = server_mode_halogen_status_response().await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/halogen/start") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_halogen_start_response(&state, &body_bytes).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/halogen/stop") => {
-            let resp = server_mode_halogen_stop_response(&state).await;
-            into_unsync(resp)
-        }
-
-        // ── PR9: vllm Server Mode (§14) ────────────────────────────────────────
-        ("GET", "/api/server-mode/vllm/status") => {
-            let resp = server_mode_vllm_status_response().await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/vllm/start") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_vllm_start_response(&state, &body_bytes).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/vllm/stop") => {
-            let resp = server_mode_vllm_stop_response(&state).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/vllm/cache-paths") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_vllm_cache_paths_response(&body_bytes).await;
-            into_unsync(resp)
-        }
-
-        // ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────
-        ("GET", "/api/server-mode/r9v/status") => {
-            let resp = server_mode_r9v_status_response().await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/r9v/start") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_r9v_start_response(&state, &body_bytes).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/r9v/stop") => {
-            let resp = server_mode_r9v_stop_response(&state).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/server-mode/r9v/paths") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = server_mode_r9v_paths_response(&body_bytes).await;
-            into_unsync(resp)
-        }
-
-        ("POST", "/api/model-downloads/r9v/prepare-ple") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let resp = model_downloads_prepare_ple_response(&state, &body_bytes).await;
             into_unsync(resp)
         }
 
@@ -2760,7 +2714,7 @@ async fn register_llama_swap_model(state: &AppState, request: RegisterLlamaSwapM
     }
     let (payload, storage) = resolve_catalog_entry(SupportedServingBackend::LlamaCpp, &request.model_id).map_err(register_error_from_download)?;
     let ModelPayload::LlamaCpp(model) = &payload else {
-        return Err(RegisterError::BadRequest("only llama_cpp catalog entries can be registered in llama-swap; use Server Mode for ds4/halogen/vllm/r9v/gufo".to_string()));
+        return Err(RegisterError::BadRequest("only llama_cpp catalog entries can be registered in llama-swap; use Server Mode for ds4/gufo".to_string()));
     };
     let models_dir = effective_models_dir(SupportedServingBackend::LlamaCpp, &storage);
     let repo_basename = model.repo.rsplit('/').next().unwrap_or(&model.repo);
@@ -3181,8 +3135,8 @@ pub async fn delete_toolbox_container(state: &AppState, container_name: &str) ->
 // ── PR6: model-download orchestration (§10) ──────────────────────────────
 
 /// `GET /api/model-downloads/status` — read-only local-presence sweep
-/// across every download-capable backend's catalog entries (ds4/halogen/
-/// r9v; llama_cpp and vllm are excluded — see `model_downloads.rs` docs).
+/// across every download-capable backend's catalog entries (ds4/gufo;
+/// llama_cpp is excluded — see `model_downloads.rs` docs).
 /// Also returns an advisory `hf` PATH-preflight (see [`status_response_value`])
 /// so the dashboard can warn when the Hugging Face CLI downloads depend on is
 /// missing from the service PATH.
@@ -3261,7 +3215,7 @@ pub async fn model_downloads_cancel_response(state: &AppState, id: &str) -> Resp
 
 /// `POST /api/model-downloads/verify` — explicit SHA256 verification pass,
 /// only meaningful for backends whose catalog entries carry a `sha256`
-/// (today, only `r9v`). Body: `{"backend": "...", "model_id": "..."}`.
+/// (the optional feed field). Body: `{"backend": "...", "model_id": "..."}`.
 pub async fn model_downloads_verify_response(body: &Bytes) -> Response<Full<Bytes>> {
     let val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -3963,274 +3917,6 @@ pub async fn server_mode_gufo_stop_response(state: &AppState) -> Response<Full<B
                 "message": "gufo server stopped.",
             }))
         }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `GET /api/server-mode/halogen/status` — always reads live `podman
-/// inspect` state, same no-persisted-registry contract as ds4's status
-/// endpoint above.
-pub async fn server_mode_halogen_status_response() -> Response<Full<Bytes>> {
-    let status = crate::server_mode::halogen_server_status().await;
-    json_response(StatusCode::OK, &status)
-}
-
-/// `POST /api/server-mode/halogen/start` — body:
-/// `{"toolbox_id": "...", "bundle_id": "...", "host": "...", "port": <n>,
-/// "context_size": <n>, "kv_pool_positions": <n>, "kv_slots": <n>,
-/// "prompt_cache": "0"|"1"|"2"}`.
-pub async fn server_mode_halogen_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::StartHalogenServerRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match crate::server_mode::start_halogen_server(&request).await {
-        Ok(()) => {
-            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_halogen_toolbox(&request.toolbox_id) {
-                register_serving_identity(
-                    state,
-                    crate::toolbox_catalog::SupportedServingBackend::Halogen,
-                    crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME,
-                    request.toolbox_id.clone(),
-                    &profile,
-                    request.bundle_id.clone(),
-                    serving_identity_endpoint(&request.host, request.port),
-                )
-                .await;
-            }
-            let status = crate::server_mode::halogen_server_status().await;
-            json_response(StatusCode::OK, &status)
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/server-mode/halogen/stop` — graceful `podman stop` then
-/// `podman rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_halogen_stop_response(state: &AppState) -> Response<Full<Bytes>> {
-    match crate::server_mode::stop_halogen_server().await {
-        Ok(()) => {
-            state.serving_identities.deregister(crate::server_mode::HALOGEN_SERVER_CONTAINER_NAME).await;
-            json_response(StatusCode::OK, &serde_json::json!({
-                "status": "ok",
-                "message": "halogen server stopped.",
-            }))
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-// ── PR9: vllm Server Mode (§14) ────────────────────────────────────────────
-
-/// `GET /api/server-mode/vllm/status` — always reads live `podman inspect`
-/// state, same no-persisted-registry contract as ds4/halogen's status
-/// endpoints above.
-pub async fn server_mode_vllm_status_response() -> Response<Full<Bytes>> {
-    let status = crate::server_mode::vllm_server_status().await;
-    json_response(StatusCode::OK, &status)
-}
-
-/// `POST /api/server-mode/vllm/start` — body:
-/// `{"toolbox_id": "...", "model_id"|"custom_repo": "...", "host": "...",
-/// "port": <n>, "tensor_parallel": <n>, "max_num_seqs": <n>,
-/// "max_model_len": "auto"|"<n>", "gpu_memory_utilization": <f>,
-/// "attention_backend": "...", "enforce_eager": <bool>, "dtype": "...",
-/// "api_key": "...", "extra_args": "...", "reset_caches": <bool>}`.
-pub async fn server_mode_vllm_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::StartVllmServerRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match crate::server_mode::start_vllm_server(&request).await {
-        Ok(()) => {
-            if let (Ok((_, profile)), Ok((served_model, _))) = (
-                crate::server_mode::resolve_vllm_toolbox(&request.toolbox_id),
-                crate::server_mode::resolve_vllm_model_and_base_policy(&request),
-            ) {
-                register_serving_identity(
-                    state,
-                    crate::toolbox_catalog::SupportedServingBackend::Vllm,
-                    crate::server_mode::VLLM_SERVER_CONTAINER_NAME,
-                    request.toolbox_id.clone(),
-                    &profile,
-                    served_model,
-                    serving_identity_endpoint(&request.host, request.port),
-                )
-                .await;
-            }
-            let status = crate::server_mode::vllm_server_status().await;
-            json_response(StatusCode::OK, &status)
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/server-mode/vllm/stop` — graceful `podman stop` then `podman
-/// rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_vllm_stop_response(state: &AppState) -> Response<Full<Bytes>> {
-    match crate::server_mode::stop_vllm_server().await {
-        Ok(()) => {
-            state.serving_identities.deregister(crate::server_mode::VLLM_SERVER_CONTAINER_NAME).await;
-            json_response(StatusCode::OK, &serde_json::json!({
-                "status": "ok",
-                "message": "vllm server stopped.",
-            }))
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/server-mode/vllm/cache-paths` — body:
-/// `{"hf_cache"?, "vllm_cache"?, "triton_cache"?, "aiter_cache"?: "..."}`,
-/// the direct analogue of upstream's separate "Save Cache Paths" action
-/// (§14 item 7) — unlike ds4/halogen, vllm does not persist its settings
-/// as a side effect of `start`.
-pub async fn server_mode_vllm_cache_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::VllmCachePathsRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match crate::server_mode::save_vllm_cache_paths(&request) {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "vllm cache paths saved.",
-        })),
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-// ── PR11: r9v Server Mode (§15/§15a) ───────────────────────────────────────
-
-/// `GET /api/server-mode/r9v/status` — always reads live `podman inspect`
-/// state, same no-persisted-registry contract as the other three backends'
-/// status endpoints above.
-pub async fn server_mode_r9v_status_response() -> Response<Full<Bytes>> {
-    let status = crate::server_mode::r9v_server_status().await;
-    json_response(StatusCode::OK, &status)
-}
-
-/// `POST /api/server-mode/r9v/start` — body:
-/// `{"toolbox_id": "...", "package_id": "...", "host"?, "port"?,
-/// "devices"?, "context"?, "batch"?, "sequences"?, "kv_bytes"?,
-/// "expert_cache_slots"?, "offload"?, "offload_devices"?, "served_model"?,
-/// "api_key"?, "extra_args"?}` — every tuning field is optional, falling
-/// back to upstream's own literal defaults (§15a).
-pub async fn server_mode_r9v_start_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::StartR9vServerRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match crate::server_mode::start_r9v_server(&request).await {
-        Ok(()) => {
-            if let Ok((_, profile, _platform_id)) = crate::server_mode::resolve_r9v_toolbox(&request.toolbox_id) {
-                let host = request.host.as_deref().unwrap_or(crate::server_mode::R9V_DEFAULT_HOST);
-                let port = request.port.unwrap_or(crate::server_mode::R9V_DEFAULT_PORT);
-                register_serving_identity(
-                    state,
-                    crate::toolbox_catalog::SupportedServingBackend::R9v,
-                    crate::server_mode::R9V_SERVER_CONTAINER_NAME,
-                    request.toolbox_id.clone(),
-                    &profile,
-                    request.package_id.clone(),
-                    serving_identity_endpoint(host, port),
-                )
-                .await;
-            }
-            let status = crate::server_mode::r9v_server_status().await;
-            json_response(StatusCode::OK, &status)
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/server-mode/r9v/stop` — graceful `podman stop` then `podman
-/// rm -f`, idempotent if the container is already gone.
-pub async fn server_mode_r9v_stop_response(state: &AppState) -> Response<Full<Bytes>> {
-    match crate::server_mode::stop_r9v_server().await {
-        Ok(()) => {
-            state.serving_identities.deregister(crate::server_mode::R9V_SERVER_CONTAINER_NAME).await;
-            json_response(StatusCode::OK, &serde_json::json!({
-                "status": "ok",
-                "message": "r9v server stopped.",
-            }))
-        }
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/server-mode/r9v/paths` — body:
-/// `{"models_dir"?, "ple_dir"?, "cache_dir"?: "..."}`, the r9v analogue of
-/// vllm's `/cache-paths` action.
-pub async fn server_mode_r9v_paths_response(body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::server_mode::R9vPathsRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match crate::server_mode::save_r9v_paths(&request) {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({
-            "status": "ok",
-            "message": "r9v paths saved.",
-        })),
-        Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
-            error: e.message().to_string(),
-        }),
-    }
-}
-
-/// `POST /api/model-downloads/r9v/prepare-ple` — body:
-/// `{"toolbox_id": "...", "package_id": "..."}`. Starts the "Prepare PLE"
-/// job (`podman run ... r9v-model prepare`) through the same
-/// [`crate::model_downloads::ModelDownloadRegistry`] job registry as
-/// ordinary downloads (§15's job-registry-widening decision) — the
-/// returned [`crate::model_downloads::ModelDownloadJob`] is polled the
-/// same way via the existing `GET /api/model-downloads/{id}` endpoint.
-pub async fn model_downloads_prepare_ple_response(state: &AppState, body: &Bytes) -> Response<Full<Bytes>> {
-    let request: crate::model_downloads::StartPreparePleRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse {
-                error: format!("invalid request body: {e}"),
-            });
-        }
-    };
-    match state.model_downloads.start_prepare_ple(&request).await {
-        Ok(job) => json_response(StatusCode::OK, &job),
         Err(e) => json_response(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &ErrorResponse {
             error: e.message().to_string(),
         }),

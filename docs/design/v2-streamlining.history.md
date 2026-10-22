@@ -1,0 +1,17 @@
+This file is a record, not a rule.
+
+# v2-streamlining history
+
+## Origins (2026-10-19 → 2026-10-21, Hank phase 1)
+- Owner kickoff: streamline brainrouter; keep Sankey + cards; kill harness-side model selection; goals = absorb llama-swap/Manifest, strixite llama-swap-equivalent, plugins for bridges, pluggable decision model (≤2GB, Clef-like contract, LFM2.5 class), credentials UI (Manifest-style), icon fleets (strixite + fedora1 hipfire/OMP) replaced, hardware-aware engine offers, distributed roles (plan fedora1/hipfire · dev fedora2/strixite · review cloud deepinfra; mac/ds4 variant), mac added as test surface, v2 revertible to v1 on github.
+- Working notes: `local://brainrouter-streamline-plan.md` (pre-design planning doc, same content lineage; kept outside repo, this file and the design supersede it).
+- Evidence gathered with citations (baseline `790fd9b`): LoC inventory; 8-layer selection surface; Feature B live routing (`router.rs` `find_server_mode_identity`); platform hardcodes (`server.rs` toolbox default, dashboard `CURRENT_PLATFORM_ID`); credential friction (Raon-strixw session 01a15f09, aborted setup 01a12e25, `fresh` reviewer-credential block); hipfire facts + `omp-launch.sh` invariants; strixite cutover practice; Clef = Cloudflare/clef 27B decision contract (bartowski GGUF); LFM2.5 sizes.
+- v1 snapshot: tag `v1-classic` + branch `v1` pushed to origin, 2026-10-21. Branch `v2-streamlining` created.
+
+## Gate history
+- Batch 1 — Step 5/5b reviewer (fresh session, commit a6e39f7): PASS/PASS, isolation certified, non-blocking notes: 8-vs-7 enumeration (fixed v2), Referenced files tightening (fixed v2), 391-test claim (verified live: full workspace suite green at a6e39f7, 98 s). Step 6 critic (fresh session, a6e39f7): 2 blocking (B1 credentials leg ordering; B2 no state rollback contract), 5 important (I1 grep gate vs frozen migration CHECK; I2 live containers/jobs on upgrade; I3 Referenced files; I4 LAN token mechanism thin; I5 heuristic undefined), 2 nits (N1 invariant citation; N2 selector contract range). All findings addressed in v2; scoped critic round 2 + diff check to follow.
+- Batch 2 — scoped critic round 2 (fresh session, v2 @ 20de00e): 0 blocking — Step 6 closes. Findings: 4 important (F1 R7 page-timing contradiction; F2 grep gate vs read-only keeper doc-comments + `src/toolbox_catalog.rs` parent; F3 `src/daemon.rs` missing from Referenced files; F4 credentials staging lacked Decision log entry), 4 nits (F5 private B1 pointer; F6 R2 duplicated degradation clause; F7 stale baseline commit cite; F8 revision date + `RoutingPreset` type name). All fixed in v3; diff check on v2 in flight (a6e39f7..20de00e), a second diff check will cover 20de00e..v3. Critic rounds: 2 of 3 used.
+- Batch 3 — readiness Step 7 (fresh session, v3 @ fa6ddf4): **READY**, 0 blockers; non-blocking builder notes: name `scripts/test-hf-preflight-ui.cjs` in L1 fixture scope (asserts dashboard halogen wiring), R9 Test-line polish, browse-only caption is L4 generalization, Node runner = repo convention. Diff-check v3 (20de00e..fa6ddf4): F1–F8 all fixed; residual important — gate text exempted only doc-comments, missing `schema_validate::KNOWN_BACKEND_IDS` code constant (fixed v3.1); nit "six presets" duplication (fixed). Owner approved v3 @ fa6ddf4 (chat, 2026-10-21). Building L1 on `v2-p1-purge`: Ray writes acceptance tests from the design in parallel; implementation log at docs/design/v2-streamlining.L1.log.md.
+
+## Hank handoffs
+- (none yet)

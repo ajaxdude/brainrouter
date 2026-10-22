@@ -1,11 +1,14 @@
 //! Strongly-typed representation of `assets/cockpit-catalog/models.json`.
 //!
-//! Unlike `toolboxes.json`, the five supported backends' model entries are
+//! Unlike `toolboxes.json`, the supported backends' model entries are
 //! **structurally incompatible** with each other (confirmed by inspecting
 //! every entry in the vendored fixture, not just the first one per
 //! backend — see field-commonality notes on each struct below). There's no
 //! single `ModelEntry` shape that fits all of them, hence [`ModelPayload`]:
 //! one variant per supported backend, holding that backend's fields.
+//! Backend ids purged in v2 L1 (`halogen`, `vllm`, `r9v`) and anything
+//! unrecognized parse their entries' id/name + raw only, with no payload —
+//! browse-only feed data, kept so the vendored feed parses unchanged.
 //!
 //! Each per-backend struct types the fields that are present on *every*
 //! entry for that backend in the real vendored data, and captures everything
@@ -52,10 +55,10 @@ pub struct Ds4Model {
     pub extra: serde_json::Map<String, Value>,
 }
 
-/// A single file within a `halogen` or `r9v` model's `files[]` manifest.
-/// r9v additionally carries `role` and `sha256`; halogen's is just
-/// `path`/`size_bytes`, so those two extra fields are optional here and
-/// simply absent for halogen entries.
+/// A single file within a model's `files[]` manifest (typed for `gufo`
+/// entries; feed entries of the purged backends carry the same shape in
+/// `raw`). The upstream feed uses `role`/`sha256` on some backends' file
+/// objects, so those two fields are optional and simply absent elsewhere.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CatalogModelFile {
     pub path: String,
@@ -66,94 +69,6 @@ pub struct CatalogModelFile {
     pub sha256: Option<String>,
 }
 
-/// `halogen` model entry ("HGN bundle"). Common across all 4 vendored
-/// entries: `id`, `name`, `repo`, `revision`, `quant`, `checkpoint`,
-/// `overlay`, `tokenizer_dir`, `recommended`, `files`. `vision_tower` is
-/// optional; kept in `extra`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HalogenModel {
-    pub id: String,
-    pub name: String,
-    pub repo: String,
-    pub revision: String,
-    pub quant: String,
-    pub checkpoint: String,
-    pub overlay: String,
-    pub tokenizer_dir: String,
-    #[serde(default)]
-    pub recommended: bool,
-    pub files: Vec<CatalogModelFile>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-
-/// `vllm` model entry (HF-repo-based). Common across all 15 vendored
-/// entries: `id`, `name`, `repo`, `trust_remote`, `valid_tp`, `max_num_seqs`,
-/// `max_tokens`. Note `max_num_seqs`/`max_tokens` are strings in the real
-/// data (e.g. `"64"`), not numbers — typed as `String` deliberately rather
-/// than guessing a numeric type. `extra_flags`, `env`, `ctx`,
-/// `attention_backend*`, `enforce_eager` are optional; kept in `extra`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VllmModel {
-    pub id: String,
-    pub name: String,
-    pub repo: String,
-    #[serde(default)]
-    pub trust_remote: bool,
-    #[serde(default)]
-    pub valid_tp: Vec<u32>,
-    pub max_num_seqs: String,
-    pub max_tokens: String,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-
-/// The single large extracted file R9V's "Prepare PLE" step produces
-/// (`per_layer_token_embd.iq4_nl.bin`, ~26.8 GiB in the vendored fixture),
-/// typed for PR11's Server Mode readiness gate (design doc §15 item 1;
-/// previously left in [`R9vModel::extra`] as "not characterized beyond the
-/// single sample"). Readiness is checked by `size_bytes` only, mirroring
-/// upstream's own `model_manager.py::ple_ready()` exactly — `sha256` is
-/// carried here for a possible future stronger check but is **not**
-/// verified today (§15's flagged open item, not silently upgraded).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R9vPleFile {
-    pub filename: String,
-    pub size_bytes: u64,
-    pub sha256: String,
-}
-
-/// `r9v` model entry. Only 1 entry exists in the vendored fixture as of the
-/// pin, so "common across all entries" is weak evidence here — every field
-/// below except `id`/`name`/`repo`/`files`/`ple` is deliberately
-/// `#[serde(default)]` as a safety margin against a second entry omitting
-/// one. `ple` is `Option` (not required) for the same reason, even though
-/// it's semantically required for the one entry that exists today — a
-/// future no-PLE r9v variant shouldn't fail catalog parsing entirely.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R9vModel {
-    pub id: String,
-    pub name: String,
-    pub repo: String,
-    #[serde(default)]
-    pub revision: String,
-    #[serde(default)]
-    pub quant: String,
-    #[serde(default)]
-    pub license: String,
-    #[serde(default)]
-    pub platform_id: String,
-    #[serde(default)]
-    pub profile_note: String,
-    #[serde(default)]
-    pub recommended: bool,
-    #[serde(default)]
-    pub files: Vec<CatalogModelFile>,
-    #[serde(default)]
-    pub ple: Option<R9vPleFile>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
 
 /// Whether a `gufo` model entry is a serveable main model or a speculative
 /// draft. Closed (unlike [`CatalogModelFile::role`], a free string) so an
@@ -216,14 +131,14 @@ pub struct GufoModel {
 /// [`CatalogModelEntry`] itself (they're the two fields proven common across
 /// literally every backend, including `comfyui`) so callers that only care
 /// about "what models exist" don't need to match on this enum at all.
+/// Payload variants for the v2 L1-purged backends (`halogen`, `vllm`,
+/// `r9v`) were removed; those feed entries keep id/name/raw and gain no
+/// actionable payload (browse-only).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum ModelPayload {
     LlamaCpp(LlamaCppModel),
     Ds4(Ds4Model),
-    Halogen(HalogenModel),
-    Vllm(VllmModel),
-    R9v(R9vModel),
     Gufo(GufoModel),
 }
 
@@ -234,9 +149,10 @@ pub struct CatalogModelEntry {
     pub id: String,
     pub name: String,
     pub backend: CatalogBackendId,
-    /// `Some` for the five supported backends; `None` for `comfyui` (out of
-    /// scope) or any unrecognized backend id — `raw` still holds the full
-    /// entry either way.
+    /// `Some` for the supported serving backends (llama_cpp/ds4/gufo);
+    /// `None` for `comfyui`, the v2 L1-purged feed ids (`halogen`, `vllm`,
+    /// `r9v`) and any unrecognized backend id — `raw` holds the full entry
+    /// in every browse-only case.
     pub payload: Option<ModelPayload>,
     pub raw: Value,
 }
@@ -375,11 +291,6 @@ fn parse_payload(
             ModelPayload::LlamaCpp(serde_json::from_value(raw.clone())?)
         }
         SupportedServingBackend::Ds4 => ModelPayload::Ds4(serde_json::from_value(raw.clone())?),
-        SupportedServingBackend::Halogen => {
-            ModelPayload::Halogen(serde_json::from_value(raw.clone())?)
-        }
-        SupportedServingBackend::Vllm => ModelPayload::Vllm(serde_json::from_value(raw.clone())?),
-        SupportedServingBackend::R9v => ModelPayload::R9v(serde_json::from_value(raw.clone())?),
         SupportedServingBackend::Gufo => ModelPayload::Gufo(serde_json::from_value(raw.clone())?),
     };
     Ok(Some(payload))
@@ -406,9 +317,6 @@ mod tests {
         for backend in [
             SupportedServingBackend::LlamaCpp,
             SupportedServingBackend::Ds4,
-            SupportedServingBackend::Halogen,
-            SupportedServingBackend::Vllm,
-            SupportedServingBackend::R9v,
         ] {
             let entry = catalog
                 .backend(backend)
@@ -417,6 +325,25 @@ mod tests {
             assert!(
                 entry.entries.iter().all(|e| e.payload.is_some()),
                 "{backend} entries should all parse into a typed payload"
+            );
+        }
+
+        // v2 L1 purge: the purged backends' feed sections keep parsing with
+        // their entries intact, but carry no actionable payload (browse-only).
+        for raw in ["halogen", "vllm", "r9v"] {
+            let section = catalog
+                .backends
+                .iter()
+                .find(|b| b.backend.as_str() == raw)
+                .unwrap_or_else(|| panic!("expected a {raw} section in the feed"));
+            assert!(!section.entries.is_empty(), "{raw} should keep feed entries");
+            assert!(
+                section.entries.iter().all(|e| e.payload.is_none()),
+                "{raw} entries must be browse-only (no typed payload) after L1"
+            );
+            assert!(
+                section.entries.iter().all(|e| e.raw.get("repo").is_some()),
+                "{raw} entries must keep their raw feed data"
             );
         }
     }
@@ -450,31 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn ds4_vllm_halogen_r9v_entries_carry_their_typed_fields() {
+    fn ds4_entries_carry_their_typed_fields() {
         let catalog = ModelCatalog::parse(&vendored_models()).unwrap();
 
         let ds4 = catalog.backend(SupportedServingBackend::Ds4).unwrap();
         assert!(ds4.entries.iter().all(|e| matches!(
             &e.payload,
             Some(ModelPayload::Ds4(m)) if m.size_gb > 0.0 && !m.family.is_empty()
-        )));
-
-        let vllm = catalog.backend(SupportedServingBackend::Vllm).unwrap();
-        assert!(vllm.entries.iter().all(|e| matches!(
-            &e.payload,
-            Some(ModelPayload::Vllm(m)) if !m.valid_tp.is_empty()
-        )));
-
-        let halogen = catalog.backend(SupportedServingBackend::Halogen).unwrap();
-        assert!(halogen.entries.iter().all(|e| matches!(
-            &e.payload,
-            Some(ModelPayload::Halogen(m)) if !m.files.is_empty() && !m.checkpoint.is_empty()
-        )));
-
-        let r9v = catalog.backend(SupportedServingBackend::R9v).unwrap();
-        assert!(r9v.entries.iter().all(|e| matches!(
-            &e.payload,
-            Some(ModelPayload::R9v(m)) if !m.files.is_empty() && m.ple.is_some()
         )));
     }
 

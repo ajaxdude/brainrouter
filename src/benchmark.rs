@@ -2,11 +2,21 @@
 //!
 //! Native execution lives in `benchmark_lab`; completed jobs enter the registry
 //! through the same validated ingestion boundary as uploaded results.
+//!
+//! v2 R2 feature gate: this core (store, ingestion types, and
+//! [`unavailable_response`] — the documented degradation contract) is always
+//! compiled. The explorer HTTP surface (`http::handle_request` + its body
+//! helpers) and the native lab ship only with the `benchmarks` cargo
+//! feature; without it the routes answer [`unavailable_response`].
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, LengthLimitError, Limited};
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper::{Response, StatusCode};
+#[cfg(feature = "benchmarks")]
+use hyper::{Request, body::Incoming};
+#[cfg(feature = "benchmarks")]
+use http_body_util::{LengthLimitError, Limited};
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction,
     TransactionBehavior,
@@ -25,13 +35,17 @@ use std::{
 use crate::toolbox_catalog;
 
 mod http;
+#[cfg(any(feature = "benchmarks", test))]
 mod imports;
+#[cfg(feature = "benchmarks")]
 pub use http::handle_request;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_benchmark_explorer.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_benchmark_lab.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_toolbox_serving_dimension.sql");
+#[cfg(feature = "benchmarks")]
 const EXPLORER_HTML: &str = include_str!("escalation/templates/benchmarks.html");
+#[cfg(feature = "benchmarks")]
 const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: u32 = 100;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -1468,6 +1482,7 @@ pub struct BenchmarkJobRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "benchmarks")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LlamaBenchIngest {
@@ -1475,6 +1490,7 @@ struct LlamaBenchIngest {
     llama_bench: Value,
 }
 
+#[cfg(any(feature = "benchmarks", test))]
 fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> BenchmarkResult<()> {
     let rows = match output {
         Value::Array(rows) => rows.as_slice(),
@@ -1698,6 +1714,7 @@ fn apply_llama_bench_metrics(bundle: &mut IngestBundle, output: &Value) -> Bench
     Ok(())
 }
 
+#[cfg(any(feature = "benchmarks", test))]
 fn llama_number(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1714,6 +1731,7 @@ fn llama_number(
         .transpose()
 }
 
+#[cfg(any(feature = "benchmarks", test))]
 fn set_llama_bench_metric(name: &str, target: &mut Option<f64>, value: f64) -> BenchmarkResult<()> {
     if target.is_some() {
         return Err(BenchmarkError::Validation(format!(
@@ -3842,11 +3860,13 @@ fn distinct_values(
     Ok(values)
 }
 
+#[cfg(feature = "benchmarks")]
 enum BodyReadError {
     TooLarge,
     Read(String),
 }
 
+#[cfg(feature = "benchmarks")]
 async fn collect_body(req: Request<Incoming>) -> Result<Bytes, BodyReadError> {
     Limited::new(req.into_body(), MAX_INGEST_BYTES)
         .collect()
@@ -3861,6 +3881,7 @@ async fn collect_body(req: Request<Incoming>) -> Result<Bytes, BodyReadError> {
         })
 }
 
+#[cfg(feature = "benchmarks")]
 fn body_error_response(
     error: BodyReadError,
     payload_name: &str,
@@ -3889,6 +3910,7 @@ pub fn unavailable_response(reason: &str) -> Response<UnsyncBoxBody<Bytes, anyho
     )
 }
 
+#[cfg(feature = "benchmarks")]
 fn parse_export_query(query: Option<&str>) -> BenchmarkResult<(RunQuery, String)> {
     let mut format = None;
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -3926,6 +3948,7 @@ fn error_response(error: BenchmarkError) -> Response<UnsyncBoxBody<Bytes, anyhow
     response
 }
 
+#[cfg(feature = "benchmarks")]
 fn download_response(format: &str, body: String) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     let (content_type, extension) = if format == "csv" {
         ("text/csv; charset=utf-8", "csv")
@@ -3978,6 +4001,7 @@ fn json_response<T: Serialize>(
         .expect("failed to build benchmark JSON response")
 }
 
+#[cfg(feature = "benchmarks")]
 fn html_response(html: &'static str) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     Response::builder()
         .status(StatusCode::OK)
@@ -4668,7 +4692,7 @@ mod tests {
 
         let unrelated = test
             .store
-            .query_runs(&RunQuery::parse(Some("toolbox_backend=vllm")).unwrap())
+            .query_runs(&RunQuery::parse(Some("toolbox_backend=gufo")).unwrap())
             .unwrap();
         assert_eq!(unrelated.total, 0);
 
@@ -4721,10 +4745,10 @@ mod tests {
         let mut missing_id = bundle("run-missing-id", 0, RunStatus::Succeeded);
         missing_id.serving_runtime = Some(ServingRuntimeDefinition {
             id: "serving-runtime-2".into(),
-            toolbox_backend: SupportedServingBackend::Vllm,
-            toolbox_id: "vllm-toolbox".into(),
-            compute_api: Backend::Cuda,
-            container_image: "example/vllm:latest".into(),
+            toolbox_backend: SupportedServingBackend::Gufo,
+            toolbox_id: "strix-halo-gufo-runtime".into(),
+            compute_api: Backend::Rocm,
+            container_image: "ghcr.io/gufo-org/toolboxes/gufo-runtime:latest".into(),
             catalog_snapshot_id: toolbox_catalog::vendored_catalog_snapshot().id,
             metadata: BTreeMap::new(),
         });
@@ -4762,10 +4786,10 @@ mod tests {
         let mut run = bundle("run-bad-snapshot", 0, RunStatus::Succeeded);
         run.serving_runtime = Some(ServingRuntimeDefinition {
             id: "serving-runtime-3".into(),
-            toolbox_backend: SupportedServingBackend::Vllm,
-            toolbox_id: "vllm-toolbox".into(),
-            compute_api: Backend::Cuda,
-            container_image: "example/vllm:latest".into(),
+            toolbox_backend: SupportedServingBackend::Ds4,
+            toolbox_id: "ds4-toolbox".into(),
+            compute_api: Backend::Rocm,
+            container_image: "docker.io/kyuz0/amd-r9700-ai-toolboxes:ds4".into(),
             catalog_snapshot_id: "not-the-embedded-snapshot".into(),
             metadata: BTreeMap::new(),
         });

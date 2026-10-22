@@ -1,6 +1,11 @@
 pub mod bonsai_server;
 pub mod anthropic;
+// Benchmark registry core (store schema, ingestion types, and the documented
+// `unavailable_response` degradation contract) is always compiled; the
+// explorer HTTP surface is gated inside the module. The native lab ships
+// only with the `benchmarks` feature (v2 R2).
 pub mod benchmark;
+#[cfg(feature = "benchmarks")]
 pub mod benchmark_lab;
 pub mod daemon_client;
 pub mod bridge;

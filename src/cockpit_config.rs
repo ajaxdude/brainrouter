@@ -235,8 +235,8 @@ pub fn apply_active_platform(platform_id: &str) -> Result<(), ApplyError> {
 /// Merges arbitrary `backends.<backend_id>` key/value pairs (PR8+), same
 /// reload-verify-write contract as [`apply_default_toolbox`]. Every value
 /// lands in [`BackendSettings::extra`] via serde's `#[serde(flatten)]` —
-/// there is no per-backend Rust-typed field for these (e.g. halogen's
-/// `host`/`port`/`context`/`pool`/`slots`/`prompt_cache`/`bundle_id`,
+/// there is no per-backend Rust-typed field for these (e.g. a Server Mode
+/// backend's `host`/`port`/model-selection keys,
 /// mirroring upstream's own `save_backend_settings(backend_id, {...})`
 /// call in `*/server.py::_start_confirmed()`), unlike `default_toolboxes`/
 /// `models_dir` which are cockpit-schema-stable enough to model explicitly.
@@ -426,7 +426,7 @@ mod tests {
             "hf_token": "hf_abc123",
             "backends": {
                 "ds4": { "models_dir": "/data/ds4-models" },
-                "halogen": {}
+                "gufo": {}
             }
         }"#;
         let cfg: CockpitConfig = serde_json::from_str(json).expect("parses");
@@ -434,9 +434,9 @@ mod tests {
         assert_eq!(cfg.models_dir("ds4"), Some("/data/ds4-models"));
         // Present backend with no models_dir set falls back to None (caller
         // then falls back to the catalog's own storage.default, per §10).
-        assert_eq!(cfg.models_dir("halogen"), None);
+        assert_eq!(cfg.models_dir("gufo"), None);
         // Absent backend entirely also falls back to None, not a panic.
-        assert_eq!(cfg.models_dir("vllm"), None);
+        assert_eq!(cfg.models_dir("llama_cpp"), None);
 
         // Round-trip through write_atomic + reparse must preserve both new
         // fields exactly, alongside the existing extra/default_toolboxes
@@ -472,32 +472,32 @@ mod tests {
         let path = dir.join("config.json");
         fs::write(
             &path,
-            r#"{"backends":{"halogen":{"models_dir":"/data/halogen-models"},"ds4":{"default_toolboxes":{"strix-halo":"strix-halo-ds4-rocm-10-0"}}}}"#,
+            r#"{"backends":{"gufo":{"models_dir":"/data/gufo-models"},"ds4":{"default_toolboxes":{"strix-halo":"strix-halo-ds4-rocm-10-0"}}}}"#,
         )
         .expect("seed file");
 
         let mut cfg: CockpitConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let backend = cfg.backends.entry("halogen".to_string()).or_default();
+        let backend = cfg.backends.entry("gufo".to_string()).or_default();
         for (key, value) in [
             ("host", Value::String("127.0.0.1".to_string())),
             ("port", Value::String("8731".to_string())),
-            ("bundle_id", Value::String("qwen38-flash-next-w4b-quality".to_string())),
+            ("model_id", Value::String("gufo-qwen38-27b-q4kxl".to_string())),
         ] {
             backend.extra.insert(key.to_string(), value);
         }
         write_atomic(&path, &cfg).expect("atomic write");
 
         let written: CockpitConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let halogen = &written.backends["halogen"];
-        assert_eq!(halogen.extra.get("host"), Some(&Value::String("127.0.0.1".to_string())));
-        assert_eq!(halogen.extra.get("port"), Some(&Value::String("8731".to_string())));
+        let gufo = &written.backends["gufo"];
+        assert_eq!(gufo.extra.get("host"), Some(&Value::String("127.0.0.1".to_string())));
+        assert_eq!(gufo.extra.get("port"), Some(&Value::String("8731".to_string())));
         assert_eq!(
-            halogen.extra.get("bundle_id"),
-            Some(&Value::String("qwen38-flash-next-w4b-quality".to_string()))
+            gufo.extra.get("model_id"),
+            Some(&Value::String("gufo-qwen38-27b-q4kxl".to_string()))
         );
         // Pre-existing typed field on the same backend and the sibling
         // backend's own settings both survive untouched.
-        assert_eq!(halogen.models_dir.as_deref(), Some("/data/halogen-models"));
+        assert_eq!(gufo.models_dir.as_deref(), Some("/data/gufo-models"));
         assert_eq!(
             written.default_toolbox("ds4", "strix-halo"),
             Some("strix-halo-ds4-rocm-10-0")

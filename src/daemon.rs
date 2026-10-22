@@ -10,9 +10,10 @@ use clap::Args;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
+#[cfg(feature = "benchmarks")]
+use brainrouter::benchmark_lab::BenchmarkLab;
 use brainrouter::{
     benchmark::BenchmarkStore,
-    benchmark_lab::BenchmarkLab,
     bonsai_server::BonsaiControl,
     classifier::Classifier,
     config,
@@ -184,16 +185,26 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let project_pins = Arc::new(brainrouter::project_pins::ProjectPinStore::load(
         config::default_config_path().with_file_name("project_pins.json"),
     ));
-    let benchmark_store = BenchmarkStore::open(config.benchmarks.database_path.clone())
-        .map(Arc::new)
-        .map_err(|error| {
-            warn!(
-                path = %config.benchmarks.database_path.display(),
-                error = %error,
-                "Benchmark explorer unavailable; continuing core daemon startup"
-            );
-            error.to_string()
-        });
+    // v2 R2: without the `benchmarks` cargo feature the explorer lab is not
+    // compiled and the store is never opened — the routes answer the
+    // documented 503 degradation envelope (`benchmark::unavailable_response`)
+    // exactly as an unopenable database does today.
+    let benchmark_store: Result<Arc<BenchmarkStore>, String> = if !cfg!(feature = "benchmarks") {
+        Err("the `benchmarks` cargo feature is not compiled into this build \
+            (rebuild with --features benchmarks to enable the explorer)"
+            .to_string())
+    } else {
+        BenchmarkStore::open(config.benchmarks.database_path.clone())
+            .map(Arc::new)
+            .map_err(|error| {
+                warn!(
+                    path = %config.benchmarks.database_path.display(),
+                    error = %error,
+                    "Benchmark explorer unavailable; continuing core daemon startup"
+                );
+                error.to_string()
+            })
+    };
 
     // Defensive, log-only check that the vendored ai-toolbox-cockpit catalog
     // (assets/cockpit-catalog/) still parses/validates. No behavior depends
@@ -403,6 +414,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         config.llama_swap.fallback_model.clone(),
     ));
 
+    #[cfg(feature = "benchmarks")]
     let benchmark_lab = if !config.benchmarks.lab.enabled {
         Err("disabled in benchmarks.lab.enabled".to_string())
     } else {
@@ -475,6 +487,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         pr_guidelines_enabled,
         inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
         benchmark_store,
+        #[cfg(feature = "benchmarks")]
         benchmark_lab,
         observability: Arc::new(brainrouter::observability::Observability::new(&config_path)),
         managed_toolboxes_path,
