@@ -2,12 +2,13 @@
 
 ## Status
 
-State: `approved-for-implementation` — building L1 on branch `v2-p1-purge`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~4 h. Critic rounds used: 2 of 3.
+State: L1 DONE (merged `e90bffe`, tag `v2.0-p1`, all gates). L2 leg section drafted — under leg-scoped review, build on `v2-p2-plugins`. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h. Time spent: ~5 h. Critic rounds used: 2 of 3 (Map); L2 has its own leg-scoped limit.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
 v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
 v3 — 2026-10-21 — round-2 residuals: R7 page-timing contradiction (F1); grep-gate keeper/parent doc-comment exceptions (F2); `src/daemon.rs` referenced (F3); credentials-staging Decision log entry (F4); F5–F8 nits (pointer, duplication, baseline citation, date/type).
 v3.1 — 2026-10-21 — diff-check residual: grep-gate exception extended to feed-vocabulary CODE constants (`schema_validate::KNOWN_BACKEND_IDS`, kept so the vendored feed parses); dedup nit in layer enumeration.
+v4 — 2026-10-22 — L1 marked complete; L2 leg section added in full (plugins + bridge pilot + minimal credentials store); L1 full spec moved to history (record lives in the L1 log + git).
 
 ## Problem
 
@@ -89,7 +90,7 @@ Cross-leg contracts (do not break without a design revision):
 
 Legs (door type; demo):
 - L0 v1 snapshot — done (tag `v1-classic` + branch `v1` pushed). Reversible.
-- L1 Purge (halogen/vllm/r9v; benchmarks feature gate R2 pending owner answer; assumed feature-gate) — two-way (git-revert of one PR). Demo: daemon builds, tests green, dashboard shows ds4+gufo server mode only.
+- L1 Purge — **done** (merged `e90bffe`, tag `v2.0-p1`; Ray 6/6, Bruce GO 0 blocking, net −3,579 lines).
 - L2 Plugins + bridge pilot + minimal credentials store (no page) — one-way (core build change). Demo: Discord + Signal via plugin binary, same commands.
 - L3 One entry + role cards + decision slot + Credentials page — one-way (UI/config contracts). Demo: omp with single model, role header matrix, credentials page managing DeepInfra.
 - L4 Swap supervisor + platform probe — one-way. Demo: scripted fake engine swapped by API; probe output on all three Linux hosts.
@@ -98,12 +99,19 @@ Legs (door type; demo):
 - L7 llama-swap removed — one-way (owner sign-off). Demo: native llama.cpp serves v1's model keys.
 - L8 mac surface + distributed-role acceptance — one-way. Demo: plan→fedora1/hipfire, dev→strixite, review→cloud, one session.
 
-**Leg L1 in full (P0-Purge).**
-Components: `src/server_mode.rs` (halogen/vllm/r9v server builders/requests/containers removed), `src/server.rs` (their route blocks removed), `src/model_downloads.rs` (halogen/r9v payloads + Prepare-PLE + sha256 verification removed), `src/toolbox_catalog/*` (`SupportedServingBackend::{Halogen,Vllm,R9v}` + payloads/types removed; `CatalogBackendId` keeps parsing those strings — feed vocabulary), `src/serving_identity.rs` (three arms removed), `main_dashboard.html` (server-mode panels + download tabs), fixtures (`src/benchmark.rs` vllm serving-runtime rows, `src/cockpit_config.rs` halogen cases retargeted to ds4/gufo), tests suite-wide, PRD/README/design-record notes.
-Contracts kept: R1 (byte-identical behavior for kept backends — ds4/gufo/llama_cpp/Manifest paths untouched), `toolbox_backend` historical rows stay (text column, no migration), vendored catalog feed parses unchanged, `/api/server-mode/{ds4,gufo}/*` unchanged. The frozen CHECK list omits `gufo` (pre-existing); no serving-runtime rows for gufo are written by current code — record in PRD notes, out of v2 patch scope.
-Error behavior: requests to removed routes → 404 (they already 404 for unknown backend paths); catalog entries for removed backends drop out of actionable listings via the pre-existing `UnsupportedBackend` filter — the visible browse-only caption ("not supported by this host") is the engine-compatibility matrix's scope (L4).
-Build order: catalog types → server_mode → routes/downloads → dashboard → fixtures/tests → docs. Checkpoint: `cargo test` green between steps 1–2 is not required (single PR, Step 9 reviews whole). Pre-merge: enumerate running containers by the `io.brainrouter.server_backend` label AND dev-shell containers by `io.brainrouter.managed` (post-purge invisible, VRAM-holding), plus active download jobs; the PR upgrade notes must require stopping/removing any halogen/vllm/r9v server or dev-shell and finishing/quitting Prepare-PLE jobs before deploying the purge.
-Acceptance: R1 + R2 tests; grep gate: no `halogen|vllm|r9v` outside `CatalogBackendId` parsing, feed-vocabulary CODE constants kept so the vendored feed parses unchanged (`src/toolbox_catalog/schema_validate.rs` `KNOWN_BACKEND_IDS`), applied migrations (frozen schema vocabulary — `migrations/0003_toolbox_serving_dimension.sql` is a DO-NOT-EDIT artifact), DB snapshots, historical docs, the feed asset, and doc-comments of keeper/parent modules recording backend names as history (`src/routing_events.rs`, `src/toolbox_catalog.rs`).
+**Leg L1 — complete** (full spec + review disposition: `docs/design/v2-streamlining.L1.log.md`; merged `e90bffe`, tag `v2.0-p1`).
+
+**Leg L2 in full (Plugins + bridge pilot + minimal credentials store).**
+Components:
+- **Plugin core** (`src/plugins/`): `plugin.toml` manifest (`id`, `name`, `version`, `binary`, `min_daemon_version`, RPC grants, config-schema path); supervisor (spawn enabled plugins at boot, restart-with-backoff, captured logs, clean shutdown; plugins run as the user — unsandboxed, documented); per-plugin UDS server at `$XDG_RUNTIME_DIR/brainrouter/plugins/<id>.sock` (dir 0700, socket 0600, peer-uid check, random per-plugin token minted at install, constant-time compare).
+- **RPC v1 surface** (JSON-RPC 2.0; additive-only evolution): plugin→daemon `chat.completions` (full router path, role header honored, routing events recorded), `models.list`, `routing.events.tail`, `inflight.list`, `config.get/set` + `kv.get/set` (namespaced per plugin id, owner-only files), `secrets.get` (ONLY credentials whose grant list names this plugin), `notify`, `set_status`; daemon→plugin `config.changed`. Per-method grant + token gating; body-size cap; unknown method → JSON-RPC −32601.
+- **Minimal credentials store** (`src/credentials.rs`): `credentials.json` (0600, atomic owner-only writes; values masked in every API/log/config-show); kinds `store` (value), `env`, `file` (ops escapes); `resolve(credential_id) -> SecretString` single implementation; grants live on the credential (credential → plugin ids). Migration: v1 plaintext `bridge.discord.token` / signal token → store credentials granted to the `bridge` plugin — snapshot first, `--dry-run` preview, logged.
+- **Bridge plugin** (`plugins/bridge/` workspace crate → binary `brainrouter-bridge`): `src/bridge/*` moves as-is (behavior unchanged — Discord/Signal commands, session/alias/cwd persistence move under the plugin's dir/kv); LLM path stays `omp` subprocess → proxy; model listing via `models.list`; tokens via `secrets.get`; manifest config schema = the v1 `bridge.*` keys.
+- **CLI**: `brainrouter plugin install <dir>|list|enable|disable|remove|status [id]` (install copies to the state dir, mints the token, registers grants).
+- **Core removals**: cargo features `bridge-discord`/`bridge-signal`, deps serenity/async-trait/serde_yml, daemon bridge startup, `bridge.*` YAML keys, dashboard bridge config panel (Plugins tab replaces).
+Contracts kept: R3 behavior-unchanged (acceptance = v1 command matrix); plugins get NO system ops (no restart/flush/upgrade methods); event schema additive; v1 config boots via migration.
+Build order: credentials store + migration → plugin core (manifest/supervisor/UDS/RPC) → CLI → bridge plugin crate (move + RPC client) → core removals → dashboard Plugins tab → docs.
+Acceptance (Ray): (1) RPC contract over a real UDS against a live daemon — handshake, grant enforcement (config/kv isolation between plugins, `secrets.get` of an ungranted credential refused), bad-token rejected, size cap; (2) supervisor: crash → backoff → no daemon impact → clean stop; (3) credentials: 0600, masked everywhere, v1-YAML live migration + `--dry-run`, resolve round-trip; (4) bridge plugin: v1 Discord/Signal command matrix green against stubbed transport + mock LLM, persistence files read from v1 paths; (5) `cargo tree` core shows no serenity.
 
 ## Testing and evaluation
 
