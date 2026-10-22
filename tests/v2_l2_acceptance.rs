@@ -90,16 +90,17 @@ use tokio::net::UnixStream;
 /// assertion greps for this exact string.
 const DISCORD_TOKEN: &str = "ray-L2-s3cr3t-discord-tok-9f3c21";
 
-/// Credential ids the secrets.get fixture probes, in order. The design names
-/// the migration ("v1 plaintext bridge.discord.token -> store credential
-/// granted to bridge") but not the resulting credential id; a resolvable id
-/// under any of these spellings satisfies the promise.
+/// Credential ids the secrets.get fixture probes, in order. The canonical id
+/// is `discord_token` (Hank ruling, L2 contract: the Discord-token migration
+/// registers the credential under that id, granted to plugin `bridge`); the
+/// remaining spellings stay as fallback probes so an alias resolution also
+/// satisfies the round-trip promise.
 const CREDENTIAL_ID_CANDIDATES: &[&str] = &[
+    "discord_token",
     "bridge.discord.token",
     "discord",
     "discord-token",
     "bridge-discord",
-    "discord_token",
     "bridge.discord",
     "bridge",
     "token",
@@ -174,8 +175,11 @@ with open(os.path.join(state, "report.json"), "w") as f:
     json.dump(report, f)
 
 # Resident: the supervisor stop tests need a live child; a SIGTERM kills the
-# default-ignored sleep loop.
+# default sleep loop. Heartbeat the pid file so tests can identify THIS
+# boot's child deterministically (pid + ppid), not a stale one.
 while True:
+    with open(os.path.join(state, "pid"), "w") as f:
+        f.write(str(os.getpid()))
     time.sleep(0.5)
 "#;
 
@@ -258,6 +262,8 @@ struct TestEnv {
     state_home: PathBuf,
     runtime: PathBuf,
     bin: PathBuf,
+    /// Only the creator owns the tree; clones (TestEnv::borrow) never delete.
+    owned: bool,
 }
 
 impl TestEnv {
@@ -273,6 +279,7 @@ impl TestEnv {
             runtime: root.join("run"),
             bin: root.join("bin"),
             root: root.clone(),
+            owned: true,
         };
         for d in [&env.home, &env.config_home, &env.data_home, &env.state_home, &env.runtime, &env.bin] {
             fs::create_dir_all(d).unwrap();
@@ -299,6 +306,20 @@ impl TestEnv {
             .env("RUST_LOG", "debug")
             .envs(extra);
     }
+    /// Cheap path-only clone for harness ownership (no fs work); Drop is a
+    /// no-op for borrows — the creator binding deletes the tree.
+    fn borrow(env: &TestEnv) -> TestEnv {
+        TestEnv {
+            root: env.root.clone(),
+            home: env.home.clone(),
+            config_home: env.config_home.clone(),
+            data_home: env.data_home.clone(),
+            state_home: env.state_home.clone(),
+            runtime: env.runtime.clone(),
+            bin: env.bin.clone(),
+            owned: false,
+        }
+    }
 
     /// `$XDG_STATE_HOME/brainrouter/plugins/<id>` (design: plugin state dir).
     fn plugin_state(&self, id: &str) -> PathBuf {
@@ -314,7 +335,9 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if self.owned {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 
@@ -425,19 +448,7 @@ impl Daemon {
         }
     }
 
-    fn borrow(env: &TestEnv) -> TestEnv {
-        // Cheap clone of path fields (no fs work; the real root is owned by the
-        // test's binding, not the harness, so Drop of the borrow is a no-op).
-        TestEnv {
-            root: env.root.clone(),
-            home: env.home.clone(),
-            config_home: env.config_home.clone(),
-            data_home: env.data_home.clone(),
-            state_home: env.state_home.clone(),
-            runtime: env.runtime.clone(),
-            bin: env.bin.clone(),
-        }
-    }
+
 
     async fn ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -479,6 +490,19 @@ impl Daemon {
             .unwrap_or_else(|e| panic!("GET {path} json: {e}"))
     }
 
+    /// Raw text body (`/api/config` serves YAML, not JSON — the masking audit
+    /// greps the body as-is).
+    async fn get_text(&self, path: &str) -> String {
+        self.client
+            .get(format!("{}{path}", self.url))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"))
+            .text()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path} text: {e}"))
+    }
+
     /// Graceful stop: SIGTERM (the daemon's documented stop path), 15 s grace,
     /// then kill. Returns after the child is reaped.
     fn stop(&mut self) {
@@ -489,6 +513,7 @@ impl Daemon {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if self.child.try_wait().unwrap().is_some() {
+                self.assert_no_plugin_children_survive();
                 return;
             }
             if Instant::now() >= deadline {
@@ -497,6 +522,36 @@ impl Daemon {
                 panic!("daemon did not exit 15 s after SIGTERM: {}", self.log_tail());
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Stop contract (design: "stop = SIGTERM with grace, then kill"; daemon
+    /// shutdown stops the plugin child): after a graceful daemon exit, no
+    /// plugin child process may survive. A survivor is a violation whether
+    /// it is unreaped (ppid = the daemon) or orphaned (ppid = 1) — the
+    /// latter is the leak class that poisons every later boot's fixtures.
+    fn assert_no_plugin_children_survive(&self) {
+        std::thread::sleep(Duration::from_millis(500));
+        let plugins_dir = self.env.state_home.join("brainrouter").join("plugins");
+        let Ok(entries) = fs::read_dir(&plugins_dir) else { return };
+        for e in entries.flatten() {
+            let Ok(text) = fs::read_to_string(e.path().join("pid")) else { continue };
+            let Ok(pid) = text.trim().parse::<u32>() else { continue };
+            let Ok(stat) = fs::read(format!("/proc/{pid}/stat")) else { continue };
+            let Some(survivor) = survivor_info(&String::from_utf8_lossy(&stat)) else { continue };
+            let cmd = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let names_plugin = String::from_utf8_lossy(&cmd)
+                .contains(&e.file_name().to_string_lossy().to_string());
+            if names_plugin {
+                panic!(
+                    "daemon shutdown must stop its plugin child (design stop contract: SIGTERM with grace, then kill): \
+                     plugin `{}` child pid {pid} survived daemon exit (state {}, ppid {}) (daemon pid {})",
+                    e.file_name().to_string_lossy(),
+                    survivor.0,
+                    survivor.1.map(|p| p.to_string()).unwrap_or("?".into()),
+                    self.child.id()
+                );
+            }
         }
     }
 
@@ -728,7 +783,7 @@ impl RpcConn {
             // (e.g. body-cap breach). EOF is an answer, not a test failure.
             return None;
         }
-        self.read_msg(timeout).await
+        self.read_msg(self.next_id, timeout).await
     }
 
     /// Returns false when the write failed (peer closed / cap breach).
@@ -743,15 +798,36 @@ impl RpcConn {
         true
     }
 
-    async fn read_msg(&mut self, timeout: Duration) -> Option<Value> {
-        match tokio::time::timeout(timeout, self.r.lines().next_line()).await {
-            Err(_) => panic!("RPC read timed out after {timeout:?}"),
-            Ok(Ok(None)) => None, // EOF
-            Ok(Ok(Some(line))) => Some(
-                serde_json::from_str(&line)
-                    .unwrap_or_else(|e| panic!("non-JSON RPC line from daemon: {e}: {line}")),
-            ),
-            Ok(Err(e)) => panic!("RPC read error: {e}"),
+    /// Read JSON-RPC frames until a response for `want_id`. Server-initiated
+    /// notifications (design: daemon→plugin `config.changed`) are consumed in
+    /// passing; a frame with two objects on one line is a framing violation
+    /// (NDJSON ruling) and panics on parse — a contract red, not skipped.
+    async fn read_msg(&mut self, want_id: u64, timeout: Duration) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut line = String::new();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, self.r.read_line(&mut line)).await {
+                Err(_) => panic!("RPC read timed out after {timeout:?} waiting for response id {want_id}"),
+                Ok(Ok(0)) => return None, // EOF
+                Ok(Ok(_)) => {
+                    let msg: Value = serde_json::from_str(line.trim())
+                        .unwrap_or_else(|e| panic!("non-JSON RPC line from daemon: {e}: {line}"));
+                    let is_response = msg.get("result").is_some() || msg.get("error").is_some();
+                    let id = msg.get("id").and_then(Value::as_u64);
+                    if is_response && id == Some(want_id) {
+                        return Some(msg);
+                    }
+                    if msg.get("method").is_some() && !is_response {
+                        continue; // server->plugin notification
+                    }
+                    if is_response {
+                        continue; // interleaved response for another id
+                    }
+                    panic!("unexpected JSON-RPC frame from daemon: {msg}");
+                }
+                Ok(Err(e)) => panic!("RPC read error: {e}"),
+            }
         }
     }
 
@@ -816,43 +892,71 @@ fn spawn_mock_upstream(delay: Duration) -> MockUpstream {
                 let mut buf = vec![0u8; 256 * 1024];
                 let mut filled = 0usize;
                 let mut content_len = None::<usize>;
+                let mut req_path = String::new();
                 loop {
-                    let Ok(n) = sock.read(&mut buf[filled.min(buf.len() - 1)..]).await else { return };
+                    let off = filled.min(buf.len() - 1);
+                    let Ok(n) = sock.read(&mut buf[off..]).await else { return };
                     if n == 0 {
                         break;
                     }
                     filled += n;
-                    if let Some(cl) = content_len {
-                        if let Some(pos) = find_headers_end(&buf[..filled]) {
-                            if filled >= pos + cl {
-                                break;
-                            }
+                    if let Some(pos) = find_headers_end(&buf[..filled]) {
+                        if content_len.is_none() {
+                            let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                            req_path = headers
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("")
+                                .to_string();
+                            content_len = Some(
+                                headers
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                    .unwrap_or(0),
+                            );
                         }
-                    } else if let Some(pos) = find_headers_end(&buf[..filled]) {
-                        let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
-                        content_len = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)));
-                        if content_len == Some(0) {
-                            break;
-                        }
-                    }
+                        if filled >= pos + content_len.unwrap_or(0) {
+                            break; // request complete — evaluated the same
+                        }                          // iteration it is parsed in (keep-alive
+                    }                              // senders never send a second packet)
                 }
                 hits.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
-                let body = json!({
-                    "id": "chatcmpl-ray-l2",
-                    "object": "chat.completion",
-                    "created": 1,
-                    "model": "test-only-model",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ray-pong"}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
-                })
-                .to_string();
+                // llama-swap fidelity: the router resolves the requested model
+                // key against the served model list, and chat.completions is
+                // proxied with stream=true (SSE chunks, [DONE] terminator).
+                let body = if req_path.contains("/models") {
+                    json!({"object": "list", "data": [{"id": "test-only-model", "object": "model", "owned_by": "ray-l2-mock"}]})
+                        .to_string()
+                } else {
+                    let chunk = |delta: Value, finish: Value, usage: Option<Value>| {
+                        let mut m = json!({
+                            "id": "chatcmpl-ray-l2",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "test-only-model",
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                        });
+                        if let Some(u) = usage {
+                            m["usage"] = u;
+                        }
+                        format!("data: {m}\n\n")
+                    };
+                    chunk(json!({"role": "assistant", "content": ""}), Value::Null, None)
+                        + &chunk(json!({"content": "ray-pong"}), Value::Null, None)
+                        + &chunk(
+                            json!({}),
+                            json!("stop"),
+                            Some(json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})),
+                        )
+                        + "data: [DONE]\n\n"
+                };
                 let _ = sock
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            if req_path.contains("/models") { "application/json" } else { "text/event-stream" },
                             body.len()
                         )
                         .as_bytes(),
@@ -888,14 +992,14 @@ async fn rpc_initialize_good_token_returns_grants() {
     let token = plugin_token(&env, "rayA");
     let mut conn = RpcConn::connect(&env.plugin_socket("rayA")).await;
     let result = conn.initialize("rayA", &token).await;
-    assert!(
-        result.get("grants").map(Value::as_array).map(|a| !a.is_empty()).unwrap_or_else(|| {
-            // Some spellings (e.g. object-valued grants) are acceptable so
-            // long as a grants member exists and is non-null.
-            result.get("grants").is_some()
-        }),
-        "grants must be returned at connect: {result}"
-    );
+    let grants = result.get("grants").cloned().unwrap_or(Value::Null);
+    let grants_ok = match &grants {
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        Value::Null => false,
+        _ => true,
+    };
+    assert!(grants_ok, "grants must be returned at connect: {result}");
     let lower = result.to_string().to_lowercase();
     assert!(
         lower.contains("grant"),
@@ -915,7 +1019,7 @@ async fn rpc_bad_token_connect_refused_not_counted_as_crash() {
     let daemon = boot_with_plugins(&env, &base_config_yaml(&dead_upstream_url()), &[&fx]).await;
     let report_path = env.plugin_state("rayA").join("report.json");
     let report0 = poll_read_json(&report_path, Duration::from_secs(20));
-    assert!(report0["initialize"]["result"].is_some(), "healthy baseline: spawned plugin must initialize: {report0}");
+    assert!(report0["initialize"].get("result").is_some(), "healthy baseline: spawned plugin must initialize: {report0}");
 
     // Repeated bad-token handshakes over the same socket: the connection must
     // be closed (EOF / error, never a grants payload).
@@ -980,14 +1084,14 @@ async fn rpc_config_kv_namespace_isolation_across_plugins() {
 
     // A writes; A reads back.
     let r = a.call("config.set", json!({"key": "k1", "name": "k1", "value": "alpha-A"}), Duration::from_secs(10)).await;
-    assert!(r.map(|v| v.get("result").is_some()).unwrap_or(false), "A config.set must succeed: {r:?}");
+    assert!(r.as_ref().map(|v| v.get("result").is_some()).unwrap_or(false), "A config.set must succeed: {r:?}");
     let r = a.call("config.get", json!({"key": "k1", "name": "k1"}), Duration::from_secs(10)).await;
     assert!(
         r.as_ref().map(|v| v.to_string().contains("alpha-A")).unwrap_or(false),
         "A must read its own config value back: {r:?}"
     );
     let r = a.call("kv.set", json!({"key": "k1", "name": "k1", "value": "kv-alpha-A"}), Duration::from_secs(10)).await;
-    assert!(r.map(|v| v.get("result").is_some()).unwrap_or(false), "A kv.set must succeed: {r:?}");
+    assert!(r.as_ref().map(|v| v.get("result").is_some()).unwrap_or(false), "A kv.set must succeed: {r:?}");
     let r = a.call("kv.get", json!({"key": "k1", "name": "k1"}), Duration::from_secs(10)).await;
     assert!(
         r.as_ref().map(|v| v.to_string().contains("kv-alpha-A")).unwrap_or(false),
@@ -1009,7 +1113,7 @@ async fn rpc_config_kv_namespace_isolation_across_plugins() {
 
     // Same key in B's namespace is a distinct value.
     let r = b.call("config.set", json!({"key": "k1", "name": "k1", "value": "bravo-B"}), Duration::from_secs(10)).await;
-    assert!(r.map(|v| v.get("result").is_some()).unwrap_or(false), "B config.set must succeed: {r:?}");
+    assert!(r.as_ref().map(|v| v.get("result").is_some()).unwrap_or(false), "B config.set must succeed: {r:?}");
     let r = a.call("config.get", json!({"key": "k1", "name": "k1"}), Duration::from_secs(10)).await;
     assert!(
         r.as_ref().map(|v| v.to_string().contains("alpha-A")).unwrap_or(false),
@@ -1271,13 +1375,18 @@ async fn supervisor_stops_plugin_children_on_daemon_shutdown() {
     // rewrites it every 500 ms (see fixture heartbeat).
     let _ = fs::remove_file(&pid_path);
     let deadline = Instant::now() + Duration::from_secs(25);
+    // Identify THIS boot's child by parentage (a child of a prior boot
+    // would already have tripped Daemon::stop's survivor scan).
+    let daemon_pid = daemon.child.id();
     let child_pid: u32 = loop {
         if let Ok(text) = fs::read_to_string(&pid_path) {
             if let Ok(pid) = text.trim().parse::<u32>() {
-                break pid;
+                if ppid_of(pid) == Some(daemon_pid) {
+                    break pid;
+                }
             }
         }
-        assert!(Instant::now() < deadline, "plugin child never wrote its pid file: {}", daemon.log_tail());
+        assert!(Instant::now() < deadline, "daemon2's plugin child never heartbeated its pid (ppid {daemon_pid}): {}", daemon.log_tail());
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert!(process_alive(child_pid), "fixture child {child_pid} must be running");
@@ -1299,6 +1408,20 @@ async fn supervisor_stops_plugin_children_on_daemon_shutdown() {
 
 fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// (state, ppid) from /proc/<pid>/stat (fields after the comm parenthesis).
+fn survivor_info(stat: &str) -> Option<(String, Option<u32>)> {
+    let (_, rest) = stat.rsplit_once(") ")?;
+    let mut f = rest.split_whitespace();
+    let state = f.next()?.to_string();
+    let ppid = f.next().and_then(|v| v.parse::<u32>().ok());
+    Some((state, ppid))
+}
+
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    survivor_info(&String::from_utf8_lossy(&stat)).and_then(|(_, ppid)| ppid)
 }
 
 // ── (3) Credentials ────────────────────────────────────────────────────────
@@ -1352,12 +1475,12 @@ async fn credentials_v1_migration_store_perms_grants_and_masking() {
         show.out()
     );
     for path in ["/api/config", "/api/config-files", "/api/service-health"] {
-        let body = daemon.get_json(path).await.to_string();
+        let body = daemon.get_text(path).await;
         assert!(!body.contains(DISCORD_TOKEN), "GET {path} must not leak the token value; body: {body}");
     }
     let plugin_bridge_dir = env.plugin_state("bridge");
     if plugin_bridge_dir.is_dir() {
-        for entry in walk_files(plugin_bridge_dir) {
+        for entry in walk_files(&plugin_bridge_dir) {
             if entry.file_name().map(|n| n == "report.json").unwrap_or(false) {
                 continue; // the fixture's own report is not a config file
             }
@@ -1403,7 +1526,7 @@ async fn credentials_plugin_secrets_get_round_trip() {
     );
     // R3: the token value must be absent from the plugin's config files —
     // it reaches the plugin ONLY over secrets.get, never on disk.
-    for entry in walk_files(env.plugin_state("bridge")) {
+    for entry in walk_files(&env.plugin_state("bridge")) {
         if entry.file_name().map(|n| n == "report.json").unwrap_or(false) {
             continue; // the fixture's own round-trip report, not a config file
         }
@@ -1536,9 +1659,9 @@ fn find_file_containing(root: &Path, path_words: &[&str], needle: &str, max_dept
     walk(root, max_depth, path_words, needle)
 }
 
-fn walk_files(root: PathBuf) -> Vec<PathBuf> {
+fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![root];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {

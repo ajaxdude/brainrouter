@@ -1327,6 +1327,7 @@ mod tests {
             cwd: String::new(),
             session_id: None,
             user_agent: String::new(),
+            source: None,
             conv_id: "same-conversation".into(),
             pp_tps: 0.0,
             tg_tps: 0.0,

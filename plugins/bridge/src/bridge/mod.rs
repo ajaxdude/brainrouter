@@ -218,7 +218,17 @@ impl Default for BridgeManager {
 /// Start enabled bridge transports. Spawns each as an independent tokio task;
 /// errors are logged, not propagated, so one crashing transport doesn't take
 /// down the server.
+///
+/// v1 entry point, behavior-unchanged: the task handles are detached here.
+/// The plugin daemon-side lifecycle (config hot-restart) uses [`spawn`].
 pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
+    let _handles = spawn(config, manager).await;
+}
+
+/// Same as [`start`], but returns the `JoinHandle`s of the spawned transport
+/// tasks so the plugin can abort and re-spawn them when the config changes.
+pub async fn spawn(config: BridgeConfig, manager: Arc<BridgeManager>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut any_started = false;
 
     // Move fields out of config to get owned values without borrow conflicts.
@@ -246,7 +256,7 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
                 let aliases = aliases.clone();
                 let default_model = default_model.clone();
                 let mgr = Arc::clone(&manager);
-                tokio::spawn(async move {
+                handles.push(tokio::spawn(async move {
                     info!("starting Discord bridge transport");
                     mgr.set_discord_connected(true);
                     if let Err(e) = discord::start(&dcfg, &omp_path, &work_dir, &aliases, timeout, &default_model, Arc::clone(&mgr)).await {
@@ -254,7 +264,7 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
                         mgr.set_discord_error(e.to_string());
                         warn!("Discord bridge exited with error: {e}");
                     }
-                });
+                }));
                 any_started = true;
             }
         }
@@ -269,14 +279,14 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
                 let aliases = aliases.clone();
                 let default_model = default_model.clone();
                 let mgr = Arc::clone(&manager);
-                tokio::spawn(async move {
+                handles.push(tokio::spawn(async move {
                     info!("starting Signal bridge transport");
                     if let Err(e) = signal::start(&scfg, &omp_path, &work_dir, &aliases, timeout, &default_model, mgr.clone()).await {
                         mgr.set_signal_connected(false);
                         mgr.set_signal_error(e.to_string());
                         warn!("Signal bridge exited with error: {e}");
                     }
-                });
+                }));
                 any_started = true;
             }
         }
@@ -285,4 +295,6 @@ pub async fn start(config: BridgeConfig, manager: Arc<BridgeManager>) {
     if !any_started {
         info!("no bridge transports configured; bridge idle");
     }
+
+    handles
 }

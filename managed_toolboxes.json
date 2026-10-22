@@ -1,0 +1,16 @@
+{
+  "gufo-runtime": {
+    "container_id": "4cae03d6f8d48096df4b92c98036d83792fe7423a134cacc047418cbe4e8d47b",
+    "image": "ghcr.io/gufo-org/toolboxes/gufo-runtime:latest",
+    "catalog_id": "strix-halo-gufo-runtime",
+    "catalog_revision": "255cb5929178",
+    "created_at": "2026-09-24T23:13:38.985027768+00:00"
+  },
+  "halogen-flash": {
+    "container_id": "51b0a5ac0e08bfe6d079ed6f926e988ce3c3325aa6745879956e7d868e8271f9",
+    "image": "ghcr.io/peonist-ai/halogen-flash-server:latest",
+    "catalog_id": "strix-halo-halogen-flash",
+    "catalog_revision": "255cb5929178",
+    "created_at": "2026-09-24T15:39:05.538322029+00:00"
+  }
+}

@@ -128,8 +128,8 @@ pub struct AppState {
     pub manifest_url: String,
     /// Whether the cloud backend (Manifest) is enabled from config.
     pub manifest_enabled: bool,
-    /// Bridge transport manager (Discord, Signal status tracking).
-    pub bridge_manager: Arc<crate::bridge::BridgeManager>,
+    /// v2 L2 plugin subsystem: registry, supervisor, RPC UDS servers.
+    pub plugins: Arc<crate::plugins::PluginManager>,
     /// Path to brainrouter's own config file (used by the config UI and
     /// the self-restart endpoint).
     pub config_path: PathBuf,
@@ -200,13 +200,13 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
-struct ModelListResponse {
+pub(crate) struct ModelListResponse {
     object: &'static str,
     data: Vec<ModelObject>,
 }
 
 #[derive(Serialize)]
-struct ModelObject {
+pub(crate) struct ModelObject {
     id: String,
     object: &'static str,
     created: u64,
@@ -288,7 +288,7 @@ fn request_is_destructive(method: &str, path: &str, has_query: bool) -> bool {
             || path == "/api/open-editor" || path == "/api/models/sync-omp"
             || path == "/api/routing-mode" || path == "/api/review-config"
             || path == "/api/routing-profile"
-            || path == "/api/bridges/toggle"
+            || path.starts_with("/api/plugins")
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
             // Review API is destructive too: it spawns reviews (arbitrary
@@ -397,47 +397,7 @@ async fn handle_request(
         }
 
         ("GET", "/v1/models") => {
-            let mut data = vec![
-                ModelObject { id: "auto".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-                ModelObject { id: "local".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-                ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
-            ];
-            // Fetch llama-swap models and append them
-            let mut seen: HashSet<String> = data.iter().map(|m| m.id.clone()).collect();
-            let ls_url = format!("{}/v1/models", state.llama_swap_url);
-            if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
-                .timeout(std::time::Duration::from_secs(2))
-                .send().await
-            {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
-                        let skip = ["auto", "local", "cloud"];
-                        for m in arr {
-                            if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                                if !skip.contains(&id) && seen.insert(id.to_string()) {
-                                    data.push(ModelObject {
-                                        id: id.to_string(),
-                                        object: "model",
-                                        created: 0,
-                                        owned_by: "llama-swap".to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for id in state.serving_identities.openai_compatible_served_models().await {
-                if seen.insert(id.clone()) {
-                    data.push(ModelObject {
-                        id,
-                        object: "model",
-                        created: 0,
-                        owned_by: "server-mode".to_string(),
-                    });
-                }
-            }
-            let models = ModelListResponse { object: "list", data };
+            let models = build_model_list(&state).await;
             let resp = json_response(StatusCode::OK, &models);
             into_unsync(resp)
         }
@@ -707,37 +667,69 @@ async fn handle_request(
             }
         }
 
-        // \_\_ Bridge status API \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-        ("GET", "/api/bridge-status") => {
-            let status = state.bridge_manager.status();
-            let resp = json_response(StatusCode::OK, &status);
+        // ── v2 L2 Plugins API (replaces the v1 bridge status/toggle pair) ──
+        ("GET", "/api/plugins") => {
+            let resp = json_response(StatusCode::OK, &state.plugins.dashboard_json());
             into_unsync(resp)
         }
 
-        ("POST", "/api/bridges/toggle") => {
-            let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-            let bridge = val.get("bridge").and_then(|v| v.as_str()).unwrap_or("");
-            let enabled = val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-            match bridge {
-                "discord" => {
-                    state.bridge_manager.discord_enabled
-                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        ("GET", p) if p.starts_with("/api/plugins/logs") => {
+            let query = req.uri().query().unwrap_or("");
+            let id = query_param(query, "id");
+            if id.is_empty() {
+                let resp = json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: "missing ?id=".into() });
+                return Ok(into_unsync(resp));
+            }
+            let tail: usize = query_param(query, "tail").parse().unwrap_or(400);
+            let path = state.plugins.log_path(&id);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let start = lines.len().saturating_sub(tail.max(1).min(5000));
+                    let body = lines[start..].join("\n");
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(Full::new(Bytes::from(body)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
+                        .unwrap()
                 }
-                "signal" => {
-                    state.bridge_manager.signal_enabled
-                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
-                }
-                _ => {
-                    let resp = json_response(
-                        StatusCode::BAD_REQUEST,
-                        &ErrorResponse { error: format!("Unknown bridge: {bridge}") },
-                    );
-                    return Ok(into_unsync(resp));
+                Err(e) => {
+                    let resp = json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: format!("no plugin logs for {id}: {e}") });
+                    into_unsync(resp)
                 }
             }
-            let resp = json_response(StatusCode::OK, &serde_json::json!({ "ok": true, "bridge": bridge, "enabled": enabled }));
-            into_unsync(resp)
+        }
+
+        ("POST", "/api/plugins/install") => {
+            let body = read_json_body(req).await;
+            let dir = body.get("dir").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            plugins_reply(state.plugins.install(std::path::Path::new(&dir)))
+        }
+
+        ("POST", "/api/plugins/enable") => {
+            let body = read_json_body(req).await;
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            plugins_reply(state.plugins.enable(&id).await)
+        }
+
+        ("POST", "/api/plugins/disable") => {
+            let body = read_json_body(req).await;
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            plugins_reply(state.plugins.disable(&id).await)
+        }
+
+        ("POST", "/api/plugins/remove") => {
+            let body = read_json_body(req).await;
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            plugins_reply(state.plugins.remove(&id).await)
+        }
+
+        ("POST", "/api/plugins/config") => {
+            let body = read_json_body(req).await;
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let value = body.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            plugins_reply(state.plugins.config_set(&id, &key, value))
         }
 
         // ── Routing mode override API ─────────────────────────────────────────
@@ -4239,6 +4231,90 @@ fn model_id_to_display_name(id: &str) -> String {
         .join(" ")
 }
 
+/// Shared builder for the proxy model list (`/v1/models`) and the plugin RPC
+/// `models.list` — one payload, two surfaces (design: models.list returns the
+/// daemon /v1/models payload verbatim).
+pub(crate) async fn build_model_list(state: &AppState) -> ModelListResponse {
+    let mut data = vec![
+        ModelObject { id: "auto".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+        ModelObject { id: "local".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+        ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
+    ];
+    let mut seen: HashSet<String> = data.iter().map(|m| m.id.clone()).collect();
+    let ls_url = format!("{}/v1/models", state.llama_swap_url);
+    if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send().await
+    {
+        if let Ok(body) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+                let skip = ["auto", "local", "cloud"];
+                for m in arr {
+                    if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                        if !skip.contains(&id) && seen.insert(id.to_string()) {
+                            data.push(ModelObject {
+                                id: id.to_string(),
+                                object: "model",
+                                created: 0,
+                                owned_by: "llama-swap".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for id in state.serving_identities.openai_compatible_served_models().await {
+        if seen.insert(id.clone()) {
+            data.push(ModelObject {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "server-mode".to_string(),
+            });
+        }
+    }
+    ModelListResponse { object: "list", data }
+}
+
+/// The `/v1/models` payload as JSON (plugin RPC `models.list`).
+pub(crate) async fn model_list_json(state: &AppState) -> serde_json::Value {
+    serde_json::to_value(build_model_list(state).await)
+        .unwrap_or_else(|_| serde_json::json!({ "object": "list", "data": [] }))
+}
+
+/// Read a JSON body (empty object on any failure).
+async fn read_json_body(req: hyper::Request<hyper::body::Incoming>) -> serde_json::Value {
+    let bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Uniform reply for the plugin management endpoints.
+fn plugins_reply(result: anyhow::Result<serde_json::Value>) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    match result {
+        Ok(v) => into_unsync(json_response(StatusCode::OK, &v)),
+        Err(e) => into_unsync(json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse { error: e.to_string() },
+        )),
+    }
+}
+
+/// Query-string parameter lookup (no percent-decoding needed for the plugin
+/// endpoints' numeric/id params).
+fn query_param(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .find_map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some(k), Some(v)) if k == key => Some(v.to_string()),
+                _ => None,
+            }
+        })
+        .unwrap_or_default()
+}
+
 fn ykey(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
 }
@@ -4263,7 +4339,7 @@ pub async fn run(
     info!("Unix socket listener bound to {:?}", uds_path);
 
     let tcp_state = state.clone();
-    let uds_state = state;
+    let uds_state = state.clone();
 
     let tcp_task = tokio::spawn(async move {
         loop {
@@ -4327,14 +4403,33 @@ pub async fn run(
         }
     });
 
+    let mut tcp_task = tcp_task;
+    let mut uds_task = uds_task;
     tokio::select! {
-        _ = tcp_task => info!("TCP listener task ended"),
-        _ = uds_task => info!("Unix socket listener task ended"),
+        _ = &mut tcp_task => info!("TCP listener task ended"),
+        _ = &mut uds_task => info!("Unix socket listener task ended"),
+        _ = shutdown_signal() => info!("Shutdown signal received; stopping plugins"),
     }
+    tcp_task.abort();
+    uds_task.abort();
+
+    // v2 L2: SIGTERM with grace, then kill (by PID) — every supervised
+    // plugin child is stopped before the daemon exits.
+    state.plugins.shutdown().await;
 
     remove_owned_uds(&uds_path_for_cleanup, uds_identity);
 
     Ok(())
+}
+
+/// SIGTERM (the systemd stop path) / Ctrl-C.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("installing SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 fn acquire_uds_lock(uds_path: &std::path::Path) -> Result<File> {

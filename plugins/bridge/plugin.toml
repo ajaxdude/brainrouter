@@ -1,0 +1,26 @@
+# brainrouter bridge plugin manifest (v2 L2).
+# Consumed by `brainrouter plugin install plugins/bridge-dist`.
+id = "bridge"
+name = "Bridge"
+version = "0.1.0"
+binary = "brainrouter-bridge"
+min_daemon_version = "1.1.0"
+
+# RPC grants. The bridge LLM path is the omp subprocess -> proxy (v1 parity),
+# so chat.completions is requested for manifest completeness only: the plugin
+# makes zero chat.completions calls. models.list is likewise granted but not
+# used for anything user-visible in L2 (Signal `!br list` keeps its v1 direct
+# llama-swap listing).
+grants = [
+    "chat.completions",
+    "models.list",
+    "routing.events.tail",
+    "inflight.list",
+    "config.get",
+    "config.set",
+    "kv.get",
+    "kv.set",
+    "secrets.get",
+    "notify",
+    "set_status",
+]

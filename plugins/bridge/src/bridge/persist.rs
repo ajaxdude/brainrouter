@@ -1,6 +1,10 @@
 //! Persistence helpers for session IDs, channel models, and working directories.
 //!
-//! All three maps are stored as JSON files under `~/.local/share/omp-bridge/`.
+//! All three maps are stored as JSON files under the plugin state directory
+//! (`BRAINROUTER_PLUGIN_STATE`, i.e. `$XDG_STATE_HOME/brainrouter/plugins/
+//! bridge/`).  The v1 path (`~/.local/share/omp-bridge/`) is kept as a
+//! read-only fallback and as the source for the one-time first-start copy
+//! performed in `main.rs`.
 //! Writes are best-effort: failures are logged but never fatal.
 
 use std::{
@@ -15,6 +19,20 @@ use std::{
 use tracing::{info, warn};
 
 fn data_dir() -> PathBuf {
+    // v2 plugin runtime: all writes land in the supervisor-assigned state dir.
+    if let Some(dir) = std::env::var_os("BRAINROUTER_PLUGIN_STATE") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    // v1 fallback (standalone runs / tests): the historical data dir.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".local/share/omp-bridge")
+}
+
+/// The v1 data directory, kept as the READ source for the one-time
+/// first-start persistence copy (originals are left in place for revert).
+pub fn v1_data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".local/share/omp-bridge")
 }

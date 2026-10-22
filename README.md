@@ -447,7 +447,7 @@ benchmark pages.
 
 ### Navigation and command strip
 
-The dashboard left rail is intentionally small: **Overview**, **Models**, **Benchmarks**, and **Config**. **Models** opens internal sub-tabs for **Local models**, **Downloads**, and **Serving**, plus a **Model activity ↗** link to the standalone `/models` page. **Overview** keeps the live cards, Sankey, in-flight table, KPIs, and HankNDory verdict ledger. **Config** holds quality toggles, bridge controls, toolbox management, service status, service restarts, raw YAML editors, and agent files.
+The dashboard left rail is intentionally small: **Overview**, **Models**, **Benchmarks**, and **Config**. **Models** opens internal sub-tabs for **Local models**, **Downloads**, and **Serving**, plus a **Model activity ↗** link to the standalone `/models` page. **Overview** keeps the live cards, Sankey, in-flight table, KPIs, and HankNDory verdict ledger. **Config** holds quality toggles, the Plugins tab (bridge and other sidecar plugins: status, config, HTML-escaped logs), toolbox management, service status, service restarts, raw YAML editors, and agent files.
 
 The always-visible command strip above the content contains:
 
@@ -909,10 +909,11 @@ brainrouter cli routing-profile pool     # clear pool; restore legacy auto behav
 brainrouter cli routing-profile set ./profile.json  # same body as POST /api/routing-profile
 brainrouter cli review-config update --forced-mode auto --clear-model
 
-brainrouter cli bridges status
-brainrouter cli bridges enable discord
-brainrouter cli bridges disable signal
-brainrouter cli bridges toggle signal
+brainrouter plugin list
+brainrouter plugin status bridge
+brainrouter plugin enable bridge
+brainrouter plugin disable bridge
+brainrouter plugin config set bridge discord.enabled=false
 ```
 
 The dashboard has independent Main and Reviewer backend/model selectors and a separate
@@ -1089,7 +1090,23 @@ Do not consider the task complete until you receive status: "approved".
 
 ## Bridge: Discord and Signal
 
-brainrouter includes bridge transports that connect Discord and Signal to OMP. Each bridge runs as part of the brainrouter daemon and shells out to the `omp` CLI to handle queries. Enable them in the `bridge` section of `brainrouter.yaml`.
+Since v2 L2 the bridges are a sidecar plugin: build the plugin binary
+(`cargo build --manifest-path plugins/bridge/Cargo.toml --release`), install
+it, and enable it —
+
+```bash
+brainrouter plugin install <dir-with-plugin.toml-and-brainrouter-bridge>
+brainrouter plugin config set bridge discord.enabled=true signal.enabled=true ...
+brainrouter plugin enable bridge
+```
+
+The plugin (`brainrouter-bridge`) shells out to the `omp` CLI, which connects
+back through the normal proxy path, so bridge conversations get the same
+routing/fallback/review behavior as v1. The Discord bot token is no longer a
+YAML key: it migrates to the credentials store (credential `discord_token`,
+granted to plugin `bridge`) at first boot and reaches the plugin only via
+the grant-scoped `secrets.get` RPC. Per-transport pause lives in plugin
+config (`discord.enabled` / `signal.enabled`).
 
 ### Discord bot commands
 
@@ -1139,12 +1156,8 @@ Each channel (Discord) or conversation (Signal) maintains its own session. Sessi
 
 | Data | Path |
 |---|---|
-| Discord sessions | `~/.local/share/omp-bridge/discord-sessions.json` |
-| Discord channel models | `~/.local/share/omp-bridge/discord-channel-models.json` |
-| Discord work dirs | `~/.local/share/omp-bridge/discord-work-dirs.json` |
-| Signal sessions | `~/.local/share/omp-bridge/signal-sessions.json` |
-| Signal channel models | `~/.local/share/omp-bridge/signal-channel-models.json` |
-| Signal work dirs | `~/.local/share/omp-bridge/signal-work-dirs.json` |
+| Plugin state (all six files, copied from v1 on first start) | `$XDG_STATE_HOME/brainrouter/plugins/bridge/` |
+| v1 originals (kept for revert) | `~/.local/share/omp-bridge/` |
 
 Long responses are automatically chunked (1500 chars for Discord, 4000 chars for Signal).
 
@@ -1210,21 +1223,11 @@ routing:
 # This example selects a cloud reviewer but leaves cloud disabled above.
 # Set manifest.enabled: true explicitly before expecting cloud execution.
 
-bridge:
-  omp_path: "omp"                              # path to omp CLI binary
-  work_dir: "/home/you"                         # default working directory
-  aliases_config: "~/.config/omp-bridge/config.yaml"  # model alias definitions
-  timeout_secs: 600                              # per-query timeout
-  default_model: "brainrouter/auto"              # model for new sessions
-  discord:
-    enabled: false                               # set true + provide token to activate
-    token: "Bot ..."                              # Discord bot token — required when enabled
-    prefix: "!"                                   # command prefix
-  signal:
-    enabled: false                               # set true + provide account to activate
-    account: "+15551234567"                       # E.164 phone — required when enabled
-    group_id: "base64..."                         # restrict to one Signal group
-    prefix: "!"                                   # command prefix
+# (v2 L2) the `bridge` section is gone — Discord/Signal run as the `bridge`
+# plugin. Same keys minus the token live in the plugin's namespaced config:
+#   brainrouter plugin config set bridge discord.enabled=true signal.enabled=true
+# The Discord token lives in the credentials store (auto-migrated from the v1
+# key at boot); see UPGRADE.md for the full move + restore path.
     storage_path: "/path/to/signal-cli/data"      # passed to signal-cli --config
     llama_swap_url: "http://localhost:8081"        # for llama-list command
 ```
@@ -1305,7 +1308,7 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `GET` | `/api/omp-sessions` | OMP session titles for the Sankey SESSION column |
 | `GET` | `/api/routing-stats` | Routing statistics |
 | `GET` | `/api/service-health` | Service health status per provider |
-| `GET` | `/api/bridge-status` | Bridge transport status (Discord / Signal) |
+| `GET` | `/api/plugins` | Plugin registry, live status lines, notification toasts (v2 L2) |
 | `GET` | `/api/inference-status` | Current inference state (for progress bar) |
 | `GET` | `/api/review-config` | Current review mode and forced model |
 | `POST` | `/api/review-config` | Replace current/new-review configuration; existing session snapshots stay unchanged |
@@ -1326,7 +1329,7 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `GET/POST` | `/api/routing-profile` | Independent role profile; POST `{preset,main,reviewer,subagent_model}` |
 | `GET/POST/DELETE` | `/api/project-pin` | Per-project role pins; `?path=` resolves an absolute path to a canonical Git-root key |
 | `GET` | `/api/routing-models` | Local/cloud catalog with explicit per-provider discovery errors; no inference |
-| `POST` | `/api/bridges/toggle` | Toggle `{bridge, enabled}`; read state from `/api/bridge-status` |
+| `POST` | `/api/plugins/install\|enable\|disable\|remove\|config` | Plugin management (v2 L2; `install` takes `{dir}`, config takes `{id,key,value}`) |
 | `GET` | `/api/toolboxes` | List llama-* toolbox containers |
 | `POST` | `/api/models/flush` | Unload all models from llama-swap memory (no restart) |
 | `POST` | `/api/models/sync-omp` | Sync llama-swap models into OMP's models.yml |

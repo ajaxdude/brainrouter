@@ -1,0 +1,64 @@
+# brainrouter-bridge — v2 L2 sidecar plugin (Discord + Signal transports).
+#
+# STANDALONE WORKSPACE ON PURPOSE: the empty `[workspace]` table below makes
+# this directory its own workspace root with its own Cargo.lock, so
+# `serenity` (and everything else the bridge pulls in) NEVER lands in the
+# daemon's root Cargo.lock (design R3 / acceptance test
+# `core_build_has_no_serenity`).  Do not add this crate to the root
+# workspace `members`.
+#
+# Build:  cargo build --manifest-path plugins/bridge/Cargo.toml
+# Test:   cargo test  --manifest-path plugins/bridge/Cargo.toml
+# Dist:   plugin.toml `binary = brainrouter-bridge` ->
+#         target/release/brainrouter-bridge, installed via
+#         `brainrouter plugin install plugins/bridge-dist`.
+
+[workspace]
+
+[package]
+name = "brainrouter-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Brainrouter bridge plugin: Discord + Signal chat transports (moved from v1 core, behavior-unchanged)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "brainrouter_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brainrouter-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (subprocess plumbing, UDS client, timers)
+tokio = { version = "1", features = ["full"] }
+
+# Serialization (config JSON, JSON-RPC frames, persisted maps)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors + logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP: v1 direct llama-swap listing (Signal `!br list`) + daemon REST helpers
+reqwest = { version = "0.12", features = ["json"] }
+
+# Session/test temp-dir suffixes (v1 parity)
+uuid = { version = "1", features = ["v4"] }
+
+# signal-cli process-group signalling (v1 parity)
+libc = "0.2"
+
+# Bridge transports (feature-gated, DEFAULT-ON in this plugin crate)
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"], optional = true }
+async-trait = { version = "0.1", optional = true }
+serde_yml = { version = "0.0.12", optional = true }
+
+[features]
+default = ["bridge-discord", "bridge-signal"]
+bridge-discord = ["dep:serenity", "dep:async-trait", "dep:serde_yml"]
+bridge-signal = ["dep:serde_yml"]

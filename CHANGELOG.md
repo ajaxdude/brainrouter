@@ -4,6 +4,76 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L2 — Plugins + bridge pilot + credentials store (branch `v2-p2-plugins`, pre-merge)
+
+Sidecar plugins replace the compiled-in bridge (design R3,
+`docs/design/v2-streamlining.L2.md`). Discord/Signal moved out of the core
+binary into the `plugins/bridge/` plugin (`brainrouter-bridge`), spoken to
+over a per-plugin Unix-domain socket using newline-delimited JSON-RPC 2.0.
+The minimal credentials store (`src/credentials.rs`) ships with its first
+consumer: the v1 plaintext `bridge.discord.token` migrates into
+`credentials.json` (0600, atomic) at boot and reaches the plugin only
+through grant-scoped `secrets.get`.
+
+### Added
+
+- **Plugin core** (`src/plugins/`): `plugin.toml` manifest
+  (id/name/version/binary/min_daemon_version/grants), supervisor (boot
+  spawn, exponential backoff capped at 60 s, 5 consecutive crashes →
+  terminal `failed` until explicit enable, SIGTERM-grace stop with explicit
+  PID kill), per-plugin UDS server (`$XDG_RUNTIME_DIR/brainrouter/plugins/
+  <id>.sock`, dir 0700 / socket 0600, stale-socket unlink, peer-uid check),
+  `initialize` handshake (constant-time token compare, grants + protocol
+  version returned; auth failure closes+logs and never counts as a crash),
+  per-plugin log capture, plugin state dir (`$XDG_STATE_HOME/brainrouter/
+  plugins/<id>/`, 0700).
+- **RPC v1 surface** (JSON-RPC 2.0, additive-only): `chat.completions`
+  (full router path; routing events carry the additive
+  `source: "plugin <id>"` tag), `models.list`, `routing.events.tail`,
+  `inflight.list`, `config.get/set` + `kv.get/set` (namespaced per plugin,
+  0600), `secrets.get` (grant-enforced), `notify`, `set_status`;
+  daemon→plugin `config.changed` push; 1 MiB body cap; per-plugin in-flight
+  4 + queue 16, excess → JSON-RPC limit error −32005; unknown method
+  −32601. No system ops.
+- **Credentials store** (`src/credentials.rs`): `credentials.json` (0600,
+  atomic owner-only writes); kinds `store`/`env`/`file`; `SecretString`
+  masks in Debug/Display/serialization; `resolve()` single implementation,
+  never panics; grants live on the credential (removing a plugin drops
+  grants naming it, logged).
+- **Migration framework** (`src/migration.rs`): boot-time
+  `bridge.discord.token` → credential `discord_token` granted to `bridge`
+  (snapshot first to `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p2/
+  <UTC timestamp>/`, `serve --dry-run` preview, logged, YAML key removed
+  with `.bak`); named restore `brainrouter migration restore v2.0-p2`.
+- **CLI**: `brainrouter plugin install <dir>|list|enable|disable|remove|
+  status|config set <id> k=v` (also `brainrouter cli plugin …`);
+  `brainrouter migration restore <phase>`.
+- **Bridge plugin** (`plugins/bridge/`, standalone workspace → binary
+  `brainrouter-bridge`): the v1 transports moved as-is (behavior
+  unchanged; Signal keeps its direct llama-swap listing via
+  `llama_swap_url`); token via `secrets.get` only; per-transport pause
+  keys move into plugin config; on first start the six v1 persistence
+  JSON files are copied into the plugin state dir (v1 originals kept).
+- **Dashboard**: Plugins tab (list with state/status line, enable/disable,
+  config view/edit, HTML-escaped plugin logs, notification toasts).
+- `GET /api/plugins*` endpoints; `cargo tree -e normal` core no longer
+  contains serenity.
+
+### Removed
+
+- Cargo features `bridge-discord`/`bridge-signal` and deps
+  serenity/async-trait/serde_yml from the core.
+- `src/bridge/` (moved to the plugin crate), daemon bridge startup,
+  `BridgeManager` from `AppState`, `bridge.*` YAML keys (the migration
+  owns them), the `bridges` CLI verb, `GET /api/bridge-status`,
+  `POST /api/bridges/toggle`, and the dashboard bridge config panel.
+
+### Restoring v2.0-p2
+
+`brainrouter migration restore v2.0-p2` restores the newest snapshot
+(config YAML incl. the v1 `bridge.discord.token` key + credentials store)
+— reverting code alone is never the whole restore.
+
 ## v2 L1 — P0-Purge (branch `v2-p1-purge`, pre-merge)
 
 Removed the v1 halogen/vllm/r9v serving backends and moved the benchmark

@@ -26,9 +26,6 @@ pub struct BrainrouterConfig {
     /// Persistent imported benchmark results and explorer.
     #[serde(default)]
     pub benchmarks: BenchmarkConfig,
-    /// Bridge transports (Discord, Signal) — optional, disabled by default.
-    #[serde(default)]
-    pub bridge: Option<crate::bridge::BridgeConfig>,
 }
 
 /// Storage settings for the benchmark explorer.

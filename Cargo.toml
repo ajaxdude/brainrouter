@@ -1,6 +1,6 @@
 [package]
 name = "brainrouter"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2021"
 
 [dependencies]
@@ -48,6 +48,11 @@ encoding_rs = "0.8"
 # Session IDs
 uuid = { version = "1", features = ["v4"] }
 
+# Plugin manifests (`plugin.toml`) — v2 L2 plugin core
+toml = "0.8"
+# Atomic owner-only writes (credentials store, plugin state)
+tempfile = "3"
+
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
@@ -55,15 +60,8 @@ flate2 = "1.1.9"
 tar = "0.4.45"
 
 
-# Bridge transports (optional, feature-gated)
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"], optional = true }
-async-trait = { version = "0.1", optional = true }
-serde_yml = { version = "0.0.12", optional = true }
-
 [features]
-default = ["bridge-discord", "bridge-signal"]
-bridge-discord = ["dep:serenity", "dep:async-trait", "dep:serde_yml"]
-bridge-signal = ["dep:serde_yml"]
+default = []
 # v2 R2 (docs/design/v2-streamlining.md): the benchmark explorer (HTTP
 # routes + native lab) is opt-in. NOT part of `default`: stock builds
 # answer the documented 503 degradation envelope on /benchmarks and
