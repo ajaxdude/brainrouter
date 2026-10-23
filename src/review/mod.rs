@@ -21,8 +21,8 @@ use tracing::{info, warn};
 
 use crate::{
     config::ReviewConfig,
+    roles::{Role, RoleCardStore},
     router::Router,
-    routing_profile::{ModelChoice, ProfileStore, RoutingPreset, RoutingProfile},
     session::{ReviewStatus, ReviewerType, SessionManager, SessionUpdate},
 };
 
@@ -41,7 +41,9 @@ pub struct RequestReviewResult {
 pub struct ReviewService {
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
-    preferences: Arc<ProfileStore>,
+    /// v2 L3: the review card (extras + assignment) is the single reviewer
+    /// source of truth; sessions snapshot it at start.
+    cards: Arc<RoleCardStore>,
     active_reviews: Arc<Mutex<HashSet<String>>>,
     /// Admission policy (memory-gated local reviewer, design H2).
     admission: Arc<admission::AdmissionCtx>,
@@ -62,30 +64,31 @@ impl ReviewService {
     pub fn new(
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
+        cards: Arc<RoleCardStore>,
         config: ReviewConfig,
         admission_config: crate::config::ReviewAdmissionConfig,
         manifest_enabled: bool,
         fallback_model: String,
     ) -> Self {
-        let preferences = router.profiles().cloned().unwrap_or_else(|| {
-            let mut store = ProfileStore::memory(RoutingProfile {
-                preset: RoutingPreset::Custom,
-                main: ModelChoice::Auto,
-                reviewer: config.model_choice().expect("validated review configuration"),
-                subagent_model: None,
-            }, config.max_iterations).expect("validated review configuration");
-            // Carry the YAML design-aware settings so a profiles-less fallback
-            // never silently disables an enabled integration.
-            store.seed_review_design(&config);
-            Arc::new(store)
-        });
+        // Seed the card extras from the YAML the first time (v1 boot order
+        // parity: `ProfileStore::load` seeds review config from YAML).
+        if !cards.has_review_extras() {
+            let extras = crate::roles::ReviewExtras {
+                max_iterations: config.max_iterations,
+                hankndory_integration: config.hankndory_integration,
+                design_doc_path: config.design_doc_path.clone(),
+            };
+            if let Err(e) = cards.set_review_extras(extras) {
+                warn!(error = %e, "could not persist review card extras");
+            }
+        }
 
         // At least one permit even if misconfigured; validation elsewhere pins it to 1.
         let permits = admission_config.local_review_permits.max(1) as usize;
         ReviewService {
             router,
             sessions,
-            preferences,
+            cards,
             active_reviews: Arc::new(Mutex::new(HashSet::new())),
             admission: Arc::new(admission::AdmissionCtx {
                 config: admission_config,
@@ -120,8 +123,10 @@ impl ReviewService {
     ) -> Result<RequestReviewResult> {
         // Create the session first — the agent gets the ID in the response regardless
         // of whether the review loop succeeds or fails.
-        let mut config_snapshot = self.get_config();
-        self.apply_reviewer_pin(&mut config_snapshot, &cwd);
+        // v2 L3: snapshot the review CARD (assignment + extras) at start;
+        // the session never re-resolves (continuations reuse the snapshot).
+        let config_snapshot = self.get_config();
+        let reviewer_selector = self.reviewer_selector(&cwd);
         let session = self.sessions.create_session_with_config(
             task_id.clone(),
             summary.clone(),
@@ -130,6 +135,7 @@ impl ReviewService {
             cwd.clone(), // clone needed: cwd is moved into Session, but also needed for run_loop below
             Some(config_snapshot.clone()),
         );
+        self.sessions.set_review_selector(&session.id, &reviewer_selector);
         info!(session_id = %session.id, task_id = %task_id, "Created review session");
         let active_review = self.begin_review(&session.id)?;
 
@@ -148,6 +154,7 @@ impl ReviewService {
             &config_snapshot,
             &cwd,
             &self.admission,
+            reviewer_selector,
         )
         .await;
         drop(active_review);
@@ -236,34 +243,37 @@ impl ReviewService {
             reviewer_type,
         })
     }
-    /// Get a copy of the current review configuration.
+    /// Get a copy of the current review configuration (the review card's
+    /// extras — v2 L3 reduced schema: iterations + integration only).
     pub fn get_config(&self) -> ReviewConfig {
-        self.preferences.review_config()
-    }
-
-    /// Apply a project's reviewer pin (if any) into a fresh review's config
-    /// snapshot — before the session persists it and before admission runs. A
-    /// pin is a *configured* choice: admission still governs the final route,
-    /// and continuations reuse the stored snapshot (they never re-resolve).
-    /// Normalization here is synchronous (off the proxy hot path) and skipped
-    /// entirely when no pin exists (the store's `has_pins` gate).
-    fn apply_reviewer_pin(&self, config: &mut ReviewConfig, cwd: &str) {
-        let Some(store) = self.router.project_pins() else {
-            return;
-        };
-        if let Some(reviewer) = store.resolve(cwd).and_then(|pin| pin.reviewer) {
-            config.forced_mode = reviewer.backend().to_string();
-            config.forced_model = reviewer.model().map(str::to_owned);
+        let extras = self.cards.review_extras();
+        ReviewConfig {
+            max_iterations: extras.max_iterations,
+            hankndory_integration: extras.hankndory_integration,
+            design_doc_path: extras.design_doc_path,
         }
     }
 
-    pub fn preferences(&self) -> &Arc<ProfileStore> { &self.preferences }
+    /// The reviewer selector for a fresh review: the review card at project
+    /// scope, then global (L3 replaces the v1 reviewer pin; the card lookup
+    /// precedence IS the pin precedence). Sessions snapshot this at start.
+    pub fn reviewer_selector(&self, cwd: &str) -> String {
+        let project = crate::roles::project_key(cwd).map(|p| p.display().to_string());
+        self.cards.assignment(Role::Review, project.as_deref())
+    }
 
-    /// A successful response means preferences reached disk before runtime mutation.
+    pub fn cards(&self) -> &Arc<RoleCardStore> { &self.cards }
+
+    /// A successful response means the review card extras reached disk.
     pub async fn update_config(&self, new_config: ReviewConfig) -> Result<()> {
         new_config.validate()?;
-        let preferences = Arc::clone(&self.preferences);
-        tokio::task::spawn_blocking(move || preferences.update_review(new_config)).await?
+        let cards = Arc::clone(&self.cards);
+        let extras = crate::roles::ReviewExtras {
+            max_iterations: new_config.max_iterations,
+            hankndory_integration: new_config.hankndory_integration,
+            design_doc_path: new_config.design_doc_path,
+        };
+        tokio::task::spawn_blocking(move || cards.set_review_extras(extras)).await?
     }
 
     /// Resolve a session with human feedback (from the escalation UI).
@@ -323,7 +333,8 @@ impl ReviewService {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         let active_review = self.begin_review(session_id)?;
 
-        // Continuations retain the original reviewer, even after profile changes.
+        // Continuations retain the original reviewer CARD snapshot, even
+        // after card changes (selector + extras were stored at start).
         let mut config_snapshot = session.review_config.clone().unwrap_or_else(|| self.get_config());
         config_snapshot.max_iterations = extra_iterations;
         config_snapshot.validate()?;
@@ -359,6 +370,10 @@ impl ReviewService {
             history.extend(session.llm_turns.clone());
             history
         };
+        let reviewer_selector = session
+            .review_selector
+            .clone()
+            .unwrap_or_else(|| self.reviewer_selector(&session.cwd));
         let result = run_loop(
             session_id,
             &session.task_id,
@@ -370,6 +385,7 @@ impl ReviewService {
             &config_snapshot,
             &session.cwd,
             &self.admission,
+            reviewer_selector,
         )
         .await;
         drop(active_review);
@@ -463,8 +479,9 @@ impl ReviewService {
         cwd: String,
     ) -> String {
         // Create the session synchronously so the caller has an ID to poll.
-        let mut config_snapshot = self.get_config();
-        self.apply_reviewer_pin(&mut config_snapshot, &cwd);
+        // v2 L3: snapshot the review card (assignment + extras) at start.
+        let config_snapshot = self.get_config();
+        let reviewer_selector = self.reviewer_selector(&cwd);
         let session = self.sessions.create_session_with_config(
             task_id.clone(),
             summary.clone(),
@@ -473,6 +490,7 @@ impl ReviewService {
             cwd.clone(),
             Some(config_snapshot.clone()),
         );
+        self.sessions.set_review_selector(&session.id, &reviewer_selector);
         let session_id = session.id.clone();
         info!(session_id = %session_id, task_id = %task_id, "Created review session (async mode)");
         let active_review = self
@@ -491,6 +509,7 @@ impl ReviewService {
         let history = session.conversation_history.clone();
         let admission = Arc::clone(&self.admission);
         let notifier = self.sessions.register_notifier(&session_id);
+        let selector = reviewer_selector.clone();
 
         tokio::spawn(async move {
             let result = run_loop(
@@ -504,6 +523,7 @@ impl ReviewService {
                 &config_snapshot,
                 &cwd2,
                 &admission,
+                selector,
             )
             .await;
             drop(active_review);

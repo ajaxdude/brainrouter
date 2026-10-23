@@ -60,13 +60,17 @@ pub async fn run_loop(
     config: &crate::config::ReviewConfig,
     project_dir: &str,
     admission: &admission::AdmissionCtx,
+    // v2 L3: the review-card assignment selector snapshotted at session
+    // start (the single reviewer source of truth; never re-resolved).
+    review_selector: String,
 ) -> Result<ReviewResult> {
     config.validate()?;
     // Resolve the reviewer backend for this run (design H2): auto→cloud-iff-
     // manifest-else-local; local only with a measured budget + /proc/meminfo
     // headroom + a permit; else cloud, or a terminal blocked reason. The permit
-    // (when local) is held for the whole loop.
-    let configured = config.model_choice()?;
+    // (when local) is held for the whole loop. The card selector compiles
+    // through the relocated ModelChoice (admission gate reads its backend).
+    let configured = crate::roles::ModelChoice::from_selector(&review_selector)?;
     let (choice, _admission_permit) = match admission.resolve(&configured) {
         admission::AdmissionResult::Admitted { choice, permit } => (choice, permit),
         admission::AdmissionResult::Blocked { reason } => {
@@ -341,7 +345,7 @@ async fn call_llm_for_review(
     router: &Arc<Router>,
     prompt: String,
     session_id: &str,
-    choice: &crate::routing_profile::ModelChoice,
+    choice: &crate::roles::ModelChoice,
     project_dir: &str,
     max_output_tokens: usize,
 ) -> Result<(String, crate::router::RouteInfo)> {

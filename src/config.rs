@@ -9,20 +9,22 @@ use std::path::{Path, PathBuf};
 pub struct BrainrouterConfig {
     pub manifest: ManifestConfig,
     pub llama_swap: LlamaSwapConfig,
-    pub bonsai: BonsaiConfig,
+    /// v2 L3: the decision-model slot (R4). Replaces the v1 `bonsai:` block
+    /// (which migrates into `kind: openai-compatible, prompt_profile: bonsai`,
+    /// with the launch backend config preserved under `launch:`) and the v1
+    /// `routing:` block (which migrates into role cards).
+    #[serde(default)]
+    pub decision_model: DecisionModelConfig,
     /// Shared model storage directory settings.
     #[serde(default)]
     pub models: ModelsConfig,
     #[serde(default)]
     pub review: ReviewConfig,
     /// Admission policy for the memory-gated local code reviewer (design H1).
-    /// Separate from `review` so its safety fields can't be lost through the
-    /// routing-profile round-trip.
+    /// Separate from `review` (which is `deny_unknown_fields`) so these safety
+    /// fields survive a review-card update.
     #[serde(default)]
     pub review_admission: ReviewAdmissionConfig,
-    /// Independent main, reviewer and subagent choices. Omitted preserves local defaults.
-    #[serde(default)]
-    pub routing: Option<crate::routing_profile::RoutingProfile>,
     /// Persistent imported benchmark results and explorer.
     #[serde(default)]
     pub benchmarks: BenchmarkConfig,
@@ -266,28 +268,120 @@ impl Default for NudgeBudgets {
     }
 }
 
-/// Configuration for the embedded Bonsai classifier model.
+/// The decision-model slot kind (L3 spec "Decision-model slot").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecisionKind {
+    /// v1 selector-matrix parity; always available. Default.
+    #[default]
+    Heuristic,
+    /// OpenAI-compatible classifier endpoint. Bonsai migrates to exactly this
+    /// with `prompt_profile: bonsai`.
+    OpenaiCompatible,
+    /// Typed question schema, strict JSON reply (the Clef contract).
+    StructuredSchema,
+    /// POST the features JSON to `{url}`; the reply is the decision.
+    Webhook,
+    /// Server-initiated `decision.classify` over the plugin RPC (protocol v2).
+    Plugin,
+}
+
+impl DecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Heuristic => "heuristic",
+            Self::OpenaiCompatible => "openai-compatible",
+            Self::StructuredSchema => "structured-schema",
+            Self::Webhook => "webhook",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+/// Launch config for the embedded Bonsai classifier llama-server. The
+/// `bonsai_server.rs` launch backend survives L3; the v1 `bonsai:` keys migrate
+/// here.
 ///
-/// Off by default: `brainrouter serve` will not spawn the llama-server and
-/// auto-routed requests go straight to llama-swap (no classification). When
+/// Off by default: `brainrouter serve` will not spawn the llama-server. When
 /// `enabled: true`, `model_path` must point at an existing GGUF file — config
-/// load fails fast if the file is missing so a headless daemon never silently
-/// runs without its classifier.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonsaiConfig {
-    /// Master switch for the classifier server. Default off.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to the Bonsai GGUF model file. Required only when enabled.
-    #[serde(default)]
-    pub model_path: Option<PathBuf>,
+/// load fails fast if the file is missing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BonsaiLaunch {
     /// Port for the external llama-server process.
     #[serde(default = "default_bonsai_port")]
     pub server_port: u16,
     /// Path to the PrismML fork llama-server binary.
     #[serde(default = "default_fork_path")]
     pub fork_path: PathBuf,
+    /// Path to the Bonsai GGUF model file. Required only when the slot is
+    /// enabled with the bonsai prompt profile.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
 }
+
+/// Configuration of the decision-model slot. Kinds needing an endpoint carry
+/// the fields marked optional below; `min_confidence` gates every model kind
+/// (default 0.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionModelConfig {
+    pub enabled: bool,
+    pub kind: DecisionKind,
+    /// openai-compatible / structured-schema: classifier base URL.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `"bonsai"` preserves the v1 classifier prompt + one-word grammar.
+    #[serde(default)]
+    pub prompt_profile: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// webhook: features endpoint URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// plugin: plugin id serving `decision.classify`.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    /// Launch backend config for the migrated bonsai classifier server.
+    #[serde(default)]
+    pub launch: Option<BonsaiLaunch>,
+}
+
+impl Default for DecisionModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: DecisionKind::Heuristic,
+            base_url: None,
+            model: None,
+            prompt_profile: None,
+            timeout_ms: None,
+            url: None,
+            plugin_id: None,
+            min_confidence: None,
+            launch: None,
+        }
+    }
+}
+
+/// The default low-confidence threshold (L3 spec: 0.4).
+pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.4;
+
+impl DecisionModelConfig {
+    pub fn min_confidence(&self) -> f64 {
+        self.min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE)
+    }
+
+    /// The bonsai profile: an openai-compatible slot carrying v1's prompt.
+    pub fn is_bonsai_profile(&self) -> bool {
+        self.kind == DecisionKind::OpenaiCompatible
+            && self.prompt_profile.as_deref() == Some("bonsai")
+    }
+}
+
 fn default_bonsai_port() -> u16 {
     9200
 }
@@ -422,20 +516,16 @@ impl ReviewAdmissionConfig {
 }
 
 /// Configuration for the review service and escalation dashboard.
+///
+/// v2 L3: reduced to the non-model survivors. The reviewer MODEL lives on the
+/// `review` role card (the single reviewer source of truth); the v1
+/// `forced_mode`/`forced_model` YAML keys migrate into it and are removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     /// Maximum number of LLM review iterations before escalating to human.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
-
-    /// Forced review mode: "auto", "cloud", or "local".
-    #[serde(default = "default_review_mode")]
-    pub forced_mode: String,
-
-    /// Explicit local or cloud model ID. None uses the backend's default.
-    #[serde(default)]
-    pub forced_model: Option<String>,
 
     /// HankNDory design-aware review (design G1). When true, a review only
     /// proceeds if an *approved* design document is loaded, and the reviewer is
@@ -454,16 +544,10 @@ fn default_max_iterations() -> u32 {
     5
 }
 
-fn default_review_mode() -> String {
-    "auto".to_string()
-}
-
 impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig {
             max_iterations: default_max_iterations(),
-            forced_mode: default_review_mode(),
-            forced_model: None,
             hankndory_integration: false,
             design_doc_path: None,
         }
@@ -471,44 +555,13 @@ impl Default for ReviewConfig {
 }
 
 impl ReviewConfig {
-    /// Legacy files could retain a model while auto mode ignored it. Do not
-    /// apply this compatibility rule during deserialization or API validation.
-    pub(crate) fn normalize_legacy_read(&mut self, source: &Path) {
-        if self.forced_mode == "auto" && self.forced_model.take().is_some() {
-            tracing::warn!(
-                path = %source.display(),
-                "Ignoring legacy forced_model with forced_mode=auto; remove forced_model from this file or choose local/cloud explicitly"
-            );
-        }
-    }
-
-    pub fn model_choice(&self) -> Result<crate::routing_profile::ModelChoice> {
-        crate::routing_profile::ModelChoice::from_legacy(
-            &self.forced_mode,
-            self.forced_model.clone(),
-        )
-    }
-
     pub fn validate(&self) -> Result<()> {
-        crate::routing_profile::validate_iterations(self.max_iterations)?;
-        self.model_choice()?;
+        crate::roles::validate_iterations(self.max_iterations)?;
         Ok(())
     }
 }
 
 impl BrainrouterConfig {
-    pub fn routing_profile(&self) -> Result<crate::routing_profile::RoutingProfile> {
-        use crate::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
-        let profile = self.routing.clone().unwrap_or(RoutingProfile {
-            preset: RoutingPreset::Custom,
-            main: ModelChoice::local(),
-            reviewer: self.review.model_choice()?,
-            subagent_model: self.llama_swap.subs_model.clone(),
-        });
-        profile.validate()?;
-        Ok(profile)
-    }
-
     /// Resolve the Manifest API key from the configured environment variable.
     /// Returns None if no env var is configured or it is unset.
     pub fn resolve_manifest_api_key(&self) -> Option<String> {
@@ -516,6 +569,7 @@ impl BrainrouterConfig {
         std::env::var(env_var).ok()
     }
 }
+
 
 /// Load and validate the brainrouter configuration from a YAML file.
 ///
@@ -545,15 +599,17 @@ pub fn load(path: &Path) -> Result<BrainrouterConfig> {
 /// persisting a configuration so a successful save cannot create a file that
 /// the next daemon restart rejects.
 pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
-    // Expand ${models_path} in bonsai.model_path.
-    // This lets users write a single `models.path` and reference it everywhere
-    // without repeating the absolute prefix.
-    if let Some(model_path) = config.bonsai.model_path.as_ref() {
-        let models_path_str = config.models.path.to_string_lossy().into_owned();
-        let raw = model_path.to_string_lossy().into_owned();
-        if raw.contains("${models_path}") {
-            let expanded = raw.replace("${models_path}", &models_path_str);
-            config.bonsai.model_path = Some(PathBuf::from(expanded));
+    // Expand ${models_path} in the decision slot's launch model_path (the
+    // migrated Bonsai GGUF). This lets users write a single `models.path` and
+    // reference it everywhere without repeating the absolute prefix.
+    if let Some(launch) = config.decision_model.launch.as_mut() {
+        if let Some(model_path) = launch.model_path.as_ref() {
+            let models_path_str = config.models.path.to_string_lossy().into_owned();
+            let raw = model_path.to_string_lossy().into_owned();
+            if raw.contains("${models_path}") {
+                let expanded = raw.replace("${models_path}", &models_path_str);
+                launch.model_path = Some(PathBuf::from(expanded));
+            }
         }
     }
 
@@ -628,29 +684,69 @@ pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
             "benchmarks.lab.plumebench_thinking must be off, minimal, low, medium, high, xhigh, max, or auto"
         );
     }
-    config.review.normalize_legacy_read(path);
     config
         .review
         .validate()
         .with_context(|| format!("Invalid review configuration in {}", path.display()))?;
-    config
-        .routing_profile()
-        .with_context(|| format!("Invalid routing configuration in {}", path.display()))?;
+    validate_decision_model(&mut config.decision_model, path)?;
+    Ok(())
+}
 
-    // Validate bonsai.model_path exists (after token expansion) — but only
-    // when the classifier is enabled. Disabled Bonsai needs no model file, so
-    // a headless local-only daemon can run without any GGUF on disk.
-    if config.bonsai.enabled {
-        match config.bonsai.model_path.as_ref() {
-            Some(path) => {
-                if !path.exists() {
-                    bail!("Bonsai model path does not exist: {}", path.display());
-                }
-            }
-            None => bail!("bonsai.enabled is true but bonsai.model_path is not set"),
+/// Validate the decision-model slot (L3). Kinds needing an endpoint require
+/// it; the migrated bonsai profile additionally keeps v1's fail-fast rule:
+/// when the slot is enabled, the launch backend needs an existing GGUF.
+fn validate_decision_model(slot: &mut DecisionModelConfig, path: &Path) -> Result<()> {
+    let need = |field: &str, present: bool| -> Result<()> {
+        if !present {
+            bail!(
+                "decision_model.{field} is required for kind {:?} (in {})",
+                slot.kind,
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    match slot.kind {
+        DecisionKind::Heuristic => {}
+        DecisionKind::OpenaiCompatible | DecisionKind::StructuredSchema => {
+            need("base_url", slot.base_url.as_deref().is_some())?;
+            need("model", slot.model.as_deref().is_some())?;
+        }
+        DecisionKind::Webhook => need("url", slot.url.as_deref().is_some())?,
+        DecisionKind::Plugin => need("plugin_id", slot.plugin_id.as_deref().is_some())?,
+    }
+    if let Some(ms) = slot.timeout_ms {
+        if ms == 0 {
+            bail!("decision_model.timeout_ms must be greater than zero (in {})", path.display());
         }
     }
-
+    if let Some(conf) = slot.min_confidence {
+        if !(0.0..=1.0).contains(&conf) {
+            bail!("decision_model.min_confidence must be within 0.0..=1.0 (in {})", path.display());
+        }
+    }
+    // The v1 fail-fast rule, migrated — scoped to the launch backend: an
+    // enabled slot whose LAUNCH config exists (daemon-managed classifier
+    // server) needs an existing GGUF. An externally-managed endpoint (no
+    // launch block) has no daemon-side model file to check.
+    if slot.enabled && slot.is_bonsai_profile() {
+        if let Some(launch) = slot.launch.as_ref() {
+            match launch.model_path.as_ref() {
+                Some(model_path) => {
+                    if !model_path.exists() {
+                        bail!(
+                            "Bonsai model path does not exist: {} (decision_model.launch.model_path)",
+                            model_path.display()
+                        );
+                    }
+                }
+                None => bail!(
+                    "decision_model is enabled with prompt_profile bonsai and a launch backend, but decision_model.launch.model_path is not set (in {})",
+                    path.display()
+                ),
+            }
+        }
+    }
     Ok(())
 }
 

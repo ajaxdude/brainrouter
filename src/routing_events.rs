@@ -94,9 +94,30 @@ pub struct RouteEvent {
     pub toolbox_backend: Option<String>,
     /// PR4 (design doc §6): the compute API/engine (`vulkan`/`rocm`/...) the
     /// serving backend above used, when derivable. Same `None` semantics as
-    /// `toolbox_backend`.
+    /// [`toolbox_backend`][Self::toolbox_backend].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_api: Option<String>,
+    /// v2 L3 additive: the role that originated the request
+    /// (`main | review | subagent`; `subs` names the subagent role). Always
+    /// present — v1 consumers ignore unknown fields.
+    pub role: String,
+    /// v2 L3 additive: the decision slot's verdict for this request
+    /// (`{route, tier, confidence}`). Absent for explicit selectors, which
+    /// bypass the slot by contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::router::DecisionEvent>,
+    /// v2 L3 additive: human-readable why of the decision (the slot's
+    /// rationale; the webhook's verbatim rationale passes through).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// v2 L3 additive: set only when the slot fell back — `"v1-safe"` (a
+    /// bonsai-profile failure), `"heuristic"` (low confidence), or
+    /// `"unavailable"` (a fresh-config kind failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_fallback: Option<&'static str>,
+    /// v2 L3 additive: the model the route actually chose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_model: Option<String>,
 }
 
 fn is_zero_f64(f: &f64) -> bool {
@@ -384,6 +405,11 @@ mod tests {
             tg_tps: 0.0,
             toolbox_backend: Some("llama_cpp".into()),
             compute_api: Some("vulkan".into()),
+            role: "main".to_string(),
+            decision: None,
+            rationale: None,
+            decision_fallback: None,
+            chosen_model: None,
         }
     }
 

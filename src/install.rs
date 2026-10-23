@@ -84,10 +84,6 @@ fn install_omp(bin: &Path, yes: bool) -> Result<()> {
     println!("    models:");
     println!("      - id: auto");
     println!("        name: Brainrouter (auto)");
-    println!("      - id: local");
-    println!("        name: Brainrouter (local)");
-    println!("      - id: cloud");
-    println!("        name: Brainrouter (cloud)");
     Ok(())
 }
 

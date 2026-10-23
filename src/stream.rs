@@ -307,8 +307,10 @@ pub struct DeferredStream {
 }
 
 enum DeferredState {
-    /// Waiting for the routing future to resolve.
-    Waiting(tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>),
+    /// Waiting for the routing future to resolve. Boxed so the L3 fast-fail
+    /// window (which takes the receiver out of the oneshot for a bounded
+    /// poll) can hand the SAME receiver back on timeout.
+    Waiting(Pin<Box<dyn Future<Output = Result<Result<crate::provider::SseStream>, tokio::sync::oneshot::error::RecvError>> + Send>>),
     /// The provider stream has arrived; forward it (keepalive-wrapped so idle
     /// generation still pings the client).
     Streaming(Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>),
@@ -334,14 +336,14 @@ impl Drop for AbortOnDrop {
 
 impl DeferredStream {
     pub fn new(
-        rx: tokio::sync::oneshot::Receiver<Result<crate::provider::SseStream>>,
+        rx: impl Future<Output = Result<Result<crate::provider::SseStream>, tokio::sync::oneshot::error::RecvError>> + Send + 'static,
         routing_task: tokio::task::AbortHandle,
         interval: Duration,
         max_wait: Duration,
         format: StreamFormat,
     ) -> Self {
         Self {
-            state: DeferredState::Waiting(rx),
+            state: DeferredState::Waiting(Box::pin(rx)),
             routing_task: AbortOnDrop(Some(routing_task)),
             sleep: Box::pin(sleep(interval)),
             deadline: Box::pin(sleep(max_wait)),
@@ -361,7 +363,7 @@ impl Stream for DeferredStream {
             match &mut this.state {
                 DeferredState::Waiting(rx) => {
                     // Check if the provider stream is ready.
-                    match Pin::new(rx).poll(cx) {
+                    match rx.as_mut().poll(cx) {
                         Poll::Ready(Ok(Ok(stream))) => {
                             // Keepalives must continue during generation: the
                             // provider stream can stall for tens of seconds

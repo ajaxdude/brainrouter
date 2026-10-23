@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-fn env_dir(var: &str, _fallback: &str, home_fallback: &str) -> PathBuf {
+pub fn env_dir(var: &str, _fallback: &str, home_fallback: &str) -> PathBuf {
     if let Ok(v) = std::env::var(var) {
         let p = PathBuf::from(&v);
         if v.starts_with('/') {

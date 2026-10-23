@@ -1,8 +1,19 @@
-//! Subs-pool routing tests.
+//! Subs-pool routing tests (v2 L3-retargeted).
 //!
-//! Verifies the `subs` / `brainrouter/subs` convention added for the dual-Dirk
-//! plan: requests targeting the subs pool route directly to `llama_swap.subs_model`
-//! and never touch the Bonsai classifier or the Manifest circuit breaker.
+//! Verifies the `subs` / `brainrouter/subs` convention: the subs selector
+//! NAMES the subagent role; its card assignment is the pool (default `auto`
+//! → decision slot, seeded from `llama_swap.subs_model` as the compatibility
+//! seed) and never touches the cloud circuit.
+//!
+//! L3 retargets, each with its authorizing spec line (docs/design/
+//! v2-streamlining.L3.md):
+//! - `ProjectPinStore` pins → project-scoped `RoleCardStore` cards —
+//!   "v1 → card migration table … per-project pins cards (project scope)".
+//! - `RouterArgs.classifier` → `slot` + `cards` — "The decision slot (
+//!   src/decision.rs, trait DecisionModel) replaces the classifier consult".
+//! - the subs direct-to-subs_model assertion keeps `bonsai_decision:
+//!   "local-subs"` — "subs → subagent card; … `config.subs_model` remains the
+//!   auto-pool compatibility seed".
 //!
 //! No real Bonsai server or cloud backend is needed — the classifier points at a
 //! dead port with `enabled=false` and the Manifest circuit is pre-opened; if the
@@ -12,11 +23,10 @@ use brainrouter::classifier::Classifier;
 use brainrouter::config::NudgeBudgets;
 use brainrouter::health::HealthTracker;
 use brainrouter::inference_state::InferenceTracker;
-use brainrouter::project_pins::{ProjectPin, ProjectPinStore};
 use brainrouter::provider::openai::OpenAiProvider;
+use brainrouter::roles::{Role, RoleCardStore};
 use brainrouter::routing_events::RoutingEvents;
 use brainrouter::router::{Router, RouterArgs};
-use brainrouter::routing_profile::ModelChoice;
 use brainrouter::types::{ChatCompletionRequest, ChatMessage};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -117,8 +127,14 @@ fn make_router(
         health.report_failure("manifest");
     }
 
-    Router::new(RouterArgs {
+    let slot = Arc::new(brainrouter::decision::DecisionSlot::new(
+        brainrouter::config::DecisionModelConfig::default(), // heuristic, enabled=false ⇒ parity anchor
         classifier,
+        None,
+    ));
+    Router::new(RouterArgs {
+        slot,
+        cards: Arc::new(RoleCardStore::memory(Default::default())),
         manifest,
         manifest_enabled: true,
         llama_swap,
@@ -132,9 +148,20 @@ fn make_router(
         nudge_budgets: NudgeBudgets::default(),
         nudge_enabled: Arc::new(AtomicBool::new(false)),
         nudge_tier: Arc::new(AtomicU8::new(0)),
+        nudge_model_key: None,
         prompt_rewrite: Arc::new(AtomicBool::new(true)),
+        llama_swap_config_path: None,
         serving_identities: None,
     })
+}
+
+/// Cards store seeded like the v1 pin store: project-scope assignments.
+fn cards_with(entries: &[(&str, Role, &str)]) -> Arc<RoleCardStore> {
+    let store = Arc::new(RoleCardStore::memory(Default::default()));
+    for (scope, role, assignment) in entries {
+        store.set_assignment(scope, *role, assignment).unwrap();
+    }
+    store
 }
 
 fn chat_request(model: &str) -> ChatCompletionRequest {
@@ -316,7 +343,7 @@ async fn auto_local_still_falls_back_on_failure() {
     drop(result);
 }
 
-// ── Per-project model pin precedence (Phase 2, R10) ──────────────────────────
+// ── Per-project card precedence (L3, was Phase-2 pins) ──────────────────────────
 
 #[tokio::test]
 async fn auto_request_honors_project_main_pin() {
@@ -324,13 +351,8 @@ async fn auto_request_honors_project_main_pin() {
     // main model wins (over the global default / auto).
     let (url, captured) = spawn_mock_llama_swap().await;
     let repo = temp_git_repo();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
-    )
-    .unwrap();
-    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+    let cards = cards_with(&[(repo.to_str().unwrap(), Role::Main, PINNED_MAIN_KEY)]);
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_cards(cards);
 
     let (resp, info) = router
         .route_tagged(chat_request("auto"), None, repo.to_string_lossy().into_owned(), String::new())
@@ -350,13 +372,8 @@ async fn explicit_model_ignores_project_main_pin() {
     // pinned cwd — the pin is never consulted for a non-default selector.
     let (url, captured) = spawn_mock_llama_swap().await;
     let repo = temp_git_repo();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
-    )
-    .unwrap();
-    let router = make_router(&url, None, vec![]).with_project_pins(Arc::new(pins));
+    let cards = cards_with(&[(repo.to_str().unwrap(), Role::Main, PINNED_MAIN_KEY)]);
+    let router = make_router(&url, None, vec![]).with_cards(cards);
 
     let (resp, info) = router
         .route_tagged(chat_request("brainrouter/client-chosen-model"), None, repo.to_string_lossy().into_owned(), String::new())
@@ -376,13 +393,8 @@ async fn subs_request_honors_project_subagent_pin() {
     // subagent pin instead of the global subs pool.
     let (url, captured) = spawn_mock_llama_swap().await;
     let repo = temp_git_repo();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { subagent: Some(PINNED_SUBS_KEY.into()), ..Default::default() },
-    )
-    .unwrap();
-    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+    let cards = cards_with(&[(repo.to_str().unwrap(), Role::Subagent, PINNED_SUBS_KEY)]);
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_cards(cards);
 
     let (resp, info) = router
         .route_tagged(chat_request("subs"), None, repo.to_string_lossy().into_owned(), String::new())
@@ -402,13 +414,12 @@ async fn subs_from_pinned_repo_without_subagent_pin_inherits_global() {
     // request from that repo still uses the global subs pool (B2 no-regression).
     let (url, captured) = spawn_mock_llama_swap().await;
     let repo = temp_git_repo();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { main: Some(ModelChoice::Local { model: Some(PINNED_MAIN_KEY.into()) }), ..Default::default() },
-    )
-    .unwrap();
-    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_project_pins(Arc::new(pins));
+    // v1 "main pin, subagent unpinned ⇒ inherits global" — in L3 the
+    // subagent card is unset at project scope and falls through to the
+    // default `auto` card ⇒ slot, seeded from subs_model (same observable
+    // outcome).
+    let cards = cards_with(&[(repo.to_str().unwrap(), Role::Main, PINNED_MAIN_KEY)]);
+    let router = make_router(&url, Some(SUBS_KEY), vec![]).with_cards(cards);
 
     let (resp, info) = router
         .route_tagged(chat_request("subs"), None, repo.to_string_lossy().into_owned(), String::new())

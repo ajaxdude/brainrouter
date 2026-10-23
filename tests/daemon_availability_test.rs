@@ -219,6 +219,46 @@ impl TestDaemon {
         Self::start_with_review_and_lab(directory, database, upstream, false, json!({}), Some(lab))
     }
 
+    /// Boot a daemon over a PREVIOUSLY-WRITTEN config file (L3 restart
+    /// keeper: the migrated YAML must not re-trigger the migration).
+    fn start_with_config(directory: &Path, database: &Path, upstream: &str, config: &[u8]) -> Self {
+        let path = directory.join("config.yaml");
+        fs::write(&path, config).unwrap();
+        let socket = directory.join("d.sock");
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let log = directory.join("daemon.log");
+        let log_file = fs::File::create(&log).unwrap();
+        let empty_bin = directory.join("empty-bin");
+        fs::create_dir_all(&empty_bin).unwrap();
+        drop(reservation);
+        let child = Command::new(env!("CARGO_BIN_EXE_brainrouter"))
+            .args(["serve", "--config"])
+            .arg(&path)
+            .args(["--tcp-addr", &address.to_string(), "--socket"])
+            .arg(&socket)
+            .current_dir(directory)
+            .env_clear()
+            .env("HOME", directory)
+            .env("XDG_CONFIG_HOME", directory.join("config"))
+            .env("XDG_DATA_HOME", directory.join("data"))
+            .env("PATH", empty_bin)
+            .env("RUST_LOG", "warn")
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            url: format!("http://{address}"),
+            socket,
+            log,
+            client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(),
+        }
+    }
+
     fn start_with_review_and_lab(
         directory: &Path,
         database: &Path,
@@ -1136,7 +1176,11 @@ async fn profile_and_model_page_remain_available_without_benchmark_storage() {
     let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
     daemon.wait_until_ready().await;
 
-    for path in ["/dashboard", "/models", "/api/routing-profile"] {
+    // v2 L3 contract-migration retarget: /api/routing-profile was removed
+    // with the role cards (docs/design/v2-streamlining.L3.md). The promise
+    // — the role/page data endpoints answer while benchmark storage is
+    // corrupt — moves to GET /api/roles.
+    for path in ["/dashboard", "/models", "/api/roles"] {
         let response = daemon
             .client
             .get(format!("{}{path}", daemon.url))
@@ -1240,14 +1284,36 @@ async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
     let upstream = MockUpstream::start().await;
     let mut daemon = TestDaemon::start_with_cloud(&directory.0, &database, &upstream.url, true);
     daemon.wait_until_ready().await;
-    let mut profile = json!({
-        "preset": "local_main_cloud_review",
-        "main": {"backend": "local", "model": "main-local-test"},
-        "reviewer": {"backend": "cloud", "model": "review-cloud-test"},
-        "subagent_model": "subagent-local-test",
-    });
-    let saved = daemon.post_json("/api/routing-profile", &profile).await;
-    assert_eq!(saved["profile"], profile);
+    // v2 L3 contract-migration retarget: the per-role independence promise
+    // of /api/routing-profile (preset round-trip) is carried by the role
+    // cards (`POST /api/roles/set` echo = the full store). v1 profile
+    // selectors map through the L3 migration table: Local{Some} ->
+    // <bare-key>, Cloud{Some} -> cloud/<id>, subagent_model -> subagent
+    // assignment.
+    daemon
+        .post_json("/api/roles/set", &json!({"role": "main", "assignment": "main-local-test"}))
+        .await;
+    daemon
+        .post_json(
+            "/api/roles/set",
+            &json!({"role": "review", "assignment": "cloud/review-cloud-test"}),
+        )
+        .await;
+    let saved = daemon
+        .post_json(
+            "/api/roles/set",
+            &json!({"role": "subagent", "assignment": "subagent-local-test"}),
+        )
+        .await;
+    assert_eq!(
+        saved["assignments"],
+        json!([
+            {"scope": "global", "role": "main", "assignment": "main-local-test"},
+            {"scope": "global", "role": "review", "assignment": "cloud/review-cloud-test"},
+            {"scope": "global", "role": "subagent", "assignment": "subagent-local-test"},
+        ]),
+        "role assignments must be independent per role and echo the full card store"
+    );
     daemon.synthetic_chat("auto").await;
     daemon.synthetic_anthropic_chat("auto").await;
     daemon.synthetic_chat("subs").await;
@@ -1257,11 +1323,24 @@ async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
         .assert_completed_observations("main-local-test", 2)
         .await;
 
-    profile["preset"] = json!("cloud_main_local_review");
-    profile["main"] = json!({"backend": "cloud", "model": "main-cloud-test"});
-    profile["reviewer"] = json!({"backend": "local", "model": "review-local-test"});
-    let saved = daemon.post_json("/api/routing-profile", &profile).await;
-    assert_eq!(saved["profile"], profile);
+    daemon
+        .post_json(
+            "/api/roles/set",
+            &json!({"role": "main", "assignment": "cloud/main-cloud-test"}),
+        )
+        .await;
+    let saved = daemon
+        .post_json("/api/roles/set", &json!({"role": "review", "assignment": "review-local-test"}))
+        .await;
+    assert_eq!(
+        saved["assignments"],
+        json!([
+            {"scope": "global", "role": "main", "assignment": "cloud/main-cloud-test"},
+            {"scope": "global", "role": "review", "assignment": "review-local-test"},
+            {"scope": "global", "role": "subagent", "assignment": "subagent-local-test"},
+        ]),
+        "flipping main+review must leave the subagent card untouched (role independence)"
+    );
     daemon.synthetic_chat("auto").await;
     daemon.synthetic_review(&directory.0).await;
     {
@@ -1291,11 +1370,30 @@ async fn hybrid_roles_are_independent_and_persist_without_benchmark_storage() {
     daemon.assert_explorer_unavailable().await;
     drop(daemon);
 
-    let mut restarted = TestDaemon::start_with_cloud(&directory.0, &database, &upstream.url, true);
+    // L3 restart keeper: boot from the daemon's MIGRATED config file.
+    // (v1's restart path re-wrote v1 YAML harmlessly because the profile
+    // lived in a sidecar state file; the L3 migration is a one-way,
+    // one-time door — re-presenting v1 YAML would deliberately re-trigger
+    // it. Persistence promise: the CARD store survives the storage-less
+    // restart, so the migrated YAML is what must boot.)
+    let migrated = fs::read(directory.0.join("config.yaml")).unwrap();
+    let mut restarted =
+        TestDaemon::start_with_config(&directory.0, &database, &upstream.url, &migrated);
     restarted.wait_until_ready().await;
-    let restored = restarted.get_json("/api/routing-profile").await;
-    assert_eq!(restored["profile"], profile);
-    assert_eq!(restored["cloud_enabled"], true);
+    let restored = restarted.get_json("/api/roles").await;
+    assert_eq!(
+        restored["assignments"],
+        json!([
+            {"scope": "global", "role": "main", "assignment": "cloud/main-cloud-test"},
+            {"scope": "global", "role": "review", "assignment": "review-local-test"},
+            {"scope": "global", "role": "subagent", "assignment": "subagent-local-test"},
+        ]),
+        "cards must persist across restart on corrupt benchmark storage"
+    );
+    // v1's GET /api/routing-profile response carried `cloud_enabled`; in the
+    // v2 schema that visibility lives on the model catalog.
+    let catalog = restarted.get_json("/api/routing-models").await;
+    assert_eq!(catalog["cloud_enabled"], true);
     restarted.synthetic_chat("auto").await;
     restarted.synthetic_anthropic_chat("auto").await;
     assert_eq!(
@@ -1315,7 +1413,7 @@ async fn synthetic_example_can_be_prepared_validated_and_imported_without_infere
     let upstream = MockUpstream::start().await;
     let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
     daemon.wait_until_ready().await;
-    let profile_before = daemon.get_json("/api/routing-profile").await;
+    let roles_before = daemon.get_json("/api/roles").await;
     let template = daemon
         .get_json("/api/benchmarks/examples/template.json")
         .await;
@@ -1372,8 +1470,9 @@ async fn synthetic_example_can_be_prepared_validated_and_imported_without_infere
         .await
         .unwrap();
     assert_eq!(reference.status(), 200);
-    let profile_after = daemon.get_json("/api/routing-profile").await;
-    assert_eq!(profile_after["profile"], profile_before["profile"]);
+    let roles_after = daemon.get_json("/api/roles").await;
+    assert_eq!(roles_after["assignments"], roles_before["assignments"]);
+    assert_eq!(roles_after["policy"], roles_before["policy"]);
     assert!(upstream.requests.lock().unwrap().is_empty());
     daemon.assert_core_routing(&upstream).await;
 }
@@ -1395,25 +1494,42 @@ async fn legacy_auto_yaml_survives_startup_but_new_auto_model_writes_are_rejecte
     );
     daemon.wait_until_ready().await;
     daemon.assert_core_routing(&upstream).await;
-    let before = daemon.get_json("/api/routing-profile").await;
-    assert_eq!(before["profile"]["reviewer"], json!({"backend":"auto"}));
+    // v2 L3 retarget of the L1 keeper (spec: "review.forced_mode/forced_model
+    // YAML keys are consumed"; "auto ⇒ Auto (leftover model ignored on read)"):
+    // the legacy auto+model review block boots, migrates to an `auto` review
+    // card, and the reduced schema REJECTS any write that re-attaches a model
+    // to auto (the forced_* keys no longer exist).
+    let cards = daemon.get_json("/api/roles").await;
+    let review_card = cards["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["role"] == "review" && c["scope"] == "global")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(review_card["assignment"], json!("auto"));
     let review = daemon.get_json("/api/review-config").await;
-    assert_eq!(review["forced_mode"], "auto");
-    assert!(review["forced_model"].is_null());
+    assert_eq!(review["max_iterations"], 5);
+    assert!(review.get("forced_mode").is_none(), "{review}");
+    assert!(review.get("forced_model").is_none(), "{review}");
     let config_path = directory.0.join("config.yaml");
-    let original_yaml = fs::read(&config_path).unwrap();
-    let mut invalid_profile = before["profile"].clone();
-    invalid_profile["reviewer"] = json!({"backend":"auto","model":"new-model"});
-    for (path, body) in [
+    let migrated_yaml = fs::read_to_string(&config_path).unwrap();
+    assert!(!migrated_yaml.contains("forced_model"), "{migrated_yaml}");
+    let backup = fs::read(format!("{}.bak", config_path.display())).unwrap();
+    for (path, body, want) in [
+        // The legacy write shape (auto + model) is inexpressible in L3: the
+        // reduced schema rejects the key.
         (
             "/api/review-config",
             serde_json::to_vec(&legacy_review).unwrap(),
+            "unknown field",
         ),
         (
-            "/api/routing-profile",
-            serde_json::to_vec(&invalid_profile).unwrap(),
+            "/api/roles/set",
+            serde_json::to_vec(&json!({"role":"review","assignment":""})).unwrap(),
+            "assignment",
         ),
-        ("/api/config", original_yaml.clone()),
+        ("/api/config", backup.clone(), "unknown field"),
     ] {
         let response = daemon
             .client
@@ -1426,26 +1542,20 @@ async fn legacy_auto_yaml_survives_startup_but_new_auto_model_writes_are_rejecte
         assert_eq!(response.status(), 400, "{path}");
         let error = response.json::<Value>().await.unwrap();
         assert!(
-            error["error"]
-                .as_str()
-                .unwrap()
-                .contains("auto cannot specify a model"),
-            "{error}"
+            error["error"].as_str().unwrap().contains(want),
+            "{path}: {error}"
         );
     }
-    assert_eq!(
-        daemon.get_json("/api/routing-profile").await["profile"],
-        before["profile"]
-    );
-    assert_eq!(fs::read(&config_path).unwrap(), original_yaml);
+    assert_eq!(daemon.get_json("/api/roles").await, cards);
     let log = fs::read_to_string(&daemon.log).unwrap();
+    // Three migration actions (cards, decision slot, snapshot) — all for
+    // the one v2.0-p3 phase.
     assert_eq!(
-        log.matches("Ignoring legacy forced_model").count(),
-        1,
+        log.matches("Migration v2.0-p3").count(),
+        3,
         "{log}"
     );
-    assert!(log.contains(config_path.to_str().unwrap()), "{log}");
-    assert!(log.contains("remove forced_model"), "{log}");
+    assert!(log.contains("migrated v1"), "{log}");
 }
 
 #[tokio::test]
@@ -1461,33 +1571,47 @@ async fn legacy_auto_saved_state_survives_startup_and_is_migrated_once() {
     let mut daemon = TestDaemon::start(&directory.0, &database, &upstream.url);
     daemon.wait_until_ready().await;
     daemon.assert_core_routing(&upstream).await;
-    let profile = daemon.get_json("/api/routing-profile").await["profile"].clone();
-    assert_eq!(profile["reviewer"], json!({"backend":"auto"}));
+    // v2 L3 retarget of the L1 keeper ("legacy saved-state files survive
+    // boot; migration runs ONCE"): the legacy `auto` + leftover model
+    // migrates to an `auto` review card; the legacy state file is left
+    // untouched; cards persist in the L3 store, not the v1 one.
+    let cards = daemon.get_json("/api/roles").await;
+    let review_card = cards["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["role"] == "review" && c["scope"] == "global")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(review_card["assignment"], json!("auto"));
     assert_eq!(
         daemon.get_json("/api/review-config").await["max_iterations"],
         5
     );
-    let state_path = config_directory.join("routing_state.json");
-    let persisted: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
-    assert_eq!(persisted, profile);
+    let role_cards_path = directory.0.join(".local/state/brainrouter/role_cards.json");
+    let persisted: Value = serde_json::from_slice(&fs::read(&role_cards_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["role"] == "review")
+            .unwrap()["assignment"],
+        "auto"
+    );
     assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy);
     let log = fs::read_to_string(&daemon.log).unwrap();
-    assert_eq!(
-        log.matches("Ignoring legacy forced_model").count(),
-        1,
-        "{log}"
-    );
-    assert!(log.contains(legacy_path.to_str().unwrap()), "{log}");
+    assert_eq!(log.matches("Migration v2.0-p3").count(), 3, "{log}");
     drop(daemon);
     fs::write(&legacy_path, "invalid legacy state; already migrated").unwrap();
-    let mut restarted = TestDaemon::start(&directory.0, &database, &upstream.url);
+    // Keep the MIGRATED config (v1's TestDaemon::start rewrites the file
+    // from scratch): a v2.0-p3-era YAML must not re-migrate.
+    let migrated = fs::read(directory.0.join("config.yaml")).unwrap();
+    let mut restarted = TestDaemon::start_with_config(&directory.0, &database, &upstream.url, &migrated);
     restarted.wait_until_ready().await;
-    assert_eq!(
-        restarted.get_json("/api/routing-profile").await["profile"],
-        profile
-    );
+    assert_eq!(restarted.get_json("/api/roles").await, cards);
     upstream.requests.lock().unwrap().clear();
     restarted.assert_core_routing(&upstream).await;
     let log = fs::read_to_string(&restarted.log).unwrap();
-    assert!(!log.contains("Ignoring legacy forced_model"), "{log}");
+    assert!(!log.contains("Migration v2.0-p3"), "{log}");
 }

@@ -1,16 +1,35 @@
+//! v1 selector/reviewer test floor, v2 L3-retargeted.
+//!
+//! Every test keeps its v1 name and observable semantics; the machinery it
+//! drove (ProfileStore/RoutingProfile/pins/presets/forced_*) was removed by
+//! L3 ("Removals: routing_profile.rs + presets + CLI `routing-profile` +
+//! dashboard role-chooser/preset widgets; project_pins store (migrated);
+//! review.forced_mode/forced_model YAML keys (migrated)" — docs/design/
+//! v2-streamlining.L3.md), so each test now drives the RoleCardStore
+//! equivalents:
+//!
+//! - global profile ⇒ global-scope cards; `update_main` ⇒ set_assignment(global, main)
+//! - project pins ⇒ project-scope cards ("per-project pins cards (project scope)")
+//! - reviewer pin snapshot ⇒ review-card selector snapshotted at session start
+//!   ("a session snapshots its card record at start, never re-resolves")
+//! - presets ⇒ explicit per-card assignment rows ("the card assignment
+//!   compiles through the SAME selector path")
+//! - CLI `routing-profile` ⇒ CLI `roles set` ("mutations via daemon HTTP")
+//! - legacy review-state migration ⇒ the v1 → card migration table
+//!
 //! Synthetic providers only: no model processes, credentials or external traffic.
 
 use brainrouter::{
     classifier::Classifier,
-    config::{self, NudgeBudgets, ReviewConfig},
+    config::{self, DecisionKind, DecisionModelConfig, NudgeBudgets, ReviewConfig},
     health::HealthTracker,
     inference_state::InferenceTracker,
-    project_pins::{ProjectPin, ProjectPinStore},
     provider::{openai::OpenAiProvider, ProviderResponse},
     review::ReviewService,
+    migration::read_v1_state,
+    roles::{migrate_v1, LegacyPreset, LegacyPin, LegacyRoutingProfile, ModelChoice, Role, RoleCardStore, GLOBAL_SCOPE},
     router::{Router, RouterArgs},
     routing_events::RoutingEvents,
-    routing_profile::{ModelChoice, ProfileStore, RoutingPreset, RoutingProfile},
     session::{ReviewStatus, SessionManager},
     types::ChatCompletionRequest,
 };
@@ -36,7 +55,7 @@ struct Directory(PathBuf);
 
 impl Directory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("br-profile-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("br-cards-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -84,10 +103,13 @@ impl SyntheticProviders {
                                     let bytes = request.collect().await.unwrap().to_bytes();
                                     let body = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
                                     captured.lock().unwrap().push(Seen { path: path.clone(), body: body.clone(), authorization });
-                                    let (status, text) = if path == "/api/routing-profile" {
-                                        (200, json!({"profile": if body.is_null() { serde_json::to_value(profile()).unwrap() } else { body.clone() }}).to_string())
-                                    } else if path == "/api/review-config" {
+                                    let (status, text) = if path == "/api/review-config" {
                                         (200, serde_json::to_string(&ReviewConfig::default()).unwrap())
+                                    } else if path.starts_with("/api/roles")
+                                        || path.starts_with("/api/policy")
+                                        || path.starts_with("/api/credentials")
+                                    {
+                                        (200, json!({"ok": true}).to_string())
                                     } else if path.starts_with("/broken") {
                                         (503, "{}".into())
                                     } else if path.ends_with("/models") {
@@ -122,8 +144,8 @@ impl SyntheticProviders {
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.path.ends_with("/chat/completions"))
-            .map(|r| (r.path.clone(), r.body["model"].as_str().unwrap().into()))
+            .filter(|r| r.path.contains("/v1/chat/completions"))
+            .map(|r| (r.path.clone(), r.body["model"].as_str().unwrap_or_default().to_string()))
             .collect()
     }
 }
@@ -135,34 +157,46 @@ impl Drop for SyntheticProviders {
 }
 
 fn local(id: &str) -> ModelChoice {
-    ModelChoice::Local {
-        model: Some(id.into()),
-    }
+    ModelChoice::Local { model: Some(id.into()) }
 }
 fn cloud(id: &str) -> ModelChoice {
-    ModelChoice::Cloud {
-        model: Some(id.into()),
-    }
+    ModelChoice::Cloud { model: Some(id.into()) }
 }
 
-fn profile() -> RoutingProfile {
-    RoutingProfile {
-        preset: RoutingPreset::Custom,
-        main: local("main-local"),
-        reviewer: cloud("vendor/reviewer-2026"),
-        subagent_model: Some("subagent-pool".into()),
-    }
+/// The v1 `profile()` floor as global-scope cards: main = local main-local,
+/// reviewer = cloud vendor/reviewer-2026, subagent pool = subagent-pool.
+fn cards() -> Arc<RoleCardStore> {
+    let store = Arc::new(RoleCardStore::memory(Default::default()));
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "main-local").unwrap();
+    store.set_assignment(GLOBAL_SCOPE, Role::Review, "cloud/vendor/reviewer-2026").unwrap();
+    store.set_assignment(GLOBAL_SCOPE, Role::Subagent, "subagent-pool").unwrap();
+    store
 }
 
 fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> RouterArgs {
+    let classifier = Arc::new(Classifier::new(
+        format!("{}/classifier", upstream.url),
+        "default-local".into(),
+        Arc::new(AtomicBool::new(classify)),
+        Arc::new(AtomicBool::new(false)),
+        None,
+    ));
+    let slot = Arc::new(brainrouter::decision::DecisionSlot::new(
+        DecisionModelConfig {
+            enabled: classify,
+            kind: DecisionKind::OpenaiCompatible,
+            base_url: Some(format!("{}/classifier", upstream.url)),
+            model: Some("bonsai".into()),
+            prompt_profile: Some("bonsai".into()),
+            timeout_ms: Some(5000),
+            ..Default::default()
+        },
+        classifier,
+        None,
+    ));
     RouterArgs {
-        classifier: Arc::new(Classifier::new(
-            format!("{}/classifier", upstream.url),
-            "default-local".into(),
-            Arc::new(AtomicBool::new(classify)),
-            Arc::new(AtomicBool::new(false)),
-            None,
-        )),
+        slot,
+        cards: Arc::new(RoleCardStore::memory(Default::default())),
         manifest: Arc::new(OpenAiProvider::new(
             "manifest".into(),
             format!("{}/cloud/v1", upstream.url),
@@ -184,18 +218,20 @@ fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> 
         nudge_budgets: NudgeBudgets::default(),
         nudge_enabled: Arc::new(AtomicBool::new(false)),
         nudge_tier: Arc::new(AtomicU8::new(0)),
+        nudge_model_key: None,
         prompt_rewrite: Arc::new(AtomicBool::new(false)),
+        llama_swap_config_path: None,
         serving_identities: None,
     }
 }
 
 fn router(
     upstream: &SyntheticProviders,
-    store: Arc<ProfileStore>,
+    store: Arc<RoleCardStore>,
     enabled: bool,
     classify: bool,
 ) -> Arc<Router> {
-    Arc::new(Router::new(router_args(upstream, enabled, classify)).with_profiles(store))
+    Arc::new(Router::new(router_args(upstream, enabled, classify)).with_cards(store))
 }
 
 fn request(model: &str) -> ChatCompletionRequest {
@@ -215,7 +251,7 @@ async fn drain(response: ProviderResponse) {
 #[tokio::test]
 async fn role_choices_and_client_models_are_independent() {
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let store = cards();
     let router = router(&upstream, store.clone(), true, false);
     for (alias, expected) in [
         ("auto", "main-local"),
@@ -248,7 +284,7 @@ async fn role_choices_and_client_models_are_independent() {
             drain(response).await;
         }
     }
-    store.update_main(cloud("author-cloud")).unwrap();
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "cloud/author-cloud").unwrap();
     for (choice, expected_provider, expected_model) in [
         (local("review-local"), "llama-swap", "review-local"),
         (cloud("review-cloud"), "manifest", "review-cloud"),
@@ -263,33 +299,24 @@ async fn role_choices_and_client_models_are_independent() {
         drain(response).await;
     }
     assert_eq!(upstream.calls().last().unwrap().1, "default-local");
-    assert_eq!(
-        store.profile().subagent_model.as_deref(),
-        Some("subagent-pool")
-    );
+    assert_eq!(store.assignment(Role::Subagent, None), "subagent-pool");
 }
 
 #[tokio::test]
 async fn project_main_pin_overrides_global_and_unpinned_follows_global() {
-    // R10 main precedence with a real global profile: a pinned project overrides
-    // the global main; an unpinned cwd follows the live global profile.
+    // Main precedence: a project-scope card overrides the global card; an
+    // unpinned cwd follows the live global card.
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap()); // global main = main-local
-    let repo = std::env::temp_dir().join(format!("br-profile-pin-{}", uuid::Uuid::new_v4()));
+    let store = cards(); // global main = main-local
+    let repo = std::env::temp_dir().join(format!("br-cards-pin-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(repo.join(".git")).unwrap();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { main: Some(local("project-pinned-main")), ..Default::default() },
-    )
-    .unwrap();
+    store
+        .set_assignment(repo.to_str().unwrap(), Role::Main, "project-pinned-main")
+        .unwrap();
     let router = Arc::new(
-        Router::new(router_args(&upstream, true, false))
-            .with_profiles(store)
-            .with_project_pins(Arc::new(pins)),
+        Router::new(router_args(&upstream, true, false)).with_cards(store),
     );
 
-    // auto from the pinned repo → the project's main pin (overrides the global).
     let (response, info) = router
         .route_tagged(request("auto"), None, repo.to_string_lossy().into_owned(), String::new())
         .await
@@ -297,7 +324,6 @@ async fn project_main_pin_overrides_global_and_unpinned_follows_global() {
     assert_eq!(info.model_key, "project-pinned-main");
     drain(response).await;
 
-    // auto from an unpinned cwd → the live global profile main.
     let (response, info) = router
         .route_tagged(request("auto"), None, String::new(), String::new())
         .await
@@ -310,36 +336,31 @@ async fn project_main_pin_overrides_global_and_unpinned_follows_global() {
 
 #[tokio::test]
 async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
-    // R10 reviewer: a project reviewer pin becomes the configured choice in the
-    // fresh-review snapshot (then admission still governs); an unpinned cwd uses
-    // the global reviewer; a continuation reuses the stored (pinned) snapshot
-    // even after the global reviewer changes.
+    // Reviewer precedence: the project-scoped review card is the configured
+    // choice in the fresh-review snapshot (admission still governs); an
+    // unpinned cwd uses the global review card; a continuation reuses the
+    // stored snapshot even after the global card changes.
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap()); // global reviewer = cloud vendor/reviewer-2026
-    let repo = std::env::temp_dir().join(format!("br-review-pin-{}", uuid::Uuid::new_v4()));
+    let store = cards(); // global review card = cloud/vendor/reviewer-2026
+    let repo = std::env::temp_dir().join(format!("br-cards-review-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(repo.join(".git")).unwrap();
-    let pins = ProjectPinStore::memory();
-    pins.set(
-        repo.to_str().unwrap(),
-        ProjectPin { reviewer: Some(cloud("project-reviewer")), ..Default::default() },
-    )
-    .unwrap();
+    store
+        .set_assignment(repo.to_str().unwrap(), Role::Review, "cloud/project-reviewer")
+        .unwrap();
     let router = Arc::new(
-        Router::new(router_args(&upstream, true, false))
-            .with_profiles(store.clone())
-            .with_project_pins(Arc::new(pins)),
+        Router::new(router_args(&upstream, true, false)).with_cards(store.clone()),
     );
     let sessions = Arc::new(SessionManager::new());
     let service = Arc::new(ReviewService::new(
         router,
         sessions.clone(),
+        store.clone(),
         ReviewConfig::default(),
         Default::default(),
         true,
         "default-local".to_string(),
     ));
 
-    // Fresh review from the pinned repo → the reviewer uses the PROJECT pin.
     let pinned = service
         .start_review("t".into(), "pinned review".into(), None, vec![], repo.to_str().unwrap().into())
         .await
@@ -349,12 +370,11 @@ async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
         upstream.calls().last().unwrap(),
         &("/cloud/v1/chat/completions".into(), "project-reviewer".into())
     );
-    // The stored snapshot carries the pinned reviewer, so continuations keep it.
-    let snapshot = sessions.get_session(&pinned.session_id).unwrap().review_config.unwrap();
-    assert_eq!(snapshot.forced_mode, "cloud");
-    assert_eq!(snapshot.forced_model.as_deref(), Some("project-reviewer"));
+    // The stored snapshot carries the pinned card selector, so continuations
+    // keep it ("a session snapshots its card record at start").
+    let snapshot = sessions.get_session(&pinned.session_id).unwrap().review_selector;
+    assert_eq!(snapshot.as_deref(), Some("cloud/project-reviewer"));
 
-    // Fresh review from an UNPINNED cwd → the global reviewer.
     let global = service
         .start_review("t2".into(), "global review".into(), None, vec![], String::new())
         .await
@@ -365,15 +385,9 @@ async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
         &("/cloud/v1/chat/completions".into(), "vendor/reviewer-2026".into())
     );
 
-    // Continuation of the pinned review keeps its snapshot even after the global
-    // reviewer changes underneath it.
+    // Continuation keeps its snapshot even after the global card changes.
     store
-        .update_review(ReviewConfig {
-            max_iterations: 1,
-            forced_mode: "cloud".into(),
-            forced_model: Some("changed-global".into()),
-            ..ReviewConfig::default()
-        })
+        .set_assignment(GLOBAL_SCOPE, Role::Review, "cloud/changed-global")
         .unwrap();
     service.continue_review(&pinned.session_id, 1).await.unwrap();
     assert_eq!(
@@ -388,12 +402,13 @@ async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
 async fn cloud_ids_survive_review_and_continuation_snapshots() {
     let directory = Directory::new();
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let store = cards();
     let router = router(&upstream, store.clone(), true, false);
     let sessions = Arc::new(SessionManager::new());
     let service = Arc::new(ReviewService::new(
         router,
         sessions.clone(),
+        store.clone(),
         ReviewConfig::default(),
         Default::default(),
         false,
@@ -406,13 +421,10 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
         vec![],
         directory.0.to_str().unwrap().into(),
     );
+    // v1 forced_mode=local + forced_model=new-reviewer ⇒ the migration-table
+    // spelling is a bare-key card (Local{Some(id)} → `<bare-key>`).
     store
-        .update_review(ReviewConfig {
-            max_iterations: 1,
-            forced_mode: "local".into(),
-            forced_model: Some("new-reviewer".into()),
-            ..ReviewConfig::default()
-        })
+        .set_assignment(GLOBAL_SCOPE, Role::Review, "new-reviewer")
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while sessions.get_session(&id).unwrap().status != ReviewStatus::Approved {
@@ -437,8 +449,8 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
     );
     let session = sessions.get_session(&id).unwrap();
     assert_eq!(
-        session.review_config.unwrap().forced_model.as_deref(),
-        Some("vendor/reviewer-2026")
+        session.review_selector.as_deref(),
+        Some("cloud/vendor/reviewer-2026")
     );
     assert!(session
         .review_model
@@ -467,8 +479,8 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
 #[tokio::test]
 async fn auto_reviewer_ignores_cloud_main_but_still_classifies() {
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
-    store.update_main(local("explicit-main")).unwrap();
+    let store = cards();
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "local/explicit-main").unwrap();
     let router = router(&upstream, store, true, true);
     let (response, info) = router
         .route_with_choice(
@@ -490,12 +502,12 @@ async fn auto_reviewer_ignores_cloud_main_but_still_classifies() {
 
 #[tokio::test]
 async fn strict_reviewer_cloud_route_errors_instead_of_local_fallback() {
-    // H3: reviewer calls pass allow_local_fallback=false. With Manifest
-    // disabled, a cloud-admitted reviewer must ERROR (so the loop escalates)
-    // rather than silently running on a local model — which would use the
-    // wrong rubric and could load an unadmitted model / OOM.
+    // H3 (preserved per-selector strictness, L3): the review loop passes
+    // allow_local_fallback=false. With Manifest disabled, a cloud-admitted
+    // reviewer must ERROR (so the loop escalates) rather than silently run
+    // on a local model.
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let store = cards();
     let disabled = router(&upstream, store, false, false);
     let result = disabled
         .route_with_choice(
@@ -517,7 +529,7 @@ async fn strict_reviewer_cloud_route_errors_instead_of_local_fallback() {
 #[tokio::test]
 async fn disabled_cloud_and_cloud_failure_expose_requested_and_actual() {
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let store = cards();
     let disabled = router(&upstream, store.clone(), false, false);
     let (response, info) = disabled
         .route_with_choice(
@@ -588,7 +600,7 @@ async fn disabled_cloud_and_cloud_failure_expose_requested_and_actual() {
 #[tokio::test]
 async fn discovery_is_authenticated_metadata_only_and_failure_is_explicit() {
     let upstream = SyntheticProviders::start().await;
-    let store = Arc::new(ProfileStore::memory(profile(), 1).unwrap());
+    let store = cards();
     let router = router(&upstream, store, true, false);
     let catalog = router.model_catalog().await;
     assert_eq!(catalog["local"]["models"], json!(["model-a", "model-b"]));
@@ -615,48 +627,20 @@ async fn discovery_is_authenticated_metadata_only_and_failure_is_explicit() {
 
 #[tokio::test]
 async fn presets_route_every_role_without_changing_the_pool() {
+    // v1 presets are removed; the SAME routing table is exercised by setting
+    // the card assignments each preset expanded to.
     let upstream = SyntheticProviders::start().await;
-    for (preset, main_provider, main_model, reviewer_provider, reviewer_model) in [
-        (
-            RoutingPreset::Auto,
-            "llama-swap",
-            "default-local",
-            "llama-swap",
-            "default-local",
-        ),
-        (RoutingPreset::Cloud, "manifest", "auto", "manifest", "auto"),
-        (
-            RoutingPreset::LocalMainSub,
-            "llama-swap",
-            "default-local",
-            "llama-swap",
-            "default-local",
-        ),
-        (
-            RoutingPreset::LocalCustom,
-            "llama-swap",
-            "main-local",
-            "llama-swap",
-            "default-local",
-        ),
-        (
-            RoutingPreset::CloudMainLocalReview,
-            "manifest",
-            "auto",
-            "llama-swap",
-            "default-local",
-        ),
-        (
-            RoutingPreset::LocalMainCloudReview,
-            "llama-swap",
-            "default-local",
-            "manifest",
-            "auto",
-        ),
+    for (label, main, reviewer, main_provider, main_model, reviewer_provider, reviewer_model) in [
+        ("auto", "auto", "auto", "llama-swap", "default-local", "llama-swap", "default-local"),
+        ("cloud", "cloud", "cloud", "manifest", "auto", "manifest", "auto"),
+        ("local-main-sub", "local", "local", "llama-swap", "default-local", "llama-swap", "default-local"),
+        ("local-custom", "main-local", "local", "llama-swap", "main-local", "llama-swap", "default-local"),
+        ("cloud-main-local-review", "cloud", "local", "manifest", "auto", "llama-swap", "default-local"),
+        ("local-main-cloud-review", "local", "cloud/vendor/reviewer-2026", "llama-swap", "default-local", "manifest", "vendor/reviewer-2026"),
     ] {
-        let mut profile = profile();
-        profile.apply_preset(preset).unwrap();
-        let store = Arc::new(ProfileStore::memory(profile.clone(), 1).unwrap());
+        let store = cards();
+        store.set_assignment(GLOBAL_SCOPE, Role::Main, main).unwrap();
+        store.set_assignment(GLOBAL_SCOPE, Role::Review, reviewer).unwrap();
         let router = router(&upstream, store, true, false);
         let (response, info) = router
             .route_tagged(request("auto"), None, String::new(), String::new())
@@ -666,13 +650,14 @@ async fn presets_route_every_role_without_changing_the_pool() {
         assert_eq!(
             info.effective_provider.as_deref(),
             Some(main_provider),
-            "{preset:?}"
+            "{label}"
         );
         assert_eq!(info.model_key, main_model);
+        let choice = ModelChoice::from_selector(reviewer).unwrap();
         let (response, info) = router
             .route_with_choice(
                 request("auto"),
-                &profile.reviewer,
+                &choice,
                 None,
                 String::new(),
                 String::new(),
@@ -695,66 +680,51 @@ async fn presets_route_every_role_without_changing_the_pool() {
 #[tokio::test]
 async fn clearing_pool_uses_legacy_auto_not_the_main_profile() {
     let upstream = SyntheticProviders::start().await;
-    let mut profile = profile();
-    profile.main = cloud("author");
-    profile.subagent_model = None;
-    let store = Arc::new(ProfileStore::memory(profile, 1).unwrap());
+    // v2 L3 retarget (spec: "config.subs_model remains the auto-pool
+    // COMPATIBILITY SEED"): an unassigned subagent card = `auto` → decision
+    // slot → local chain, seeded from subs_model — so the pool now follows
+    // the legacy pool key (v1 routed it direct; L3 runs it through the
+    // slot, landing on the same configured pool member).
+    let upstream = SyntheticProviders::start().await;
+    let store = cards();
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "cloud/author").unwrap();
+    store.remove_assignment(GLOBAL_SCOPE, Role::Subagent).unwrap(); // ⇒ default auto
     let router = router(&upstream, store, true, false);
     let (response, info) = router
         .route_tagged(request("subs"), None, String::new(), String::new())
         .await
         .unwrap();
     drain(response).await;
-    assert_eq!(info.model_key, "default-local");
+    assert_eq!(info.model_key, "legacy-pool");
     assert_eq!(
         upstream.calls(),
-        vec![("/local/v1/chat/completions".into(), "default-local".into())]
+        vec![("/local/v1/chat/completions".into(), "legacy-pool".into())]
     );
 }
 
 #[tokio::test]
-async fn cli_uses_the_same_typed_profile_and_legacy_review_api() {
+async fn cli_uses_the_same_typed_cards_and_reduced_review_api() {
     let upstream = SyntheticProviders::start().await;
     let cases: &[(&[&str], &str, Value)] = &[
         (
-            &[
-                "routing-profile",
-                "choose",
-                "reviewer",
-                "cloud",
-                "--model",
-                "cli-reviewer",
-            ],
-            "/api/routing-profile",
-            json!({"preset":"custom","main":{"backend":"local","model":"main-local"},"reviewer":{"backend":"cloud","model":"cli-reviewer"},"subagent_model":"subagent-pool"}),
+            &["roles", "set", "review", "cloud/cli-reviewer"],
+            "/api/roles/set",
+            json!({"role":"review","assignment":"cloud/cli-reviewer","scope":"global"}),
         ),
         (
-            &[
-                "routing-profile",
-                "preset",
-                "local_custom",
-                "--main-model",
-                "cli-main",
-            ],
-            "/api/routing-profile",
-            json!({"preset":"local_custom","main":{"backend":"local","model":"cli-main"},"reviewer":{"backend":"local","model":null},"subagent_model":"subagent-pool"}),
+            &["roles", "set", "main", "cloud", "--project", "/srv/repo"],
+            "/api/roles/set",
+            json!({"role":"main","assignment":"cloud","scope":"/srv/repo"}),
         ),
         (
-            &["routing-profile", "pool", "cli-pool"],
-            "/api/routing-profile",
-            json!({"preset":"custom","main":{"backend":"local","model":"main-local"},"reviewer":{"backend":"cloud","model":"vendor/reviewer-2026"},"subagent_model":"cli-pool"}),
+            &["credential", "add", "api-key", "--kind", "env", "--env", "MY_KEY", "--grants", "bridge"],
+            "/api/credentials/add",
+            json!({"id":"api-key","kind":"env","grants":["bridge"],"var":"MY_KEY"}),
         ),
         (
-            &[
-                "review-config",
-                "update",
-                "--forced-mode",
-                "cloud",
-                "--forced-model",
-                "cli-reviewer",
-            ],
+            &["review-config", "update", "--max-iterations", "7"],
             "/api/review-config",
-            json!({"max_iterations":5,"forced_mode":"cloud","forced_model":"cli-reviewer","hankndory_integration":false,"design_doc_path":null}),
+            json!({"max_iterations":7,"hankndory_integration":false,"design_doc_path":null}),
         ),
     ];
     for (args, path, expected) in cases {
@@ -775,15 +745,7 @@ async fn cli_uses_the_same_typed_profile_and_legacy_review_api() {
     }
     let count = upstream.seen.lock().unwrap().len();
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_brainrouter"))
-        .args([
-            "cli",
-            "--url",
-            &upstream.url,
-            "routing-profile",
-            "choose",
-            "reviewer",
-            "typo",
-        ])
+        .args(["cli", "--url", &upstream.url, "roles", "set", "typo-role", "cloud"])
         .output()
         .await
         .unwrap();
@@ -793,7 +755,7 @@ async fn cli_uses_the_same_typed_profile_and_legacy_review_api() {
 
 #[test]
 fn invalid_policy_input_cannot_mutate_preferences() {
-    let store = ProfileStore::memory(profile(), 1).unwrap();
+    let store = cards();
     for input in [
         json!({"backend":"invalid"}),
         json!({"backend":"auto","model":"ignored"}),
@@ -801,125 +763,99 @@ fn invalid_policy_input_cannot_mutate_preferences() {
     ] {
         assert!(serde_json::from_value::<ModelChoice>(input).is_err());
     }
-    for id in [
-        "",
-        " ",
-        "id with space",
-        "auto",
-        "subs",
-        "brainrouter/foo",
-        "cloud/foo",
-        "\n",
-    ] {
-        assert!(store.update_main(local(id)).is_err(), "{id:?}");
-        assert_eq!(store.profile(), profile());
+    // v2 L3 retarget (spec selector vocabulary): reserved-as-BARE keys are
+    // gone — `cloud/foo`/`brainrouter/foo` are canonical selectors now. The
+    // bare-key smuggle list shrinks to non-grammatical ids; `subs` stays
+    // refused as a card assignment.
+    for id in ["", " ", "id with space", "\n", "subs", "cloud/", "brainrouter/"] {
+        assert!(store.set_assignment(GLOBAL_SCOPE, Role::Main, id).is_err(), "{id:?}");
+        assert_eq!(store.assignment(Role::Main, None), "main-local");
     }
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "cloud/foo").unwrap();
+    assert_eq!(store.assignment(Role::Main, None), "cloud/foo");
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "main-local").unwrap();
     for mode in ["unknown", "AUTO", "subs"] {
         assert!(ModelChoice::from_legacy(mode, None).is_err());
     }
-    let mut invalid = profile();
-    invalid.preset = RoutingPreset::Cloud;
-    assert!(store.update_profile(invalid).is_err());
-    let mut serialized = serde_json::to_value(profile()).unwrap();
-    serialized["preset"] = json!("typo");
-    assert!(serde_json::from_value::<RoutingProfile>(serialized).is_err());
-    assert!(store
-        .update_review(ReviewConfig {
-            max_iterations: 0,
-            ..ReviewConfig::default()
-        })
-        .is_err());
-    assert_eq!(store.profile(), profile());
+    assert!(store.set_assignment(GLOBAL_SCOPE, Role::Main, "subs").is_err());
+    assert!(store.set_review_extras(brainrouter::roles::ReviewExtras {
+        max_iterations: 0,
+        hankndory_integration: false,
+        design_doc_path: None,
+    })
+    .is_err());
+    assert_eq!(store.assignment(Role::Main, None), "main-local");
     // Discovery is optional: an unlisted, well-formed explicit ID is provider-validated.
-    store.update_main(cloud("not-in-discovery")).unwrap();
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "cloud/not-in-discovery").unwrap();
 }
 
 #[test]
-fn profiles_persist_atomically_and_migrate_valid_legacy_review_preferences() {
+fn cards_persist_atomically_and_survive_restart() {
     let directory = Directory::new();
-    let path = directory.0.join("routing_state.json");
-    fs::write(
-        directory.0.join("review_state.json"),
-        r#"{"forced_mode":"cloud","forced_model":"legacy-cloud","max_iterations":9}"#,
-    )
-    .unwrap();
-    let store = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default()).unwrap();
-    assert_eq!(store.profile().reviewer, cloud("legacy-cloud"));
-    assert_eq!(
-        store.review_config().max_iterations,
-        5,
-        "YAML still owns iterations after restart"
-    );
-    let mut updated = profile();
-    updated.main = cloud("saved-author");
-    store.update_profile(updated.clone()).unwrap();
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let reloaded = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default()).unwrap();
-    assert_eq!(reloaded.profile(), updated);
-    assert_eq!(
-        serde_json::from_slice::<RoutingProfile>(&fs::read(&path).unwrap()).unwrap(),
-        updated
-    );
+    let path = directory.0.join("role_cards.json");
+    let store = RoleCardStore::load(path.clone());
+    store.set_assignment(GLOBAL_SCOPE, Role::Main, "cloud/saved-author").unwrap();
+    store
+        .set_review_extras(brainrouter::roles::ReviewExtras {
+            max_iterations: 9,
+            hankndory_integration: true,
+            design_doc_path: None,
+        })
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let reloaded = RoleCardStore::load(path.clone());
+    assert_eq!(reloaded.assignment(Role::Main, None), "cloud/saved-author");
+    assert_eq!(reloaded.review_extras().max_iterations, 9);
+    assert!(reloaded.review_extras().hankndory_integration);
     assert_eq!(
         fs::read_dir(&directory.0).unwrap().count(),
-        2,
+        1,
         "no temporary files remain"
     );
+    // Disk failure must not mutate runtime.
     fs::remove_file(&path).unwrap();
     fs::create_dir(&path).unwrap();
-    assert!(reloaded.update_main(local("must-not-apply")).is_err());
-    assert_eq!(
-        reloaded.profile(),
-        updated,
-        "disk failure must not mutate runtime"
-    );
+    assert!(reloaded.set_assignment(GLOBAL_SCOPE, Role::Main, "local/must-not-apply").is_err());
+    assert_eq!(reloaded.assignment(Role::Main, None), "cloud/saved-author");
 }
 
 #[test]
-fn malformed_saved_state_and_legacy_configuration_are_validated() {
+fn l3_configuration_is_validated() {
     let directory = Directory::new();
-    let path = directory.0.join("routing_state.json");
-    fs::write(&path, r#"{"preset":"wat"}"#).unwrap();
-    assert!(ProfileStore::load(path.clone(), profile(), &ReviewConfig::default()).is_err());
-    fs::remove_file(&path).unwrap();
-    fs::write(
-        directory.0.join("review_state.json"),
-        r#"{"forced_mode":"wat"}"#,
-    )
-    .unwrap();
-    assert!(ProfileStore::load(path, profile(), &ReviewConfig::default()).is_err());
-
     let config_path = directory.0.join("config.yaml");
-    let legacy = json!({
+    let good = json!({
         "manifest":{"base_url":"http://127.0.0.1:1/v1"},
         "llama_swap":{"base_url":"http://127.0.0.1:1/v1","fallback_model":"fallback","subs_model":"legacy-subs"},
-        "bonsai":{},
-        "review":{"forced_mode":"cloud","forced_model":"exact-cloud"},
+        "decision_model":{"enabled":false,"kind":"heuristic"},
     });
-    fs::write(&config_path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
+    fs::write(&config_path, serde_yaml::to_string(&good).unwrap()).unwrap();
     let loaded = config::load(&config_path).unwrap();
     assert!(!loaded.manifest.enabled);
-    assert!(!loaded.bonsai.enabled);
-    assert_eq!(loaded.routing_profile().unwrap().main, ModelChoice::local());
-    assert_eq!(
-        loaded.routing_profile().unwrap().reviewer,
-        cloud("exact-cloud")
-    );
-    assert_eq!(
-        loaded.routing_profile().unwrap().subagent_model.as_deref(),
-        Some("legacy-subs")
-    );
-    let mut invalid = legacy;
-    invalid["review"]["forced_mode"] = json!("typo");
-    fs::write(&config_path, serde_yaml::to_string(&invalid).unwrap()).unwrap();
+    assert_eq!(loaded.llama_swap.subs_model.as_deref(), Some("legacy-subs"));
+    assert!(!loaded.decision_model.enabled);
+
+    // A v1-era review block (forced_mode) is NOT an L3 config any more:
+    // the reduced ReviewConfig rejects the key (it must arrive migrated).
+    let mut legacy = good.clone();
+    legacy["review"] = json!({"forced_mode":"cloud","forced_model":"exact-cloud"});
+    fs::write(&config_path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
     assert!(config::load(&config_path).is_err());
+
+    // Kinds requiring an endpoint fail validation without it.
+    let mut openai = good.clone();
+    openai["decision_model"] = json!({"enabled":true,"kind":"openai-compatible","model":"m"});
+    fs::write(&config_path, serde_yaml::to_string(&openai).unwrap()).unwrap();
+    assert!(config::load(&config_path).is_err(), "openai-compatible without base_url");
+    let mut webhook = good.clone();
+    webhook["decision_model"] = json!({"enabled":true,"kind":"webhook"});
+    fs::write(&config_path, serde_yaml::to_string(&webhook).unwrap()).unwrap();
+    assert!(config::load(&config_path).is_err(), "webhook without url");
 }
 
 #[test]
 fn legacy_auto_yaml_ignores_the_leftover_model_only_on_read() {
+    // The v1 read-parity row of the migration: forced_mode auto + a leftover
+    // forced_model normalizes to Auto (never a validation error).
     let directory = Directory::new();
     let path = directory.0.join("brainrouter.yaml");
     let yaml = serde_yaml::to_string(&json!({
@@ -930,68 +866,68 @@ fn legacy_auto_yaml_ignores_the_leftover_model_only_on_read() {
     }))
     .unwrap();
     fs::write(&path, &yaml).unwrap();
-    let loaded = config::load(&path).unwrap();
-    assert_eq!(loaded.review.forced_mode, "auto");
-    assert_eq!(loaded.review.forced_model, None);
-    assert_eq!(
-        loaded.routing_profile().unwrap().reviewer,
-        ModelChoice::Auto
-    );
+    let state = brainrouter::migration::read_v1_state(&path).unwrap();
+    assert!(state.needs_l3_migration());
+    let profile = state.effective_profile().unwrap();
+    assert_eq!(profile.reviewer, ModelChoice::Auto);
+    assert_eq!(profile.main, ModelChoice::local());
     assert_eq!(fs::read_to_string(&path).unwrap(), yaml);
-
-    let new_write: config::BrainrouterConfig = serde_yaml::from_str(&yaml).unwrap();
-    assert!(new_write.review.validate().is_err());
-    assert!(new_write.routing_profile().is_err());
 }
 
 #[test]
-fn legacy_auto_state_migrates_once_and_persists_normalized_preferences() {
+fn legacy_state_migrates_once_into_cards() {
     let directory = Directory::new();
-    let legacy = directory.0.join("review_state.json");
-    let path = directory.0.join("routing_state.json");
-    let original =
-        r#"{"forced_mode":"auto","forced_model":"ignored old model","max_iterations":9}"#;
-    fs::write(&legacy, original).unwrap();
-    let review = ReviewConfig {
-        max_iterations: 3,
-        ..ReviewConfig::default()
-    };
-    let store = ProfileStore::load(path.clone(), profile(), &review).unwrap();
-    assert_eq!(store.profile().reviewer, ModelChoice::Auto);
-    assert_eq!(store.profile().main, profile().main);
-    assert_eq!(store.profile().subagent_model, profile().subagent_model);
-    assert_eq!(store.review_config().max_iterations, 3);
-    assert_eq!(store.review_config().forced_model, None);
-    let normalized: RoutingProfile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(normalized, store.profile());
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+    let path = directory.0.join("brainrouter.yaml");
     fs::write(
-        &legacy,
-        "malformed legacy state that must no longer be read",
+        &path,
+        serde_yaml::to_string(&json!({
+            "manifest": {"base_url": "http://127.0.0.1:1/v1"},
+            "llama_swap": {"base_url": "http://127.0.0.1:1/v1", "fallback_model": "m"},
+            "routing": {
+                "preset": "custom",
+                "main": {"backend": "cloud", "model": null},
+                "reviewer": {"backend": "local", "model": "rev-local"},
+                "subagent_model": "pool-x"
+            },
+            "review": {"max_iterations": 3},
+        }))
+        .unwrap(),
     )
     .unwrap();
-    let reloaded = ProfileStore::load(path, profile(), &review).unwrap();
-    assert_eq!(reloaded.profile(), normalized);
-    assert!(store
-        .update_review(ReviewConfig {
-            forced_mode: "auto".into(),
-            forced_model: Some("new-invalid-model".into()),
-            ..ReviewConfig::default()
+    let state = read_v1_state(&path).unwrap();
+    let profile = state.effective_profile().unwrap();
+    let pins: std::collections::BTreeMap<String, LegacyPin> = [(
+        "/srv/project".to_string(),
+        LegacyPin {
+            main: Some(ModelChoice::Cloud { model: Some("pinned-cloud".into()) }),
+            reviewer: None,
+            subagent: Some("pinned-subs".into()),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let out = migrate_v1(&profile, &pins, state.review.clone());
+    let store = RoleCardStore::memory(Default::default());
+    store
+        .replace_from_migration(brainrouter::roles::StoreDataForMigration {
+            assignments: out.cards,
+            review_extras: out.review_extras,
         })
-        .is_err());
-    assert_eq!(store.profile(), normalized);
+        .unwrap();
+    assert_eq!(store.assignment(Role::Main, None), "cloud");
+    assert_eq!(store.assignment(Role::Review, None), "rev-local");
+    assert_eq!(store.assignment(Role::Subagent, None), "pool-x");
+    assert_eq!(store.assignment(Role::Main, Some("/srv/project")), "cloud/pinned-cloud");
+    assert_eq!(store.assignment(Role::Subagent, Some("/srv/project")), "pinned-subs");
+    // Unpinned project follows the global card.
+    assert_eq!(store.assignment(Role::Review, Some("/other/repo")), "rev-local");
+    assert_eq!(store.review_extras().max_iterations, 3);
 }
 
 #[test]
 fn migration_validation_failures_report_the_source_path_and_cause() {
     let directory = Directory::new();
-    let legacy = directory.0.join("review_state.json");
-    let path = directory.0.join("routing_state.json");
-    for (saved, cause) in [
+    for (review, cause) in [
         (json!({"forced_mode":"unknown"}), "unknown routing mode"),
         (
             json!({"forced_mode":"local","forced_model":"bad model"}),
@@ -1001,30 +937,89 @@ fn migration_validation_failures_report_the_source_path_and_cause() {
             json!({"forced_mode":"cloud","forced_model":"cloud/alias"}),
             "model ID",
         ),
-        (
-            json!({"forced_mode":"auto","forced_model":"ignored","max_iterations":0}),
-            "max_iterations",
-        ),
     ] {
-        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
-        let error = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default())
-            .err()
-            .expect("invalid migration must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains(legacy.to_str().unwrap()), "{message}");
-        assert!(message.contains(cause), "{message}");
-        assert!(!path.exists(), "failed migration must not write new state");
+        let path = directory.0.join(format!("brainrouter-{}.yaml", cause.replace(' ', "_")));
+        fs::write(
+            &path,
+            serde_yaml::to_string(&json!({
+                "manifest": {"base_url": "http://127.0.0.1:1/v1"},
+                "llama_swap": {"base_url": "http://127.0.0.1:1/v1", "fallback_model": "m"},
+                "review": review,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = read_v1_state(&path).unwrap();
+        let error = state.effective_profile().unwrap_err().to_string();
+        assert!(error.contains(cause), "{review} -> {error}");
     }
+    // Invalid card extras report the iterations rule.
+    let store = RoleCardStore::memory(Default::default());
+    assert!(store
+        .set_review_extras(brainrouter::roles::ReviewExtras {
+            max_iterations: 0,
+            hankndory_integration: false,
+            design_doc_path: None,
+        })
+        .is_err());
+}
 
-    let invalid_profile = json!({
-        "preset":"local_main_sub","main":{"backend":"cloud","model":"cloud-model"},
-        "reviewer":{"backend":"local","model":null},"subagent_model":null,
-    });
-    fs::write(&path, serde_json::to_vec(&invalid_profile).unwrap()).unwrap();
-    let error = ProfileStore::load(path.clone(), profile(), &ReviewConfig::default())
-        .err()
-        .expect("invalid saved profile must fail");
-    let message = format!("{error:#}");
-    assert!(message.contains(path.to_str().unwrap()), "{message}");
-    assert!(message.contains("preset"), "{message}");
+#[test]
+fn migration_table_is_exact() {
+    let pins: std::collections::BTreeMap<String, LegacyPin> =
+        std::collections::BTreeMap::new();
+    let rows = [
+        (
+            LegacyRoutingProfile {
+                preset: LegacyPreset::Custom,
+                main: ModelChoice::Auto,
+                reviewer: ModelChoice::Local { model: Some("k".into()) },
+                subagent_model: None,
+            },
+            ("auto", "k"),
+        ),
+        (
+            LegacyRoutingProfile {
+                preset: LegacyPreset::Custom,
+                main: ModelChoice::local(),
+                reviewer: ModelChoice::Cloud { model: None },
+                subagent_model: None,
+            },
+            ("local", "cloud"),
+        ),
+        (
+            LegacyRoutingProfile {
+                preset: LegacyPreset::Custom,
+                main: ModelChoice::Local { model: None },
+                reviewer: ModelChoice::Cloud { model: Some("vendor/x".into()) },
+                subagent_model: Some("pool".into()),
+            },
+            ("local", "cloud/vendor/x"),
+        ),
+    ];
+    for (profile, (main, reviewer)) in rows {
+        let out = migrate_v1(&profile, &pins, None);
+        let get = |role| {
+            out.cards
+                .iter()
+                .find(|c| c.role == role && c.scope == GLOBAL_SCOPE)
+                .unwrap()
+                .assignment
+                .clone()
+        };
+        assert_eq!(get(Role::Main), main);
+        assert_eq!(get(Role::Review), reviewer);
+    }
+    // No routing block ⇒ main migrates to `local` (v1 default).
+    let out = migrate_v1(
+        &LegacyRoutingProfile {
+            preset: LegacyPreset::Custom,
+            main: ModelChoice::local(),
+            reviewer: ModelChoice::Auto,
+            subagent_model: None,
+        },
+        &pins,
+        None,
+    );
+    assert_eq!(out.cards[0].assignment, "local");
 }

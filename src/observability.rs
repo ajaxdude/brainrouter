@@ -1333,6 +1333,11 @@ mod tests {
             tg_tps: 0.0,
             toolbox_backend: Some("llama_cpp".into()),
             compute_api: Some("vulkan".into()),
+            role: "main".to_string(),
+            decision: None,
+            rationale: None,
+            decision_fallback: None,
+            chosen_model: None,
         }
     }
 

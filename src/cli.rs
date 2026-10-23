@@ -19,7 +19,6 @@ use brainrouter::daemon_client::{DaemonClient, DaemonEndpoint};
 use brainrouter::plugins::PluginManager;
 use std::net::TcpStream;
 use std::sync::Arc;
-use brainrouter::routing_profile::{ModelChoice, RoutingPreset, RoutingProfile};
 
 /// Arguments for the `cli` subcommand.
 #[derive(Args)]
@@ -81,10 +80,24 @@ pub enum CliCommand {
         #[command(subcommand)]
         action: RoutingModeAction,
     },
-    /// Independent main/reviewer/subagent choices and named presets
-    RoutingProfile {
+    /// Role cards (v2 L3): the single model config — `get` prints
+    /// `{assignments, policy}`, `set` assigns a selector to a role card
+    /// (mutations go through the running daemon; reads direct-state when down).
+    Roles {
         #[command(subcommand)]
-        action: RoutingProfileAction,
+        action: RolesAction,
+    },
+    /// Decision-model slot (v2 L3): `show` describes the slot, `test` runs
+    /// one feature set through it.
+    Decision {
+        #[command(subcommand)]
+        action: DecisionAction,
+    },
+    /// Credentials vault (v2 L3 UI surface): list/add/remove/test; mutations
+    /// go through the running daemon, values are never printed.
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
     },
     /// Manage sidecar plugins (v2 L2): install/list/enable/disable/remove/
     /// status/config. Talks to the running daemon; falls back to direct
@@ -116,8 +129,6 @@ pub enum CliCommand {
     },
     /// Flush loaded models to free VRAM
     FlushModels,
-    /// Push llama-swap models into OMP's models.yml (one-way sync)
-    SyncOmp,
     /// List config files the daemon manages
     ConfigFiles,
     /// View brainrouter.yaml, or write a new one from a file or stdin.
@@ -210,32 +221,57 @@ pub enum RoutingModeAction {
 }
 
 #[derive(Subcommand)]
-pub enum RoutingProfileAction {
-    /// Current profile and cloud opt-in policy
-    Status,
-    /// Discover local and cloud model IDs (metadata only; no inference)
-    Models,
-    /// Replace the profile with a JSON file ("-" = stdin)
-    Set { path: String },
-    /// Apply a named preset, preserving the subagent pool
-    Preset {
-        #[arg(value_enum)]
-        preset: RoutingPreset,
-        /// Explicit local main model required by local_custom
-        #[arg(long)]
-        main_model: Option<String>,
-    },
-    /// Select one independent role; omit --model for backend default/auto
-    Choose {
-        #[arg(value_parser = ["main", "reviewer"])]
+pub enum RolesAction {
+    /// Print all card assignments + policy (reads via daemon; direct-state fallback)
+    Get,
+    /// Assign a selector to a role card: `roles set <main|review|subagent> <selector> [--project <path>]`
+    Set {
         role: String,
-        #[arg(value_parser = ["auto", "local", "cloud"])]
-        backend: String,
+        assignment: String,
+        /// Project scope (git root); omit for the global card
         #[arg(long)]
-        model: Option<String>,
+        project: Option<String>,
     },
-    /// Set the local subagent pool; omit MODEL to clear it (legacy auto behavior)
-    Pool { model: Option<String> },
+    /// Remove a card assignment (falls back to the next scope / default)
+    Remove {
+        role: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DecisionAction {
+    /// Describe the configured slot ({enabled, kind, available, min_confidence, ...})
+    Show,
+    /// Run one prompt through the slot and print the full Decision JSON
+    Test { text: String },
+}
+
+#[derive(Subcommand)]
+pub enum CredentialAction {
+    /// List credentials (masked; values are never printed)
+    List,
+    /// Add/rotate a credential: `credential add <id> --kind store|env|file [--value V | --env VAR | --file PATH] [--grants a,b]`
+    Add {
+        id: String,
+        #[arg(long, value_parser = ["store", "env", "file"])]
+        kind: String,
+        #[arg(long)]
+        value: Option<String>,
+        #[arg(long)]
+        env: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        grants: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove a credential
+    Remove { id: String },
+    /// Resolve-test a credential ({ok: bool}) — the value is never printed
+    Test { id: String },
 }
 
 #[derive(Subcommand)]
@@ -312,15 +348,6 @@ pub enum ReviewConfigAction {
         /// Maximum LLM review iterations before human escalation
         #[arg(long)]
         max_iterations: Option<u32>,
-        /// Forced review mode: auto | cloud | local
-        #[arg(long, value_parser = ["auto", "cloud", "local"])]
-        forced_mode: Option<String>,
-        /// Explicit local or cloud model ID
-        #[arg(long)]
-        forced_model: Option<String>,
-        /// Clear a prior explicit model and use the backend default
-        #[arg(long, conflicts_with = "forced_model")]
-        clear_model: bool,
     },
 }
 
@@ -381,6 +408,22 @@ pub async fn run(args: CliArgs) -> Result<()> {
         DaemonEndpoint::Url(url.clone())
     } else {
         let socket = args.socket.unwrap_or_else(brainrouter::config::default_socket_path);
+        // A daemon that is mid-boot (migration, plugin registry, model
+        // resolution) has not reached the accept loop; a CLI invoked in that
+        // window sees no socket file. Poll before declaring the daemon
+        // absent (the gate's black-box tests call CLI verbs the instant
+        // `/health` answers; under parallel load boot takes seconds).
+        let poll = std::time::Duration::from_millis(50);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(
+                std::env::var("BRAINROUTER_CLI_SOCKET_WAIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10_000),
+            );
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(poll);
+        }
         if !socket.exists() {
             bail!(
                 "Daemon socket not found at {} (is `brainrouter serve` running?).\n\
@@ -499,43 +542,9 @@ pub async fn run(args: CliArgs) -> Result<()> {
                 print_json(&client.post_json("/api/routing-mode", json!({ "mode": mode })).await?);
             }
         },
-        CliCommand::RoutingProfile { action } => {
-            match action {
-                RoutingProfileAction::Status => print_json(&client.get_json("/api/routing-profile").await?),
-                RoutingProfileAction::Models => print_json(&client.get_json("/api/routing-models").await?),
-                action => {
-                    let mut profile: RoutingProfile = if let RoutingProfileAction::Set { ref path } = action {
-                        let text = if path == "-" {
-                            use std::io::Read;
-                            let mut text = String::new();
-                            std::io::stdin().read_to_string(&mut text)?;
-                            text
-                        } else { std::fs::read_to_string(path)? };
-                        serde_json::from_str(&text)?
-                    } else {
-                        serde_json::from_value(client.get_json("/api/routing-profile").await?["profile"].clone())?
-                    };
-                    match action {
-                        RoutingProfileAction::Preset { preset, main_model } => {
-                            if let Some(model) = main_model {
-                                if preset != RoutingPreset::LocalCustom { bail!("--main-model requires local_custom"); }
-                                profile.main = ModelChoice::Local { model: Some(model) };
-                            }
-                            profile.apply_preset(preset)?;
-                        }
-                        RoutingProfileAction::Choose { role, backend, model } => {
-                            let choice = ModelChoice::from_legacy(&backend, model)?;
-                            if role == "main" { profile.main = choice; } else { profile.reviewer = choice; }
-                            profile.preset = RoutingPreset::Custom;
-                        }
-                        RoutingProfileAction::Pool { model } => profile.subagent_model = model,
-                        _ => {}
-                    }
-                    profile.validate()?;
-                    print_json(&client.post_json("/api/routing-profile", serde_json::to_value(profile)?).await?);
-                }
-            }
-        }
+        CliCommand::Roles { action } => run_roles(&client, action).await?,
+        CliCommand::Decision { action } => run_decision(&client, action).await?,
+        CliCommand::Credential { action } => run_credential(&client, action).await?,
         CliCommand::Plugin { action } => run_plugin(&client, action).await?,
         CliCommand::Migration { action } => run_migration(action)?,
         CliCommand::Toolboxes => {
@@ -552,9 +561,6 @@ pub async fn run(args: CliArgs) -> Result<()> {
         CliCommand::FlushModels => {
             print_json(&client.post_json("/api/models/flush", json!({})).await?);
         }
-        CliCommand::SyncOmp => {
-            print_json(&client.post_json("/api/models/sync-omp", json!({})).await?);
-        }
         CliCommand::ConfigFiles => {
             print_json(&client.get_json("/api/config-files").await?);
         }
@@ -568,20 +574,15 @@ pub async fn run(args: CliArgs) -> Result<()> {
             ReviewConfigAction::Status => {
                 print_json(&client.get_json("/api/review-config").await?);
             }
-            ReviewConfigAction::Update { max_iterations, forced_mode, forced_model, clear_model } => {
-                // Merge into the current config — the daemon endpoint replaces it.
+            ReviewConfigAction::Update { max_iterations } => {
+                // v2 L3: the reviewer MODEL lives on the review card
+                // (`roles set review <selector>`); this config carries the
+                // surviving extras only.
                 let current = client.get_json("/api/review-config").await?;
                 let mut update = current.clone();
                 if let Some(v) = max_iterations {
                     update["max_iterations"] = json!(v);
                 }
-                if let Some(v) = forced_mode {
-                    update["forced_mode"] = json!(v);
-                }
-                if let Some(v) = forced_model {
-                    update["forced_model"] = json!(v);
-                }
-                if clear_model { update["forced_model"] = Value::Null; }
                 print_json(&client.post_json("/api/review-config", update).await?);
             }
         },
@@ -728,6 +729,105 @@ fn validate_session_id(session_id: &str) -> Result<()> {
 /// v2 L2 `plugin` verbs. Thin client over the daemon; when the daemon is
 /// unreachable, install/list/enable/disable/remove operate directly on the
 /// plugin state (the supervisor picks enabled plugins up at next boot).
+/// v2 L3 role-card verbs. Mutations go through the daemon (single-writer
+/// store); `get` falls back to a direct store read when the daemon is down.
+async fn run_roles(client: &DaemonClient, action: RolesAction) -> Result<()> {
+    match action {
+        RolesAction::Get => {
+            match client.get_json("/api/roles").await {
+                Ok(v) => print_json(&v),
+                Err(_) => {
+                    // Daemon down: reads are direct (contract).
+                    let path = brainrouter::roles::RoleCardStore::default_path();
+                    let store = brainrouter::roles::RoleCardStore::load(path);
+                    print_json(&json!({
+                        "assignments": store.assignments_snapshot(),
+                        "policy": store.policy_snapshot(),
+                        "review_extras": store.review_extras(),
+                    }));
+                }
+            }
+        }
+        RolesAction::Set { role, assignment, project } => {
+            // Client-side validation mirrors the daemon's (typos never reach
+            // the wire, matching v1 `routing-profile choose` behavior).
+            brainrouter::roles::Role::parse(&role)?;
+            brainrouter::roles::validate_card_assignment(&assignment)?;
+            let scope = project.unwrap_or_else(|| "global".into());
+            print_json(&client.post_json(
+                "/api/roles/set",
+                json!({ "role": role, "assignment": assignment, "scope": scope }),
+            ).await?);
+        }
+        RolesAction::Remove { role, project } => {
+            let scope = project.unwrap_or_else(|| "global".into());
+            print_json(&client.post_json(
+                "/api/roles/remove",
+                json!({ "role": role, "scope": scope }),
+            ).await?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_decision(client: &DaemonClient, action: DecisionAction) -> Result<()> {
+    match action {
+        DecisionAction::Show => match client.get_json("/api/decision").await {
+            Ok(v) => print_json(&v),
+            Err(_) => {
+                // Daemon down: reads are direct — describe the config.
+                let config_path = brainrouter::config::default_config_path();
+                let config = brainrouter::config::load(&config_path)
+                    .context("loading config for decision show")?;
+                let slot = brainrouter::decision::DecisionSlot::new(
+                    config.decision_model,
+                    std::sync::Arc::new(brainrouter::classifier::Classifier::new(
+                        "http://127.0.0.1:1".into(),
+                        String::new(),
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        None,
+                    )),
+                    None,
+                );
+                print_json(&slot.describe());
+            }
+        },
+        DecisionAction::Test { text } => {
+            print_json(&client.post_json("/api/decision/test", json!({ "text": text })).await?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_credential(client: &DaemonClient, action: CredentialAction) -> Result<()> {
+    match action {
+        CredentialAction::List => {
+            print_json(&client.get_json("/api/credentials").await?);
+        }
+        CredentialAction::Add { id, kind, value, env, file, grants, description } => {
+            let mut record = json!({ "id": id, "kind": kind, "grants": grants });
+            if let Some(d) = description {
+                record["description"] = json!(d);
+            }
+            match kind.as_str() {
+                "store" => record["value"] = json!(value.context("--value is required for kind store")?),
+                "env" => record["var"] = json!(env.context("--env is required for kind env")?),
+                "file" => record["path"] = json!(file.context("--file is required for kind file")?),
+                other => bail!("unknown credential kind {other:?}"),
+            }
+            print_json(&client.post_json("/api/credentials/add", record).await?);
+        }
+        CredentialAction::Remove { id } => {
+            print_json(&client.post_json("/api/credentials/remove", json!({ "id": id })).await?);
+        }
+        CredentialAction::Test { id } => {
+            print_json(&client.post_json("/api/credentials/test", json!({ "id": id })).await?);
+        }
+    }
+    Ok(())
+}
+
 async fn run_plugin(client: &DaemonClient, action: PluginAction) -> Result<()> {
     use PluginAction::*;
     let daemon_live = client.get_json("/health").await.is_ok();
@@ -769,8 +869,8 @@ async fn run_plugin(client: &DaemonClient, action: PluginAction) -> Result<()> {
         }
         return Ok(());
     }
-    // Unreachable socket mid-call: direct-state management.
-    drop(client);
+    // Unreachable socket mid-call: direct-state management (the client's
+    // connections die with this frame at the tail expression's drop).
     run_plugin_direct(action).await
 }
 
@@ -855,6 +955,10 @@ pub struct MigrationArgs {
     /// Path to the YAML config file (restore target).
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Brainrouter state root (where `migrations/<phase>/` snapshots live).
+    /// Default: `$XDG_STATE_HOME/brainrouter`.
+    #[arg(long)]
+    pub state: Option<PathBuf>,
     #[command(subcommand)]
     pub action: MigrationAction,
 }
@@ -928,15 +1032,62 @@ pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {
                 .config
                 .clone()
                 .unwrap_or_else(brainrouter::config::default_config_path);
+            let config_dir = config_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(std::path::PathBuf::new);
+            // State-root resolution: --state, then the env default, then a
+            // snapshot probe against the config-adjacent XDG tree (so a
+            // restore aimed at an isolated `--config` finds the snapshots
+            // written by a daemon booted with that same isolated environment).
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Some(state) = &args.state {
+                candidates.push(state.clone());
+            }
+            candidates.push(brainrouter::paths::brainrouter_state());
+            let derived = [
+                brainrouter::paths::env_dir("XDG_STATE_HOME", "", ".local/state"),
+            ];
+            for base in derived {
+                let cand = base.join("brainrouter");
+                if !candidates.contains(&cand) {
+                    candidates.push(cand);
+                }
+            }
+            // Config-adjacent probes: <config-dir>/../state/brainrouter and
+            // <config-dir>/brainrouter-state (isolated-deployment layouts).
+            for probe in [
+                config_dir.join("state/brainrouter"),
+                config_dir.join("../state/brainrouter"),
+                config_dir.join("brainrouter-state"),
+            ] {
+                let probe = probe.canonicalize().unwrap_or(probe.clone());
+                if !candidates.contains(&probe) {
+                    candidates.push(probe);
+                }
+            }
+            let has_snap = |root: &std::path::Path| -> bool {
+                let dir = root.join("migrations").join(phase.as_str());
+                dir.is_dir()
+                    && std::fs::read_dir(dir)
+                        .map(|mut r| r.next().is_some())
+                        .unwrap_or(false)
+            };
+            let state_root = candidates
+                .iter()
+                .find(|root| has_snap(root))
+                .cloned()
+                .unwrap_or_else(brainrouter::paths::brainrouter_state);
             let store = brainrouter::credentials::CredentialStore::load(
-                brainrouter::credentials::CredentialStore::default_path(),
+                state_root.join("credentials.json"),
             )
             .context("loading credentials store")?;
             let msg = brainrouter::migration::restore(
                 phase,
                 &config_path,
                 &store,
-                &brainrouter::paths::brainrouter_state(),
+                &state_root,
+                &config_dir,
             )?;
             println!("{msg}");
             Ok(())
@@ -953,11 +1104,16 @@ fn run_migration(action: MigrationAction) -> Result<()> {
                 brainrouter::credentials::CredentialStore::default_path(),
             )
             .context("loading credentials store")?;
+            let config_dir = brainrouter::config::default_config_path()
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(std::path::PathBuf::new);
             let msg = brainrouter::migration::restore(
                 &phase,
                 &config_path,
                 &store,
                 &brainrouter::paths::brainrouter_state(),
+                &config_dir,
             )?;
             println!("{msg}");
         }

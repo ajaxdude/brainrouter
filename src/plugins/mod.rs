@@ -42,8 +42,11 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const INFLIGHT_CAP: usize = 4;
 /// Per-plugin queue beyond the in-flight cap (design: "queue 16").
 pub const INFLIGHT_QUEUE: usize = 16;
-/// The RPC protocol version returned by `initialize`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The RPC protocol version returned by `initialize`. v2 (v2 L3) adds the
+/// server-initiated `decision.classify` request (daemon → plugin, with
+/// request-id correlation + `timeout_ms`); v1 plugins keep working (the
+/// negotiated version is the minimum of both sides).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Standard JSON-RPC error codes used by this surface.
 pub const JSONRPC_PARSE_ERROR: i32 = -32700;
@@ -102,12 +105,28 @@ struct Inner {
     creds: Arc<CredentialStore>,
     app: Arc<AppHandle>,
     supervisors: Mutex<HashMap<String, mpsc::UnboundedSender<SupCmd>>>,
-    /// Live RPC sessions per plugin, for daemon→plugin notifications.
-    sessions: Mutex<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>,
+    /// Live RPC sessions per plugin, for daemon→plugin pushes and
+    /// server-initiated requests. Protocol version is negotiated at
+    /// `initialize` (v2 = `decision.classify` supported).
+    sessions: Mutex<HashMap<String, Vec<LiveSession>>>,
     runtimes: Mutex<HashMap<String, Arc<PluginRuntime>>>,
     listeners: Mutex<HashMap<String, Arc<UnixListener>>>,
     toasts: Mutex<VecDeque<Value>>,
+    /// Pids of children the supervisors last spawned, kept across the
+    /// supervisor's exit so `shutdown()`'s final sweep can reach a child
+    /// that finished spawning after the map enumeration (orphan guard).
+    last_pids: Mutex<HashMap<String, u32>>,
     shutting_down: AtomicBool,
+    /// Server-initiated request correlation (protocol v2): (plugin id,
+    /// daemon request id) → the reader loop resolves the response frame.
+    pending: Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Value>>>,
+    next_request_id: std::sync::atomic::AtomicU64,
+}
+
+/// A live RPC session with its negotiated protocol version.
+pub(crate) struct LiveSession {
+    pub tx: mpsc::UnboundedSender<String>,
+    pub protocol: u32,
 }
 
 /// The daemon-side plugin subsystem.
@@ -147,9 +166,107 @@ impl PluginManager {
                 runtimes: Mutex::new(HashMap::new()),
                 listeners: Mutex::new(HashMap::new()),
                 toasts: Mutex::new(VecDeque::new()),
+                last_pids: Mutex::new(HashMap::new()),
                 shutting_down: AtomicBool::new(false),
+                pending: Mutex::new(HashMap::new()),
+                next_request_id: std::sync::atomic::AtomicU64::new(1),
             }),
         })
+    }
+
+    // ── Server-initiated RPC (protocol v2; v2 L3 `decision.classify`) ──────
+
+    /// A live, authenticated RPC session speaking protocol ≥ 2 exists.
+    pub fn has_live_session(&self, plugin_id: &str) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .get(plugin_id)
+            .map(|sessions| sessions.iter().any(|s| s.protocol >= 2 && !s.tx.is_closed()))
+            .unwrap_or(false)
+    }
+
+    /// Send `decision.classify` to the plugin and await its answer, with
+    /// request-id correlation (the plugin's response frame carries the same
+    /// id) and a hard timeout. The response `result` is the decision JSON.
+    pub async fn request_decision(
+        &self,
+        plugin_id: &str,
+        features: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let id = self
+            .inner
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "decision.classify",
+            "params": { "request_id": id, "features": features, "timeout_ms": timeout_ms },
+        })
+        .to_string()
+            + "\n";
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            let Some(sessions) = sessions.get_mut(plugin_id) else {
+                anyhow::bail!("plugin {plugin_id} has no live RPC session");
+            };
+            sessions.retain(|s| !s.tx.is_closed());
+            let Some(session) = sessions.iter().find(|s| s.protocol >= 2) else {
+                anyhow::bail!("plugin {plugin_id} has no protocol-v2 session (decision.classify unsupported)");
+            };
+            if session.tx.send(request).is_err() {
+                anyhow::bail!("pushing decision.classify to plugin: session closed");
+            }
+            self.inner
+                .pending
+                .lock()
+                .unwrap()
+                .insert((plugin_id.to_string(), id), reply_tx);
+        }
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms.max(1) + 500),
+            reply_rx,
+        )
+        .await;
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(plugin_id.to_string(), id));
+        match outcome {
+            Ok(Ok(frame)) => {
+                if let Some(error) = frame.get("error").filter(|e| !e.is_null()) {
+                    anyhow::bail!("plugin {plugin_id} decision error: {error}");
+                }
+                frame
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("plugin {plugin_id} reply carried no result"))
+            }
+            Ok(Err(_)) => anyhow::bail!("plugin {plugin_id} session closed mid-decision"),
+            Err(_) => anyhow::bail!("plugin {plugin_id} decision.classify timed out after {timeout_ms}ms"),
+        }
+    }
+
+    /// Resolve a server-initiated request from the connection reader loop.
+    pub(crate) fn resolve_pending(&self, plugin_id: &str, frame: &Value) -> bool {
+        let Some(id) = frame.get("id").and_then(Value::as_u64) else {
+            return false;
+        };
+        let tx = self
+            .inner
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(plugin_id.to_string(), id));
+        match tx {
+            Some(tx) => tx.send(frame.clone()).is_ok(),
+            None => false,
+        }
     }
 
     /// Re-handle from the shared inner (used by the RPC dispatcher).
@@ -214,13 +331,20 @@ impl PluginManager {
     }
 
     /// Graceful daemon shutdown: stop every supervised child (SIGTERM with
-    /// grace, then kill), then remove the plugin sockets.
+    /// grace, then kill), sweep children spawned after the enumeration
+    /// (boot-spawn race), then remove the plugin sockets.
     pub async fn shutdown(&self) {
-        self.inner
-            .shutting_down
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // N4 (ordered before every spawn enumeration): a stop/enable/boot
+        // spawn racing shutdown must not create a child the daemon is about
+        // to exit past. The guard + enumeration run under one supervisor
+        // lock with `start_supervisor` (no window between them).
         let senders: Vec<(String, mpsc::UnboundedSender<SupCmd>)> = {
             let mut sup = self.inner.supervisors.lock().unwrap();
+            // N4: guard set BEFORE the enumeration, under the same lock as
+            // `start_supervisor`'s guard check (see there).
+            self.inner
+                .shutting_down
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             std::mem::take(&mut *sup).into_iter().collect()
         };
         for (id, tx) in senders {
@@ -230,7 +354,11 @@ impl PluginManager {
             info!(plugin = %id, "plugin supervisor stop requested");
         }
         // Give supervisors time to SIGTERM→SIGKILL their children (grace is
-        // 5 s per child, all in parallel).
+        // 5 s per child, all in parallel), then a grace beat + a final
+        // sweep for pids that registered after the enumeration above —
+        // the boot-spawn race: SIGTERM arriving mid `start_at_boot` used to
+        // see a zero-entry map, the supervisor finishing its spawn
+        // moments later, and the child escaping as an orphan (ppid 1).
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
         loop {
             let n = self.inner.supervisors.lock().unwrap().len();
@@ -239,6 +367,8 @@ impl PluginManager {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        self.sweep_spawned_children().await;
         // Remove sockets we own.
         let listeners: HashMap<String, Arc<UnixListener>> = {
             let mut l = self.inner.listeners.lock().unwrap();
@@ -250,9 +380,62 @@ impl PluginManager {
         }
     }
 
+    /// Kill-by-pid sweep over the spawn ledger (`last_pids`), for children
+    /// whose supervisor registered after the shutdown enumeration — in
+    /// flight between `spawn()` and the Shutdown command, or already
+    /// reaped/absent (the sweep no-ops then). Pure pid polling: the
+    /// supervisors own the children; we never adopt a pid (no double-reap).
+    async fn sweep_spawned_children(&self) {
+        let pids: Vec<(String, u32)> = self
+            .inner
+            .last_pids
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (id, pid) in pids {
+            let path = format!("/proc/{pid}");
+            if !std::path::Path::new(&path).exists() {
+                continue; // already reaped by its supervisor
+            }
+            // SIGTERM; a supervisor mid-stop_child sent the same signal
+            // (inert duplicate). Then poll for exit, SIGKILL past the grace.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    supervisor::STOP_GRACE.as_millis() as u64 * 2 + 2_000,
+                );
+            loop {
+                if !std::path::Path::new(&path).exists() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(plugin = %id, pid, "sweep: plugin child outlived shutdown grace; SIGKILL");
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    let kill_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::path::Path::new(&path).exists()
+                        && tokio::time::Instant::now() < kill_deadline
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
     pub fn is_shutting_down(&self) -> bool {
         self.inner.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+
 
     // ── Registry queries ──────────────────────────────────────────────────
 
@@ -575,8 +758,8 @@ impl PluginManager {
         .to_string()
             + "\n";
         let mut sessions = self.inner.sessions.lock().unwrap();
-        if let Some(senders) = sessions.get_mut(id) {
-            senders.retain(|tx| tx.send(msg.clone()).is_ok());
+        if let Some(sessions) = sessions.get_mut(id) {
+            sessions.retain(|s| s.tx.send(msg.clone()).is_ok());
         }
     }
 
@@ -584,6 +767,7 @@ impl PluginManager {
         &self,
         id: &str,
         tx: mpsc::UnboundedSender<String>,
+        protocol: u32,
     ) {
         self.inner
             .sessions
@@ -591,7 +775,7 @@ impl PluginManager {
             .unwrap()
             .entry(id.to_string())
             .or_default()
-            .push(tx);
+            .push(LiveSession { tx, protocol });
     }
 
     // ── Sockets ───────────────────────────────────────────────────────────
@@ -640,11 +824,16 @@ impl PluginManager {
     fn start_supervisor(&self, id: &str) {
         // N4: a stop/enable race with daemon shutdown must not spawn a child
         // the daemon is about to stop (and whose socket is being unlinked).
+        // The guard check and the supervisor enumeration run under ONE
+        // supervisors lock, with `shutdown()` taking the same lock to set the
+        // guard — a spawn can neither slip past the guard nor slip between
+        // the enumeration and the sweep ledger.
+        let mut sup = self.inner.supervisors.lock().unwrap();
         if self.is_shutting_down() {
+            drop(sup);
             warn!(plugin = %id, "daemon is shutting down; not spawning plugin");
             return;
         }
-        let mut sup = self.inner.supervisors.lock().unwrap();
         if let Some(tx) = sup.get(id) {
             let _ = tx.send(SupCmd::Start);
             return;
@@ -676,7 +865,16 @@ impl PluginManager {
                 tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
             }
         }
+        // Final sweep: a child mid-spawn when Stop arrived (registered on
+        // the ledger after the supervisor enumerated, or orphaned by the
+        // stop) must never outlive the stop contract.
+        self.sweep_spawned_children().await;
     }
+}
+
+/// Record the pid a supervisor spawned for `id` (shutdown-sweep ledger).
+pub(crate) fn register_child_pid(inner: &Inner, id: &str, pid: u32) {
+    inner.last_pids.lock().unwrap().insert(id.to_string(), pid);
 }
 
 fn entry_version(inner: &Inner, id: &str) -> String {

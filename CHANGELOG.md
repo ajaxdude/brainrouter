@@ -4,6 +4,72 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L3 — Role cards + decision slot (branch `v2-p3-roles`, pre-merge)
+
+One model config for everything: role cards replace the routing profile, the
+per-project pins store, presets, the reviewer `forced_*` keys, the Bonsai
+config special case, and the sync-omp/`models.yml` machinery. Every proxied
+request resolves through a single grammar — role (header, `subs`, review
+loop) → card (project > global > default `auto`) → selector
+(`auto | local | cloud | cloud/<id> | <bare-key>`), with v1's per-selector
+strictness preserved verbatim. Explicit selectors bypass cards and are never
+policy-clamped.
+
+### Added
+
+- **Role cards** (`src/roles.rs`): `role_cards.json` (0600, atomic) with
+  `{scope, role, assignment}` records, project→global→default precedence,
+  guardrail **policy** records (privacy `cloud-ok|local-only`, quality
+  `fast|balanced|maximum`), and the review card's surviving extras
+  (`max_iterations`, `hankndory_integration`). Migration table is exact
+  (`Auto→auto, Local{None}→local, Local{Some}→<bare-key>, Cloud{None}→cloud,
+  Cloud{Some}→cloud/<id>`); the `v2.0-p3` snapshot phase covers config +
+  credentials + pins + routing state and `restore v2.0-p3` byte-round-trips
+  the v1 YAML. `--dry-run` previews both phases.
+- **Decision slot** (`src/decision.rs`, `decision_model:` config): features
+  (`(bytes+3)/4` tokens, role, privacy, msg_count, has_tools, code_density,
+  project) → `{route, tier, confidence}`. Kinds: `heuristic` (v1
+  selector-matrix parity), `openai-compatible` (Bonsai migrates to exactly
+  this, `prompt_profile: bonsai`, v1 prompt/grammar verbatim, v1-safe
+  failure rows), `structured-schema` (`schema_version: 1` question, strict
+  JSON), `webhook` (features JSON, no prompt excerpt), `plugin`
+  (server-initiated `decision.classify`, plugin RPC **protocol v2** with
+  request-id correlation + `timeout_ms`, negotiated at `initialize`).
+  Guardrail clamps (privacy ⇒ local; quality raises tier) apply to slot
+  decisions only. `auto` selects from the pool (llama-swap models +
+  server-mode identities; `parameters.ctx` ranking, known-ctx only) and
+  chains on connect/headline failure — never mid-stream.
+- **Events** are additive: `role`, `decision{route,tier,confidence}`,
+  `rationale`, `decision_fallback`, `chosen_model`.
+- **Endpoints/CLI**: `GET/POST /api/roles*`, `/api/policy*`,
+  `/api/credentials*` (masked list, add/update/remove/test + verdicts,
+  grants, audit; loopback+CSRF-gated, plaintext never leaves the process),
+  `GET /api/decision`, `POST /api/decision/test`; CLI verbs `roles
+  get|set|remove`, `decision show|test`, `credential list|add|remove|test`
+  (mutations via daemon; reads direct-state when down).
+- **Dashboard**: Credentials tab (masked list/add/edit/delete/Test/
+  grants/audit), role-card strip with per-project scope, policy chips,
+  read-only Decisions panel, and a Sankey ROUTING column reading
+  role → route/tier.
+- Install templates are one entry (`auto`) per harness.
+
+### Removed
+
+- `routing_profile` store/presets/CLI/dashboard widgets, `project_pins`
+  store, `review.forced_mode/forced_model`, the `bonsai:` config block
+  (migrated; `bonsai_server.rs` stays as the launch backend under
+  `decision_model.launch`), and `sync-omp` at all four points (CLI,
+  route, daemon bootstrap, CSRF; templates print one `auto` entry).
+- The proxy fast-fails: a routing failure landing within 15 s answers with
+  a real HTTP status (deferred-200 streaming is preserved for slow model
+  loads).
+
+### Migrations
+
+`v2.0-p3`: v1 `routing:` blocks, persisted profiles, project pins,
+`review.forced_*`, and `bonsai.*` → role cards + `decision_model:` (exact
+table, snapshot + `.bak`, `--dry-run`, `restore v2.0-p3`).
+
 ## v2 L2 — Plugins + bridge pilot + credentials store (branch `v2-p2-plugins`, pre-merge)
 
 Sidecar plugins replace the compiled-in bridge (design R3,

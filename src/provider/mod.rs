@@ -5,6 +5,8 @@ use futures_util::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
+
+pub mod util;
 /// A stream of SSE-formatted bytes in OpenAI chat completion format.
 pub type SseStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 

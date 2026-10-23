@@ -34,6 +34,19 @@ pub enum BudgetTier {
     Deep,
 }
 
+/// Provenance of one classification (v2 L3): v1's grammar always answers;
+/// L3 records WHETHER the answer came from a clean one-word reply or from a
+/// failure row (HTTP/timeout/parse/server-down/missing-message ⇒ v1's Cloud
+/// "safe default", recorded on the event as `decision_fallback: "v1-safe"`).
+#[derive(Debug, Clone)]
+pub enum ClassifyQuality {
+    /// A valid one-word reply (or the off-anchor: no classifier consulted).
+    /// Carries the word for the rationale.
+    Clean(&'static str),
+    /// A v1 failure row: cloud is the safe default.
+    V1Safe(String),
+}
+
 /// Maximum tokens to generate during classification. We only need one word.
 const CLASSIFY_MAX_TOKENS: usize = 10;
 /// Truncate the user message to this many characters before classifying.
@@ -116,6 +129,17 @@ impl Classifier {
     /// Classify a request asynchronously via the external llama-server.
     /// On any error, defaults to Cloud — the safe default.
     pub async fn classify_async(&self, request: ChatCompletionRequest) -> RoutingDecision {
+        self.classify_with_provenance(request).await.0
+    }
+
+    /// The provenance-carrying classification (L3 decision slot). The wire,
+    /// the grammar, and every default are v1-verbatim: the only addition is
+    /// the `ClassifyQuality` tag that lets the slot record failure rows as
+    /// `decision_fallback: "v1-safe"` instead of a clean decision.
+    pub async fn classify_with_provenance(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> (RoutingDecision, ClassifyQuality) {
         if !self.enabled.load(Ordering::Relaxed) {
             // No classifier → "auto" means local. Route directly to llama-swap
             // (Manifest is off by default too) instead of making a pointless
@@ -128,14 +152,20 @@ impl Classifier {
             } else {
                 self.default_local_model.clone()
             };
-            return RoutingDecision::Local { model, tier: BudgetTier::Light };
+            return (
+                RoutingDecision::Local { model, tier: BudgetTier::Light },
+                ClassifyQuality::Clean("classifier off"),
+            );
         }
         let requested_model = request.model.clone();
 
         let last_user_msg = extract_last_user_message(&request);
         if last_user_msg.is_empty() {
             debug!("No user message found; defaulting to Cloud");
-            return RoutingDecision::Cloud;
+            return (
+                RoutingDecision::Cloud,
+                ClassifyQuality::V1Safe("missing/empty last user message".into()),
+            );
         }
 
         let server_url = self.server_url.clone();
@@ -175,12 +205,14 @@ impl Classifier {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("Classifier HTTP response read failed: {}; defaulting to Cloud", e);
-                    return RoutingDecision::Cloud;
+                    return (RoutingDecision::Cloud, ClassifyQuality::V1Safe(format!("response read failed: {e}")));
                 }
             },
             Err(e) => {
                 warn!("Classifier HTTP request failed: {}; defaulting to Cloud", e);
-                return RoutingDecision::Cloud;
+                // Server-down (connection refused) is v1's single classifier
+                // failure mode — the L3 binding matrix's v1-safe row.
+                return (RoutingDecision::Cloud, ClassifyQuality::V1Safe(format!("HTTP request failed: {e}")));
             }
         };
 
@@ -189,7 +221,7 @@ impl Classifier {
             Ok(r) => r,
             Err(e) => {
                 warn!("Classifier response parse failed (raw={:?}): {}; defaulting to Cloud", raw, e);
-                return RoutingDecision::Cloud;
+                return (RoutingDecision::Cloud, ClassifyQuality::V1Safe(format!("response parse failed: {e}")));
             }
         };
 
@@ -199,9 +231,10 @@ impl Classifier {
 
         let decision = parse_decision(choice_text);
         debug!(raw = %choice_text.trim(), ?decision, "Bonsai classification");
+        let quality = classify_quality(choice_text, decision);
 
         match decision {
-            ParsedDecision::Cloud => RoutingDecision::Cloud,
+            ParsedDecision::Cloud => (RoutingDecision::Cloud, quality),
             ParsedDecision::Local | ParsedDecision::Deep => {
                 let tier = match decision {
                     ParsedDecision::Deep => BudgetTier::Deep,
@@ -221,7 +254,54 @@ impl Classifier {
                 } else {
                     self.default_local_model.clone()
                 };
-                RoutingDecision::Local { model, tier }
+                (RoutingDecision::Local { model, tier }, quality)
+            }
+        }
+    }
+
+    /// L3 slot constructor: an endpoint owned by the decision-model config
+    /// (the migrated bonsai classifier, or any OpenAI-compatible model).
+    /// `enabled` is the shared "classifier server is on" flag.
+    pub fn for_slot(
+        server_url: String,
+        default_local_model: String,
+        enabled: Arc<AtomicBool>,
+        nudge_enabled: Arc<AtomicBool>,
+        nudge_model_key: Option<String>,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::with_timeout(
+            server_url,
+            default_local_model,
+            enabled,
+            nudge_enabled,
+            nudge_model_key,
+            request_timeout,
+        )
+    }
+}
+
+/// Distinguish a clean one-word reply from a v1 safe-default failure row.
+/// v1's grammar (verbatim): first non-whitespace char 'l'→Local, 'd'→Deep,
+/// else Cloud. L3's event taxonomy: an exact canonical word (or an 'l'/'d'
+/// first char, which is the grammar's real signal) is CLEAN; a non-word reply
+/// that fell through to Cloud is a PARSE failure row (v1-safe).
+fn classify_quality(raw: &str, decision: ParsedDecision) -> ClassifyQuality {
+    let first_word = raw
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let clean = |word: &'static str| ClassifyQuality::Clean(word);
+    match decision {
+        ParsedDecision::Local => clean("local"),
+        ParsedDecision::Deep => clean("deep"),
+        ParsedDecision::Cloud => {
+            if first_word.starts_with("cloud") {
+                clean("cloud")
+            } else {
+                ClassifyQuality::V1Safe(format!("non-word reply {first_word:?}"))
             }
         }
     }
@@ -247,7 +327,7 @@ fn parse_decision(raw: &str) -> ParsedDecision {
 }
 
 /// Extract the last user message from the request, truncated for prompt brevity.
-fn extract_last_user_message(request: &ChatCompletionRequest) -> String {
+pub fn extract_last_user_message(request: &ChatCompletionRequest) -> String {
     let last_user = request.messages.iter().rev().find(|m| m.role == "user");
     let raw = match last_user {
         Some(msg) => match &msg.content {

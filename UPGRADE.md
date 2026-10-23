@@ -4,6 +4,55 @@ Per-phase upgrade/rollback procedures. Phase tags + the per-leg restore
 contract live in `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback"); the change list is in `CHANGELOG.md`.
 
+## v2.0-p3 (L3): role cards + decision slot
+
+v1 configured models in four places: the `routing:` profile block
+(+ presets), `project_pins.json`, `review.forced_mode`/`forced_model`, and
+the `bonsai:` classifier section. v2 L3 replaces all of them with
+**role cards** (`$XDG_STATE_HOME/brainrouter/role_cards.json`) + the
+**decision slot** (`decision_model:` in YAML). Booting a v2 L3 daemon with a
+pre-L3 config runs the `v2.0-p3` migration automatically:
+
+1. Everything consumed is snapshotted — the config YAML, the credentials
+   store, `project_pins.json`, and `routing_state.json` — under
+   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p3/<UTC timestamp>/`.
+2. Cards are written via the exact table:
+
+   | v1 state | card |
+   |---|---|
+   | `Auto` | `auto` |
+   | `Local{None}` (the default with no `routing:` block) | `local` |
+   | `Local{Some(id)}` | `<bare-key>` |
+   | `Cloud{None}` | `cloud` |
+   | `Cloud{Some(id)}` | `cloud/<id>` |
+   | presets | expanded over `main`/`reviewer` via the same table |
+   | project pins (per scope, incl. `subagent_model`/subagent pin) | per-project cards |
+   | `review.forced_mode`/`forced_model` | global `review` card (the routing block's reviewer wins, v1 precedence) |
+   | `review.max_iterations`/`hankndory_integration`/`design_doc_path` | review-card extras |
+   | `bonsai.*` | `decision_model:` (kind `openai-compatible`, `prompt_profile: bonsai`, launch backend under `decision_model.launch`) |
+
+3. The consumed YAML keys (`routing:`, `review.forced_mode/forced_model`,
+   `bonsai:`) are stripped; a `.bak` copy of the original is written next to
+   the config. The `v2.0-p3` phase runs BEFORE `v2.0-p2`, so restoring it
+   returns the pristine v1 YAML.
+
+Preview without writing: `brainrouter serve --config <path> --dry-run`.
+Rollback:
+
+```bash
+brainrouter migration --config brainrouter.yaml restore v2.0-p3
+# restores the pre-migration YAML byte-for-byte + the v1 pins/profile state
+# files and removes role_cards.json
+```
+
+The v1 selector surface on the proxy is unchanged (`auto`, `local`, `cloud`,
+`cloud/<id>`, `subs`, `brainrouter/<id>`); a new `x-brainrouter-role` header
+(labels `main|review|subagent`) tags events, and the `subs` selector now
+NAMES the subagent role and resolves through its card. `sync-omp` and
+`routing-profile` are gone: `brainrouter roles get|set|remove`,
+`brainrouter decision show|test`, and `brainrouter credential …` replace
+them, and install templates carry exactly one `auto` entry per harness.
+
 ## v2.0-p2 (L2): the bridge becomes a plugin
 
 v1 ran Discord/Signal inside the daemon behind cargo features. v2 L2 moves

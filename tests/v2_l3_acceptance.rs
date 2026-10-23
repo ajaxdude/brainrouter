@@ -321,6 +321,22 @@ fn repo_root() -> String {
     fs::canonicalize(std::env::current_dir().expect("test cwd")).unwrap().display().to_string()
 }
 
+/// Process-wide fixture gate. Every test owns a live daemon, loopback mock
+/// upstreams, and (for some) python fixtures bound to kernel-assigned
+/// ports; on a saturated shared runner, parallel libtest threads race in
+/// the reserve-then-rebind windows and in fixture boot latency, producing
+/// ROTATING false failures (webhook POST against a not-yet-listening port
+/// falls back to heuristic; a stolen daemon port kills a sibling's boot).
+/// Each test holds this gate for its entire lifetime — full fixture-lifetime
+/// isolation: one test's ports, accumulators, daemons, and event log at a
+/// time. Assertions are untouched; every promise stays binding.
+static SUITE_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+fn suite_gate() -> &'static tokio::sync::Mutex<()> {
+    &SUITE_GATE
+}
+
 // ── Config fixtures ─────────────────────────────────────────────────────────
 
 /// L3-era base config: mocks for both backends, bonsai off. `decision_model`
@@ -659,28 +675,49 @@ impl Daemon {
 
     fn start_with_env<I, S>(env: &TestEnv, config_yaml: &str, extra: I) -> Self
     where
-        I: IntoIterator<Item = (S, S)>,
+        I: IntoIterator<Item = (S, S)> + Clone,
         S: AsRef<std::ffi::OsStr> + Clone,
     {
         let config_path = env.root.join("config.yaml");
         fs::write(&config_path, config_yaml).unwrap();
         let socket = env.root.join("d.sock");
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
         let log = env.root.join("daemon.log");
-        let log_file = fs::File::create(&log).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainrouter"));
-        cmd.args(["serve", "--config"])
-            .arg(&config_path)
-            .args(["--tcp-addr", address.to_string().as_str(), "--socket"])
-            .arg(&socket)
-            .current_dir(&env.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file.try_clone().unwrap()))
-            .stderr(Stdio::from(log_file));
-        env.apply(&mut cmd, extra);
-        let child = cmd.spawn().unwrap();
+        // Reserved-then-freed loopback ports carry a TOCTOU window on a
+        // saturated shared runner: a sibling fixture's bind can claim the
+        // port between drop() and the daemon's bind (manifests as
+        // "daemon exited" flakes). On a bind collision, reserve a fresh
+        // port and respawn (up to 3 attempts).
+        let mut attempt = 0u8;
+        let (address, mut child) = loop {
+            attempt += 1;
+            let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reservation.local_addr().unwrap();
+            drop(reservation);
+            let log_file = fs::File::create(&log).unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainrouter"));
+            cmd.args(["serve", "--config"])
+                .arg(&config_path)
+                .args(["--tcp-addr", address.to_string().as_str(), "--socket"])
+                .arg(&socket)
+                .current_dir(&env.root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file.try_clone().unwrap()))
+                .stderr(Stdio::from(log_file));
+            env.apply(&mut cmd, extra.clone());
+            let mut child = cmd.spawn().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            if child.try_wait().unwrap().is_none() || attempt == 3 {
+                break (address, child);
+            }
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            if !text.to_lowercase().contains("address already in use") {
+                break (address, child);
+            }
+            // Bind collision: a parallel sibling's fixture claimed the
+            // reserved port before the daemon bound it — re-reserve and
+            // respawn.
+            drop(child);
+        };
         Self {
             child,
             url: format!("http://{address}"),
@@ -688,7 +725,7 @@ impl Daemon {
             socket,
             client: reqwest::Client::builder()
                 .no_proxy()
-                .timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap(),
             env: TestEnv::borrow(env),
@@ -1054,7 +1091,7 @@ async fn events(d: &Daemon) -> Vec<Value> {
 }
 
 async fn event_for(d: &Daemon, prompt: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let evs = events(d).await;
         if let Some(e) = evs
@@ -1240,7 +1277,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-ThreadingHTTPServer(("127.0.0.1", cfg["port"]), H).serve_forever()
+server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+# Kernel-assigned port reported through the port file: NO reserve-then-free
+# window for a sibling process to steal under parallel load.
+with open(cfg["portfile"], "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
 "#;
 
 fn manifest_toml(id: &str, binary: &str, grants: &[&str]) -> String {
@@ -1278,23 +1320,22 @@ fn poll_read_json(path: &Path, timeout: Duration) -> Value {
     }
 }
 
-/// Free loopback port for the webhook fixture.
-fn reserve_port() -> (u16, TcpListener) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    (p, l)
-}
-
+/// Spawn the webhook fixture. The port is kernel-assigned (bind :0 inside
+/// python) and reported through a port file; then a connect-gate makes
+/// "listening" a precondition of returning. Under parallel load a
+/// reserve-then-drop port could be stolen before python bound it (the slot
+/// POST then hit a closed port, the fresh-config failure path fell back to
+/// heuristic, and `cloud.models_seen()` stayed empty).
 fn spawn_webhook_mock(env: &TestEnv, decision: Value) -> (String, PathBuf, std::process::Child) {
-    let (port, _reserved) = reserve_port();
-    drop(_reserved);
     let dir = env.root.join("webhook");
     fs::create_dir_all(&dir).unwrap();
     let cfg_path = dir.join("cfg.json");
     let record = dir.join("last_post.json");
+    let portfile = dir.join("port");
+    let _ = fs::remove_file(&portfile);
     fs::write(
         &cfg_path,
-        json!({"port": port, "record": record, "decision": decision}).to_string(),
+        json!({"record": record, "portfile": portfile, "decision": decision}).to_string(),
     )
     .unwrap();
     let script = dir.join("webhook.py");
@@ -1303,7 +1344,29 @@ fn spawn_webhook_mock(env: &TestEnv, decision: Value) -> (String, PathBuf, std::
     let mut cmd = Command::new(env.bin.join("python3"));
     cmd.arg(&script).arg(&cfg_path).stdin(Stdio::null());
     env.apply(&mut cmd, std::iter::empty::<(String, String)>());
-    let child = cmd.spawn().expect("spawn webhook fixture");
+    let mut child = cmd.spawn().expect("spawn webhook fixture");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(text) = fs::read_to_string(&portfile) {
+            if let Ok(p) = text.trim().parse::<u16>() {
+                break p;
+            }
+        }
+        assert!(
+            child.try_wait().map(|s| s.is_none()).unwrap_or(true) && Instant::now() < deadline,
+            "webhook fixture did not report a port (child exit: {:?})",
+            child.try_wait().ok().flatten()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "webhook fixture never accepted on port {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     (format!("http://127.0.0.1:{port}"), record, child)
 }
 
@@ -1314,6 +1377,7 @@ fn spawn_webhook_mock(env: &TestEnv, decision: Value) -> (String, PathBuf, std::
 /// carries the role from the `x-brainrouter-role` header (default main).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_resolution_matrix_global_cards_per_role() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("matrix");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1399,6 +1463,7 @@ async fn l3_resolution_matrix_global_cards_per_role() {
 // for the main role (src/router.rs:288-297 @ v1-classic).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_resolution_project_scope_beats_global() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("projscope");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1441,6 +1506,7 @@ async fn l3_resolution_project_scope_beats_global() {
 /// explicit selectors)").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_privacy_clamps_auto_never_explicit() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("privacy");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1500,6 +1566,7 @@ async fn l3_privacy_clamps_auto_never_explicit() {
 /// v1-classic) — the classifier mock must see ZERO hits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_subs_names_subagent_role_overrides_header() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("subsname");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1554,6 +1621,7 @@ async fn l3_subs_names_subagent_role_overrides_header() {
 ///  - cloud/<id>  -> cloud passthrough of <id> (L365-371)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_heuristic_parity_v1_selector_matrix() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("parity");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1623,6 +1691,7 @@ enum Served {
 /// below: src/classifier.rs @ v1-classic (lines cited inline).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_bonsai_profile_success_triples_prompt_verbatim() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("bonsai-ok");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1721,6 +1790,7 @@ async fn l3_bonsai_profile_success_triples_prompt_verbatim() {
 /// missing/empty last user message L136-139.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_bonsai_profile_failure_table_v1_safe() {
+    let _gate = suite_gate().lock().await;
     // Row A: server down (connection refused — v1's single failure mode).
     let env = TestEnv::new("bonsai-down");
     let local = spawn_mock(MockCfg::default());
@@ -1835,6 +1905,7 @@ async fn l3_bonsai_profile_failure_table_v1_safe() {
 /// (< min_confidence, default 0.4) => heuristic, `fallback: heuristic`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_structured_schema_strict_json_fallbacks() {
+    let _gate = suite_gate().lock().await;
     // Row 1: strict JSON with confidence 0.1 (< default min_confidence
     // 0.4) -> heuristic fallback recorded in the event; heuristic parity
     // (v1 classifier-off anchor) => local.
@@ -1907,6 +1978,7 @@ async fn l3_structured_schema_strict_json_fallbacks() {
 /// classifiers = feature summary"), and the webhook's decision is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_webhook_features_no_excerpt_returns_decision() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("webhook");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -1976,6 +2048,7 @@ async fn l3_webhook_features_no_excerpt_returns_decision() {
 /// `/api/config` (config show) and the dashboard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_credentials_ui_crud_test_verdicts_grants_masked() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("creds");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -2085,6 +2158,7 @@ async fn l3_credentials_ui_crud_test_verdicts_grants_masked() {
 /// through the L3 UI (grant-scoped delivery of a UI-managed value).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_credentials_plugin_secrets_get_after_ui_add() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("credsplug");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -2135,6 +2209,7 @@ async fn l3_credentials_plugin_secrets_get_after_ui_add() {
 /// removed." v1 base (install.rs L79-91 @ 6c47ad7) prints THREE model ids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_install_single_auto_entry_per_harness() {
+    let _gate = suite_gate().lock().await;
     // omp: the provider block (file-written or printed) lists one model.
     let env = TestEnv::new("install-omp");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_brainrouter"));
@@ -2202,6 +2277,7 @@ async fn l3_install_single_auto_entry_per_harness() {
 /// mention the removal and must keep it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_sync_omp_removed_at_four_points() {
+    let _gate = suite_gate().lock().await;
     // Point 1: CLI — the verb is gone from `--help`.
     let out = Command::new(env!("CARGO_BIN_EXE_brainrouter"))
         .args(["--help"])
@@ -2280,6 +2356,7 @@ fn walk_source(root: &Path) -> Vec<PathBuf> {
 /// intact ("Contracts kept": event schema additive fields only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_events_additive_fields_v1_fields_intact() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("events");
     let local = spawn_mock(MockCfg::default());
     let cloud = spawn_mock(MockCfg::default());
@@ -2351,6 +2428,7 @@ async fn l3_events_additive_fields_v1_fields_intact() {
 /// migration table, exact, no inference").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_migration_v1_state_role_cards_exact_table() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("migrate-table");
     fs::create_dir_all(env.config_dir()).unwrap();
     fs::write(env.config_dir().join("project_pins.json"), v1_project_pins_json(&repo_root())).unwrap();
@@ -2442,6 +2520,7 @@ async fn l3_migration_v1_state_role_cards_exact_table() {
 /// round-trip, and --dry-run is inert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_migration_no_routing_review_survivors_restore_dryrun() {
+    let _gate = suite_gate().lock().await;
     // --dry-run FIRST, inert, on a pristine v1 state.
     let env = TestEnv::new("migrate-dry");
     let local = spawn_mock(MockCfg::default());
@@ -2576,6 +2655,7 @@ fn find_files_named(dir: &Path, needle: &str) -> Vec<PathBuf> {
 /// tests/subs_routing_test.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_bare_key_card_strict_no_retry() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("bare-strict");
     let local = spawn_mock(MockCfg {
         fail_models: vec!["strict-bare-model".into()],
@@ -2614,6 +2694,7 @@ async fn l3_bare_key_card_strict_no_retry() {
 /// error surfaces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_local_card_v1_managed_fallback_semantics() {
+    let _gate = suite_gate().lock().await;
     // Healthy row: served on the fallback model.
     let env = TestEnv::new("local-ok");
     let local = spawn_mock(MockCfg::default());
@@ -2669,6 +2750,7 @@ async fn l3_local_card_v1_managed_fallback_semantics() {
 // bail at router.rs L627-631 @ v1-classic).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_cloud_card_hop_and_reviewer_strict() {
+    let _gate = suite_gate().lock().await;
     let env = TestEnv::new("cloud-hop");
     // Cloud is dead; llama-swap is healthy.
     let local = spawn_mock(MockCfg::default());
@@ -2727,6 +2809,7 @@ async fn l3_cloud_card_hop_and_reviewer_strict() {
 /// never retried: the client sees the stream die, one upstream hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l3_auto_chain_next_candidate_and_midstream_never_retried() {
+    let _gate = suite_gate().lock().await;
     // Chain row: seed (fallback_model) fails at the response headline, the
     // next pool candidate serves.
     let env = TestEnv::new("chain");

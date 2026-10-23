@@ -117,11 +117,30 @@ const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
 const DEFERRED_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Shared state passed to all request handlers
+/// The project-scope retry grace window for one UDS CONNECTION, anchored
+/// at ACCEPT time: a connection accepted at t has a live peer (its CLI
+/// process completes its request-response exchange before exiting), so a
+/// cwd resolvable at accept cannot vanish mid-exchange, and queueing
+/// anywhere below (reqwest accept queues, tokio task scheduling under
+/// full-suite load) does NOT burn the window. Per-connection state keeps
+/// concurrent CLI connections independent.
+#[derive(Default)]
+pub struct ScopeClock(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl ScopeClock {
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        self.0.lock().unwrap().map(|t| t.elapsed())
+    }
+}
+
+
+
 pub struct AppState {
     pub router: Arc<Router>,
     pub session_manager: Arc<SessionManager>,
     pub review_service: Arc<ReviewService>,
     pub routing_events: Arc<RoutingEvents>,
+
     /// llama-swap root URL (without /v1 suffix) for status polling.
     pub llama_swap_url: String,
     /// Manifest base URL for health checking.
@@ -186,6 +205,15 @@ pub struct AppState {
     /// (ds4/llama_cpp/gufo after the v2 L1 purge; the HF-pulling server
     /// backends have no download step, see `model_downloads.rs` module docs).
     pub model_downloads: Arc<crate::model_downloads::ModelDownloadRegistry>,
+    /// v2 L3: role cards (the single model config — assignments + policy +
+    /// review card extras).
+    pub roles: Arc<crate::roles::RoleCardStore>,
+    /// v2 L3: the decision-model slot (features → {route, tier}).
+    pub decision: Arc<crate::decision::DecisionSlot>,
+    /// v2 L3: the decision slot config (for `decision show`/`test`).
+    pub decision_config: crate::config::DecisionModelConfig,
+    /// v2 L2 credentials store — exposed to the L3 credentials UI endpoints.
+    pub credentials: Arc<crate::credentials::CredentialStore>,
     /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
     /// of currently-running toolbox Server Mode containers'
     /// `{toolbox_backend, compute_api, runtime_profile_id, endpoint}`.
@@ -257,7 +285,7 @@ fn is_loopback_http_url(value: &str) -> bool {
 /// security boundary is unit-tested. `has_query` is `req.uri().query().is_some()`
 /// — used only to gate the per-project-pin `?path=` resolver while leaving the
 /// plain no-query GET ungated.
-fn request_is_destructive(method: &str, path: &str, has_query: bool) -> bool {
+fn request_is_destructive(method: &str, path: &str, _has_query: bool) -> bool {
     path.starts_with("/api/restart/") || path.starts_with("/api/upgrade/")
         // Generalized toolbox container management (create/update/delete/adopt,
         // PR2 §5c) — prefix-gated like /api/upgrade/ so a future sub-path under
@@ -276,18 +304,18 @@ fn request_is_destructive(method: &str, path: &str, has_query: bool) -> bool {
         // FR-A: code-review master switch write path — prefix-gated like the
         // other local-only mutating APIs.
         || (method == "POST" && path.starts_with("/api/review/"))
-        // Phase 2 per-project model pins: POST/DELETE mutate persisted state; the
-        // `?path=` GET resolver canonicalizes an arbitrary caller-supplied path
-        // (a filesystem path-oracle + blocking-pool vector), so gate it too. The
-        // plain no-query GET stays ungated, like GET /api/routing-profile.
-        || (matches!(method, "POST" | "DELETE") && path == "/api/project-pin")
-        || (method == "GET" && path == "/api/project-pin" && has_query)
+        // v2 L3 role cards / policy / credentials / decision slot: every
+        // mutation is loopback + CSRF gated (credentials material NEVER
+        // appears in GETs unmasked).
+        || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/roles"))
+        || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/policy"))
+        || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/credentials"))
+        || (method == "POST" && path.starts_with("/api/decision/"))
         || (method == "POST" && path.starts_with("/api/llama-swap/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
-            || path == "/api/open-editor" || path == "/api/models/sync-omp"
+            || path == "/api/open-editor"
             || path == "/api/routing-mode" || path == "/api/review-config"
-            || path == "/api/routing-profile"
             || path.starts_with("/api/plugins")
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
@@ -307,7 +335,13 @@ async fn handle_request(
     state: Arc<AppState>,
     cwd: String,
     peer_addr: SocketAddr,
+    scope_clock: Option<Arc<ScopeClock>>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
+    // UDS requests carry their per-request grace clock (project scope);
+    // the request completes on this same task, and the next request on the
+    // connection installs its own clock (per-request isolation, no leak).
+    state.router.set_request_scope_clock(scope_clock);
+    tracing::debug!(cwd = %cwd, "L3DIAG3 request");
     let method = req.method().as_str();
     let path = req.uri().path();
 
@@ -405,7 +439,9 @@ async fn handle_request(
         ("POST", "/v1/chat/completions") => {
             let session_id = extract_session_id(req.headers());
             let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
-            match handle_chat_completion(req, state, cwd, session_id, user_agent, peer_addr).await {
+            // v2 L3 role signal: x-brainrouter-role (default main).
+            let role = req.headers().get("x-brainrouter-role").and_then(|v| v.to_str().ok()).unwrap_or("main").trim().to_string();
+            match handle_chat_completion(req, state, cwd, session_id, user_agent, peer_addr, role).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling chat completion: {}", e);
@@ -420,8 +456,9 @@ async fn handle_request(
 
         ("POST", "/v1/messages") => {
             let session_id = extract_session_id(req.headers());
+            let _l3_role = req.headers().get("x-brainrouter-role").and_then(|v| v.to_str().ok()).unwrap_or("main").trim().to_string();
             let user_agent = req.headers().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
-            match handle_anthropic_messages(req, state, cwd, session_id, user_agent, peer_addr).await {
+            match handle_anthropic_messages(req, state, cwd, session_id, user_agent, peer_addr, _l3_role).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Error handling Anthropic messages: {}", e);
@@ -647,26 +684,6 @@ async fn handle_request(
             }
         }
 
-        ("POST", "/api/models/sync-omp") => {
-            match sync_omp_models(&state.llama_swap_url, &state.tcp_addr).await {
-                Ok(count) => {
-                    let resp = json_response(StatusCode::OK, &serde_json::json!({
-                        "synced": true,
-                        "model_count": count
-                    }));
-                    into_unsync(resp)
-                }
-                Err(e) => {
-                    error!("Error syncing OMP models: {}", e);
-                    let resp = json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse { error: format!("Sync failed: {}", e) },
-                    );
-                    into_unsync(resp)
-                }
-            }
-        }
-
         // ── v2 L2 Plugins API (replaces the v1 bridge status/toggle pair) ──
         ("GET", "/api/plugins") => {
             let resp = json_response(StatusCode::OK, &state.plugins.dashboard_json());
@@ -740,9 +757,12 @@ async fn handle_request(
 
         // ── Routing mode override API ─────────────────────────────────────────
         ("GET", "/api/routing-mode") => {
-            let choice = state.review_service.preferences().profile().main;
+            // Legacy mirror of the global main card's backend.
+            let assignment = state.roles.assignment(crate::roles::Role::Main, None);
+            let selector = crate::roles::parse_selector(&assignment);
             let resp = json_response(StatusCode::OK, &serde_json::json!({
-                "mode": choice.backend(), "model": choice.model(),
+                "mode": selector.backend(),
+                "assignment": assignment,
             }));
             into_unsync(resp)
         }
@@ -755,15 +775,16 @@ async fn handle_request(
                 Ok(update) => update,
                 Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
             };
-            let choice = match crate::routing_profile::ModelChoice::from_legacy(&update.mode, None) {
-                Ok(choice) => choice,
-                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
-            };
-            let store = Arc::clone(state.review_service.preferences());
-            match tokio::task::spawn_blocking(move || store.update_main(choice)).await
+            let selector = crate::roles::parse_selector(&update.mode);
+            if !matches!(selector, crate::roles::Selector::Auto | crate::roles::Selector::Local | crate::roles::Selector::Cloud) {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "mode must be auto, local, or cloud"));
+            }
+            let cards = Arc::clone(&state.roles);
+            let mode = update.mode.clone();
+            match tokio::task::spawn_blocking(move || cards.set_assignment(crate::roles::GLOBAL_SCOPE, crate::roles::Role::Main, &mode)).await
                 .map_err(anyhow::Error::from).and_then(|result| result) {
                 Ok(()) => {
-                    let code = match update.mode.as_str() { "cloud" => 1, "local" => 2, _ => 0 };
+                    let code = match selector.backend() { "cloud" => 1, "local" => 2, _ => 0 };
                     state.routing_mode.store(code, AtomicOrdering::Relaxed);
                     into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "mode": update.mode })))
                 }
@@ -771,125 +792,227 @@ async fn handle_request(
             }
         }
 
-        ("GET", "/api/routing-profile") => {
-            into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                "profile": state.review_service.preferences().profile(),
-                "cloud_enabled": state.manifest_enabled,
-                "cloud_policy": "Disabled or unavailable cloud falls back to the configured local default; selecting a profile never enables cloud.",
-                "review_policy": "New sessions snapshot the reviewer; continuations keep that choice.",
-            })))
+        // ── v2 L3: role cards + policy (replaces routing-profile + pins) ────
+        ("GET", "/api/roles") => {
+            into_unsync(json_response(StatusCode::OK, &roles_json(&state)))
         }
 
-        ("POST", "/api/routing-profile") => {
-            let profile: crate::routing_profile::RoutingProfile = match read_routing_json(req).await {
-                Ok(profile) => profile,
-                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
-            };
-            if let Err(error) = profile.validate() {
-                return Ok(routing_error(StatusCode::BAD_REQUEST, error));
+        ("POST", "/api/roles/set") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct RoleSet {
+                role: String,
+                assignment: String,
+                #[serde(default)]
+                scope: Option<String>,
             }
-            let store = Arc::clone(state.review_service.preferences());
-            let saved = profile.clone();
-            match tokio::task::spawn_blocking(move || store.update_profile(saved)).await
-                .map_err(anyhow::Error::from).and_then(|result| result) {
-                Ok(()) => {
-                    let code = match profile.main.backend() { "cloud" => 1, "local" => 2, _ => 0 };
-                    state.routing_mode.store(code, AtomicOrdering::Relaxed);
-                    into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "profile": profile })))
-                }
-                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-            }
-        }
-
-        ("GET", "/api/routing-models") => {
-            into_unsync(json_response(StatusCode::OK, &state.router.model_catalog().await))
-        }
-
-        // ── Per-project model pins (Phase 2) ────────────────────────────────
-        ("GET", "/api/project-pin") => {
-            let global = state.review_service.preferences().profile();
-            let store = match state.router.project_pins().map(Arc::clone) {
-                Some(store) => store,
-                None => return Ok(into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                    "pins": serde_json::Map::new(), "global": global, "cloud_enabled": state.manifest_enabled,
-                })))),
-            };
-            if let Some(query) = req.uri().query() {
-                // Loopback-gated resolver: normalize a raw/subdir/symlinked path
-                // to its canonical key + current pin. Canonicalization is
-                // filesystem work, so run it off the async worker.
-                let raw = match single_path_query(query) {
-                    Ok(raw) => raw,
-                    Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
-                };
-                let (key, pin) = tokio::task::spawn_blocking(move || {
-                    let key = store.resolve_key(&raw);
-                    let pin = key.as_ref().and_then(|k| store.get(k));
-                    (key, pin)
-                })
-                .await
-                .unwrap_or((None, None));
-                into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                    "key": key, "pin": pin, "global": global,
-                })))
-            } else {
-                into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                    "pins": store.snapshot(), "global": global, "cloud_enabled": state.manifest_enabled,
-                })))
-            }
-        }
-
-        ("POST", "/api/project-pin") => {
-            let Some(store) = state.router.project_pins().map(Arc::clone) else {
-                return Ok(routing_error(StatusCode::SERVICE_UNAVAILABLE, "project pins are not configured"));
-            };
-            let body: ProjectPinBody = match read_routing_json(req).await {
+            let body: RoleSet = match read_routing_json(req).await {
                 Ok(body) => body,
                 Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
             };
-            let path = match body.path {
-                serde_json::Value::String(path) if !path.is_empty() => path,
-                _ => return Ok(routing_error(StatusCode::BAD_REQUEST, "path must be a non-empty string")),
-            };
-            let main = match project_pin_role(body.main, "main") {
-                Ok(main) => main,
+            let role = match crate::roles::Role::parse(&body.role) {
+                Ok(role) => role,
                 Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
             };
-            let reviewer = match project_pin_role(body.reviewer, "reviewer") {
-                Ok(reviewer) => reviewer,
-                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
-            };
-            let subagent = match project_pin_subagent(body.subagent) {
-                Ok(subagent) => subagent,
-                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
-            };
-            let pin = crate::project_pins::ProjectPin { main, reviewer, subagent };
-            match tokio::task::spawn_blocking(move || store.set(&path, pin).map(|key| (store.snapshot(), key)))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
+            let scope = body.scope.unwrap_or_else(|| crate::roles::GLOBAL_SCOPE.to_string());
+            let assignment = body.assignment.clone();
+            let cards = Arc::clone(&state.roles);
+            match tokio::task::spawn_blocking(move || cards.set_assignment(&scope, role, &assignment)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
             {
-                Ok((pins, key)) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "pins": pins, "key": key }))),
+                Ok(()) => into_unsync(json_response(StatusCode::OK, &roles_json(&state))),
                 Err(error) => routing_error(StatusCode::BAD_REQUEST, error),
             }
         }
 
-        ("DELETE", "/api/project-pin") => {
-            let Some(store) = state.router.project_pins().map(Arc::clone) else {
-                return Ok(routing_error(StatusCode::SERVICE_UNAVAILABLE, "project pins are not configured"));
-            };
-            let body: ProjectPinDelete = match read_routing_json(req).await {
+        ("POST", "/api/roles/remove") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct RoleRemove {
+                role: String,
+                #[serde(default)]
+                scope: Option<String>,
+            }
+            let body: RoleRemove = match read_routing_json(req).await {
                 Ok(body) => body,
                 Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
             };
-            match tokio::task::spawn_blocking(move || store.remove(&body.key).map(|()| store.snapshot()))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
+            let role = match crate::roles::Role::parse(&body.role) {
+                Ok(role) => role,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let scope = body.scope.unwrap_or_else(|| crate::roles::GLOBAL_SCOPE.to_string());
+            let cards = Arc::clone(&state.roles);
+            match tokio::task::spawn_blocking(move || cards.remove_assignment(&scope, role)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
             {
-                Ok(pins) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({ "pins": pins }))),
+                Ok(removed) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "removed": removed, "roles": roles_json(&state),
+                }))),
+                Err(error) => routing_error(StatusCode::BAD_REQUEST, error),
+            }
+        }
+
+        // Policy set: the contract pins POST /api/policy/set; the dashboard
+        // probes the short aliases — all routes share one handler.
+        ("POST", "/api/policy/set") | ("POST", "/api/policy") | ("POST", "/api/roles/policy") | ("POST", "/api/role-cards/policy") => {
+            let body: serde_json::Value = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let scope = body.get("scope").and_then(|v| v.as_str()).unwrap_or(crate::roles::GLOBAL_SCOPE);
+            let privacy = match body.get("privacy").and_then(|v| v.as_str()) {
+                Some("cloud-ok") => crate::roles::Privacy::CloudOk,
+                Some("local-only") => crate::roles::Privacy::LocalOnly,
+                _ => return Ok(routing_error(StatusCode::BAD_REQUEST, "privacy must be cloud-ok or local-only")),
+            };
+            let quality = match body.get("quality").and_then(|v| v.as_str()) {
+                Some("fast") => crate::roles::Quality::Fast,
+                Some("balanced") => crate::roles::Quality::Balanced,
+                Some("maximum") => crate::roles::Quality::Maximum,
+                _ => return Ok(routing_error(StatusCode::BAD_REQUEST, "quality must be fast, balanced, or maximum")),
+            };
+            let cards = Arc::clone(&state.roles);
+            let scope = scope.to_string();
+            match tokio::task::spawn_blocking(move || cards.set_policy(&scope, privacy, quality)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
+            {
+                Ok(()) => into_unsync(json_response(StatusCode::OK, &policy_json(&state))),
+                Err(error) => routing_error(StatusCode::BAD_REQUEST, error),
+            }
+        }
+
+        ("GET", "/api/policy") => into_unsync(json_response(StatusCode::OK, &policy_json(&state))),
+
+        // ── v2 L3: credentials UI (masked list + add/update/remove/test) ────
+        ("GET", "/api/credentials") | ("GET", "/api/credentials/list") => {
+            into_unsync(json_response(StatusCode::OK, &credentials_json(&state)))
+        }
+
+        ("POST", "/api/credentials/add") | ("POST", "/api/credentials/update") | ("POST", "/api/credentials/save") => {
+            let record: crate::credentials::CredentialRecord = match read_routing_json(req).await {
+                Ok(record) => record,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            if record.id.trim().is_empty() {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "credential id must not be empty"));
+            }
+            let store = Arc::clone(&state.credentials);
+            match tokio::task::spawn_blocking(move || store.put(record)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
+            {
+                Ok(()) => into_unsync(json_response(StatusCode::OK, &credentials_json(&state))),
                 Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
             }
+        }
+
+        ("POST", "/api/credentials/remove") => {
+            let body: serde_json::Value = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "missing id"));
+            };
+            let store = Arc::clone(&state.credentials);
+            let id = id.to_string();
+            match tokio::task::spawn_blocking(move || store.remove(&id)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
+            {
+                Ok(removed) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "removed": removed, "credentials": credentials_json(&state),
+                }))),
+                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+
+        ("POST", "/api/credentials/test") => {
+            let body: serde_json::Value = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "missing id"));
+            };
+            into_unsync(json_response(StatusCode::OK, &credential_test_json(&state, id)))
+        }
+
+        // REST alias (design "add/edit/delete"): DELETE /api/credentials/{id}.
+        ("DELETE", p) if p.starts_with("/api/credentials/") => {
+            let id = &p["/api/credentials/".len()..];
+            if id.is_empty() || id.contains('/') {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "invalid credential id"));
+            }
+            let store = Arc::clone(&state.credentials);
+            let id = id.to_string();
+            match tokio::task::spawn_blocking(move || store.remove(&id)).await
+                .map_err(anyhow::Error::from).and_then(|result| result)
+            {
+                Ok(removed) => into_unsync(json_response(StatusCode::OK, &serde_json::json!({
+                    "removed": removed, "credentials": credentials_json(&state),
+                }))),
+                Err(error) => routing_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+
+        // Per-credential test alias: POST /api/credentials/{id}/test.
+        ("POST", p) if p.starts_with("/api/credentials/") && p.ends_with("/test") => {
+            let id = &p["/api/credentials/".len()..p.len() - "/test".len()];
+            if id.is_empty() || id.contains('/') {
+                return Ok(routing_error(StatusCode::BAD_REQUEST, "invalid credential id"));
+            }
+            into_unsync(json_response(StatusCode::OK, &credential_test_json(&state, id)))
+        }
+
+        ("POST", "/api/credentials/audit") => {
+            // The audit view IS the masked list (contract: GET is masked; the
+            // audit endpoint exists so the dashboard's probe list is honest).
+            into_unsync(json_response(StatusCode::OK, &credentials_json(&state)))
+        }
+
+        // ── v2 L3: decision slot (read-only describe + test classify) ───────
+        ("GET", "/api/decision") => into_unsync(json_response(
+            StatusCode::OK,
+            &state.decision.describe(),
+        )),
+
+        ("POST", "/api/decision/test") => {
+            #[derive(serde::Deserialize)]
+            struct DecisionTest { text: String }
+            let body: DecisionTest = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let request = ChatCompletionRequest {
+                model: "auto".into(),
+                messages: vec![crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: Some(serde_json::Value::String(body.text)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: None,
+                temperature: None,
+                max_tokens: None,
+                top_p: None,
+                stop: None,
+                extra: serde_json::json!({}),
+            };
+            let policy = state.roles.policy_for(None);
+            let features = crate::decision::RequestFeatures::extract(
+                &request, 0, "main", "auto", policy.privacy, policy.quality, "",
+            );
+            let outcome = state.decision.decide(&features).await;
+            let mut out = serde_json::to_value(&outcome.decision).unwrap_or_default();
+            if let Some(map) = out.as_object_mut() {
+                map.insert("fallback".into(), serde_json::json!(outcome.fallback.map(|f| f.as_str())));
+            }
+            into_unsync(json_response(StatusCode::OK, &out))
+        }
+
+        ("GET", "/api/routing-models") => {
+            into_unsync(json_response(StatusCode::OK, &state.router.model_catalog().await))
         }
 
         // ── Bonsai classifier server API ────────────────────────────────────
@@ -1046,7 +1169,7 @@ async fn handle_request(
                     &crate::review::runtime_state::state_path(),
                     enabled,
                     state.pr_guidelines_enabled.load(AtomicOrdering::Relaxed),
-                    state.review_service.preferences().hankndory_integration(),
+                    state.review_service.get_config().hankndory_integration,
                 ) {
                     tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
                 }
@@ -1073,7 +1196,7 @@ async fn handle_request(
                     &crate::review::runtime_state::state_path(),
                     state.code_review_enabled.load(AtomicOrdering::Relaxed),
                     enabled,
-                    state.review_service.preferences().hankndory_integration(),
+                    state.review_service.get_config().hankndory_integration,
                 ) {
                     tracing::warn!(error = %e, "Failed to persist review_runtime_state.json");
                 }
@@ -1089,7 +1212,7 @@ async fn handle_request(
         // value lives in the ProfileStore (what `run_loop` reads).
         ("GET", "/api/review/hankndory") => {
             into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                "enabled": state.review_service.preferences().hankndory_integration(),
+                "enabled": state.review_service.get_config().hankndory_integration,
             })))
         }
 
@@ -1099,7 +1222,9 @@ async fn handle_request(
             if let Some(enabled) = val.get("enabled").and_then(|v| v.as_bool()) {
                 // Update the live value read by the review loop, then persist all
                 // flags (the override becomes authoritative over the YAML seed).
-                state.review_service.preferences().set_hankndory_integration(enabled);
+                if let Err(e) = state.roles.set_hankndory_integration(enabled) {
+                    tracing::warn!(error = %e, "Failed to persist the review card extras");
+                }
                 if let Err(e) = crate::review::runtime_state::save_state(
                     &crate::review::runtime_state::state_path(),
                     state.code_review_enabled.load(AtomicOrdering::Relaxed),
@@ -1110,7 +1235,7 @@ async fn handle_request(
                 }
             }
             into_unsync(json_response(StatusCode::OK, &serde_json::json!({
-                "enabled": state.review_service.preferences().hankndory_integration(),
+                "enabled": state.review_service.get_config().hankndory_integration,
             })))
         }
 
@@ -1696,6 +1821,7 @@ async fn handle_chat_completion(
     session_id: Option<String>,
     user_agent: String,
     peer_addr: SocketAddr,
+    role: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let mut request: ChatCompletionRequest = serde_json::from_slice(&body_bytes)?;
@@ -1725,7 +1851,7 @@ async fn handle_chat_completion(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
         let result = tokio::select! {
-            result = state.router.route_tagged(request, session_id, cwd, user_agent) => result,
+            result = state.router.route_tagged_role(request, session_id, cwd, user_agent, &role) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {
@@ -1739,6 +1865,44 @@ async fn handle_chat_completion(
         });
         let _ = tx.send(stream_result);
     });
+
+    // v2 L3 fast-fail window: a routing failure that lands within the first
+    // few seconds (explicit selector refused, chain exhausted, reviewer strict
+    // bail, provider 5xx on a fast path) surfaces as a real HTTP status.
+    // Slower resolutions (model loading — minutes) keep v1's deferred
+    // headers: the stream commits 200 and the error arrives in-body, exactly
+    // as before, so harness first-event timeouts never fire during a load.
+    let mut rx = Box::pin(rx);
+    match tokio::time::timeout(L3_FAST_FAIL_WINDOW, rx.as_mut()).await {
+        Ok(Ok(Ok(stream))) => {
+            let stream_body = StreamBody::new(
+                stream
+                    .map(|chunk| chunk.map(Frame::data).map_err(|e| e)),
+            );
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(stream_body.boxed_unsync())?;
+            return Ok(response);
+        }
+        Ok(Ok(Err(error))) => {
+            routing_task.abort();
+            return Ok(into_unsync(json_response(
+                StatusCode::BAD_GATEWAY,
+                &ErrorResponse { error: format!("routing failed: {error}") },
+            )));
+        }
+        Ok(Err(_)) => {
+            routing_task.abort();
+            return Ok(into_unsync(json_response(
+                StatusCode::BAD_GATEWAY,
+                &ErrorResponse { error: "routing task ended".into() },
+            )));
+        }
+        Err(_elapsed) => {} // headline still pending (model load): defer, v1 path
+    }
 
     let deferred = DeferredStream::new(
         rx,
@@ -1758,6 +1922,10 @@ async fn handle_chat_completion(
     Ok(response)
 }
 
+/// v2 L3: how long the proxy waits for the routing headline (connect /
+/// response-headline failure) before committing streamed 200 headers.
+const L3_FAST_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Handle POST /v1/messages (Anthropic Messages API)
 ///
 /// Translates the Anthropic request to OpenAI format, routes through Bonsai,
@@ -1769,6 +1937,7 @@ async fn handle_anthropic_messages(
     session_id: Option<String>,
     user_agent: String,
     peer_addr: SocketAddr,
+    role: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
@@ -1793,7 +1962,7 @@ async fn handle_anthropic_messages(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
         let result = tokio::select! {
-            result = state.router.route_tagged(oai_request, session_id, cwd, user_agent) => result,
+            result = state.router.route_tagged_role(oai_request, session_id, cwd, user_agent, &role) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {
@@ -3993,6 +4162,37 @@ async fn handle_update_review_config(
     }
 }
 
+/// The `GET /api/roles` payload (contract: assignments + policy; the review
+/// card's extras ride along for the dashboard panel).
+fn roles_json(state: &AppState) -> serde_json::Value {
+    serde_json::json!({
+        "assignments": state.roles.assignments_snapshot(),
+        "policy": state.roles.policy_snapshot(),
+        "review_extras": state.roles.review_extras(),
+    })
+}
+
+fn policy_json(state: &AppState) -> serde_json::Value {
+    serde_json::json!({ "policy": state.roles.policy_snapshot() })
+}
+
+/// `GET /api/credentials` — masked list (the store's own masking; plaintext
+/// is NEVER serializable through `SecretString`).
+fn credentials_json(state: &AppState) -> serde_json::Value {
+    serde_json::json!({ "credentials": state.credentials.list_masked().unwrap_or_default() })
+}
+
+/// The credentials UI test verdict: resolve through the store (store value /
+/// env var set / file readable) and answer `{ "ok": bool }` — the value
+/// itself never leaves the process.
+fn credential_test_json(state: &AppState, id: &str) -> serde_json::Value {
+    let ok = match state.credentials.resolve(id) {
+        Ok(secret) => !secret.expose().is_empty(),
+        Err(_) => false,
+    };
+    serde_json::json!({ "ok": ok, "id": id })
+}
+
 fn routing_error(status: StatusCode, error: impl std::fmt::Display) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     into_unsync(json_response(status, &ErrorResponse { error: error.to_string() }))
 }
@@ -4005,58 +4205,6 @@ async fn read_routing_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// `POST /api/project-pin` body. Every role key is **required and present**
-/// (missing ⇒ serde error ⇒ 400; unknown ⇒ 400): serde cannot distinguish an
-/// omitted field from an explicit `null` on a plain `Option`, so the fields are
-/// required `Value`s and `null` is interpreted as "inherit" (B3′).
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectPinBody {
-    path: serde_json::Value,
-    main: serde_json::Value,
-    reviewer: serde_json::Value,
-    subagent: serde_json::Value,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectPinDelete {
-    key: String,
-}
-
-/// A POST role value: `null` ⇒ inherit; otherwise a validated `ModelChoice`.
-fn project_pin_role(
-    value: serde_json::Value,
-    role: &str,
-) -> Result<Option<crate::routing_profile::ModelChoice>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    serde_json::from_value(value).map(Some).map_err(|error| format!("{role}: {error}"))
-}
-
-/// The subagent value: `null` ⇒ inherit; otherwise a non-empty local model key
-/// (validity is enforced by `ProjectPinStore::set`).
-fn project_pin_subagent(value: serde_json::Value) -> Result<Option<String>, String> {
-    match value {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(id) if !id.is_empty() => Ok(Some(id)),
-        _ => Err("subagent must be a non-empty string or null".to_string()),
-    }
-}
-
-/// Extract exactly one `path` query parameter from the resolver GET (R5-I1):
-/// a missing, duplicate, or unexpected parameter is a `400`.
-fn single_path_query(query: &str) -> Result<String, String> {
-    let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    match params.as_slice() {
-        [(key, value)] if key == "path" => Ok(value.clone()),
-        _ => Err("expected exactly one `path` query parameter".to_string()),
-    }
-}
-
 async fn handle_llama_swap_models(
     llama_swap_url: &str,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
@@ -4066,175 +4214,6 @@ async fn handle_llama_swap_models(
     
     let resp = json_response(StatusCode::OK, &data);
     Ok(into_unsync(resp))
-}
-
-/// Fetch live models from llama-swap and update the brainrouter section of
-/// `~/.omp/agent/models.yml`. Preserves all other provider sections.
-///
-/// Returns the total number of models written to the brainrouter section.
-pub async fn sync_omp_models(llama_swap_url: &str, tcp_addr: &str) -> anyhow::Result<usize> {
-    let home = home_dir();
-    // Refuse to write to /root — brainrouter is a user-facing daemon and
-    // should not modify root's home directory.
-    if home.is_empty() || home == "/root" {
-        anyhow::bail!("$HOME is not set; cannot locate models.yml");
-    }
-
-    // Fetch live models from llama-swap (async HTTP).
-    let url = format!("{}/v1/models", llama_swap_url);
-    let resp = VERSION_CLIENT.get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send().await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch llama-swap models: {}", e))?
-        .error_for_status()
-        .map_err(|e| anyhow::anyhow!("llama-swap models request failed: {}", e))?;
-    let body: serde_json::Value = resp.json().await
-        .map_err(|e| anyhow::anyhow!("Failed to parse llama-swap models response: {}", e))?;
-    let model_ids = parse_llama_swap_model_ids(&body)?;
-
-    // All filesystem + YAML work runs off the async executor.
-    let tcp_addr_owned = tcp_addr.to_string();
-    tokio::task::spawn_blocking(move || write_omp_models_yml(&home, &model_ids, &tcp_addr_owned))
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {}", e))?
-}
-
-fn parse_llama_swap_model_ids(body: &serde_json::Value) -> anyhow::Result<Vec<String>> {
-    body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("llama-swap models response is missing a data array"))?
-        .iter()
-        .enumerate()
-        .map(|(index, model)| {
-            model
-                .get("id")
-                .and_then(|value| value.as_str())
-                .filter(|id| !id.is_empty())
-                .map(String::from)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "llama-swap models response has an invalid id at data[{}]",
-                        index
-                    )
-                })
-        })
-        .collect()
-}
-
-/// Blocking: read models.yml, merge brainrouter models, write atomically.
-fn write_omp_models_yml(home: &str, model_ids: &[String], tcp_addr: &str) -> anyhow::Result<usize> {
-    let models_path = format!("{}/.omp/agent/models.yml", home);
-    let path = std::path::Path::new(&models_path);
-
-    // Read existing models.yml (or start fresh).
-    let mut doc: serde_yaml::Value = if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", models_path, e))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", models_path, e))?
-    } else {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
-    };
-
-    // Build the brainrouter models list.
-    let mut models = Vec::new();
-
-    // Fixed routing models.
-    for (id, name) in [("auto", "Brainrouter (auto)"), ("local", "Brainrouter (local)"), ("cloud", "Brainrouter (cloud)")] {
-        let mut entry = serde_yaml::Mapping::new();
-        entry.insert(ykey("id"), yval(id));
-        entry.insert(ykey("name"), yval(name));
-        entry.insert(ykey("reasoning"), serde_yaml::Value::Bool(false));
-        let mut input = serde_yaml::Sequence::new();
-        input.push(yval("text"));
-        entry.insert(ykey("input"), serde_yaml::Value::Sequence(input));
-        models.push(serde_yaml::Value::Mapping(entry));
-    }
-
-    // llama-swap models (skip the fixed ones).
-    let skip = ["auto", "local", "cloud"];
-    for id in model_ids {
-        if skip.contains(&id.as_str()) {
-            continue;
-        }
-        let mut entry = serde_yaml::Mapping::new();
-        entry.insert(ykey("id"), yval(id));
-        entry.insert(ykey("name"), yval(&model_id_to_display_name(id)));
-        models.push(serde_yaml::Value::Mapping(entry));
-    }
-
-    let total = models.len();
-
-    // Build the brainrouter provider entry.
-    let mut br_provider = serde_yaml::Mapping::new();
-    br_provider.insert(ykey("baseUrl"), yval(&format!("http://{}/v1", tcp_addr)));
-    br_provider.insert(ykey("api"), yval("openai-completions"));
-    br_provider.insert(ykey("auth"), yval("none"));
-    br_provider.insert(ykey("models"), serde_yaml::Value::Sequence(models));
-
-    // Merge into the document, preserving other providers.
-    let providers = doc
-        .as_mapping_mut()
-        .ok_or_else(|| anyhow::anyhow!("models.yml root is not a mapping"))?
-        .entry(ykey("providers"))
-        .or_insert(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    let providers_map = providers
-        .as_mapping_mut()
-        .ok_or_else(|| anyhow::anyhow!("models.yml 'providers' is not a mapping"))?;
-    providers_map.insert(ykey("brainrouter"), serde_yaml::Value::Mapping(br_provider));
-
-    // Atomic write: tempfile (PID-qualified to avoid races) then rename.
-    let yaml_str = serde_yaml::to_string(&doc)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize models.yml: {}", e))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("Failed to create directory {}: {}", parent.display(), e))?;
-    }
-    let tmp_path = format!("{}.{}.tmp", models_path, uuid::Uuid::new_v4());
-    std::fs::write(&tmp_path, &yaml_str)
-        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", tmp_path, e))?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        std::fs::set_permissions(&tmp_path, metadata.permissions())
-            .map_err(|e| anyhow::anyhow!("Failed to preserve permissions on {}: {}", tmp_path, e))?;
-    }
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path, models_path, e))?;
-
-    info!(path = %models_path, model_count = total, "Synced OMP models.yml");
-    Ok(total)
-}
-
-/// Convert a model ID like "qwen3.6-27b-q6-amdvlk" to "Qwen3.6 27B Q6 AMDVLK".
-fn model_id_to_display_name(id: &str) -> String {
-    id.split('-')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let upper = part.to_uppercase();
-            // Parameter-count suffixes: 27b, 120b, 128B → 27B, 120B
-            if part.len() >= 2 && (part.ends_with('b') || part.ends_with('B')) {
-                let prefix = &part[..part.len() - 1];
-                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
-                    return upper;
-                }
-            }
-            match upper.as_str() {
-                // Quant tags: Q6, Q8, Q4, etc.
-                s if s.starts_with('Q') && s.len() <= 4 && s[1..].chars().all(|c| c.is_ascii_digit()) => upper,
-                // Known all-caps abbreviations
-                "A4B" | "A3B" | "A10B" | "E2B" | "E4B" | "AIR" | "OSS" | "GOOG" | "AMDVLK" | "DRAFT" => upper,
-                _ => {
-                    // Titlecase: capitalize first char, leave rest as-is
-                    let mut chars = part.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Shared builder for the proxy model list (`/v1/models`) and the plugin RPC
@@ -4321,28 +4300,65 @@ fn query_param(query: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-fn ykey(s: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(s.to_string())
-}
-
-fn yval(s: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(s.to_string())
-}
-
 /// Run the HTTP server with dual listeners (TCP + Unix domain socket)
+pub struct BoundListeners {
+    pub tcp: TcpListener,
+    pub uds: UnixListener,
+    pub uds_path: PathBuf,
+    pub uds_identity: (u64, u64),
+    pub uds_lock: File,
+}
+
+/// Bind the TCP + UDS listeners. The daemon calls this BEFORE the boot work
+/// (migration, plugin registry, model resolution) so a CLI invoked the
+/// instant `/health` answers always finds the UDS socket file — the bind
+/// used to sit behind all of that, and under parallel load the window was
+/// long enough for "Daemon socket not found".
+pub async fn bind_listeners(tcp_addr: SocketAddr, uds_path: PathBuf) -> Result<BoundListeners> {
+    // Bind the UDS socket FIRST: between TCP bind and UDS bind a CLI (the
+    // gate's black-box tests call verbs the instant /health answers) could
+    // connect, be accepted, and have its socket file unlinked by the
+    // stale-socket cleanup below — the request would then hit the accept
+    // queue of a dead inode and hang until the daemon exits.
+    let uds_lock = acquire_uds_lock(&uds_path)?;
+    prepare_uds_path(&uds_path).await?;
+    let uds_listener = UnixListener::bind(&uds_path)?;
+    let uds_identity = socket_identity(&uds_path)?;
+    info!("Unix socket listener bound to {:?}", uds_path);
+
+    let tcp_listener = TcpListener::bind(tcp_addr).await?;
+    info!("TCP listener bound to {}", tcp_addr);
+
+    Ok(BoundListeners {
+        tcp: tcp_listener,
+        uds: uds_listener,
+        uds_path,
+        uds_identity,
+        uds_lock,
+    })
+}
+
 pub async fn run(
     tcp_addr: SocketAddr,
     uds_path: PathBuf,
     state: Arc<AppState>,
 ) -> Result<()> {
-    let tcp_listener = TcpListener::bind(tcp_addr).await?;
-    info!("TCP listener bound to {}", tcp_addr);
+    let bound = bind_listeners(tcp_addr, uds_path).await?;
+    run_with_listeners(bound.tcp, bound.uds_path, bound.uds, bound.uds_identity, bound.uds_lock, state).await
+}
 
-    let _uds_lock = acquire_uds_lock(&uds_path)?;
-    prepare_uds_path(&uds_path).await?;
-    let uds_listener = UnixListener::bind(&uds_path)?;
-    let uds_identity = socket_identity(&uds_path)?;
-    info!("Unix socket listener bound to {:?}", uds_path);
+/// The accept loops + shutdown contract, split out so the daemon can bind
+/// the listeners BEFORE the boot work (migration, plugin registry, model
+/// resolution) — a CLI invoked the instant `/health` answers must always
+/// find the UDS socket file (the bind used to sit behind all of it).
+pub async fn run_with_listeners(
+    tcp_listener: TcpListener,
+    uds_path: PathBuf,
+    uds_listener: UnixListener,
+    uds_identity: (u64, u64),
+    _uds_lock: File,
+    state: Arc<AppState>,
+) -> Result<()> {
 
     let tcp_state = state.clone();
     let uds_state = state.clone();
@@ -4357,11 +4373,15 @@ pub async fn run(
                     // Resolve the cwd of the connecting OMP process once per
                     // connection; all requests on this keep-alive connection
                     // share the same process and thus the same cwd.
-                    // Runs in spawn_blocking because peer_cwd scans /proc synchronously.
-                    let conn_cwd = tokio::task::spawn_blocking(move || peer_cwd(&addr).unwrap_or_default()).await.unwrap_or_default();
+                    // Synchronous on this task: the default blocking pool
+                    // saturates under full-suite load, and queueing there
+                    // burned the project-scope grace window before the
+                    // first probe ran (the scope flakes). The /proc scans
+                    // are a few reads of hot pseudo-files.
+                    let conn_cwd = peer_cwd(&addr).unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr)))
+                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr, None)))
                             .await
                         {
                             error!("Error serving TCP connection: {}", e);
@@ -4379,27 +4399,45 @@ pub async fn run(
             match uds_listener.accept().await {
                 Ok((stream, _addr)) => {
                     info!("New Unix socket connection");
-                    // Resolve the cwd of the connecting process via UDS peer credentials.
-                    // cwd_from_pid is a blocking readlink; run it off the async executor.
-                    let conn_cwd = if let Ok(cred) = stream.peer_cred() {
-                        if let Some(pid) = cred.pid() {
-                            tokio::task::spawn_blocking(move || crate::peer_cwd::cwd_from_pid(pid).unwrap_or_default())
-                                .await
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
+                    // The peer pid (UDS credentials). The cwd is read PER
+                    // REQUEST, not cached at accept: a CLI process that
+                    // chdir'd after connecting (the gate's black-box scope
+                    // tests spawn the daemon, then change directory) must
+                    // resolve its CURRENT project scope. cwd_from_pid is a
+                    // cheap readlink on /proc of a live local process.
+                    let conn_pid = stream
+                        .peer_cred()
+                        .ok()
+                        .and_then(|cred| cred.pid())
+                        .unwrap_or(0);
+                    // Grace anchor = ACCEPT time: the window for this
+                    // connection's requests (see `ScopeClock`).
+                    let conn_clock = Arc::new(ScopeClock(std::sync::Mutex::new(Some(
+                        std::time::Instant::now(),
+                    ))));
                     let io = TokioIo::new(stream);
                     let state = uds_state.clone();
                     let dummy_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    let pid_for_request = conn_pid;
                     tokio::spawn(async move {
-                        if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), dummy_addr)))
-                            .await
-                        {
+                        let io = http1::Builder::new().serve_connection(io, service_fn(move |req| {
+                            let clock = conn_clock.clone();
+                            let cwd = {
+                                // Read the peer cwd at REQUEST time (a CLI
+                                // process that chdir'd after connecting —
+                                // the gate's black-box scope tests — must
+                                // resolve its CURRENT project scope; cheap
+                                // readlink on a live local process).
+                                if pid_for_request > 0 {
+                                    crate::peer_cwd::cwd_from_pid(pid_for_request).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                }
+                            };
+                            let state2 = state.clone();
+                            async move { handle_request(req, state2, cwd, dummy_addr, Some(clock)).await }
+                        }));
+                        if let Err(e) = io.await {
                             error!("Error serving Unix socket connection: {}", e);
                         }
                     });
@@ -4438,7 +4476,7 @@ async fn shutdown_signal() {
     }
 }
 
-fn acquire_uds_lock(uds_path: &std::path::Path) -> Result<File> {
+pub(crate) fn acquire_uds_lock(uds_path: &std::path::Path) -> Result<File> {
     let mut lock_name = uds_path.as_os_str().to_os_string();
     lock_name.push(".lock");
     let lock_path = PathBuf::from(lock_name);
@@ -4480,12 +4518,12 @@ fn lock_uds_file(_lock: &File, uds_path: &std::path::Path) -> Result<()> {
     )
 }
 
-fn socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
+pub(crate) fn socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
     let metadata = std::fs::symlink_metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
-fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
+pub(crate) fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return;
     };
@@ -4502,11 +4540,22 @@ fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
     }
 }
 
-async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(uds_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+pub(crate) async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
+    let metadata = loop {
+        match std::fs::symlink_metadata(uds_path) {
+            Ok(metadata) => break metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // ENOTDIR: an ancestor of the path is not a directory — the
+            // caller's state dir (e.g. a test tmpdir) was deleted out from
+            // under the boot. Clean startup failure, not a bind success.
+            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                anyhow::bail!(
+                    "the parent directory of {} no longer exists; not binding (the daemon's                      state directory was deleted during startup)",
+                    uds_path.display()
+                )
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
     if !metadata.file_type().is_socket() {
         anyhow::bail!(
@@ -4657,51 +4706,22 @@ mod tests {
 
     #[test]
     fn project_pin_gate_covers_mutations_and_the_resolver() {
-        assert!(request_is_destructive("POST", "/api/project-pin", false));
-        assert!(request_is_destructive("DELETE", "/api/project-pin", false));
-        assert!(request_is_destructive("GET", "/api/project-pin", true), "?path= resolver is gated");
-        assert!(!request_is_destructive("GET", "/api/project-pin", false), "plain GET is ungated");
-        // Unrelated classifications are unchanged.
-        assert!(!request_is_destructive("GET", "/api/routing-profile", false));
-        assert!(request_is_destructive("POST", "/api/routing-profile", false));
-    }
-
-    #[test]
-    fn project_pin_body_requires_every_role_key_and_rejects_unknown() {
-        let ok: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
-            "path": "/r", "main": null, "reviewer": null, "subagent": null
-        }));
-        assert!(ok.is_ok());
-        let missing: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
-            "path": "/r", "main": null, "reviewer": null
-        }));
-        assert!(missing.is_err(), "a missing role key is rejected");
-        let unknown: Result<ProjectPinBody, _> = serde_json::from_value(serde_json::json!({
-            "path": "/r", "main": null, "reviewer": null, "subagent": null, "extra": 1
-        }));
-        assert!(unknown.is_err(), "an unknown key is rejected");
-    }
-
-    #[test]
-    fn project_pin_role_and_subagent_parsing() {
-        assert!(project_pin_role(serde_json::Value::Null, "main").unwrap().is_none());
-        let choice = project_pin_role(serde_json::json!({"backend":"local","model":"m"}), "main").unwrap();
-        assert!(matches!(choice, Some(crate::routing_profile::ModelChoice::Local { model: Some(_) })));
-        assert!(project_pin_role(serde_json::json!({"backend":"bogus"}), "main").is_err());
-
-        assert!(project_pin_subagent(serde_json::Value::Null).unwrap().is_none());
-        assert_eq!(project_pin_subagent(serde_json::json!("pool-x")).unwrap().as_deref(), Some("pool-x"));
-        assert!(project_pin_subagent(serde_json::json!("")).is_err(), "empty subagent rejected");
-        assert!(project_pin_subagent(serde_json::json!(3)).is_err(), "non-string subagent rejected");
-    }
-
-    #[test]
-    fn single_path_query_requires_exactly_one_path() {
-        assert_eq!(single_path_query("path=%2Fusr%2Frepo").unwrap(), "/usr/repo");
-        assert!(single_path_query("").is_err(), "missing path");
-        assert!(single_path_query("path=/a&path=/b").is_err(), "duplicate path");
-        assert!(single_path_query("other=/a").is_err(), "unexpected key");
-        assert!(single_path_query("path=/a&x=1").is_err(), "extra key");
+        // v2 L3 retarget (spec "Removals: routing_profile store/CLI/widgets;
+        // project_pins store (migrated)"): the L3 mutation surface replaces the
+        // pins/profile pairs and is gated the same way.
+        assert!(request_is_destructive("POST", "/api/roles/set", false));
+        assert!(request_is_destructive("POST", "/api/roles/policy", false));
+        assert!(request_is_destructive("POST", "/api/policy/set", false));
+        assert!(request_is_destructive("DELETE", "/api/credentials/x", false));
+        assert!(request_is_destructive("POST", "/api/credentials/add", false));
+        assert!(request_is_destructive("POST", "/api/decision/test", false));
+        // Reads stay ungated.
+        assert!(!request_is_destructive("GET", "/api/roles", false));
+        assert!(!request_is_destructive("GET", "/api/credentials", false));
+        assert!(!request_is_destructive("GET", "/api/policy", false));
+        assert!(!request_is_destructive("GET", "/api/decision", false));
+        // Removed v1 endpoints answer from the 404 catch-all (not gated code).
+        assert!(!request_is_destructive("POST", "/api/routing-profile", false));
     }
 
     // ── FR-D: maybe_inject_pr_guidelines ─────────────────────────────────────
@@ -4794,11 +4814,6 @@ mod tests {
         assert!(marker_at(&r, 1));
     }
 
-    #[test]
-    fn display_name_full_model_id() {
-        assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-amdvlk"), "Qwen3.6 27B Q6 AMDVLK");
-    }
-
     /// Regression test for the podman version-check leak (design doc
     /// `docs/design/ai-toolbox-cockpit-integration.md` §5a): a normal completion within the
     /// timeout must NOT trigger the best-effort cleanup command. This must actually exercise the
@@ -4861,117 +4876,6 @@ mod tests {
         ] {
             assert!(!is_loopback_http_url(value), "{value}");
         }
-    }
-
-    #[test]
-    fn display_name_size_suffixes() {
-        assert_eq!(model_id_to_display_name("llama-3.1-8b"), "Llama 3.1 8B");
-        assert_eq!(model_id_to_display_name("gpt-oss-120b"), "Gpt OSS 120B");
-        assert_eq!(model_id_to_display_name("mistral-medium-3.5-128B"), "Mistral Medium 3.5 128B");
-    }
-
-    #[test]
-    fn display_name_quant_tags() {
-        assert_eq!(model_id_to_display_name("gemma-4-31b-q6"), "Gemma 4 31B Q6");
-        assert_eq!(model_id_to_display_name("gemma-4-31b-q8-heretic"), "Gemma 4 31B Q8 Heretic");
-    }
-
-    #[test]
-    fn display_name_known_abbreviations() {
-        assert_eq!(model_id_to_display_name("gemma-4-e2b"), "Gemma 4 E2B");
-        assert_eq!(model_id_to_display_name("glm4.5-air"), "Glm4.5 AIR");
-        assert_eq!(model_id_to_display_name("qwen3.6-27b-q6-draft"), "Qwen3.6 27B Q6 DRAFT");
-    }
-
-    #[test]
-    fn display_name_empty_and_edge_cases() {
-        assert_eq!(model_id_to_display_name(""), "");
-        assert_eq!(model_id_to_display_name("foo--bar"), "Foo Bar");  // consecutive hyphens
-        assert_eq!(model_id_to_display_name("stepfun"), "Stepfun");  // single word
-    }
-
-    #[test]
-    fn display_name_moe_parts() {
-        assert_eq!(model_id_to_display_name("qwen3.6-35b-a3b"), "Qwen3.6 35B A3B");
-        assert_eq!(model_id_to_display_name("qwen3.5-122b-a10b"), "Qwen3.5 122B A10B");
-    }
-
-    #[test]
-    fn write_omp_preserves_other_providers() {
-        // Create a temp dir to simulate ~/.omp/agent/
-        let tmp = std::env::temp_dir().join(format!(
-            "brainrouter-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let agent_dir = tmp.join(".omp/agent");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let models_file = agent_dir.join("models.yml");
-
-        // Write initial YAML with a manifest provider
-        std::fs::write(&models_file, r#"providers:
-  manifest:
-    baseUrl: http://localhost:3001/v1
-    models:
-    - id: auto
-      name: Manifest
-"#).unwrap();
-
-        // Sync with some fake model IDs
-        let result = write_omp_models_yml(tmp.to_str().unwrap(), &[
-            "auto".to_string(), "local".to_string(), "my-model-27b".to_string(),
-        ], "127.0.0.1:9099");
-        assert!(result.is_ok());
-        let count = result.unwrap();
-        assert_eq!(count, 4); // auto + local + cloud + my-model-27b
-
-        // Verify manifest provider survived
-        let content = std::fs::read_to_string(&models_file).unwrap();
-        assert!(content.contains("manifest"), "manifest provider should be preserved");
-        assert!(content.contains("brainrouter"), "brainrouter provider should exist");
-        assert!(content.contains("my-model-27b"), "synced model should be present");
-        assert!(content.contains("http://127.0.0.1:9099/v1"), "brainrouter baseUrl must use the daemon's tcp_addr");
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn malformed_omp_models_file_is_not_replaced() {
-        let tmp = std::env::temp_dir().join(format!(
-            "brainrouter-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let agent_dir = tmp.join(".omp/agent");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let models_file = agent_dir.join("models.yml");
-        let original = "providers: [invalid\n";
-        std::fs::write(&models_file, original).unwrap();
-
-        let result = write_omp_models_yml(
-            tmp.to_str().unwrap(),
-            &["model-a".to_string()],
-            "127.0.0.1:9099",
-        );
-        assert!(result.is_err());
-        assert_eq!(std::fs::read_to_string(&models_file).unwrap(), original);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn invalid_llama_swap_model_payload_is_rejected() {
-        assert!(parse_llama_swap_model_ids(&serde_json::json!({})).is_err());
-        assert!(parse_llama_swap_model_ids(&serde_json::json!({
-            "data": [{"id": "model-a"}, {"name": "missing-id"}]
-        }))
-        .is_err());
-        assert_eq!(
-            parse_llama_swap_model_ids(&serde_json::json!({
-                "data": [{"id": "model-a"}, {"id": "model-b"}]
-            }))
-            .unwrap(),
-            vec!["model-a", "model-b"]
-        );
     }
 
     #[tokio::test]

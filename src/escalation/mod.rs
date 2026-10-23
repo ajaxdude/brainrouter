@@ -599,6 +599,9 @@ struct SessionDetail {
     reviewer_type: Option<String>,
     review_model: Option<String>,
     review_config: Option<crate::config::ReviewConfig>,
+    /// v2 L3: the review-card selector this session snapshotted at start
+    /// (continuity: never re-resolved).
+    review_selector: Option<String>,
     created_at: String,
     updated_at: String,
     cwd: String,
@@ -626,6 +629,7 @@ impl From<&Session> for SessionDetail {
                 .map(|reviewer| reviewer.as_str().to_string()),
             review_model: s.review_model.clone(),
             review_config: s.review_config.clone(),
+            review_selector: s.review_selector.clone(),
             created_at: s.created_at.clone(),
             updated_at: s.updated_at.clone(),
             cwd: s.cwd.clone(),
