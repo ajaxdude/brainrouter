@@ -10,6 +10,7 @@ v3 — 2026-10-21 — round-2 residuals: R7 page-timing contradiction (F1); grep
 v3.1 — 2026-10-21 — diff-check residual: grep-gate exception extended to feed-vocabulary CODE constants (`schema_validate::KNOWN_BACKEND_IDS`, kept so the vendored feed parses); dedup nit in layer enumeration.
 v4 — 2026-10-22 — L1 marked complete; L2 leg section added in full (plugins + bridge pilot + minimal credentials store); L1 full spec moved to history (record lives in the L1 log + git).
 v5 — 2026-10-22 — L2 marked done; L3 leg spec file added (`v2-streamlining.L3.md`) with key contracts in the leg entry.
+v6 — 2026-10-22 — L4-v3 keeper-additive authorization applied to Referenced files (`src/inflight.rs` named-additive changes); L4 spec pointer added.
 
 ## Problem
 
@@ -108,6 +109,8 @@ Legs (door type; demo):
 
 **Leg L4 in full** — spec: `docs/design/v2-streamlining.L4.md` (v3). Key contracts: Residency view (shim `/running` observer + native registry + containers + sized pins; attach-not-spawn, single residency, each model counted once, Residency BEFORE budget), platform probe in catalog vocabulary (feed lacks gfx1100 → generic id + visible banner), child-held flock, systemd-scope cgroup escape for adoption, engine-validated launch specs, llama-swap config import with macro expansion.
 
+**Leg L5 in full** — spec: `docs/design/v2-streamlining.L5.md` (v2). Key contracts: Active-Consumer Set (proxy rows + in-process router streams + grace span), single-action override, pid-scoped cutover with external-engine Residency observer (icon squat structurally closed), conf-generated ports + `min_mem_gib` gate data, version-keyed flag schema, operator-gated icon retirement.
+
 ## Testing and evaluation
 
 Per leg: existing suite (`cargo test`, Node browser-logic) + leg-specific tests named in R1–R9; Ray writes acceptance tests from R# criteria before code, builder never edits them. Live checks (L4–L8) run on owner machines (strix-halo local, fedora1, fedora2, mac) with Bailey cards for spikes (ds4-Metal probe; LFM2.5-GGUF load test).
@@ -166,6 +169,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `src/cli.rs` — `routing-profile` CLI surface (L1 route removals, L3 replacement).
 - `src/llama_swap_register.rs` — GGUF→llama-swap import; L7 catalog source.
 - `docs/design/v2-streamlining.L3.md` — leg L3 full spec (roles, decision slot, credentials page, one-entry).
+- `docs/design/v2-streamlining.L5.md` — leg L5 full spec (strixite + hipfire adapters, Active-Consumer protection).
 - `docs/design/v2-streamlining.L4.md` — leg L4 full spec (swap supervisor, platform probe, residency view).
 - `docs/design/v2-streamlining.L2.md` — leg L2 full spec (per-leg detail files keep this Map under the length limit).
 - keeper modules: `src/routing_events.rs`, `src/observability.rs` read-only for regression; `src/inflight.rs` — additive changes authorized where a leg spec names them (L4: catalog-id stamp, loading rows, registry clock hook).
