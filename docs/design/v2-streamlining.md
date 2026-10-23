@@ -109,7 +109,9 @@ Legs (door type; demo):
 
 **Leg L4 in full** — spec: `docs/design/v2-streamlining.L4.md` (v3). Key contracts: Residency view (shim `/running` observer + native registry + containers + sized pins; attach-not-spawn, single residency, each model counted once, Residency BEFORE budget), platform probe in catalog vocabulary (feed lacks gfx1100 → generic id + visible banner), child-held flock, systemd-scope cgroup escape for adoption, engine-validated launch specs, llama-swap config import with macro expansion.
 
-**Leg L5 in full** — spec: `docs/design/v2-streamlining.L5.md` (v2). Key contracts: Active-Consumer Set (proxy rows + in-process router streams + grace span), single-action override, pid-scoped cutover with external-engine Residency observer (icon squat structurally closed), conf-generated ports + `min_mem_gib` gate data, version-keyed flag schema, operator-gated icon retirement.
+**Leg L5 in full** — spec: `docs/design/v2-streamlining.L5.md` (v3; Step 6 closed, READY). Key contracts: Active-Consumer Set (proxy rows + in-process router streams + grace span), single-action override, pid-scoped cutover with external-engine Residency observer (icon squat structurally closed), conf-generated ports + `min_mem_gib` gate data, version-keyed flag schema, operator-gated icon retirement.
+
+**Leg L6 in full** — spec: `docs/design/v2-streamlining.L6.md` (draft, leg review pending). Key contracts: providers.json (openai-compatible/anthropic/manifest kinds, credential-id bindings, per-provider breakers), manifest migration with cloud-parity harness, LAN federation (default-off, route-guarded /v1-only inbound, bearer tokens from the store, peer-info discovery, hop events), distributed-role acceptance flows.
 
 ## Testing and evaluation
 
@@ -168,6 +170,7 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `migrations/0003_toolbox_serving_dimension.sql` — frozen schema vocabulary; grep-gate exception, DO NOT EDIT.
 - `src/cli.rs` — `routing-profile` CLI surface (L1 route removals, L3 replacement).
 - `src/llama_swap_register.rs` — GGUF→llama-swap import; L7 catalog source.
+- `docs/design/v2-streamlining.L6.md` — leg L6 full spec (providers, Manifest absorbed, LAN federation).
 - `docs/design/v2-streamlining.L3.md` — leg L3 full spec (roles, decision slot, credentials page, one-entry).
 - `docs/design/v2-streamlining.L5.md` — leg L5 full spec (strixite + hipfire adapters, Active-Consumer protection).
 - `docs/design/v2-streamlining.L4.md` — leg L4 full spec (swap supervisor, platform probe, residency view).
