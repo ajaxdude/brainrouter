@@ -11,6 +11,7 @@ v3.1 — 2026-10-21 — diff-check residual: grep-gate exception extended to fee
 v4 — 2026-10-22 — L1 marked complete; L2 leg section added in full (plugins + bridge pilot + minimal credentials store); L1 full spec moved to history (record lives in the L1 log + git).
 v5 — 2026-10-22 — L2 marked done; L3 leg spec file added (`v2-streamlining.L3.md`) with key contracts in the leg entry.
 v6 — 2026-10-22 — L4-v3 keeper-additive authorization applied to Referenced files (`src/inflight.rs` named-additive changes); L4 spec pointer added.
+v7 — 2026-10-23 — L5 design closed (READY); L6 spec drafted + selector-vocabulary contract amended with the provider-qualified federation form.
 
 ## Problem
 
@@ -82,7 +83,7 @@ State: role cards + pins (migrated store), `credentials.json`, catalog + per-hos
 ## Detailed implementation
 
 Cross-leg contracts (do not break without a design revision):
-- **Selector vocabulary**: `auto/local/cloud/cloud/<id>/subs/bare-id` keep routing meaning through L7 — `cloud`/`cloud/<id>` rebind to provider adapters at L6, `local`/`subs`/bare-ids to the swap supervisor at L7; user-facing only as role cards from L3.
+- **Selector vocabulary**: `auto/local/cloud/cloud/<id>/cloud/<provider>/<id>/subs/bare-id` keep routing meaning through L7 — `cloud`/`cloud/<id>` rebind to provider adapters at L6 (qualified form = federation), `local`/`subs`/bare-ids to the swap supervisor at L7; user-facing only as role cards from L3.
 - **Served-model namespace**: catalog id is canonical from L4; `served_model` string match stays resolvable (migration).
 - **Config migration framework**: one mechanism (`--dry-run`, logged, v1 boots); **every leg that migrates or creates a state file first snapshots the pre-migration state (owner-only, versioned, same atomic-write machinery); restore is a named command per leg** — reverse path includes credentials export to env-line form so reverted v1 can read them.
 - **Credentials interface**: `resolve(credential_id) -> SecretString`, single implementation; plugins get `secrets.get` grant-scoped.
