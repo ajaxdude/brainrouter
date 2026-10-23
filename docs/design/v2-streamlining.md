@@ -112,7 +112,7 @@ Legs (door type; demo):
 
 **Leg L5 in full** — spec: `docs/design/v2-streamlining.L5.md` (v3; Step 6 closed, READY). Key contracts: Active-Consumer Set (proxy rows + in-process router streams + grace span), single-action override, pid-scoped cutover with external-engine Residency observer (icon squat structurally closed), conf-generated ports + `min_mem_gib` gate data, version-keyed flag schema, operator-gated icon retirement.
 
-**Leg L6 in full** — spec: `docs/design/v2-streamlining.L6.md` (draft, leg review pending). Key contracts: providers.json (openai-compatible/anthropic/manifest kinds, credential-id bindings, per-provider breakers), manifest migration with cloud-parity harness, LAN federation (default-off, route-guarded /v1-only inbound, bearer tokens from the store, peer-info discovery, hop events), distributed-role acceptance flows.
+**Leg L6 in full** — spec: `docs/design/v2-streamlining.L6.md` (v4, leg rounds exhausted + diff-check fold). Key contracts: providers.json (credential-id bindings, per-provider breakers, `auto` manifest kind), cloud/<id> resolution with v1-parity passthrough, parity corpus (7 v1 behaviors, v1-classic vs mocks), v2.0-p6 migration, LAN second listener (auth/rate/expose/budget), role-header forwarding = distributed roles, hop events.
 
 ## Testing and evaluation
 
@@ -120,7 +120,7 @@ Per leg: existing suite (`cargo test`, Node browser-logic) + leg-specific tests 
 
 ## Security, privacy, reliability, and operations
 
-Credentials: 0600 file, masked in every API/log/preview; write paths loopback+CSRF-gated (existing pattern). LAN: opt-in bind, bearer token, constant-time compare, per-provider tokens; peer-info is read-only model+health. Inbound LAN peer tokens live in the credentials store (rotate + revoke via CLI, page in L3+); a valid inbound token authorizes inference to explicitly exposed model ids and read-only `peer-info` ONLY — role resolution and admin APIs are never exposed over LAN. If Q3 lands on bearer, bearer-over-HTTP-on-LAN is an explicitly accepted risk (trusted home network), stated here so the owner-reserved LAN enable nod carries it. Plugins: user-level, no system ops, documented unsandboxed. Decision slot: prompt content sent to classifiers = feature summary, never full prompt to `webhook`/cloud kinds. Reliability: v1-restore via tag; migrations logged and previewable; supervisors backoff; engine cutover serialized.
+Credentials: 0600 file, masked in every API/log/preview; write paths loopback+CSRF-gated (existing pattern). LAN: **second listener only** (primary loopback surface byte-unchanged), opt-in bind, bearer token (store-managed, rotate + revoke), constant-time compare, per-token rate limit, expose list double-enforced (raw + resolved), per-provider monthly budget guard (warn/stop); peer-info is read-only model+health+tier, enumerated to any token holder (accepted). **Role resolution over LAN:** a LAN-authenticated inbound request resolves the PEER's role cards — the distributed-role mechanism (R7), authorized by the peer's bearer token; role ADMIN APIs (writes) and all dashboard/admin endpoints stay loopback-only, never registered on the LAN listener. Bearer-over-HTTP-on-LAN is an explicitly accepted risk (trusted home network), stated so the owner-reserved LAN-enable nod carries it. Plugins: user-level, no system ops, documented unsandboxed. Decision slot: prompt content sent to classifiers = feature summary, never full prompt to `webhook`/cloud kinds. Reliability: v1-restore via tag; migrations logged and previewable; supervisors backoff; engine cutover serialized.
 
 ## Rollout, migration, and rollback
 
@@ -149,6 +149,8 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - v2 in-place on master with v1 tag, phase-per-PR — approved (owner revert requirement) — 2026-10-21.
 - Credentials UI-first, `env/file` refs as ops escape — approved (owner: Manifest-style UI, nothing in code) — 2026-10-21.
 - Credentials delivery staged store L2 / page L3 / binding+rotation L6 — from batch-1 critic B1 (store ships with its first consumer, the bridge plugin) — 2026-10-21.
+- Per-provider monthly budget guard (price × usage tokens; warn/stop; stop fires the managed-hop fallback): owner cost-safety for direct cloud + LAN tokens — 2026-10-23.
+- LAN inbound requests resolve the PEER's role cards (distributed roles); supersedes the plain reading of "role resolution never exposed over LAN" — admin APIs stay loopback-only — 2026-10-23.
 
 ## Referenced files
 
@@ -171,6 +173,8 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `migrations/0003_toolbox_serving_dimension.sql` — frozen schema vocabulary; grep-gate exception, DO NOT EDIT.
 - `src/cli.rs` — `routing-profile` CLI surface (L1 route removals, L3 replacement).
 - `src/llama_swap_register.rs` — GGUF→llama-swap import; L7 catalog source.
+- `docs/design/v2-streamlining.L7.md` — leg L7 spec (llama-swap absorbed; native-mode flip, parity checklist, deletion).
+- `docs/design/v2-streamlining.L8.md` — leg L8 spec (mac surface, ds4-Metal spike gate, fleet-tier distributed roles).
 - `docs/design/v2-streamlining.L6.md` — leg L6 full spec (providers, Manifest absorbed, LAN federation).
 - `docs/design/v2-streamlining.L3.md` — leg L3 full spec (roles, decision slot, credentials page, one-entry).
 - `docs/design/v2-streamlining.L5.md` — leg L5 full spec (strixite + hipfire adapters, Active-Consumer protection).
