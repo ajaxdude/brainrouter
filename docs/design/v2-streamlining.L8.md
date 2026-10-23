@@ -4,9 +4,7 @@ This file is part of the design: the Map lives in `v2-streamlining.md`; this is 
 
 Goal (R8/R5): the mac joins the fleet; the owner's distributed-role flows run end-to-end across real machines. Everything upstream (roles, decisions, credentials, swap, engines, providers, LAN federation) exists; L8 is platform + proof.
 
-## Spike gate (Bailey card first, code second)
-
-- **ds4 on macOS**: the owner expects DS4 as the mac engine. VERIFY: ds4 engine macOS/Metal support (repo/toolbox matrix — today's toolbox catalog platforms are linux-only: strix-halo/r9700/gb10/intel-b70; `ds4` toolboxes ship ROCm images). If unsupported: documented fallback = llama.cpp Metal (native adapter, GGUFs, `llama-server` brew formula), offered as the mac engine in the compatibility matrix. Card records the verdict + evidence; the spec's Engine work follows the card.
+- **ds4 on macOS** — web evidence (2026-10-23): antirez/ds4 is "a local inference engine for Metal, CUDA and ROCm" with a documented OpenAI-compatible server mode (`model: "deepseek-v4-flash"`); Metal is a first-class backend (plus a maintained mitsuhiko Metal fork). The owner's expectation is well-founded. Spike (Bailey card, on hardware, before the adapter is committed): `ds4 serve` flag surface for the launch spec, model weights for the mac's unified memory (Flash sizes), tool-call support level. Fallback if the card fails: llama.cpp Metal (native adapter, GGUFs) as the mac engine.
 
 ## Mac platform surface
 
