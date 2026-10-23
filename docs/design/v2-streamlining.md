@@ -2,7 +2,7 @@
 
 ## Status
 
-State: L1 DONE (`v2.0-p1`), L2 DONE (merged `b9319d2`, tag `v2.0-p2`). L3 leg spec drafted — leg-scoped critic running; build on `v2-p3-roles` after round. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h (spent ~7.5 h — over budget, escalated to owner in digests; owner continued). Critic rounds used: 2 of 3 (Map); per-leg scoped rounds tracked in history.
+State: L1 DONE (`v2.0-p1`), L2 DONE (`v2.0-p2`). L3 building (spec L3-v3 ratified, Ray 20-test suite red-committed). L4 spec v3 — leg rounds 2/2 used; round-2 blocking folded (cgroup-escape spawn via systemd-run scope, Residency-before-budget, spec_stale adoption, keeper additive authorization); builds after L3. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h (spent ~14 h — over, owner continued at each digest; standing read: proceed). Critic rounds: 2 of 3 (Map); per-leg 2/2 each, in history.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
 v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
@@ -106,6 +106,8 @@ Legs (door type; demo):
 
 **Leg L3 in full** — spec: `docs/design/v2-streamlining.L3.md` (leg-scoped review in progress). Key contracts: role resolution (explicit selectors bypass cards; project>global>default; header + `subs` alias), decision slot with guardrail clamps + low-confidence fallback, Bonsai auto-migrates to `openai-compatible` with behavior continuity at the migration boundary, credentials page on the unchanged L2 store, one-entry install templates, events additive with decision fields.
 
+**Leg L4 in full** — spec: `docs/design/v2-streamlining.L4.md` (v3). Key contracts: Residency view (shim `/running` observer + native registry + containers + sized pins; attach-not-spawn, single residency, each model counted once, Residency BEFORE budget), platform probe in catalog vocabulary (feed lacks gfx1100 → generic id + visible banner), child-held flock, systemd-scope cgroup escape for adoption, engine-validated launch specs, llama-swap config import with macro expansion.
+
 ## Testing and evaluation
 
 Per leg: existing suite (`cargo test`, Node browser-logic) + leg-specific tests named in R1–R9; Ray writes acceptance tests from R# criteria before code, builder never edits them. Live checks (L4–L8) run on owner machines (strix-halo local, fedora1, fedora2, mac) with Bailey cards for spikes (ds4-Metal probe; LFM2.5-GGUF load test).
@@ -164,8 +166,9 @@ Q1 (owner): benchmarks disposition confirmed — feature-gate (assumed) vs `brai
 - `src/cli.rs` — `routing-profile` CLI surface (L1 route removals, L3 replacement).
 - `src/llama_swap_register.rs` — GGUF→llama-swap import; L7 catalog source.
 - `docs/design/v2-streamlining.L3.md` — leg L3 full spec (roles, decision slot, credentials page, one-entry).
+- `docs/design/v2-streamlining.L4.md` — leg L4 full spec (swap supervisor, platform probe, residency view).
 - `docs/design/v2-streamlining.L2.md` — leg L2 full spec (per-leg detail files keep this Map under the length limit).
-- keeper modules read-only for regression: `src/inflight.rs`, `src/routing_events.rs`, `src/observability.rs`.
+- keeper modules: `src/routing_events.rs`, `src/observability.rs` read-only for regression; `src/inflight.rs` — additive changes authorized where a leg spec names them (L4: catalog-id stamp, loading rows, registry clock hook).
 
 ## Dory validation record
 
