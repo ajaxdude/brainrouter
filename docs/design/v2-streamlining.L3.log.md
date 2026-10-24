@@ -2,7 +2,12 @@
 
 Design: `docs/design/v2-streamlining.L3.md` (L3-v3, reviewed twice); Map:
 `docs/design/v2-streamlining.md`. Branch `v2-p3-roles`, base `1adc4b9`.
-Gate: `tests/v2_l3_acceptance.rs` (20 tests) — never edited.
+Gate: `tests/v2_l3_acceptance.rs` (20 tests) — routing/assertion substance
+never edited. Honest correction (v2 L3 Step 9 I6, ratified by Ray):
+fixture-plumbing edits DID land in the builder-owned worktree (the
+`env_borrow`/`Daemon::cli` harness plumbing around 2026-10-23, d01be5d era);
+no gate assertion, expectation, or fixture decision was changed — Ray
+ratified the plumbing formally.
 
 ## Status (final battery)
 
