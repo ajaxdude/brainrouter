@@ -1,4 +1,4 @@
-This file is part of the design: the Map lives in `v2-streamlining.md`; this is leg L7's full spec. Version L7-v2 (2026-10-23): round-1 fold — flip sequence with quiesce + refusal (B1), config-section migration + honest grep-gate (B2), suite mode-pinning + provider-string end-state (B3), fedora import path key (B4), groups kickoff artifact (B5), consumer list completed (I1), soak exit criteria (I2), R8 scope line (I3), nits (N1–N3).
+This file is part of the design: the Map lives in `v2-streamlining.md`; this is leg L7's full spec. Version L7-v3 (2026-10-24): round-1 fold (flip gate, section migration, mode-pinning, config_path, groups artifact, consumer list, soak criteria, R8 scope, nits) + round-2 fold (in-flight/observability pollers + config view/edit surface in the consumer list; `local_system_prompt` in the kept-key enumeration).
 
 # Leg L7 in full — llama-swap absorbed
 
@@ -11,9 +11,11 @@ Goal (R8, llama-swap clauses): the native swap supervisor serves every model lla
 - Rollback (native→shim): daemon shutdown stops native children (L4 lifecycle: SIGTERM-grace, flock released at child exit); boot in shim mode; llama-swap reloads on demand. Acceptance pins BOTH directions: flip with shim-resident models = refusal + no :8081 traffic after flush+flip; flip-back with native children = none survive.
 - `swap: {mode}` end state: key exists through the soak; at deletion the shim code goes, `mode: shim` becomes a config error (migration strips the key, logged), single-mode engine.
 
-## Config-section migration (v2.0-p7) — the grep-gate's honesty condition
 
-Every kept key today lives under `llama_swap:` (`fallback_model`, `subs_model`, `local_models`, `nudge.model_key` — `src/config.rs`; plus `base_url`, which dies). v2.0-p7 renames the section to `swap:` (keys move verbatim; values validated against the native catalog; snapshot + dry-run + restore per contract; `base_url` removed with a "no longer used" migration note). Grep-gate after deletion: zero `llama_swap`/`llama-swap`/`8081` in src/tests/scripts EXCEPT: migration provenance (`swap_catalog` import, v2.0-p7 migration code, migration-history notes), the provider-string literal (below), and the prompt-rewrite text (fixed by N3).
+
+## Config-section migration (v2.0-p7) — the grep-gate's honesty condition
+Every kept key today lives under `llama_swap:` (`fallback_model`, `subs_model`, `local_models`, `local_system_prompt`, `nudge.model_key` — `src/config.rs`; plus `base_url`, which dies). v2.0-p7 renames the section to `swap:` (keys move verbatim; values validated against the native catalog; snapshot + dry-run + restore per contract; `base_url` removed with a "no longer used" migration note). Grep-gate after deletion: zero `llama_swap`/`llama-swap`/`8081` in src/tests/scripts EXCEPT: migration provenance (`swap_catalog` import, v2.0-p7 migration code, migration-history notes), the provider-string literal (below), and the prompt-rewrite text (fixed by N3).
+
 
 ## Provider-string end-state
 
@@ -21,7 +23,7 @@ Native llama.cpp-family routes report `effective_provider = "llama-swap"` throug
 
 ## Consumer list (every `:8081`/llama-swap touchpoint the flip must retarget)
 
-Router (`try_llama_swap`, `route_local` seed), model listing (`/api/models` source + llama-swap keys), `poll_llama_swap_model` (startup model poll), `poll_llama_swap_running`/`poll_llama_swap_slot` (inference-status enrichment — PP-progress/activity panels) ⇒ retarget to swap-supervisor per-model slot data; `flush_models` endpoint ⇒ drives the supervisor in native mode; `POST /api/restart/llama-swap` + service allowlist + dashboard "Restart Local Stack" ⇒ per-engine restart; GGUF registration (`llama_swap_register.rs`, download flow) ⇒ `swap catalog add`; versions/upgrades row for llama-swap; toolbox runtime health rows (container source — the full four-source Residency list is shim/native/container/external, shim retires, the rest remain); nudge budget prompt text (prompt_rewriter "running on a local LLM via llama-swap" ⇒ engine-honest text, part of the deletion pass); install.sh llama-swap install/service; docs surfaces (PRD/README/UPGRADE).
+Router (`try_llama_swap`, `route_local` seed), model listing (`/api/models` source + llama-swap keys), `poll_llama_swap_model` (startup model poll), `poll_llama_swap_running`/`poll_llama_swap_slot` (inference-status enrichment — PP-progress/activity panels) ⇒ retarget to swap-supervisor per-model slot data; the in-flight PP feed (`fetch_slots` loop, daemon.rs — a separate dialer from the inference-status pollers) ⇒ same supervisor slot source; `poll_backend` (observability per-model loop ⇒ supervisor/registry state); the llama-swap config view/edit surface (`GET/POST /api/llama-swap-config`, config-file panel row, dashboard panel, CLI verb) ⇒ retarget to swap-catalog view/edit (never a silent admin trap on a non-governing file); `flush_models` endpoint ⇒ drives the supervisor in native mode; `POST /api/restart/llama-swap` + service allowlist + dashboard "Restart Local Stack" ⇒ per-engine restart; GGUF registration (`llama_swap_register.rs`, download flow) ⇒ `swap catalog add`; versions/upgrades row for llama-swap; toolbox runtime health rows (container source — the full four-source Residency list is shim/native/container/external, shim retires, the rest remain); nudge budget prompt text (prompt_rewriter "running on a local LLM via llama-swap" ⇒ engine-honest text, part of the deletion pass); install.sh llama-swap install/service; docs surfaces (PRD/README/UPGRADE, benchmarks.html placeholder text).
 
 ## Import path (fedora reality)
 
