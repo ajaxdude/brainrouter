@@ -337,11 +337,18 @@ async fn handle_request(
     peer_addr: SocketAddr,
     scope_clock: Option<Arc<ScopeClock>>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
-    // UDS requests carry their per-request grace clock (project scope);
-    // the request completes on this same task, and the next request on the
-    // connection installs its own clock (per-request isolation, no leak).
-    state.router.set_request_scope_clock(scope_clock);
-    tracing::debug!(cwd = %cwd, "L3DIAG3 request");
+    // v2 L3 Step 9 I4: the grace clock lives in a task-local scope around
+    // the whole request (per-connection task; concurrent requests on the
+    // shared Router each see their own window).
+    Box::pin(Router::scope_clock_scope(scope_clock, handle_request_inner(req, state, cwd, peer_addr))).await
+}
+
+async fn handle_request_inner(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+    cwd: String,
+    peer_addr: SocketAddr,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
     let path = req.uri().path();
 
@@ -965,9 +972,61 @@ async fn handle_request(
         }
 
         ("POST", "/api/credentials/audit") => {
-            // The audit view IS the masked list (contract: GET is masked; the
-            // audit endpoint exists so the dashboard's probe list is honest).
-            into_unsync(json_response(StatusCode::OK, &credentials_json(&state)))
+            // v2 L3 Step 9 I6: a usage audit — every masked record plus the
+            // plugins (grants consumers) that reference it. No plaintext,
+            // ever: records are the store's own masked shape.
+            let plugins = state.plugins.list().unwrap_or_default();
+            let mut audit = state
+                .credentials
+                .list_masked()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    let id = r
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let consumers: Vec<String> = plugins
+                        .iter()
+                        .filter(|c| {
+                            c.get("grants")
+                                .and_then(|g| g.as_array())
+                                .map(|arr| {
+                                    arr.iter().any(|g| {
+                                        g.as_str()
+                                            .map(|grant| {
+                                                grant == id || grant.starts_with(&format!("{id}:"))
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                        .map(|c| {
+                            c.get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        })
+                        .collect();
+                    let mut v = r;
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("consumers".into(), serde_json::json!(consumers));
+                    }
+                    v
+                })
+                .collect::<Vec<_>>();
+            audit.sort_by_key(|v| {
+                v.get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "credentials": audit }),
+            ))
         }
 
         // ── v2 L3: decision slot (read-only describe + test classify) ───────
@@ -975,6 +1034,52 @@ async fn handle_request(
             StatusCode::OK,
             &state.decision.describe(),
         )),
+
+        // v2 L3 Step 9 I6: the Decisions panel's feature summary (what the
+        // slot sees per request shape; excerpt-free).
+        ("GET", "/api/decision/features") => {
+            #[derive(serde::Deserialize)]
+            struct FeaturesProbe {
+                #[serde(default)]
+                text: Option<String>,
+                #[serde(default)]
+                role: Option<String>,
+                #[serde(default)]
+                selector: Option<String>,
+            }
+            let body: FeaturesProbe = match read_routing_json(req).await {
+                Ok(body) => body,
+                Err(error) => return Ok(routing_error(StatusCode::BAD_REQUEST, error)),
+            };
+            let request = ChatCompletionRequest {
+                model: body.selector.unwrap_or_else(|| "auto".into()),
+                messages: vec![crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: Some(serde_json::Value::String(
+                        body.text.unwrap_or_default(),
+                    )),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: Some(false),
+                temperature: None,
+                max_tokens: None,
+                top_p: None,
+                stop: None,
+                extra: serde_json::Value::Null,
+            };
+            let features = crate::decision::RequestFeatures::extract(
+                &request,
+                64,
+                body.role.as_deref().unwrap_or("main"),
+                &request.model,
+                crate::roles::Privacy::CloudOk,
+                crate::roles::Quality::Fast,
+                "",
+            );
+            into_unsync(json_response(StatusCode::OK, &features.to_json(false)))
+        }
 
         ("POST", "/api/decision/test") => {
             #[derive(serde::Deserialize)]
@@ -1122,11 +1227,18 @@ async fn handle_request(
         ("POST", "/api/prompt-rewrite") => {
             let body_bytes = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-            // Rewriting the local system prompt is only meaningful with the
-            // classifier driving auto/local routing. Refuse to turn it on while
-            // Bonsai is off; turning off is always allowed.
+            // v2 L3 Step 9 B2: rewrite requires the DECISION SLOT enabled
+            // (any kind — the heuristic slot routes auto/local exactly like
+            // the classifier did). The server health check applies only to
+            // the bonsai profile, the one kind backed by the external
+            // llama-server. Turning off is always allowed.
+            let slot_enabled = state.decision.config().enabled;
+            let bonsai_health_needed = state.decision.rewrite_requires_launch_health();
+            let slot_ok = slot_enabled
+                && (!bonsai_health_needed
+                    || (state.bonsai.is_running() && state.bonsai.healthy().await));
             let rejected = match val.get("enabled").and_then(|v| v.as_bool()) {
-                Some(true) if !(state.bonsai.is_running() && state.bonsai.healthy().await) => true,
+                Some(true) if !slot_ok => true,
                 Some(enabled) => {
                     state.prompt_rewrite.store(enabled, AtomicOrdering::Relaxed);
                     false
@@ -1137,7 +1249,7 @@ async fn handle_request(
                 into_unsync(json_response(
                     StatusCode::CONFLICT,
                     &ErrorResponse {
-                        error: "Prompt rewrite requires the Bonsai classifier to be on".into(),
+                        error: "Prompt rewrite requires the decision slot to be enabled (and, for the bonsai classifier profile, its server healthy)".into(),
                     },
                 ))
             } else {
@@ -4368,6 +4480,9 @@ pub async fn run_with_listeners(
             match tcp_listener.accept().await {
                 Ok((stream, addr)) => {
                     info!("New TCP connection from {}", addr);
+                    let local_addr = stream
+                        .local_addr()
+                        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
                     let io = TokioIo::new(stream);
                     let state = tcp_state.clone();
                     // Resolve the cwd of the connecting OMP process once per
@@ -4378,7 +4493,7 @@ pub async fn run_with_listeners(
                     // burned the project-scope grace window before the
                     // first probe ran (the scope flakes). The /proc scans
                     // are a few reads of hot pseudo-files.
-                    let conn_cwd = peer_cwd(&addr).unwrap_or_default();
+                    let conn_cwd = peer_cwd(&addr, &local_addr).unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
                             .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr, None)))

@@ -509,6 +509,11 @@ impl RoleCardStore {
         data.assignments.retain(|c| !(c.role == role && c.scope == scope));
         let removed = data.assignments.len() != before;
         if removed {
+            // Keep the scoped-card hint honest (last scoped card removed).
+            self.has_scoped.store(
+                data.assignments.iter().any(|c| c.scope != GLOBAL_SCOPE),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             self.persist(&data)?;
         }
         Ok(removed)

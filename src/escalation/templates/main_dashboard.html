@@ -412,6 +412,9 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         </div>
         <div id="credentials-list" style="display:flex;flex-direction:column;gap:6px"></div>
         <div id="credentials-message" role="status" style="color:var(--amber);font-size:11px"></div>
+        <h2 style="font-size:14px;margin:18px 0 8px">Usage audit</h2>
+        <div style="margin-bottom:8px"><button class="br-btn" onclick="credentialAudit()">Refresh audit</button></div>
+        <div id="credentials-audit" class="muted" style="font-size:12px">Grants consumers per credential (plugins referencing it).</div>
       </div>
       <h2 style="font-size:14px;margin:18px 0 8px">Decisions (read-only)</h2>
       <div id="decision-panel" class="recent-events">
@@ -1358,10 +1361,10 @@ function cardTitle(group) {
 // card for the whole harness conversation), otherwise by (prompt_excerpt +
 // cwd) within a 60s window.
 function reviewSelector(sess) {
-  const config = sess && sess.review_config;
-  if (!config) return 'review';
-  const mode = config.forced_mode || 'auto';
-  return config.forced_model ? `${mode}/${config.forced_model}` : mode;
+  // v2 L3 Step 9 I3: the review card snapshot the session took at start
+  // (`review_selector`, e.g. "cloud/vendor/review-2026"). The v1 forced_*
+  // fields are gone from the reduced review config.
+  return (sess && sess.review_selector) || 'review';
 }
 
 function virtualSessionEvent(sess) {
@@ -2662,7 +2665,7 @@ async function loadRoleCards() {
       const scopes = [...new Set((data.assignments || []).map(a => a.scope).filter(x => x !== 'global'))];
       const current = sel.value;
       sel.innerHTML = '<option value="global">Global (all projects)</option>' +
-        scopes.map(k => `<option value="${k.replace(/"/g, '&quot;')}">${k.split('/').filter(Boolean).pop()}</option>`).join('');
+        scopes.map(k => `<option value="${escHtml(k)}">${escHtml(k.split('/').filter(Boolean).pop())}</option>`).join('');
       if ([...sel.options].some(o => o.value === current)) sel.value = current;
     }
     // Review extras on the review card.
@@ -2741,7 +2744,7 @@ async function loadRoleModels() {
     const list = document.getElementById('routing-models-list');
     if (!list) return;
     const models = [...(data.local?.models || []), ...(data.cloud?.models || [])];
-    list.innerHTML = models.map(m => `<option value="${m.replace(/"/g, '&quot;')}">`).join('');
+    list.innerHTML = models.map(m => `<option value="${escHtml(m)}">`).join('');
   } catch (e) { /* lists are advisory */ }
 }
 
@@ -2828,6 +2831,20 @@ async function loadCredentials() {
   }
 }
 
+async function credentialAudit() {
+  const box = document.getElementById('credentials-audit');
+  if (!box) return;
+  try {
+    const data = await routingFetch('/api/credentials/audit', {});
+    const rows = (data.credentials || []).map(rec =>
+      '<div><b>' + esc(rec.id) + '</b> <span class="muted">grants: ' + esc((rec.grants || []).join(', ') || 'none')
+      + ' · consumers: ' + esc((rec.consumers || []).join(', ') || 'none') + '</span></div>');
+    box.innerHTML = rows.length ? rows.join('') : '<span class="muted">no credentials</span>';
+  } catch (e) {
+    box.innerHTML = '<span class="muted">audit unavailable: ' + esc(e.message) + '</span>';
+  }
+}
+
 // Decisions panel (read-only): the additive L3 event fields.
 function renderDecisions() {
   const panel = document.getElementById('decision-panel');
@@ -2835,6 +2852,24 @@ function renderDecisions() {
   const rows = allEvents.slice().reverse().filter(e => e.role || e.decision || e.chosen_model).slice(0, 12);
   if (!rows.length) return;
   panel.replaceChildren();
+  // Slot summary + feature view (I6): what the slot is and what it sees.
+  const summary = document.createElement('div');
+  summary.style.cssText = 'font-size:11px;margin-bottom:6px';
+  summary.id = 'decision-summary';
+  panel.appendChild(summary);
+  fetch('/api/decision').then(r => r.json()).then(d => {
+    summary.innerHTML = '<span class="muted">slot: <b>' + esc(d.kind) + '</b> · enabled ' + (d.enabled ? 'on' : 'off') + ' · available ' + (d.available ? 'yes' : 'no') + '</span>';
+  }).catch(() => {});
+  const probe = document.createElement('div');
+  probe.style.cssText = 'display:flex;gap:8px;font-size:11px;margin-bottom:6px';
+  probe.innerHTML = '<input id="decision-probe-text" class="config-input" style="flex:1;font-size:11px" placeholder="probe: prompt text (features the slot sees)">'
+    + '<button class="br-btn" style="font-size:11px" onclick="decisionProbe()">Show features</button>';
+  panel.appendChild(probe);
+  const features = document.createElement('div');
+  features.id = 'decision-features';
+  features.className = 'muted';
+  features.style.cssText = 'font-size:11px;margin-bottom:6px';
+  panel.appendChild(features);
   for (const e of rows) {
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;gap:10px;align-items:baseline;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:11.5px;margin-bottom:4px';
@@ -2844,6 +2879,20 @@ function renderDecisions() {
       + '<span class="muted" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.rationale || '') + '</span>'
       + '<span style="color:var(--accent)">' + esc(e.chosen_model || '') + '</span>';
     panel.appendChild(row);
+  }
+}
+
+async function decisionProbe() {
+  const box = document.getElementById('decision-features');
+  if (!box) return;
+  const text = (document.getElementById('decision-probe-text') || {}).value || '';
+  try {
+    const f = await routingFetch('/api/decision/features', { text, role: 'main', selector: 'auto' });
+    box.textContent = 'features: role ' + f.role + ' · selector ' + f.selector + ' · privacy ' + f.privacy
+      + ' · quality ' + f.quality + ' · msgs ' + f.msg_count + ' · ~' + f.approx_prompt_tokens + ' tokens'
+      + ' · tools ' + (f.has_tools ? 'yes' : 'no') + ' · code density ' + f.code_density;
+  } catch (e) {
+    box.textContent = 'features unavailable: ' + e.message;
   }
 }
 

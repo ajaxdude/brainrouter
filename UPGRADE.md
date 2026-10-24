@@ -14,8 +14,10 @@ the `bonsai:` classifier section. v2 L3 replaces all of them with
 pre-L3 config runs the `v2.0-p3` migration automatically:
 
 1. Everything consumed is snapshotted — the config YAML, the credentials
-   store, `project_pins.json`, and `routing_state.json` — under
-   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p3/<UTC timestamp>/`.
+   store, `project_pins.json`, `routing_state.json`, and (from Step 9) the
+   `role_cards.json` store — under the stable directory
+   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p3/` (one snapshot per
+   migration phase; a one-shot migration has one pre-state).
 2. Cards are written via the exact table:
 
    | v1 state | card |
@@ -42,7 +44,8 @@ Rollback:
 ```bash
 brainrouter migration --config brainrouter.yaml restore v2.0-p3
 # restores the pre-migration YAML byte-for-byte + the v1 pins/profile state
-# files and removes role_cards.json
+# files, and the role_cards.json captured in the snapshot (or removes it
+# when the snapshot predates the cards store)
 ```
 
 The v1 selector surface on the proxy is unchanged (`auto`, `local`, `cloud`,
@@ -65,8 +68,8 @@ Booting a v2 daemon with a v1 `brainrouter.yaml` runs the `v2.0-p2`
 migration before validation:
 
 1. The pre-migration config YAML + credentials store are snapshotted to
-   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p2/<UTC timestamp>/`
-   (owner-only, mode 0700).
+   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p2/` (one snapshot per
+   phase; owner-only, mode 0700).
 2. The plaintext `bridge.discord.token` value moves into
    `$XDG_STATE_HOME/brainrouter/credentials.json` (0600, atomic writes) as
    credential `discord_token`, granted to plugin `bridge`. The value is

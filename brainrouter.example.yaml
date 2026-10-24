@@ -47,17 +47,32 @@ llama_swap:
   #     light: 10240
   #     deep: 12288
 
-bonsai:
-  # Bonsai classifier is OFF by default — auto-routing goes straight to local
-  # (llama-swap). Set enabled: true and point model_path at a GGUF to run the
-  # external classifier server; model=auto then hops Bonsai → cloud/local.
+# v2 L3: the v1 `bonsai:` block is the decision slot (`decision_model:`, see
+# below). A config with `bonsai:` boots by migrating it once at startup
+# (kind openai-compatible + prompt_profile bonsai; the GGUF/fork/port move
+# under decision_model.launch).
+decision_model:
+  # The slot is OFF by default — model=auto routes straight to local
+  # (llama-swap), the v1 classifier-off parity anchor.
   enabled: false
-  # Absolute path to the Bonsai GGUF file.
-  # You may use ${models_path} as a shorthand for the models.path value below.
-  # Download: huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \
-  #             --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" \
-  #             --local-dir /opt/models/bonsai
-  model_path: "${models_path}/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
+  # heuristic (default) | openai-compatible | structured-schema | webhook | plugin
+  kind: heuristic
+  # openai-compatible (the v1 Bonsai wire): endpoint + model + prompt_profile:
+  #   kind: openai-compatible
+  #   base_url: "http://127.0.0.1:9200"  # daemon appends /v1/chat/completions
+  #   model: bonsai
+  #   prompt_profile: bonsai
+  # webhook: url: "https://router.internal/decide" (features JSON, no excerpt)
+  # plugin:  plugin_id: "<installed plugin id>" (decision.classify)
+  # timeout_ms: 5000
+  # Managed llama-server launch backend (v1 bonsai.fork_path/model_path/server_port):
+  # launch:
+  #   server_port: 9200
+  #   fork_path: "/home/yourname/.local/share/brainrouter/llama-prism/llama-server"
+  #   # Absolute GGUF path (${models_path} shorthand available). Download:
+  #   # huggingface-cli download bartowski/prism-ml_Bonsai-8B-unpacked-GGUF \
+  #   #   --include "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf" --local-dir /opt/models/bonsai
+  #   model_path: "${models_path}/bonsai/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
 
 # Shared model storage directory.
 # All fields are optional — defaults shown.
@@ -87,22 +102,32 @@ models:
 # benchmarks:
 #   database_path: "/home/yourname/.local/share/brainrouter/benchmarks.sqlite3"
 
-# Review loop configuration (all fields optional — defaults shown)
+# Review loop configuration (v2 L3: model selection lives on the review
+# role card, NOT here — `forced_mode`/`forced_model` are consumed by the
+# v2.0-p3 migration and rejected by the reduced schema).
 # review:
-#   max_iterations: 5
-#   forced_mode: local       # auto | local | cloud
-#   forced_model: null       # explicit local OR cloud provider ID, or default
+#   max_iterations: 5          # LLM review rounds before escalating to human
+#   hankndory_integration: false
+#   design_doc_path: null
 
-# Independent role defaults. Saved dashboard/CLI preferences in routing_state.json
-# override these on restart. Omit routing to retain local main, review settings
-# above, and llama_swap.subs_model. Selecting a profile never enables cloud.
-# routing:
-#   preset: local_main_cloud_review
-#   main: { backend: local, model: "your-local-model-key" }
-#   reviewer: { backend: cloud, model: "vendor/reviewer-model" }
-#   subagent_model: "your-subs-pool-key"
-# Presets: auto, cloud, local_main_sub, local_custom (explicit local main required),
-# cloud_main_local_review, local_main_cloud_review, custom.
+# Role cards replace the v1 `routing:` profile block and per-project pins.
+# Set them via the dashboard (role-card strip) or CLI:
+#   brainrouter cli roles set main local
+#   brainrouter cli roles set review cloud/vendor/reviewer-model
+#   brainrouter cli roles set subagent cloud --project /path/to/repo
+# They persist in $XDG_STATE_HOME/brainrouter/role_cards.json (0600).
+# v1 configs with `routing:`/`forced_*`/`bonsai:` migrate once at boot
+# (`brainrouter migration restore v2.0-p3` rolls back).
+
+# Decision slot (the v1 `bonsai:` block's successor; selects the `auto`
+# route). kind: heuristic (default, parity anchor) | openai-compatible
+# (the v1 Bonsai wire: prompt_profile bonsai) | structured-schema |
+# webhook | plugin. Launch backend (the managed llama-server) goes under
+# `launch:`.
+# decision_model:
+#   enabled: false
+#   kind: heuristic
+#   timeout_ms: 5000          # per-decision bound for networked kinds
 
 
 # Bridge transports — forward Discord/Signal messages to OMP (all optional)

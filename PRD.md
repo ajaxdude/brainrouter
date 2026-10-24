@@ -1311,7 +1311,7 @@ Resolve a review session with feedback.
 | Review hits max iterations | Iteration counter | Escalate to human via dashboard UI |
 | Review disabled | `review_runtime_state.json` / `/api/review/enabled` | New review requests return `disabled` without contacting a model |
 | Review prompt would exceed safe budget or required evidence is truncated | `review/tokens.rs` budget planner | Terminal escalation rather than a confident approval |
-| Project pin path is non-absolute or not in a Git repo | `ProjectPinStore::set` / resolver | Reject pin write or inherit global profile |
+| Role-card project scope is non-absolute or not in a Git repo | `roles::validate_card_scope` (relocated `ProjectPinStore` checks) / resolver | Reject the assignment write or inherit the global card |
 | Peer CWD resolution fails | `/proc` read failure | Use a valid explicit review CWD; invalid/absent resolved review directories are rejected, not silently substituted |
 | Config validation failure at startup | Missing required fields, invalid URLs, missing GGUF | Daemon refuses to start with descriptive error |
 | Legacy auto reviewer retains an ignored model | YAML/legacy-state read normalization | Discard only that ignored field, warn with source/action, persist state migration once; keep new API writes strict |

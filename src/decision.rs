@@ -501,6 +501,14 @@ pub struct DecisionSlot {
 }
 
 impl DecisionSlot {
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    pub fn is_bonsai_profile(&self) -> bool {
+        self.config.is_bonsai_profile()
+    }
+
     pub fn new(
         config: DecisionModelConfig,
         classifier: Arc<crate::classifier::Classifier>,
@@ -527,6 +535,13 @@ impl DecisionSlot {
             model,
             heuristic: HeuristicModel,
         }
+    }
+
+    /// The kind/config the prompt-rewrite gate needs (L3 spec invariant
+    /// "prompt rewriting requires the decision slot"): the handler applies
+    /// `enabled` + the bonsai-profile health check (async, server-side).
+    pub fn rewrite_requires_launch_health(&self) -> bool {
+        self.config.is_bonsai_profile() && self.config.launch.is_some()
     }
 
     pub fn config(&self) -> &DecisionModelConfig {

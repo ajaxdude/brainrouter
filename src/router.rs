@@ -147,6 +147,12 @@ struct Resolution {
     proxy_review_strict: bool,
 }
 
+tokio::task_local! {
+    /// The UDS request's grace clock (`None` for TCP/Router-level callers,
+    /// whose grace window starts at the request itself).
+    static REQUEST_SCOPE_CLOCK: Option<Arc<ScopeClock>>;
+}
+
 pub struct Router {
     slot: Arc<DecisionSlot>,
     cards: Arc<RoleCardStore>,
@@ -179,10 +185,10 @@ pub struct Router {
     /// llama-swap model key that runs the nudge fork (chain seed when the
     /// nudge switch is on — v1 `Classifier::default_local_model` parity).
     nudge_model_key: Option<String>,
-    /// Request-scoped UDS grace clock (stamped by the server at request
-    /// arrival; `None` for Router-level/test callers, whose grace starts at
-    /// the request itself).
-    request_clock: std::sync::Mutex<Option<Arc<ScopeClock>>>,
+    /// (v2 L3 Step 9 I4: the per-request grace clock travels as a tokio
+    /// task-local — the Router is shared by every connection, and a slot
+    /// on it let a concurrent request clear/overwrite the window of the
+    /// request being resolved.)
     /// Runtime prompt-rewrite toggle. When off, local routes forward the
     /// incoming messages untouched (no system-prompt rewrite).
     prompt_rewrite: Arc<AtomicBool>,
@@ -235,7 +241,6 @@ impl Router {
             health: args.health,
             routing_events: args.routing_events,
             scope_lookup_ms: std::sync::atomic::AtomicU64::new(0),
-            request_clock: std::sync::Mutex::new(None),
             local_system_prompt: args.local_system_prompt,
             inference_tracker: args.inference_tracker,
             nudge_budgets: args.nudge_budgets,
@@ -338,22 +343,25 @@ impl Router {
     /// canonical git root (the relocated `project_key`). Gated: zero
     /// filesystem work when the store has no scoped cards, and always cheap
     /// (one canonicalize + walk).
-    /// Install the request's UDS grace clock (server: one per request;
-    /// `None` clears — TCP connections and Router-level callers).
-    pub fn set_request_scope_clock(&self, clock: Option<Arc<ScopeClock>>) {
-        *self.request_clock.lock().unwrap() = clock;
+    /// Run one request's handling with its UDS grace clock installed (the
+    /// server sets this at request arrival on the connection's task; the
+    /// task-local propagates to the routing future, so concurrent requests
+    /// on the shared Router can never clear each other's window).
+    pub fn scope_clock_scope<F: std::future::Future>(
+        clock: Option<Arc<ScopeClock>>,
+        f: F,
+    ) -> F {
+        REQUEST_SCOPE_CLOCK.sync_scope(clock, || f)
     }
 
     async fn resolve_project(&self, cwd: &str) -> Option<String> {
         // A UDS request owns its grace window (the CLI peer is alive for
         // the request; the clock was stamped at arrival); Router-level
         // callers (tests, the review loop) start the window at the request.
-        let window_start = self
-            .request_clock
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| c.elapsed());
+        let window_start = REQUEST_SCOPE_CLOCK
+            .try_with(|c| c.as_ref().and_then(|c| c.elapsed()))
+            .ok()
+            .flatten();
         self.resolve_project_with(cwd, std::time::Duration::from_secs(120), window_start)
             .await
     }
@@ -397,7 +405,6 @@ impl Router {
                 Err(_) => (None, false),
             };
             used += probe_started.elapsed();
-            tracing::debug!(cwd = %cwd, key = ?key, probe_ok, "L3DIAG2 probe");
             if key.is_some() {
                 self.scope_lookup_ms.store(used.as_millis() as u64, Relaxed);
                 return key;

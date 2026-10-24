@@ -876,47 +876,6 @@ fn alive_plugin_pids() -> Vec<u32> {
     out
 }
 
-/// TEMP DIAG: replicate the scope path — a CLI connection (roles set with
-/// --project) followed by a chat from a DIFFERENT connection — and dump
-/// daemon logs on failure.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn diag_scope_publish_race() {
-    let env = TestEnv::new("diagscope");
-    let local = MockServer::local("diag-local", &[L3_LOCAL_MODELS]);
-    let cloud = MockServer::cloud("diag-cloud");
-    for round in 0..40u32 {
-        let mut daemon = Daemon::start(env_borrow(&env), &config_yaml(&local.url, &cloud.url, "decision_model:\n  enabled: true\n  kind: heuristic\n"));
-        daemon.ready().await;
-        let out = daemon.cli(&["roles", "set", "main", "cloud"]);
-        assert!(out.status.success(), "set global: {round}");
-        let out = daemon.cli(&["roles", "set", "main", "local", "--project", "/home/papa/ai/projects/brainrouter"]);
-        assert!(out.status.success(), "set project: {round}");
-        // chat from THIS process (cwd = repo root = the scoped card)
-        let r = client()
-            .post(format!("{}/v1/chat/completions", daemon.url))
-            .json(&json!({"model": "brainrouter/auto", "stream": true, "max_tokens": 8,
-                          "messages": [{"role": "user", "content": format!("diag {round}")}]}))
-            .send()
-            .await
-            .unwrap();
-        let _ = r.text().await;
-        // The scoped `local` card routes DIRECT local (v1 semantics):
-        // model = fallback on the local mock. The global `cloud` card would
-        // hit the cloud mock — so a local hit IS the scoped-card win.
-        let hit_local = local.hits().iter().any(|(_, m)| m == "rayl3p-fallback");
-        if !hit_local {
-            let log = fs::read_to_string(&daemon.log).unwrap_or_default();
-            let tail: Vec<&str> = log.lines().filter(|l| l.contains("L3DIAG2")).rev().take(8).collect();
-            daemon.stop();
-            panic!(
-                "round {round}: scoped card (local-direct) did NOT win — cloud hits {:?}, local {:?}\ndaemon scope lines:\n{}",
-                cloud.hits(), local.hits(), tail.join("\n")
-            );
-        }
-        daemon.stop();
-    }
-}
-
 fn env_borrow(env: &TestEnv) -> TestEnv {
     TestEnv {
         root: env.root.clone(),
@@ -928,4 +887,78 @@ fn env_borrow(env: &TestEnv) -> TestEnv {
         bin: env.bin.clone(),
         owned: false,
     }
+}
+
+// ── Step 9 B3: the bridge !br review command's daemon contract ─────────────
+
+/// `!br review <mode>` (bridge) speaks: POST /api/roles/set
+/// {role: review, assignment: <mode>} | POST /api/roles/remove
+/// {role: review} (auto), readback GET /api/roles → assignments
+/// [{scope, role, assignment}]. This test pins that round-trip against the
+/// live daemon (the bridge binary itself is exercised by Ray's suites).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn br_review_command_roles_round_trip() {
+    let env = TestEnv::new("brreview");
+    let local = MockServer::local("brv-local", &[L3_LOCAL_MODELS]);
+    let cloud = MockServer::cloud("brv-cloud");
+    let mut daemon = Daemon::start(
+        env_borrow(&env),
+        &config_yaml(&local.url, &cloud.url, "decision_model:\n  enabled: true\n  kind: heuristic\n"),
+    );
+    daemon.ready().await;
+    let base = daemon.url.clone();
+    let client = client();
+
+    async fn read_review(client: &reqwest::Client, base: &str) -> Value {
+        client
+            .get(format!("{base}/api/roles"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    }
+
+    // Default: no review card -> the readback renders "auto" (absent).
+    let roles = read_review(&client, &base).await;
+    let review_of = |roles: &Value| -> String {
+        roles
+            .get("assignments")
+            .and_then(|a| a.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|c| {
+                    c.get("role").and_then(|r| r.as_str()) == Some("review")
+                        && c.get("scope").and_then(|s| s.as_str()) == Some("global")
+                })
+            })
+            .and_then(|c| c.get("assignment").and_then(|a| a.as_str()))
+            .unwrap_or("auto")
+            .to_string()
+    };
+    assert_eq!(review_of(&roles), "auto", "fresh daemon: no review card");
+
+    for mode in ["local", "cloud", "cloud/vendor/review-bridge-1"] {
+        let r = client
+            .post(format!("{base}/api/roles/set"))
+            .json(&json!({"role": "review", "assignment": mode}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "!br review {mode}");
+        let roles = read_review(&client, &base).await;
+        assert_eq!(review_of(&roles), mode, "readback after set {mode}");
+    }
+
+    // `auto` = remove (the card default).
+    let r = client
+        .post(format!("{base}/api/roles/remove"))
+        .json(&json!({"role": "review"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "!br review auto");
+    let roles = read_review(&client, &base).await;
+    assert_eq!(review_of(&roles), "auto", "readback after remove");
+    daemon.stop();
 }

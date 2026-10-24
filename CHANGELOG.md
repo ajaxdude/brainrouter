@@ -145,6 +145,36 @@ quarantined (`.corrupt-<ts>`, daemon stays up); CI covers the
 `plugins/bridge` workspace; plugin log/status text is scrubbed of control
 characters; snapshot files and the migration snapshot set are written 0600.
 
+### v2 L3 Step 9 (roles review pass)
+
+Migration: a v1 config without a `bonsai:` block now receives the
+parity-anchor `decision_model:` section, making the `v2.0-p3` migration
+one-shot (previously it re-ran on EVERY boot over its own output: cards
+reset to the stale v1 profile, per-boot snapshots). Snapshots are now one
+directory per phase (stable path; a one-shot migration has one pre-state;
+the legacy timestamped layout stays restorable), and the p3 snapshot
+captures `role_cards.json`, so restore rolls the cards back. The migrated
+YAML writes atomically; `restore v2.0-p3` byte-round-trips the pristine v1
+YAML. The peer cwd used for project scope is re-read per REQUEST (a CLI
+peer that chdir'd after connecting resolves its CURRENT project), and the
+`/proc/net/tcp` scan identifies the client socket by (local port, remote
+daemon port) — a bare port match can land on a foreign LISTEN socket under
+ephemeral-port churn (the confirmed cause of the scope flakes). Proxy
+fast-fail contract: routing failures within 15 s of the request return a
+real HTTP status; the deferred-200 streaming contract for slow resolutions
+(model loads) is unchanged. The prompt-rewrite gate now requires the
+decision slot (any kind), probing classifier health only for the bonsai
+profile. Bridge `review` commands set/read the review role card
+(`/api/roles/set`; `/api/review-config` is reduced). Dashboard: scope
+dropdown + model datalist escape option text; the session review label
+shows the card snapshot (`review_selector`); Decisions panel gained the
+slot summary + feature probe (`/api/decision/features`); the Credentials
+tab gained the usage audit (`/api/credentials/audit`: masked records +
+grant consumers). Boot-window hardening: listeners bind before the boot
+work (UDS first), the CLI tolerates the startup window, shutdown sweeps
+plugin children spawned mid-boot (no orphans), and a deleted state dir is
+a clean startup error.
+
 ### Restoring v2.0-p2
 
 `brainrouter migration restore v2.0-p2` restores the newest snapshot

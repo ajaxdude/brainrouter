@@ -351,23 +351,35 @@ impl EventHandler for DiscordHandler {
             }
         }
 
-        // !br review [auto|local|cloud] — set/show review mode
+        // !br review [auto|local|cloud|cloud/<id>] — v2 L3: the reviewer
+        // MODEL is the review role card (v1's forced_* review-config keys
+        // are gone; the reduced endpoint rejects them, so this command
+        // writes the card via POST /api/roles/set). v1's mode vocabulary
+        // maps 1:1 onto card selectors; `cloud/<id>` passes through (v1's
+        // forced_model on a cloud reviewer). No max_iterations side effect
+        // (v1's "set mode => iterations=5" silently rewrote the owner's
+        // tuned budget); `auto` removes the card (the card default).
         if let Some(rest) = text.strip_prefix("review ") {
             let mode = rest.trim();
-            if mode != "auto" && mode != "local" && mode != "cloud" {
+            let valid = mode == "auto" || mode == "local" || mode == "cloud"
+                || (mode.starts_with("cloud/") && mode.len() > 6);
+            if !valid {
                 let _ = msg.channel_id.say(&ctx.http,
-                    "Usage: `review auto|local|cloud`").await;
+                    "Usage: `review auto|local|cloud|cloud/<model-id>`").await;
                 return;
             }
-            let body = serde_json::json!({
-                "forced_mode": mode,
-                "max_iterations": 5
-            });
-            match reqwest::Client::new()
-                .post("http://127.0.0.1:9099/api/review-config")
-                .json(&body)
-                .send().await
-            {
+            let result = if mode == "auto" {
+                reqwest::Client::new()
+                    .post("http://127.0.0.1:9099/api/roles/remove")
+                    .json(&serde_json::json!({"role": "review"}))
+                    .send().await
+            } else {
+                reqwest::Client::new()
+                    .post("http://127.0.0.1:9099/api/roles/set")
+                    .json(&serde_json::json!({"role": "review", "assignment": mode}))
+                    .send().await
+            };
+            match result {
                 Ok(resp) if resp.status().is_success() => {
                     let _ = msg.channel_id.say(&ctx.http,
                         format!("Review mode set to `{}`.", mode)).await;
@@ -385,17 +397,23 @@ impl EventHandler for DiscordHandler {
             return;
         }
         if text == "review" {
-            match reqwest::get("http://127.0.0.1:9099/api/review-config").await {
+            match reqwest::get("http://127.0.0.1:9099/api/roles").await {
                 Ok(resp) => {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        let mode = json.get("forced_mode").and_then(|v| v.as_str()).unwrap_or("auto");
-                        let model = json.get("forced_model").and_then(|v| v.as_str());
-                        let reply = if let Some(m) = model {
-                            format!("Review mode: `{}` (model: `{}`)", mode, m)
-                        } else {
-                            format!("Review mode: `{}`", mode)
-                        };
-                        let _ = msg.channel_id.say(&ctx.http, reply).await;
+                        let card = json
+                            .get("assignments")
+                            .and_then(|a| a.as_array())
+                            .and_then(|arr| {
+                                arr.iter().find(|c| {
+                                    c.get("role").and_then(|r| r.as_str()) == Some("review")
+                                        && c.get("scope").and_then(|s| s.as_str()) == Some("global")
+                                })
+                            })
+                            .and_then(|c| c.get("assignment").and_then(|a| a.as_str()))
+                            .unwrap_or("auto")
+                            .to_string();
+                        let _ = msg.channel_id.say(&ctx.http,
+                            format!("Review mode: `{}`", card)).await;
                     } else {
                         let _ = msg.channel_id.say(&ctx.http, "Failed to parse review config.").await;
                     }

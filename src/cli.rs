@@ -253,6 +253,11 @@ pub enum CredentialAction {
     /// List credentials (masked; values are never printed)
     List,
     /// Add/rotate a credential: `credential add <id> --kind store|env|file [--value V | --env VAR | --file PATH] [--grants a,b]`
+    ///
+    /// NOTE: `--value` puts the secret in the process argv (visible to any
+    /// local process via /proc/<pid>/cmdline for the call's lifetime). For
+    /// long-lived secrets prefer `--env VAR` / `--file PATH`; `--value` is
+    /// the convenience path for one-shot local use.
     Add {
         id: String,
         #[arg(long, value_parser = ["store", "env", "file"])]

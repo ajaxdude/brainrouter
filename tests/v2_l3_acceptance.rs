@@ -38,6 +38,8 @@
 //! - (6) Migrations:
 //!   * `l3_migration_v1_state_role_cards_exact_table`
 //!   * `l3_migration_no_routing_review_survivors_restore_dryrun`
+//!   * `l3_migration_no_bonsai_block_is_one_shot` (B1, Step-9 NO-GO guard:
+//!     one-shot migration for v1 YAML WITHOUT a bonsai block)
 //! - (7) Strictness per selector (live, failing mock upstream):
 //!   * `l3_bare_key_card_strict_no_retry`
 //!   * `l3_local_card_v1_managed_fallback_semantics`
@@ -680,6 +682,27 @@ impl Daemon {
     {
         let config_path = env.root.join("config.yaml");
         fs::write(&config_path, config_yaml).unwrap();
+        Self::boot(env, extra)
+    }
+
+    /// Restart: boot the config file boot 1 already left on disk (the
+    /// migrated YAML). This is the real systemd-restart procedure the
+    /// one-shot migration contract pins: a boot over an L3-era YAML is a
+    /// migration no-op.
+    fn start_from_disk(env: &TestEnv) -> Self {
+        assert!(
+            env.root.join("config.yaml").exists(),
+            "restart precondition: a config must already be on disk"
+        );
+        Self::boot(env, std::iter::empty::<(String, String)>())
+    }
+
+    fn boot<I, S>(env: &TestEnv, extra: I) -> Self
+    where
+        I: IntoIterator<Item = (S, S)> + Clone,
+        S: AsRef<std::ffi::OsStr> + Clone,
+    {
+        let config_path = env.root.join("config.yaml");
         let socket = env.root.join("d.sock");
         let log = env.root.join("daemon.log");
         // Reserved-then-freed loopback ports carry a TOCTOU window on a
@@ -2627,6 +2650,87 @@ async fn l3_migration_no_routing_review_survivors_restore_dryrun() {
         seed,
         "restore must round-trip the pre-migration v1 YAML byte-for-byte"
     );
+}
+
+/// B1 (Bruce NO-GO, Step 9): the v2.0-p3 migration must be one-shot for
+/// EVERY v1 config. The trigger guard is `needs_l3_migration =
+/// !has_decision_model` (src/migration.rs); the fix inserts
+/// `decision_model:` unconditionally (enabled: false, kind: heuristic on
+/// the no-bonsai path). With the insertion gated on the bonsai block, a v1
+/// YAML without `bonsai:` re-ran the migration on EVERY boot: post-
+/// migration card/policy edits were clobbered back to the migrated seed, a
+/// snapshot accumulated per boot, and the warn-level migration action
+/// ("Migration v2.0-p3: migrated v1 routing profile …", src/daemon.rs)
+/// repeated in every log. Two boots, v1 YAML WITHOUT a bonsai block:
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l3_migration_no_bonsai_block_is_one_shot() {
+    let _gate = suite_gate().lock().await;
+    let env = TestEnv::new("migrate-nobonsai");
+    let local = spawn_mock(MockCfg::default());
+    let cloud = spawn_mock(MockCfg::default());
+    // v1 state: routing block + review.forced_* present, deliberately NO
+    // bonsai: key.
+    let seed = {
+        let mut v: Value =
+            serde_yaml::from_str(&v1_seed_yaml(&local.url, &cloud.url, true)).unwrap();
+        v.as_object_mut().unwrap().remove("bonsai");
+        serde_yaml::to_string(&v).unwrap()
+    };
+    let mut d = Daemon::start(&env, &seed);
+    d.ready().await;
+
+    // Boot 1 consumed the v1 keys; make post-migration edits — the state a
+    // re-running migration would clobber.
+    roles_set(&d, "main", "post-mig-main-model", None);
+    set_policy(&d, "local-only", "fast").await;
+    let roles1 = d.get_json("/api/roles").await;
+    d.stop();
+
+    // Boot 2 over the config left on disk (a real operator restart).
+    let mut d = Daemon::start_from_disk(&env);
+    d.ready().await;
+    let roles2 = d.get_json("/api/roles").await;
+    assert_eq!(
+        roles2["assignments"], roles1["assignments"],
+        "boot 2 must not re-run v2.0-p3: post-migration cards must survive. \
+         boot1: {} boot2: {}",
+        roles1["assignments"], roles2["assignments"]
+    );
+    assert_eq!(
+        roles2["policy"], roles1["policy"],
+        "boot 2 must not re-run v2.0-p3: the policy record must survive. \
+         boot1: {} boot2: {}",
+        roles1["policy"], roles2["policy"]
+    );
+
+    // The preserved card is LIVE: the v1 routing block said main = local;
+    // a boot-2 re-run resets the card and serves the fallback seed.
+    let r = chat(&d, "brainrouter/auto", None, "r3-nobonsai-boot2").await;
+    assert_served(&r, "post-boot-1 card live on boot 2");
+    assert_eq!(
+        local.models_seen(),
+        vec!["post-mig-main-model".to_string()],
+        "the post-migration bare-key card must serve; a re-migration would \
+         route `local` to ray-l3-fallback"
+    );
+
+    // Exactly one v2.0-p3 snapshot directory (boot 1's; boot 2 is a no-op).
+    let snaps = env.state_dir().join("migrations").join("v2.0-p3");
+    let n = fs::read_dir(&snaps).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(
+        n, 1,
+        "boot 2 created a second v2.0-p3 snapshot: {n} entries under {}",
+        snaps.display()
+    );
+
+    // No repeated migration action in boot 2's log (warn-level, prefix
+    // "Migration v2.0-p3:").
+    let log = d.log_tail();
+    assert!(
+        !log.contains("Migration v2.0-p3"),
+        "boot 2 logged a migration action — v2.0-p3 is not one-shot:\n{log}"
+    );
+    d.stop();
 }
 
 fn find_files_named(dir: &Path, needle: &str) -> Vec<PathBuf> {
