@@ -2,7 +2,7 @@
 
 ## Status
 
-State: L1 DONE (`v2.0-p1`), L2 DONE (`v2.0-p2`). L3 building (spec L3-v3 ratified, Ray 20-test suite red-committed). L4 spec v3 — leg rounds 2/2 used; round-2 blocking folded (cgroup-escape spawn via systemd-run scope, Residency-before-budget, spec_stale adoption, keeper additive authorization); builds after L3. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h (spent ~14 h — over, owner continued at each digest; standing read: proceed). Critic rounds: 2 of 3 (Map); per-leg 2/2 each, in history.
+State: L1 DONE (`v2.0-p1`), L2 DONE (`v2.0-p2`). L3 built, Bruce fix round (d01be5d). Design gates L1-L7 all CLOSED; L8 critic round 1 running. Ray suites: L1 6/6, L2 14/14, L3 21/21. Review spend ~16 h vs 6 h budget (owner standing continuations). L4 spec v3 — leg rounds 2/2 used; round-2 blocking folded (cgroup-escape spawn via systemd-run scope, Residency-before-budget, spec_stale adoption, keeper additive authorization); builds after L3. Classification: **standard** (public API removals, config migrations, auth/credential handling, LAN security boundary — "Always standard"). Pace: **careful** (charter names no faster pace; auth/migration work). Charter: `docs/design/v2-streamlining.charter.md` v0. Target approval date: 2026-10-24. Review budget: 6 h (spent ~14 h — over, owner continued at each digest; standing read: proceed). Critic rounds: 2 of 3 (Map); per-leg 2/2 each, in history.
 Revisions:
 v1 — 2026-10-21 — first Map: contracts, legs L0–L8, leg L1 (Purge) in full.
 v2 — 2026-10-21 — B1 credentials ordering (store lands L2, page L3); B2 state-snapshot rollback contract; I1 grep-gate migration exception; I2 L1 live-state checkpoint; I3 Referenced files; I4 LAN token scope; I5 heuristic contract; N1/N2 citation + contract-range fixes; 8-layer enumeration; test baseline verified green at a6e39f7.
@@ -95,12 +95,12 @@ Legs (door type; demo):
 - L0 v1 snapshot — done (tag `v1-classic` + branch `v1` pushed). Reversible.
 - L1 Purge — **done** (merged `e90bffe`, tag `v2.0-p1`; Ray 6/6, Bruce GO 0 blocking, net −3,579 lines).
 - L2 Plugins + bridge pilot + credentials store — **done** (merged `b9319d2`, tag `v2.0-p2`; Ray 14/14 load-verified, Bruce NO-GO→fixed→GO, 7 P3 follow-ups in history).
-- L3 One entry + role cards + decision slot + Credentials page — one-way (UI/config contracts). Demo: omp with single model, role header matrix, credentials page managing DeepInfra.
-- L4 Swap supervisor + platform probe — one-way. Demo: scripted fake engine swapped by API; probe output on all three Linux hosts.
-- L5 strixite + hipfire adapters — one-way. Demo: swap strixite models from dashboard, no GUI icons; hipfire launch on fedora1 with stem assertion.
-- L6 Providers + federation-lite + Manifest absorbed — one-way. Demo: reviewer = deepinfra/DeepSeek-V4-flash from Credentials UI.
-- L7 llama-swap removed — one-way (owner sign-off). Demo: native llama.cpp serves v1's model keys.
-- L8 mac surface + distributed-role acceptance — one-way. Demo: plan→fedora1/hipfire, dev→strixite, review→cloud, one session.
+- L3 One entry + role cards + decision slot + Credentials page — **built, Bruce NO-GO → fix round** (B1 migration re-run clobber, B2 rewrite gate, I1-I6; commit d01be5d + fixes; merge on re-review GO). Design CLOSED (2 rounds, READY 8/10).
+- L4 Swap supervisor + platform probe — **design CLOSED** (v3, READY 8/10; systemd-scope spawn, Residency-before-budget, adoption markers, sized pins). Build queued behind L3 merge. Demo: scripted fake engine swapped by API; probe output on all three Linux hosts.
+- L5 strixite + hipfire adapters — **design CLOSED** (v3, READY 8/10; Active-Consumer Set incl. in-process streams, pid-scoped cutover, min_mem_gib). Pilot nods needed: live strixite swap (strix-halo), fedora1 unit migration. Demo: swap strixite models from dashboard, no GUI icons; hipfire launch on fedora1 with stem assertion.
+- L6 Providers + federation-lite + Manifest absorbed — **design CLOSED** (v5, READY 9/10; cloud/<id> resolution, v1-parity passthrough, LAN listener+budget guard, role-header forwarding, credential export). Build after L4/L5. Demo: reviewer = deepinfra/DeepSeek-V4-flash from Credentials UI.
+- L7 llama-swap removed — **design CLOSED** (v3, READY 8/10; flip boot-refusal gate, census-complete consumer retarget list, v2.0-p7 section rename, suite mode-pinning, soak exit criteria, deletion grep-gate). Build after L6. Demo: native llama.cpp serves v1's model keys.
+- L8 mac surface + distributed-role acceptance — spec draft v1; critic round 1 dispatching. Hardware-bound spike (strixite llama-swap on macOS). Demo: plan→fedora1/hipfire, dev→strixite, review→cloud, one session. Manifest-retirement owner sign-off lands in L8 acceptance at L8 kickoff.
 
 **Leg L1 — complete** (full spec + review disposition: `docs/design/v2-streamlining.L1.log.md`; merged `e90bffe`, tag `v2.0-p1`).
 

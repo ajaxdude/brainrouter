@@ -45,6 +45,11 @@ Goal (R4): a harness is configured ONCE to brainrouter; the app owns the model d
 
 ## Contracts kept
 
+Proxy fast-fail contract (L3 implementation): a routing failure that lands
+within 15 s of the request returns a real HTTP status (502 + JSON error);
+failures after that keep the v1 deferred-200 streaming contract (the client
+sees the stream error), so slow model loads are unchanged.
+
 Selector vocabulary (L7 range; cards emit selector strings); event schema additive (`role`, `decision {route,tier,confidence}`, `rationale`, `decision_fallback`, `chosen_model`; `hop` lands with L6 LAN events); v1 configs boot (routing_profile/pins/bonsai/review-forced migrations — dry-run, snapshot, restore `v2.0-p3`); credentials format unchanged; plugins RPC additive via version-negotiated protocol bump.
 
 ## Build order
