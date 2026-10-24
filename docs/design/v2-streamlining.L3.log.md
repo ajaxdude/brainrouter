@@ -205,17 +205,29 @@ parallel load (all in src/, no test changes):
    boot work (UDS bound FIRST, then TCP — a TCP-visible daemon never has a
    pending socket file); `server::run_with_listeners` serves the pair.
 3. **Project-scope peer-cwd races** (the `l3_resolution_project_scope...` /
-   `l3_migration_v1_state...` flakes): the scope lookup retried a cwd that
-   `/proc/<pid>/cwd` had not yet republished after the CLI's
-   spawn+chdir (the kernel updates it on the *exec'd* task's next
-   scheduler tick — the window is unbounded under full-suite load).
-   `roles get` (read-only, no window needed) passing while `chat` (routing
-   needs the scope) failed pinpoints this. Daemon side: cwd read per
-   REQUEST (not accept snapshot); one `ScopeClock` per connection anchored
-   at accept; the probe walk runs on the request task (the default
-   blocking pool saturates under suite load); deleted-cwd returns instantly;
-   30 s ceiling. This fixes the CLI-connection path and keeps v1 daemon
-   behavior (per-connection accept-cwd) for the TCP path.
+   `l3_migration_v1_state...` flakes). Two independent root causes, both
+   fixed at the daemon (the gate's scope tests are black-box; they only
+   observe the mis-routed request):
+   - **TCP peer resolution ambiguity** (`src/peer_cwd.rs`, the confirmed
+     final cause): the `/proc/net/tcp` scan matched the FIRST row whose
+     local port equals the client's ephemeral port. On a busy box (and the
+     suite runs ~40 servers per process) that row is routinely a foreign
+     LISTEN socket reusing the port; its inode names the wrong process and
+     the request silently gets the wrong cwd -> global card -> `local saw
+     [ray-l3-fallback], cloud saw []`. Fixed: the scan matches
+     (local port == client port AND remote port == daemon port), which
+     identifies the client socket uniquely. Unit-tested
+     (`port_collision_needs_remote_match`); the instrumented 30-run
+     full-suite loop after the fix: 0 flakes.
+   - **UDS window plumbing** (earlier, also real): the project-scope retry
+     grace must be measured per REQUEST from the request's arrival on the
+     connection's task (a `ScopeClock` in a tokio task-local around the
+     request; `Router::scope_clock_scope`), the peer cwd is read per
+     request, the probe walk runs on the request task (the default
+     blocking pool saturates under suite load), and the window accounting
+     charges queue time. Unresolvable cwds return instantly; the ceiling
+     (30 s) covers the kernel's `/proc/<pid>/cwd` republication after a
+     CLI chdir, which is unbounded under load.
 4. **ENOTDIR on a deleted state dir** during `prepare_uds_path` is now a
    clean startup error (previously a noisy startup-time crash variant).
 
