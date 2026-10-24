@@ -199,6 +199,11 @@ pub struct Router {
     /// backends. `None` preserves the pre-Feature-B llama-swap-only path.
     serving_identities: Option<Arc<ServingIdentityRegistry>>,
     serving_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
+    /// v2 L4: the swap supervisor. `None` preserves the v1 llama-swap path
+    /// byte-identically (integration tests and shim-only deployments).
+    swap: Option<Arc<crate::swap_scheduler::SwapScheduler>>,
+    /// Direct providers for native/external residents (outside llama-swap).
+    native_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
 }
 
 pub struct RouterArgs {
@@ -251,7 +256,19 @@ impl Router {
             llama_swap_config_path: args.llama_swap_config_path,
             serving_identities: args.serving_identities,
             serving_providers: Mutex::new(HashMap::new()),
+            swap: None,
+            native_providers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// v2 L4: install the swap supervisor. Without it every local route is
+    /// the untouched v1 path.
+    pub fn install_swap(&mut self, swap: Arc<crate::swap_scheduler::SwapScheduler>) {
+        self.swap = Some(swap);
+    }
+
+    pub fn swap(&self) -> Option<&Arc<crate::swap_scheduler::SwapScheduler>> {
+        self.swap.as_ref()
     }
 
     pub fn cards(&self) -> &Arc<RoleCardStore> {
@@ -704,10 +721,13 @@ impl Router {
                         rationale: slot.as_ref().map(|s| s.rationale.clone()),
                         decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                         chosen_model: Some(f.model_key.clone()),
+                        swap_state: None,
+                        swap_source: None,
                     });
                 }
                 let (toolbox_backend, compute_api) =
                     crate::routing_events::derive_serving_identity(info.effective_provider.as_deref());
+                let (swap_state, swap_source) = self.swap_event_fields(&info);
                 let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
@@ -735,6 +755,8 @@ impl Router {
                     rationale: slot.as_ref().map(|s| s.rationale.clone()),
                     decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                     chosen_model: Some(info.model_key.clone()),
+                    swap_state,
+                    swap_source,
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -776,6 +798,8 @@ impl Router {
                     rationale: slot.as_ref().map(|s| s.rationale.clone()),
                     decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                     chosen_model: None,
+                    swap_state: None,
+                    swap_source: None,
                 });
                 return Err(e);
             }
@@ -999,7 +1023,7 @@ impl Router {
     /// One local attempt: server-mode identity wins, then llama-swap.
     async fn try_local_once(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         stage: Stage,
     ) -> Result<(ProviderResponse, String)> {
         let requested = request.model.clone();
@@ -1009,9 +1033,72 @@ impl Router {
             let resp = provider.chat_completion(request).await?;
             return Ok((wrap_with_timeout_stream(resp)?, provider_name));
         }
+        // v2 L4: catalogued models resolve through the swap supervisor's
+        // `ensure` (Residency-first attach / budget-admitted spawn / queue).
+        // Catalogued models only — every v1 selector/key keeps the old path.
+        if let Some(swap) = &self.swap {
+            if let Some(resolved) = swap.catalog().resolve_alias(&requested) {
+                use crate::residency::ResidentSource;
+                let outcome = swap.ensure(&resolved).await?;
+                let source = match &outcome {
+                    crate::swap_scheduler::EnsureOutcome::Attach { source, .. } => *source,
+                };
+                if matches!(
+                    source,
+                    ResidentSource::Native | ResidentSource::External | ResidentSource::Container
+                ) {
+                    let endpoint = outcome.endpoint().to_string();
+                    let entry = swap.catalog().entry(&resolved);
+                    let served = entry
+                        .as_ref()
+                        .map(|e| e.served_alias())
+                        .unwrap_or_else(|| resolved.clone());
+                    let provider = self.native_provider(&endpoint).await;
+                    sanitize_for_llama_family(&mut request);
+                    request.model = served;
+                    let resp = provider.chat_completion(request).await?;
+                    return Ok((wrap_with_timeout_stream(resp)?, "native".to_string()));
+                }
+                // Shim/other resident: the existing llama-swap/identity path
+                // below attaches to the same endpoint (single residency).
+            }
+        }
         let (resp, model_key) = self.try_llama_swap(request, stage).await?;
         let _ = model_key;
         Ok((resp, "llama-swap".to_string()))
+    }
+
+    /// Direct provider for a native/external resident endpoint.
+    async fn native_provider(&self, endpoint: &str) -> Arc<OpenAiProvider> {
+        let mut providers = self.native_providers.lock().await;
+        if let Some(provider) = providers.get(endpoint) {
+            return Arc::clone(provider);
+        }
+        let provider = Arc::new(OpenAiProvider::new(
+            "native".to_string(),
+            format!("{}/v1", endpoint.trim_end_matches('/')),
+            None,
+        ));
+        providers.insert(endpoint.to_string(), Arc::clone(&provider));
+        provider
+    }
+
+    /// v2 L4 event fields: the swap lifecycle/source for a routed model, when
+    /// the catalog owns it. Additive; `None` for every non-swap route.
+    fn swap_event_fields(&self, info: &RouteInfo) -> (Option<String>, Option<String>) {
+        let Some(swap) = &self.swap else {
+            return (None, None);
+        };
+        if swap.catalog().resolve_alias(&info.model_key).is_none() {
+            return (None, None);
+        }
+        let source = match info.effective_provider.as_deref() {
+            Some("native") => "native",
+            Some("llama-swap") => "shim",
+            Some("manifest") => return (None, None),
+            _ => "external",
+        };
+        (Some("ready".to_string()), Some(source.to_string()))
     }
 
     /// Cloud path: try Manifest first. On error/circuit-open, fall back to
@@ -1181,26 +1268,9 @@ impl Router {
                 stage
             ));
         }
-        // Sanitize messages for local llama-server compatibility:
-        //  1. Normalize 'developer' role → 'system' (OpenAI-style role that Qwen3
-        //     templates don't recognize).
-        //  2. Merge system messages into one (Qwen3 requires single system msg at pos 0).
-        //  3. Ensure assistant messages have content (llama-server rejects assistant
-        //     messages with neither content nor tool_calls).
-        for msg in &mut request.messages {
-            if msg.role == "developer" {
-                msg.role = "system".to_string();
-            }
-        }
-        let (sys, rest): (Vec<_>, Vec<_>) = request
-            .messages
-            .into_iter()
-            .partition(|m| m.role == "system");
-        request.messages = merge_system_messages(sys)
-            .into_iter()
-            .chain(rest)
-            .collect();
-        sanitize_assistant_messages(&mut request.messages);
+        // Shared llama-server-family shaping (shim + native): the exact same
+        // sanitized body must reach both endpoint kinds.
+        sanitize_for_llama_family(&mut request);
         let model_key = request.model.clone();
         debug!(
             provider = LLAMA_SWAP_KEY,
@@ -1273,6 +1343,33 @@ fn server_mode_provider_name(identity: &ServingIdentity) -> String {
 
 fn server_mode_provider_base_url(identity: &ServingIdentity) -> String {
     format!("{}/v1", identity.endpoint.trim_end_matches('/'))
+}
+
+/// The shared llama-server-family request shape (v2 L4): applied to BOTH the
+/// llama-swap shim and native llama-server endpoints so one request produces a
+/// byte-identical sanitized body on either path (golden-body contract).
+///
+/// 1. Normalize 'developer' role → 'system' (OpenAI-style role that Qwen3
+///    templates don't recognize).
+/// 2. Merge system messages into one (Qwen3 requires a single system msg at
+///    position 0).
+/// 3. Ensure assistant messages have content (llama-server rejects assistant
+///    messages with neither content nor tool_calls).
+pub fn sanitize_for_llama_family(request: &mut ChatCompletionRequest) {
+    for msg in &mut request.messages {
+        if msg.role == "developer" {
+            msg.role = "system".to_string();
+        }
+    }
+    let (sys, rest): (Vec<_>, Vec<_>) = request
+        .messages
+        .drain(..)
+        .partition(|m| m.role == "system");
+    request.messages = merge_system_messages(sys)
+        .into_iter()
+        .chain(rest)
+        .collect();
+    sanitize_assistant_messages(&mut request.messages);
 }
 
 /// Collapse multiple system messages into a single one by concatenating their
@@ -1986,6 +2083,43 @@ mod tests {
     }
 
     #[test]
+    fn golden_body_shim_equals_native_sanitization() {
+        // The shared llama-server-family contract: whatever the shim sends,
+        // the native adapter must send byte-identically.
+        let base: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "catalog-model",
+            "messages": [
+                {"role": "developer", "content": "dev instructions"},
+                {"role": "system", "content": "system instructions"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": null}
+            ]
+        }))
+        .unwrap();
+        let mut shim = base.clone();
+        sanitize_for_llama_family(&mut shim);
+        let mut native = base;
+        sanitize_for_llama_family(&mut native);
+        let shim_bytes = serde_json::to_vec(&shim).unwrap();
+        let native_bytes = serde_json::to_vec(&native).unwrap();
+        assert_eq!(shim_bytes, native_bytes, "golden body is endpoint-independent");
+        assert_eq!(shim.messages[0].role, "system");
+        assert_eq!(
+            shim.messages.iter().filter(|m| m.role == "system").count(),
+            1,
+            "developer→system and the system block merged"
+        );
+        // Idempotent (a re-applied sanitizer must not reshape again).
+        let mut twice = shim.clone();
+        sanitize_for_llama_family(&mut twice);
+        assert_eq!(
+            serde_json::to_vec(&twice).unwrap(),
+            shim_bytes,
+            "sanitization is idempotent"
+        );
+    }
+
+    #[test]
     fn merge_empty() {
         let result = merge_system_messages(vec![]);
         assert!(result.is_empty());
@@ -2114,6 +2248,8 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
         });
         // Matching conversation backfills.
         assert!(events.update_tps("abc123", 41.5, 77.0));
@@ -2152,6 +2288,8 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
         }
     }
 

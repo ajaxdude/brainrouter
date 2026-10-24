@@ -4,6 +4,93 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L4 — Swap supervisor + platform probe (branch `v2-p4-l4`, pre-merge)
+
+brainrouter now owns engine processes and model lifecycle behind one
+abstraction, with the owner's icon-script invariants inherited: single-instance
+per-GGUF lock, start-ownership, health, and a served-model stem assertion. The
+Residency view is the input side of every decision — **Residency before
+budget**: a model already serving anywhere (llama-swap, a native child, a
+server-mode container, or the L5 external slot) is attached with no spawn and
+no budget gate. Shim-mode routing stays byte-identical.
+
+### Added
+
+- **Platform probe** (`src/platform.rs`): machine-id identity, GPU arch from
+  KFD topology (sysfs PCI fallback), `MemTotal`/`MemAvailable`, GTT from
+  `ttm.pages_limit`/`amdgpu.gttsize`, install markers, a vendored feed
+  (`strix-halo`, `r9700`, `gb10`, `intel-b70`) plus an optional remote feed
+  URL cached under `$XDG_STATE_HOME/brainrouter/platform_feed.json` with a
+  24 h staleness bound. `id = feed platform id` when the detected arch
+  matches, else `generic-<gpu-arch>` with an explicit unknown-platform banner
+  (fedora1 = `generic-gfx1100`, fail-open: every engine/toolbox offered). The
+  engine compatibility matrix is data (`ENGINE_MATRIX`: strixite = gfx1151 +
+  GTT ≥ 100 GiB, gufo = gfx1151, hipfire = discrete gfx9/10/11/12,
+  llama.cpp = universal) and drives offers + reasons-not. The dashboard's
+  hardcoded `CURRENT_PLATFORM_ID` is replaced by the probe's id at render
+  time; `GET /api/platform` exposes the probe.
+- **Swap catalog** (`src/swap_catalog.rs`): `swap_catalog.json` (0600,
+  atomic) with entries `{id, engine, files, ctx, quant, family, tools,
+  vram_estimate_gib, launch_spec, aliases, groups, provenance,
+  last_stream_completed, ewma_load_ms, fingerprints}`, sized **pins**, and
+  llama-swap **groups** as metadata. Entry fingerprints (mtime+size) make a
+  changed GGUF a `spec_stale` signal.
+- **llama-swap import** (inverse of `llama_swap_register.rs`): parses
+  `config.yaml`, resolves the macro chain recursively (top-level `macros:`
+  shadowed by per-model `macros:`, so `${common}` → `${ctx}` → concrete
+  flags) while preserving runtime placeholders (`${PORT}`), maps `--model`/
+  `-c`/`--alias`/`--jinja`, records `env`, `aliases`, groups, and llama-swap
+  settings. Idempotent merge (CLI-owned entries are never overwritten);
+  `--dry-run` is stable and inert.
+- **Residency view** (`src/residency.rs`): shim (`/running`, every entry, not
+  just `running[0]`), native children, server-mode container identities, and
+  the external-engine registry slot (L5 feeds it). `ready_for` matches
+  catalog id / canonical GGUF / served alias.
+- **Swap supervisor** (`src/swap_scheduler.rs`): lifecycle
+  `Stopped|Loading|Ready|Draining|Failed`; `ensure` = Residency → queue →
+  budget admission → LRU evict-to-fit → spawn; in-memory queue with cap +
+  cancel; pins counted once as `max(vram_estimate, reserved_gib)`; append-only
+  `budget.json` ledger; in-flight-aware LRU keyed on last **stream
+  completion**; child-held per-GGUF `flock` (inherited fd, CLOEXEC cleared);
+  adoption markers (`adoption/<model>.json` with pid/start_time/spec_hash)
+  written before spawn and scanned at boot — live+match ⇒ adopt, mismatch ⇒
+  adopt + `spec_stale` (never killed), dead ⇒ clean; bounded restart.
+  `FakeAdapter` is the scripted acceptance substrate (load ms, stem set,
+  crash, progress) with a real child process.
+- **Native llama.cpp adapter** (`src/engine_native.rs`): spawns through
+  `systemd-run --user --scope --quiet --collect -p KillMode=control-group`
+  (cgroup escape — adoption needs the child outside the daemon's cgroup),
+  plain `setsid` fallback where systemd is absent (documented best-effort
+  adoption); SIGTERM → grace → KILL plus scope stop; `/health` + `/v1/models`
+  status; load progress indeterminate + elapsed (EWMA ETA from the registry).
+- **Shared llama-server shaping**: `sanitize_for_llama_family` (developer→
+  system, single system block, assistant content fix) is applied to the shim
+  and native paths identically; a golden-body test pins byte equality.
+- **Engines tab + API**: `GET /api/engines` (models/queue/budget/adoption),
+  `/api/engines/{ensure,evict,pin,unpin,import/preview,import/apply,logs,
+  catalog/add,catalog/rm}`, `GET /api/platform`; loopback+CSRF gated
+  mutations; Engines tab (platform card, offers+reasons, lifecycle,
+  queue+cancel, budget gauge by source + pins, import panel) and a Models-tab
+  "serve via" column.
+- **CLI**: `brainrouter swap status|ensure|evict|catalog list|
+  import-llamaswap [--dry-run]|pin|unpin|add|rm` and
+  `brainrouter platform show [--json]`. Reads are direct; mutations go
+  through the daemon and refuse cleanly when it is down.
+- **Migration `v2.0-p4`**: first boot imports the live llama-swap config into
+  `swap_catalog.json` (one stable snapshot directory per phase, atomic
+  writes, CLI-owned entries preserved, one-shot marker);
+  `--dry-run` previews and `migration restore v2.0-p4` round-trips the
+  pre-migration catalog + budget ledger.
+- **Events + in-flight (additive)**: `RouteEvent.swap_state` /
+  `swap_source`; in-flight rows gain `catalog_id` (stamped at route time)
+  and a clean-stream-completion hook that writes the LRU clock.
+
+### Revert
+
+`git revert -m 1 <merge>` for the phase; `brainrouter migration restore
+v2.0-p4` restores the pre-import catalog/budget, then `v2.0-p3`/`v2.0-p2`
+restore the pre-L3/L2 state. `v1-classic` remains the global rollback.
+
 ## v2 L3 — Role cards + decision slot (branch `v2-p3-roles`, pre-merge)
 
 One model config for everything: role cards replace the routing profile, the

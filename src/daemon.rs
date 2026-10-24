@@ -193,6 +193,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         )? {
             println!("{line}");
         }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let llama_swap_config = std::path::PathBuf::from(&home)
+            .join(".config/llama-swap/config.yaml");
+        for line in brainrouter::migration::preview_v2_p4(
+            &llama_swap_config,
+            &brainrouter::paths::brainrouter_state(),
+            &brainrouter::swap_catalog::default_path(),
+        )? {
+            println!("{line}");
+        }
         println!("dry-run complete: no state written");
         return Ok(());
     }
@@ -238,6 +248,22 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         &brainrouter::paths::brainrouter_state(),
     )? {
         info!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P2);
+    }
+
+    // v2 L4: import the live llama-swap config into the swap catalog (one-shot,
+    // snapshot + restore; CLI-owned entries are preserved).
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let llama_swap_config = std::path::PathBuf::from(&home)
+            .join(".config/llama-swap/config.yaml");
+        for action in brainrouter::migration::run_v2_p4(
+            &llama_swap_config,
+            &brainrouter::paths::brainrouter_state(),
+            &brainrouter::swap_catalog::default_path(),
+            &brainrouter::swap_scheduler::budget_path(),
+        )? {
+            warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P4);
+        }
     }
 
     // Config
@@ -474,6 +500,100 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let inference_tracker = Arc::new(InferenceTracker::new());
     let serving_identities = Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new());
 
+    // v2 L4: platform probe (feed cache + optional remote URL, staleness
+    // bounded) and the swap supervisor. A corrupt catalog is quarantined
+    // beside the live file rather than silently dropped (pins are state).
+    let platform_client = reqwest::Client::new();
+    let (platform_feed, platform_feed_origin) = brainrouter::platform::resolve_feed(
+        &platform_client,
+        std::env::var(brainrouter::platform::FEED_URL_ENV).ok().as_deref(),
+        &brainrouter::platform::feed_cache_path(),
+        std::time::SystemTime::now(),
+    )
+    .await;
+    let platform = Arc::new(brainrouter::platform::resolve(
+        &brainrouter::platform::detect_facts(),
+        &platform_feed,
+        platform_feed_origin,
+    ));
+    if !platform.known {
+        warn!(
+            platform = %platform.id,
+            "Unknown platform (fail-open): no feed platform matches this hardware;              all engines/toolboxes are offered and the dashboard shows the banner"
+        );
+    }
+    let swap_catalog_path = brainrouter::swap_catalog::default_path();
+    let swap_catalog = Arc::new(
+        match brainrouter::swap_catalog::SwapCatalog::load(swap_catalog_path.clone()) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let quarantine = swap_catalog_path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&swap_catalog_path, &quarantine);
+                warn!(
+                    %error,
+                    quarantine = %quarantine.display(),
+                    "Swap catalog unreadable; quarantined and starting empty"
+                );
+                brainrouter::swap_catalog::SwapCatalog::in_memory(swap_catalog_path.clone())
+            }
+        },
+    );
+    let budget_ledger = Arc::new(
+        brainrouter::swap_scheduler::BudgetLedger::load(
+            brainrouter::swap_scheduler::budget_path(),
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "Budget ledger unreadable; starting an in-memory ledger");
+            brainrouter::swap_scheduler::BudgetLedger::in_memory(
+                brainrouter::swap_scheduler::budget_path(),
+            )
+        }),
+    );
+    let mut swap_adapters: std::collections::BTreeMap<
+        String,
+        Arc<dyn brainrouter::swap_scheduler::EngineAdapter>,
+    > = std::collections::BTreeMap::new();
+    swap_adapters.insert(
+        "fake".into(),
+        Arc::new(brainrouter::swap_scheduler::FakeAdapter::new()),
+    );
+    swap_adapters.insert(
+        "external".into(),
+        Arc::new(brainrouter::swap_scheduler::ExternalAdapter),
+    );
+    let native_adapter = Arc::new(brainrouter::engine_native::NativeLlamaCppAdapter::new());
+    swap_adapters.insert(
+        "llama_cpp".into(),
+        native_adapter as Arc<dyn brainrouter::swap_scheduler::EngineAdapter>,
+    );
+    let swap_scheduler = Arc::new(
+        brainrouter::swap_scheduler::SwapScheduler::new(
+            Arc::clone(&swap_catalog),
+            budget_ledger,
+            brainrouter::swap_scheduler::SwapSchedulerConfig {
+                llama_swap_url: config
+                    .llama_swap
+                    .base_url
+                    .trim_end_matches('/')
+                    .strip_suffix("/v1")
+                    .unwrap_or(&config.llama_swap.base_url)
+                    .to_string(),
+                ..Default::default()
+            },
+            swap_adapters,
+        )
+        .with_serving_identities(Arc::clone(&serving_identities)),
+    );
+    let adoption = swap_scheduler.scan_adoption();
+    if !adoption.adopted.is_empty() {
+        warn!(
+            adopted = ?adoption.adopted,
+            spec_stale = ?adoption.spec_stale,
+            cleaned = ?adoption.cleaned,
+            "Adopted native engines from the previous daemon (no kill, no respawn)"
+        );
+    }
+
     // v2 L2 plugin subsystem (registry + supervisor + per-plugin UDS RPC).
     // Constructed before the router: the `plugin` decision kind speaks to it.
     let plugins = Arc::new(
@@ -492,7 +612,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
         std::fs::canonicalize(&p).ok()
     };
-    let router = Arc::new(Router::new(brainrouter::router::RouterArgs {
+    let mut router_builder = Router::new(brainrouter::router::RouterArgs {
         slot: Arc::clone(&decision_slot),
         cards: Arc::clone(&cards),
         manifest,
@@ -512,7 +632,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         prompt_rewrite: Arc::clone(&prompt_rewrite),
         llama_swap_config_path,
         serving_identities: Some(Arc::clone(&serving_identities)),
-    }));
+    });
+    router_builder.install_swap(Arc::clone(&swap_scheduler));
+    let router = Arc::new(router_builder);
 
     // Session manager (in-memory; ephemeral per process lifetime)
     let session_manager = Arc::new(SessionManager::new());
@@ -570,6 +692,14 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let (versions_tx, versions_rx) = tokio::sync::watch::channel(serde_json::json!({}));
     let versions_tx = Arc::new(versions_tx);
 
+    let inflight = Arc::new(brainrouter::inflight::InflightRegistry::new());
+    swap_scheduler.attach_inflight(Arc::clone(&inflight));
+    {
+        let scheduler = Arc::clone(&swap_scheduler);
+        inflight.set_completion_hook(Arc::new(move |catalog_id: &str| {
+            scheduler.record_stream_completed(catalog_id);
+        }));
+    }
     let state = Arc::new(AppState {
         router,
         session_manager,
@@ -602,7 +732,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         prompt_rewrite,
         code_review_enabled,
         pr_guidelines_enabled,
-        inflight: Arc::new(brainrouter::inflight::InflightRegistry::new()),
+        inflight,
+        platform,
+        swap: swap_scheduler,
         benchmark_store,
         #[cfg(feature = "benchmarks")]
         benchmark_lab,
@@ -657,6 +789,20 @@ pub async fn run(args: ServeArgs) -> Result<()> {
                     progress.generated_tokens,
                     progress.max_tokens,
                 );
+            }
+        });
+    }
+
+    // Background task: refresh the Residency view (llama-swap /running +
+    // container identities) and run crash detection/bounded restart every 2 s.
+    {
+        let swap = Arc::clone(&state.swap);
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                swap.refresh_residency(&client).await;
+                swap.maintenance().await;
             }
         });
     }

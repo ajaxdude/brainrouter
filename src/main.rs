@@ -37,6 +37,10 @@ enum Command {
     Plugin(cli::PluginCliArgs),
     /// Config migration controls (`migration restore <phase>`).
     Migration(cli::MigrationArgs),
+    /// Swap supervisor control (v2 L4): status/ensure/evict/catalog/import/pin
+    Swap(cli::SwapArgs),
+    /// Platform probe (v2 L4): detected hardware, budgets, engine offers
+    Platform(cli::PlatformArgs),
     /// Install brainrouter into a coding harness config
     Install(install::InstallArgs),
     /// Internal inference-only proxy used inside Benchmark Lab sandboxes.
@@ -72,6 +76,8 @@ async fn main() -> Result<()> {
         Command::Cli(args) => cli::run(args).await,
         Command::Plugin(args) => cli::run_plugin_standalone(args).await,
         Command::Migration(args) => cli::run_migration_standalone(args),
+        Command::Swap(args) => cli::run_swap_standalone(args).await,
+        Command::Platform(args) => cli::run_platform_standalone(args),
         Command::Install(args) => {
             install::run(args)?;
             Ok(())

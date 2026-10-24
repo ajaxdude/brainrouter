@@ -101,12 +101,16 @@ const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashbo
 /// v2 R2: token the dashboard's nav script reads to hide the Benchmarks
 /// explorer link in builds without the `benchmarks` feature.
 const BENCHMARKS_FEATURE_TOKEN: &str = "__BENCHMARKS_FEATURE_ENABLED__";
+/// v2 L4: the probe's catalog platform id replaces the hardcoded literal.
+const CURRENT_PLATFORM_TOKEN: &str = "__CURRENT_PLATFORM_ID__";
 
-fn main_dashboard_html() -> String {
-    MAIN_DASHBOARD_HTML.replace(
-        BENCHMARKS_FEATURE_TOKEN,
-        if cfg!(feature = "benchmarks") { "true" } else { "false" },
-    )
+fn main_dashboard_html(platform_id: &str) -> String {
+    MAIN_DASHBOARD_HTML
+        .replace(
+            BENCHMARKS_FEATURE_TOKEN,
+            if cfg!(feature = "benchmarks") { "true" } else { "false" },
+        )
+        .replace(CURRENT_PLATFORM_TOKEN, platform_id)
 }
 const FAVICON_SVG: &[u8] = include_bytes!("escalation/templates/favicon.svg");
 const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
@@ -214,6 +218,10 @@ pub struct AppState {
     pub decision_config: crate::config::DecisionModelConfig,
     /// v2 L2 credentials store — exposed to the L3 credentials UI endpoints.
     pub credentials: Arc<crate::credentials::CredentialStore>,
+    /// v2 L4: the boot platform probe (id, GPUs, budgets, engine offers).
+    pub platform: Arc<crate::platform::PlatformProbe>,
+    /// v2 L4: swap supervisor (catalog, residency, budget, queue, adapters).
+    pub swap: Arc<crate::swap_scheduler::SwapScheduler>,
     /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
     /// of currently-running toolbox Server Mode containers'
     /// `{toolbox_backend, compute_api, runtime_profile_id, endpoint}`.
@@ -244,6 +252,110 @@ pub(crate) struct ModelObject {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// v2 L4: one canonical path per engine operation so the documented route
+/// names (list/queue/pin/unpin/import/logs) and their obvious aliases hit the
+/// same handlers (`/api/engines/list` → `/api/engines`,
+/// `/api/engines/import` GET/POST → preview/apply, trailing slashes ignored).
+fn normalize_engines_path<'a>(method: &str, path: &'a str) -> &'a str {
+    if !(path.starts_with("/api/engines") || path.starts_with("/api/platform")) {
+        return path;
+    }
+    let trimmed = path.trim_end_matches('/');
+    match (method, trimmed) {
+        ("GET", "/api/engines/list") => "/api/engines",
+        ("GET", "/api/engines/import") => "/api/engines/import/preview",
+        ("POST", "/api/engines/import") => "/api/engines/import/apply",
+        _ => {
+            if trimmed.is_empty() {
+                path
+            } else {
+                trimmed
+            }
+        }
+    }
+}
+
+/// v2 L4: a swap admission failure is an explicit 503 with the shared
+/// `-32005` busy code (never a generic 502). Returns `None` for other errors.
+fn swap_busy_response(error: &anyhow::Error) -> Option<Response<Full<Bytes>>> {
+    let text = error.to_string();
+    if !text.contains(&format!("{}", crate::swap_scheduler::BUSY_CODE))
+        && !text.contains("no-fit")
+        && !text.contains("swap queue")
+    {
+        return None;
+    }
+    Some(json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({
+            "error": {
+                "message": text,
+                "type": "insufficient_capacity",
+                "code": crate::swap_scheduler::BUSY_CODE,
+            }
+        }),
+    ))
+}
+
+/// v2 L4 import source path: the daemon's configured llama-swap config, or an
+/// explicit `path` confined to the caller's HOME (never an arbitrary read).
+fn engines_import_path(
+    state: &AppState,
+    requested: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let Some(requested) = requested.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(state.llama_swap_config_path.clone());
+    };
+    let path = std::fs::canonicalize(requested)
+        .map_err(|e| anyhow::anyhow!("resolving import path {requested}: {e}"))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let home = std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home));
+    let state_root = crate::paths::brainrouter_state();
+    if !path.starts_with(&home) && !path.starts_with(&state_root) {
+        anyhow::bail!(
+            "import path must live under $HOME or the brainrouter state directory"
+        );
+    }
+    Ok(path)
+}
+
+/// v2 L4: the Engines tab / `swap status` payload.
+fn engines_json(state: &AppState) -> serde_json::Value {
+    let status = state.swap.status();
+    serde_json::json!({
+        "platform": &*state.platform,
+        "models": status.models,
+        "queue": status.queue,
+        "budget": status.budget,
+        "adoption": status.adoption,
+        "shim_error": status.shim_error,
+        "adapters": status.adapter_names,
+        "groups": state.swap.catalog().groups(),
+        "pins": state.swap.catalog().pins(),
+        "logs_dir": state.swap.logs_dir().display().to_string(),
+    })
+}
+
+/// Map a swap failure onto its HTTP status (`404` unknown model, `503`
+/// no-fit/queue-full/spawn-failure with `-32005`, `504` timeout).
+fn swap_api_error(error: anyhow::Error) -> Response<Full<Bytes>> {
+    use crate::swap_scheduler::SwapError;
+    if let Some(swap_error) = error.downcast_ref::<SwapError>() {
+        return json_response(
+            StatusCode::from_u16(swap_error.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &serde_json::json!({
+                "error": swap_error.to_string(),
+                "code": swap_error.code(),
+            }),
+        );
+    }
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &serde_json::json!({ "error": error.to_string() }),
+    )
 }
 
 /// Create a JSON response with the given status code
@@ -311,6 +423,8 @@ fn request_is_destructive(method: &str, path: &str, _has_query: bool) -> bool {
         || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/policy"))
         || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/credentials"))
         || (method == "POST" && path.starts_with("/api/decision/"))
+        // v2 L4 swap supervisor mutations (spawn/stop/pin/import/add/rm).
+        || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/engines"))
         || (method == "POST" && path.starts_with("/api/llama-swap/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
@@ -350,7 +464,7 @@ async fn handle_request_inner(
     peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
-    let path = req.uri().path();
+    let path = normalize_engines_path(method, req.uri().path());
 
     debug!("Request: {} {}", method, path);
 
@@ -494,7 +608,9 @@ async fn handle_request_inner(
                 .status(StatusCode::OK)
                 .header("content-type", "text/html; charset=utf-8")
                 .header("cache-control", "no-store")
-                .body(Full::new(Bytes::from(main_dashboard_html().into_bytes())))
+                .body(Full::new(Bytes::from(
+                    main_dashboard_html(&state.platform.id).into_bytes(),
+                )))
                 .expect("Failed to build HTML response");
             into_unsync(resp)
         }
@@ -515,6 +631,239 @@ async fn handle_request_inner(
                 .body(Full::new(Bytes::from_static(LOGO_SVG)))
                 .expect("Failed to build logo response");
             into_unsync(resp)
+        }
+
+        // ── v2 L4: platform probe + swap supervisor API ──────────────────────
+        ("GET", "/api/platform") => {
+            into_unsync(json_response(StatusCode::OK, &*state.platform))
+        }
+
+        ("GET", "/api/engines") | ("GET", "/api/engines/status") => {
+            into_unsync(json_response(StatusCode::OK, &engines_json(&state)))
+        }
+
+        ("GET", "/api/engines/queue") => {
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "queue": state.swap.status().queue }),
+            ))
+        }
+
+        ("POST", "/api/engines/queue") | ("POST", "/api/engines/ensure") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            match state.swap.ensure(model).await {
+                Ok(outcome) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "model": match &outcome {
+                            crate::swap_scheduler::EnsureOutcome::Attach { model, .. } => model,
+                        },
+                        "endpoint": outcome.endpoint(),
+                        "spawned": outcome.spawned(),
+                    }),
+                )),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("POST", "/api/engines/evict") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            match state.swap.evict(model, "explicit evict") {
+                Ok(stopped) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "model": model, "stopped": stopped }),
+                )),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("DELETE", p) if p.starts_with("/api/engines/queue/") => {
+            match p["/api/engines/queue/".len()..].parse::<u64>() {
+                Ok(id) if state.swap.cancel(id) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "cancelled": true, "id": id }),
+                )),
+                _ => into_unsync(json_response(
+                    StatusCode::NOT_FOUND,
+                    &serde_json::json!({ "error": "Unknown queue id" }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/pin") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            let gib = val
+                .get("reserved_gib")
+                .or_else(|| val.get("gib"))
+                .and_then(|g| g.as_f64())
+                .unwrap_or(0.0);
+            match state.swap.catalog().pin(model, gib) {
+                Ok(()) => {
+                    let _ = state
+                        .swap
+                        .ledger()
+                        .record("pin", model, gib, "sized pin reservation");
+                    into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "pins": state.swap.catalog().pins() }),
+                    ))
+                }
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/unpin") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            match state.swap.catalog().unpin(model) {
+                Ok(removed) => {
+                    if removed {
+                        let _ = state
+                            .swap
+                            .ledger()
+                            .record("unpin", model, 0.0, "pin removed");
+                    }
+                    into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "removed": removed, "pins": state.swap.catalog().pins() }),
+                    ))
+                }
+                Err(error) => into_unsync(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("GET", "/api/engines/import/preview") => {
+            let requested = query_param(req.uri().query().unwrap_or(""), "path");
+            let config = match engines_import_path(&state, Some(&requested)) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )))
+                }
+            };
+            match crate::swap_catalog::import_llama_swap_file(&config) {
+                Ok(plan) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "config": config.display().to_string(),
+                        "would_import": plan.entries.len(),
+                        "entries": plan.entries.keys().collect::<Vec<_>>(),
+                        "groups": plan.groups,
+                        "warnings": plan.warnings,
+                        "lines": plan.summary_lines(),
+                    }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/import/apply") => {
+            let val = read_json_body(req).await;
+            let requested = val.get("path").and_then(|p| p.as_str());
+            let config = match engines_import_path(&state, requested) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )))
+                }
+            };
+            match crate::swap_catalog::import_llama_swap_file(&config)
+                .and_then(|plan| state.swap.catalog().apply_import(&plan))
+            {
+                Ok(outcome) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "config": config.display().to_string(),
+                        "added": outcome.added,
+                        "updated": outcome.updated,
+                        "unchanged": outcome.unchanged,
+                        "skipped": outcome.skipped,
+                    }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/catalog/add") => {
+            let val = read_json_body(req).await;
+            match serde_json::from_value::<crate::swap_catalog::CatalogEntry>(val) {
+                Ok(entry) => match crate::swap_catalog::validate_entry(&entry)
+                    .and_then(|()| state.swap.catalog().upsert_entry(entry))
+                {
+                    Ok(()) => into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "ok": true }),
+                    )),
+                    Err(error) => into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )),
+                },
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/catalog/rm") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            match state.swap.catalog().remove_entry(model) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "removed": removed }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("GET", p) if p == "/api/engines/logs" => {
+            let query = req.uri().query().unwrap_or("");
+            let model = query_param(query, "model");
+            let lines = query_param(query, "lines")
+                .parse::<usize>()
+                .unwrap_or(200)
+                .min(2000);
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "model": model,
+                    "lines": state.swap.logs(&model, lines),
+                }),
+            ))
         }
 
         // ── In-flight request tracking API ────────────────────────────────────────
@@ -1950,6 +2299,11 @@ async fn handle_chat_completion(
         0,
         request.max_tokens,
     );
+    // v2 L4 additive: stamp the swap-catalog id at route time so the LRU
+    // never evicts a model with an active (or loading) stream.
+    if let Some(catalog_id) = state.swap.catalog().resolve_alias(&request.model) {
+        handle.set_catalog_id(catalog_id);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
         let result = tokio::select! {
@@ -1991,6 +2345,9 @@ async fn handle_chat_completion(
         }
         Ok(Ok(Err(error))) => {
             routing_task.abort();
+            if let Some(response) = swap_busy_response(&error) {
+                return Ok(into_unsync(response));
+            }
             return Ok(into_unsync(json_response(
                 StatusCode::BAD_GATEWAY,
                 &ErrorResponse { error: format!("routing failed: {error}") },
@@ -2061,6 +2418,9 @@ async fn handle_anthropic_messages(
         0,
         oai_request.max_tokens,
     );
+    if let Some(catalog_id) = state.swap.catalog().resolve_alias(&oai_request.model) {
+        handle.set_catalog_id(catalog_id);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
         let result = tokio::select! {
@@ -4650,21 +5010,19 @@ pub(crate) fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
 }
 
 pub(crate) async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
-    let metadata = loop {
-        match std::fs::symlink_metadata(uds_path) {
-            Ok(metadata) => break metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            // ENOTDIR: an ancestor of the path is not a directory — the
-            // caller's state dir (e.g. a test tmpdir) was deleted out from
-            // under the boot. Clean startup failure, not a bind success.
-            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-                anyhow::bail!(
-                    "the parent directory of {} no longer exists; not binding (the daemon's                      state directory was deleted during startup)",
-                    uds_path.display()
-                )
-            }
-            Err(error) => return Err(error.into()),
+    let metadata = match std::fs::symlink_metadata(uds_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // ENOTDIR: an ancestor of the path is not a directory — the
+        // caller's state dir (e.g. a test tmpdir) was deleted out from
+        // under the boot. Clean startup failure, not a bind success.
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            anyhow::bail!(
+                "the parent directory of {} no longer exists; not binding (the daemon's                      state directory was deleted during startup)",
+                uds_path.display()
+            )
         }
+        Err(error) => return Err(error.into()),
     };
     if !metadata.file_type().is_socket() {
         anyhow::bail!(
@@ -5010,6 +5368,16 @@ mod tests {
         let socket_path = dir.join("brainrouter.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         drop(listener);
+        // Under the full parallel suite another test may fork a child while
+        // this listener exists; until that child execs (CLOEXEC closes the
+        // inherited fd) a connect can briefly succeed. Wait for the kernel to
+        // report the socket dead — the condition the test is about.
+        for _ in 0..400 {
+            if UnixStream::connect(&socket_path).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         prepare_uds_path(&socket_path).await.unwrap();
         assert!(!socket_path.exists());
@@ -5049,4 +5417,35 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn engines_mutations_are_gated_and_reads_are_not() {
+        assert!(request_is_destructive("POST", "/api/engines/ensure", false));
+        assert!(request_is_destructive("POST", "/api/engines/import/apply", false));
+        assert!(request_is_destructive("DELETE", "/api/engines/queue/3", false));
+        assert!(!request_is_destructive("GET", "/api/engines", false));
+        assert!(!request_is_destructive("GET", "/api/engines/import/preview", false));
+        assert!(!request_is_destructive("GET", "/api/platform", false));
+    }
+
+    #[test]
+    fn engine_route_aliases_normalize_to_one_handler() {
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/list"),
+            "/api/engines"
+        );
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/import"),
+            "/api/engines/import/preview"
+        );
+        assert_eq!(
+            normalize_engines_path("POST", "/api/engines/import"),
+            "/api/engines/import/apply"
+        );
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/logs/"),
+            "/api/engines/logs"
+        );
+        assert_eq!(normalize_engines_path("GET", "/health"), "/health");
+    }
+
 }

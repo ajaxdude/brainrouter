@@ -118,6 +118,15 @@ pub struct RouteEvent {
     /// v2 L3 additive: the model the route actually chose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_model: Option<String>,
+    /// v2 L4 additive: the swap supervisor's lifecycle state for the routed
+    /// model (`ready`/`loading`) when the catalog owned the route. Carried,
+    /// not rendered, until the Engines tab consumes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_state: Option<String>,
+    /// v2 L4 additive: where the residency came from (`shim`/`native`/
+    /// `container`/`external`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_source: Option<String>,
 }
 
 fn is_zero_f64(f: &f64) -> bool {
@@ -410,6 +419,8 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
         }
     }
 

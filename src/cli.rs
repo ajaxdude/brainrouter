@@ -336,6 +336,82 @@ pub enum MigrationAction {
     },
 }
 
+/// `brainrouter swap ...` (v2 L4): reads are direct (state files); mutations
+/// go through the running daemon and refuse cleanly when it is down.
+#[derive(Args)]
+pub struct SwapArgs {
+    /// Daemon Unix socket (mutations only). Defaults to config::default_socket_path.
+    #[arg(long, global = true)]
+    pub socket: Option<PathBuf>,
+    /// Talk to the daemon over TCP instead of the Unix socket.
+    #[arg(long, global = true)]
+    pub url: Option<String>,
+    /// State root override (reads: swap_catalog.json / budget.json live here).
+    #[arg(long, global = true)]
+    pub state: Option<PathBuf>,
+    #[command(subcommand)]
+    pub action: SwapAction,
+}
+
+#[derive(Subcommand)]
+pub enum SwapAction {
+    /// Lifecycle + budget snapshot (daemon when up, state-file summary otherwise)
+    Status,
+    /// Ensure a model is ready (spawns/queues through the daemon)
+    Ensure { model: String },
+    /// Evict a native child
+    Evict { model: String },
+    /// Catalog reads (direct; no daemon required)
+    Catalog {
+        #[command(subcommand)]
+        action: SwapCatalogAction,
+    },
+    /// Import llama-swap's config.yaml (--dry-run prints the plan only)
+    #[command(name = "import-llamaswap", alias = "import")]
+    ImportLlamaswap {
+        #[arg(long)]
+        dry_run: bool,
+        /// llama-swap config path (default: ~/.config/llama-swap/config.yaml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Size-pin a catalog model (reserved_gib)
+    Pin {
+        model: String,
+        #[arg(long)]
+        reserved_gib: f64,
+    },
+    /// Remove a pin
+    Unpin { model: String },
+    /// Add a launch spec from a JSON file
+    Add { spec: String },
+    /// Remove a catalog entry
+    Rm { model: String },
+}
+
+#[derive(Subcommand)]
+pub enum SwapCatalogAction {
+    /// List catalog entries, groups and pins (direct read)
+    List,
+}
+
+/// `brainrouter platform show` (v2 L4): direct probe (no daemon).
+#[derive(Args)]
+pub struct PlatformArgs {
+    #[command(subcommand)]
+    pub action: PlatformAction,
+}
+
+#[derive(Subcommand)]
+pub enum PlatformAction {
+    /// Print the detected platform, GPUs, budgets and engine offers
+    Show {
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum ConfigAction {
     /// Print the current config (YAML)
@@ -1028,6 +1104,177 @@ async fn run_plugin_direct(action: PluginAction) -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn swap_state_root(args_state: &Option<PathBuf>) -> PathBuf {
+    args_state
+        .clone()
+        .unwrap_or_else(brainrouter::paths::brainrouter_state)
+}
+
+fn swap_daemon_client(socket: &Option<PathBuf>, url: &Option<String>) -> DaemonClient {
+    let endpoint = match url {
+        Some(url) => DaemonEndpoint::Url(url.clone()),
+        None => DaemonEndpoint::Socket(
+            socket
+                .clone()
+                .unwrap_or_else(brainrouter::config::default_socket_path),
+        ),
+    };
+    DaemonClient::new(endpoint)
+}
+
+async fn ensure_daemon_up(client: &DaemonClient) -> Result<()> {
+    match client.get_json("/api/platform").await {
+        Ok(_) => Ok(()),
+        Err(error) => bail!(
+            "the brainrouter daemon is not reachable ({error}); start `brainrouter serve`              — swap mutations go through the daemon"
+        ),
+    }
+}
+
+/// `brainrouter swap ...`
+pub async fn run_swap_standalone(args: SwapArgs) -> Result<()> {
+    let root = swap_state_root(&args.state);
+    let catalog_path = root.join(brainrouter::swap_catalog::CATALOG_FILE);
+    let budget_path = root.join(brainrouter::swap_scheduler::BUDGET_FILE);
+    let client = swap_daemon_client(&args.socket, &args.url);
+    match args.action {
+        SwapAction::Catalog { action } => match action {
+            SwapCatalogAction::List => {
+                let catalog = brainrouter::swap_catalog::SwapCatalog::load(catalog_path)?;
+                print_json(&serde_json::json!({
+                    "path": catalog.path().display().to_string(),
+                    "entries": catalog.entries(),
+                    "groups": catalog.groups(),
+                    "pins": catalog.pins(),
+                }));
+                Ok(())
+            }
+        },
+        SwapAction::Status => {
+            // Read-direct when the daemon is down; live status otherwise.
+            match client.get_json("/api/engines").await {
+                Ok(status) => print_json(&status),
+                Err(_) => {
+                    let catalog = brainrouter::swap_catalog::SwapCatalog::load(catalog_path)?;
+                    let ledger = brainrouter::swap_scheduler::BudgetLedger::load(budget_path)?;
+                    print_json(&serde_json::json!({
+                        "source": "state files (daemon down)",
+                        "entries": catalog.entries().len(),
+                        "pins": catalog.pins(),
+                        "budget_entries": ledger.entries().len(),
+                        "hint": "start `brainrouter serve` for residency/queue/lifecycle state",
+                    }));
+                }
+            }
+            Ok(())
+        }
+        SwapAction::Ensure { model } => {
+            ensure_daemon_up(&client).await?;
+            print_json(&client.post_json("/api/engines/ensure", json!({ "model": model })).await?);
+            Ok(())
+        }
+        SwapAction::Evict { model } => {
+            ensure_daemon_up(&client).await?;
+            print_json(&client.post_json("/api/engines/evict", json!({ "model": model })).await?);
+            Ok(())
+        }
+        SwapAction::ImportLlamaswap { dry_run, config } => {
+            let config = config.unwrap_or_else(default_llama_swap_config_path);
+            if dry_run {
+                let plan = brainrouter::swap_catalog::import_llama_swap_file(&config)?;
+                println!("dry-run: {}", config.display());
+                for line in plan.summary_lines() {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+            ensure_daemon_up(&client).await?;
+            print_json(&client.post_json("/api/engines/import/apply", json!({})).await?);
+            Ok(())
+        }
+        SwapAction::Pin { model, reserved_gib } => {
+            ensure_daemon_up(&client).await?;
+            print_json(
+                &client
+                    .post_json("/api/engines/pin", json!({ "model": model, "reserved_gib": reserved_gib }))
+                    .await?,
+            );
+            Ok(())
+        }
+        SwapAction::Unpin { model } => {
+            ensure_daemon_up(&client).await?;
+            print_json(&client.post_json("/api/engines/unpin", json!({ "model": model })).await?);
+            Ok(())
+        }
+        SwapAction::Add { spec } => {
+            ensure_daemon_up(&client).await?;
+            let text = std::fs::read_to_string(&spec)
+                .with_context(|| format!("reading launch spec {}", spec))?;
+            let value: Value = serde_json::from_str(&text).context("parsing launch spec JSON")?;
+            print_json(&client.post_json("/api/engines/catalog/add", value).await?);
+            Ok(())
+        }
+        SwapAction::Rm { model } => {
+            ensure_daemon_up(&client).await?;
+            print_json(&client.post_json("/api/engines/catalog/rm", json!({ "model": model })).await?);
+            Ok(())
+        }
+    }
+}
+
+fn default_llama_swap_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".config/llama-swap/config.yaml")
+}
+
+/// `brainrouter platform show`
+pub fn run_platform_standalone(args: PlatformArgs) -> Result<()> {
+    match args.action {
+        PlatformAction::Show { json: as_json } => {
+            let feed = brainrouter::platform::load_feed_file(
+                &brainrouter::platform::feed_cache_path(),
+            )
+            .unwrap_or_else(brainrouter::platform::bundled_feed);
+            let probe = brainrouter::platform::resolve(
+                &brainrouter::platform::detect_facts(),
+                &feed,
+                "cache-or-bundled",
+            );
+            if as_json {
+                print_json(&serde_json::to_value(&probe)?);
+            } else {
+                println!("platform: {}", probe.id);
+                if let Some(banner) = &probe.banner {
+                    println!("banner:   {banner}");
+                }
+                println!("label:    {}", probe.label);
+                println!("machine:  {}", probe.facts.machine_id);
+                println!("cpu:      {}", probe.facts.cpu_arch);
+                println!("memory:   {:.0} GiB total / {:.0} GiB available", probe.facts.mem_total_gib, probe.facts.mem_available_gib);
+                if let Some(gtt) = probe.facts.gtt_budget_gib {
+                    println!("gtt:      {gtt:.0} GiB");
+                }
+                if let Some(vram) = probe.facts.vram_budget_gib {
+                    println!("vram:     {vram:.0} GiB");
+                }
+                println!("budget:   {:.0} GiB", probe.budget_gib);
+                for gpu in &probe.facts.gpus {
+                    println!("gpu:      {} {} {}", gpu.arch, gpu.vendor, gpu.device);
+                }
+                for offer in &probe.offers {
+                    println!(
+                        "engine:   {} {} — {}",
+                        offer.engine,
+                        if offer.offered { "offered" } else { "not offered" },
+                        offer.reason
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {

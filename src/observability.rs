@@ -1338,6 +1338,8 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
         }
     }
 

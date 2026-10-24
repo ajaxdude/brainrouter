@@ -435,6 +435,153 @@ fn strip_v1_keys_and_add_decision_model(config_path: &Path, state: &V1State) -> 
     Ok(())
 }
 
+// ── v2.0-p4: swap catalog import (L4) ───────────────────────────────────────
+
+/// The L4 phase tag: `brainrouter migration restore v2.0-p4`. On first boot it
+/// imports the live llama-swap `config.yaml` into `swap_catalog.json`
+/// (snapshot + dry-run + restore, one stable snapshot directory per phase —
+/// the v2.0-p3 shape).
+pub const PHASE_V2_P4: &str = "v2.0-p4";
+pub const SNAPSHOT_SWAP_CATALOG_FILE: &str = "swap_catalog.json";
+pub const SNAPSHOT_BUDGET_FILE: &str = "budget.json";
+
+/// `--dry-run` preview for `v2.0-p4` — describes the import, never writes.
+pub fn preview_v2_p4(
+    llama_swap_config_path: &Path,
+    state_root: &Path,
+    catalog_path: &Path,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P4} (state untouched)"));
+    if !llama_swap_config_path.exists() {
+        lines.push(format!(
+            "  no llama-swap config at {} — import would be a no-op",
+            llama_swap_config_path.display()
+        ));
+        return Ok(lines);
+    }
+    match crate::swap_catalog::import_llama_swap_file(llama_swap_config_path) {
+        Ok(plan) => lines.extend(plan.summary_lines()),
+        Err(e) => lines.push(format!("  llama-swap config unreadable: {e}")),
+    }
+    if catalog_path.exists() {
+        match crate::swap_catalog::SwapCatalog::load(catalog_path.to_path_buf()) {
+            Ok(catalog) if catalog.migration_done(PHASE_V2_P4) => lines.push(format!(
+                "  {} already carries the {PHASE_V2_P4} marker — nothing to do",
+                catalog_path.display()
+            )),
+            Ok(_) => lines.push(format!(
+                "  would merge into {} (CLI-added entries are preserved)",
+                catalog_path.display()
+            )),
+            Err(e) => lines.push(format!("  existing catalog unreadable: {e}")),
+        }
+    } else {
+        lines.push(format!(
+            "  would create {}",
+            catalog_path.display()
+        ));
+    }
+    lines.push(format!(
+        "  would snapshot the pre-migration catalog + budget under {}",
+        snapshot_root(state_root, PHASE_V2_P4).display()
+    ));
+    Ok(lines)
+}
+
+/// The `v2.0-p4` migration: import the live llama-swap config into the swap
+/// catalog. Idempotent (a catalog already carrying the phase marker is a
+/// no-op); snapshots the pre-migration catalog + budget ledger first.
+pub fn run_v2_p4(
+    llama_swap_config_path: &Path,
+    state_root: &Path,
+    catalog_path: &Path,
+    budget_path: &Path,
+) -> Result<Vec<String>> {
+    let catalog = crate::swap_catalog::SwapCatalog::load(catalog_path.to_path_buf())?;
+    if catalog.migration_done(PHASE_V2_P4) {
+        return Ok(Vec::new());
+    }
+    if !llama_swap_config_path.exists() {
+        // No llama-swap here (e.g. a native-only host): nothing to import, and
+        // no marker — a later config appearing still migrates on some boot.
+        return Ok(Vec::new());
+    }
+    let plan = crate::swap_catalog::import_llama_swap_file(llama_swap_config_path)?;
+    let snapshot_dir = snapshot_root(state_root, PHASE_V2_P4);
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+    let _ = std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700));
+    for (source, name) in [
+        (catalog_path, SNAPSHOT_SWAP_CATALOG_FILE),
+        (budget_path, SNAPSHOT_BUDGET_FILE),
+    ] {
+        if source.exists() {
+            let bytes = std::fs::read(source)
+                .with_context(|| format!("reading {} for snapshot", source.display()))?;
+            crate::plugins::store::atomic_write_0600(&snapshot_dir.join(name), &bytes)?;
+        }
+    }
+    let outcome = catalog.apply_import(&plan)?;
+    catalog.mark_migration(PHASE_V2_P4)?;
+    Ok(vec![format!(
+        "imported llama-swap config {} into {} (added {}, updated {}, unchanged {}, skipped {} CLI-owned);          pre-migration snapshot: {}",
+        llama_swap_config_path.display(),
+        catalog_path.display(),
+        outcome.added,
+        outcome.updated,
+        outcome.unchanged,
+        outcome.skipped.len(),
+        snapshot_dir.display()
+    )])
+}
+
+/// Restore `v2.0-p4`: put the pre-migration catalog + budget ledger back
+/// (absent in the snapshot = remove, the pre-migration state).
+pub fn restore_v2_p4(
+    state_root: &Path,
+    catalog_path: &Path,
+    budget_path: &Path,
+) -> Result<String> {
+    let latest = newest_snapshot(PHASE_V2_P4, state_root)?.with_context(|| {
+        format!(
+            "no {PHASE_V2_P4} migration snapshot found under {}",
+            snapshot_root(state_root, PHASE_V2_P4).display()
+        )
+    })?;
+    let mut restored = Vec::new();
+    for (name, target, label) in [
+        (
+            SNAPSHOT_SWAP_CATALOG_FILE,
+            catalog_path,
+            "swap catalog",
+        ),
+        (SNAPSHOT_BUDGET_FILE, budget_path, "budget ledger"),
+    ] {
+        let snapshot = latest.join(name);
+        if snapshot.exists() {
+            std::fs::copy(&snapshot, target)
+                .with_context(|| format!("restoring {label} to {}", target.display()))?;
+            restored.push(label);
+        } else if target.exists() {
+            std::fs::remove_file(target)
+                .with_context(|| format!("removing {} (absent before the migration)", target.display()))?;
+            restored.push(match label {
+                "swap catalog" => "swap catalog (removed: absent before the migration)",
+                _ => "budget ledger (removed: absent before the migration)",
+            });
+        }
+    }
+    if restored.is_empty() {
+        anyhow::bail!("snapshot {} contains no restorable swap state", latest.display());
+    }
+    Ok(format!(
+        "restored {PHASE_V2_P4} from {} ({})",
+        latest.display(),
+        restored.join(", ")
+    ))
+}
+
 /// `--dry-run` preview: describe exactly what the `v2.0-p2` migration would
 /// do, without touching any state. Token values are never rendered.
 pub fn preview_v2_p2(
@@ -487,6 +634,15 @@ pub fn restore(
     state_root: &Path,
     config_dir: &Path,
 ) -> Result<String> {
+    // v2 L4: the p4 snapshot holds swap state only (no config/credentials/
+    // cards); restoring it must not touch those unrelated files.
+    if phase == PHASE_V2_P4 {
+        return restore_v2_p4(
+            state_root,
+            &state_root.join(crate::swap_catalog::CATALOG_FILE),
+            &state_root.join(crate::swap_scheduler::BUDGET_FILE),
+        );
+    }
     let latest = newest_snapshot(phase, state_root)?.with_context(|| {
         format!(
             "no {phase} migration snapshot found under {}",
@@ -596,7 +752,12 @@ pub fn newest_snapshot(phase: &str, state_root: &Path) -> Result<Option<PathBuf>
     // timestamps). Accept the legacy timestamped layout too (restore of a
     // pre-B1 state dir): if the phase root directly contains a snapshot
     // file, it IS the snapshot.
-    if root.join(SNAPSHOT_CONFIG_FILE).exists() {
+    // The phase root IS the snapshot for the stable layout. p2/p3 carry a
+    // config snapshot; p4 carries swap state only — accept either marker.
+    if root.join(SNAPSHOT_CONFIG_FILE).exists()
+        || root.join(SNAPSHOT_SWAP_CATALOG_FILE).exists()
+        || root.join(SNAPSHOT_BUDGET_FILE).exists()
+    {
         return Ok(Some(root));
     }
     let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
@@ -919,4 +1080,95 @@ mod tests {
         assert!(!dir.path().join("state").exists());
         assert!(std::fs::read_to_string(&config).unwrap().contains("TOK-DRY"));
     }
+    // ── v2.0-p4 (L4 swap catalog import) ───────────────────────────────────
+
+    fn llama_swap_fixture() -> &'static str {
+        r#"
+startPort: 5800
+macros:
+  ls: /usr/bin/llama-server
+  common: >-
+    --jinja -ngl 999
+groups:
+  pair:
+    swap: false
+    members: [m1, m2]
+models:
+  m1:
+    cmd: |
+      ${ls} --port ${PORT} ${common} --model /models/m1.gguf
+  m2:
+    cmd: |
+      ${ls} --port ${PORT} --model /models/m2.gguf
+"#
+    }
+
+    #[test]
+    fn p4_imports_once_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let llama = dir.path().join("llama-swap.yaml");
+        std::fs::write(&llama, llama_swap_fixture()).unwrap();
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let budget_path = dir.path().join(crate::swap_scheduler::BUDGET_FILE);
+
+        // Pre-migration state: one CLI-owned entry.
+        let mut cli_entry = crate::swap_catalog::CatalogEntry::default();
+        cli_entry.id = "cli-model".into();
+        cli_entry.files = vec!["/models/cli.gguf".into()];
+        let catalog = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        catalog.upsert_entry(cli_entry).unwrap();
+
+        let actions = run_v2_p4(&llama, &state, &catalog_path, &budget_path).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let after_import = std::fs::read_to_string(&catalog_path).unwrap();
+        let loaded = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        assert!(loaded.migration_done(PHASE_V2_P4));
+        assert_eq!(loaded.entries().len(), 3, "two imported + one CLI entry");
+        assert!(loaded.entry("m1").is_some() && loaded.entry("m2").is_some());
+        assert_eq!(loaded.groups().get("pair").unwrap().members.len(), 2);
+
+        // Second boot: one-shot no-op, bytes untouched.
+        let actions = run_v2_p4(&llama, &state, &catalog_path, &budget_path).unwrap();
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(std::fs::read_to_string(&catalog_path).unwrap(), after_import);
+
+        // Mutate, then restore the pre-migration catalog (CLI entry only).
+        std::fs::write(&catalog_path, "{}").unwrap();
+        let msg = restore_v2_p4(&state, &catalog_path, &budget_path).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        let restored = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        assert_eq!(restored.entries().len(), 1);
+        assert!(restored.entry("cli-model").is_some());
+    }
+
+    #[test]
+    fn p4_dry_run_is_inert_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let llama = dir.path().join("llama-swap.yaml");
+        std::fs::write(&llama, llama_swap_fixture()).unwrap();
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let first = preview_v2_p4(&llama, &state, &catalog_path).unwrap();
+        let second = preview_v2_p4(&llama, &state, &catalog_path).unwrap();
+        assert_eq!(first, second);
+        let text = first.join("\n");
+        assert!(text.contains("would import 2 model"), "{text}");
+        assert!(text.contains("dry-run"));
+        assert!(!state.exists(), "dry-run writes no state");
+        assert!(!catalog_path.exists(), "dry-run writes no catalog");
+    }
+
+    #[test]
+    fn p4_without_a_llama_swap_config_is_a_quiet_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let budget_path = dir.path().join(crate::swap_scheduler::BUDGET_FILE);
+        let actions = run_v2_p4(&dir.path().join("missing.yaml"), &state, &catalog_path, &budget_path).unwrap();
+        assert!(actions.is_empty());
+        assert!(!catalog_path.exists());
+    }
+
+
 }

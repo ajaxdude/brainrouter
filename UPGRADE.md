@@ -4,6 +4,61 @@ Per-phase upgrade/rollback procedures. Phase tags + the per-leg restore
 contract live in `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback"); the change list is in `CHANGELOG.md`.
 
+## v2.0-p4 (L4): swap catalog + platform probe
+
+L4 introduces two owner-visible state files under
+`$XDG_STATE_HOME/brainrouter/`:
+
+- `swap_catalog.json` — the model registry (entries with resolved launch
+  specs, sized pins, llama-swap groups metadata);
+- `budget.json` — the append-only budget ledger (admit/deny/evict/pin/spawn/
+  stop/adopt entries);
+- plus `adoption/<model>.json` markers (one per native child) and
+  `swap_logs/<model>.log` engine logs.
+
+On the first boot of a v2 L4 daemon the `v2.0-p4` migration imports the live
+llama-swap `~/.config/llama-swap/config.yaml` into `swap_catalog.json`:
+
+1. A stable snapshot directory
+   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p4/` captures the
+   pre-migration catalog and budget ledger (0600, atomic).
+2. The macro chain is expanded (`${ls}`, `${common}`, per-model macro
+   overrides) but runtime placeholders (`${PORT}`) are preserved; groups are
+   recorded as metadata; existing CLI-added entries are never overwritten.
+3. The catalog is marked with the phase; later boots are no-ops. Re-running
+   the import is idempotent (`brainrouter swap import-llamaswap`), and
+   `--dry-run` prints the plan without touching state.
+
+Preview before booting:
+
+```sh
+brainrouter serve --dry-run            # includes the v2.0-p4 preview
+brainrouter swap import-llamaswap --dry-run
+```
+
+Rollback: `brainrouter migration restore v2.0-p4` restores the pre-import
+catalog/budget (or removes them if they did not exist), then revert the
+phase merge. Pins and budget reservations are state, not config — the
+snapshot is what returns them.
+
+Operational notes:
+
+- Native spawns go through a transient systemd user scope
+  (`systemd-run --user --scope`) so engines survive daemon restarts and can
+  be adopted. Without systemd the daemon falls back to `setsid`; adoption is
+  best-effort and the Engines tab says so. Do not run the daemon with
+  `KillMode=control-group` expecting native children to die with it — that
+  is the point of the scope.
+- A running engine is never killed by an upgrade. If the resolved launch spec
+  changed, it is adopted and badged `spec_stale`; `swap ensure <model>`
+  converges it explicitly.
+- The swap queue is in-memory and resets on daemon restart (clients retry;
+  adopted loads keep serving).
+- `BRAINROUTER_BUDGET_GIB` overrides the probe-reported budget (GiB);
+  `BRAINROUTER_SWAP_QUEUE_CAP`, `BRAINROUTER_SWAP_WAIT_MS`,
+  `BRAINROUTER_SWAP_STOP_GRACE_MS`, and `BRAINROUTER_SWAP_NO_SYSTEMD=1` are
+  operational knobs.
+
 ## v2.0-p3 (L3): role cards + decision slot
 
 v1 configured models in four places: the `routing:` profile block

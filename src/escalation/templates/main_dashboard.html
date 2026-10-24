@@ -222,6 +222,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⬢</span>
       <span>Models</span>
     </button>
+    <button class="nav-item" id="nav-engines" onclick="switchView('engines')">
+      <span class="nav-icon">▤</span>
+      <span>Engines</span>
+    </button>
     <a class="nav-item" id="nav-benchmarks" href="/benchmarks">
       <span class="nav-icon">◇</span>
       <span>Benchmarks</span>
@@ -662,6 +666,28 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
          panels this page shipped in v1 (design doc §13/§14/§15) were
          removed; server-mode is ds4 + gufo, and those feed ids are
          browse-only catalog data. -->
+    <!-- v2 L4: Engines — platform probe, engine offers, lifecycle, queue,
+         budget gauge (residents by source + pins), pins, llama-swap import. -->
+    <div id="engines-view" style="display:none;max-width:980px">
+      <div id="platform-banner" role="status" data-testid="platform-banner" style="display:none;background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:10px;padding:10px 12px;font-size:12px;margin-bottom:12px"></div>
+      <div id="engines-platform" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Budget</div>
+      <div id="engines-budget" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Lifecycle</div>
+      <div id="engines-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Queue</div>
+      <div id="engines-queue" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Import from llama-swap</div>
+      <div id="engines-import" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="br-btn" data-eng-action="import-preview">Preview import</button>
+          <button class="br-btn" data-eng-action="import-apply">Apply import</button>
+          <span id="engines-import-msg" role="status" style="color:var(--textMute)"></span>
+        </div>
+        <pre id="engines-import-out" style="margin:0;white-space:pre-wrap;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim);max-height:220px;overflow:auto"></pre>
+      </div>
+    </div>
+
     <div id="server-mode-view" style="display:none;max-width:900px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
@@ -955,12 +981,15 @@ function switchView(view) {
   document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
   document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
   document.getElementById('plugins-view').style.display   = view === 'plugins' ? 'block' : 'none';
+  const enginesView = document.getElementById('engines-view');
+  if (enginesView) enginesView.style.display = view === 'engines' ? 'block' : 'none';
   const credView = document.getElementById('credentials-view');
   if (credView) credView.style.display = view === 'credentials' ? 'block' : 'none';
   if (view === 'credentials') loadCredentials();
+  if (view === 'engines') loadEngines();
 
   const modelsActive = isModelsView(view);
-  ['stream','config','models','plugins','credentials'].forEach(v => {
+  ['stream','config','models','plugins','credentials','engines'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (!btn) return;
     const active = v === 'models' ? modelsActive : v === view;
@@ -979,7 +1008,7 @@ function switchView(view) {
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
   });
 
-  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins' };
+  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins', credentials: 'Credentials', engines: 'Engines' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
@@ -989,6 +1018,7 @@ function switchView(view) {
     'toolbox-models': 'Catalog models for ds4 / llama.cpp / gufo — browse, download, verify',
     'server-mode': 'Launch/stop headless inference servers — ds4 and gufo',
     plugins: 'Sidecar plugins over UDS JSON-RPC — status, config, and logs (v2 L2)',
+    engines: 'Platform probe, engine offers, lifecycle, queue, budget and pins (v2 L4)',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -2314,6 +2344,13 @@ async function loadModels() {
     const r = await fetch('/api/models/llama-swap');
     const j = await r.json().catch(() => ({}));
     const models = (j && j.data) || [];
+    // v2 L4: "serve via" column — catalog engine per model id.
+    let serveVia = {};
+    try {
+      const er = await fetch('/api/engines');
+      const ej = await er.json();
+      (ej.models || []).forEach(m => { serveVia[m.id] = m.engine + (m.resident ? ' · resident' : ''); });
+    } catch (e) {}
     if (!models.length) {
       list.innerHTML = '<div style="color:var(--textMute);font-size:12px">No models reported by llama-swap.</div>';
       return;
@@ -2328,7 +2365,7 @@ async function loadModels() {
         + '<span style="width:8px;height:8px;border-radius:50%;background:' + dot + '"></span>'
         + '<div style="flex:1;min-width:0">'
         + '  <div style="font-size:12px;font-weight:600;color:var(--text)">' + key + ' <span style="font-size:10px;color:var(--textMute);font-weight:400">' + (loaded ? 'loaded' : 'unloaded') + port + '</span></div>'
-        + '  <div style="font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--textMute)">' + val + '</div>'
+        + '  <div style="font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--textMute)">' + val + (serveVia[key] ? ' · serve via ' + escHtml(serveVia[key]) : '') + '</div>'
         + '</div>'
         + '<button onclick="copyOmpValue(\'' + key + '\')" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;white-space:nowrap">Copy for OMP</button>'
         + '</div>';
@@ -3127,7 +3164,7 @@ const TOOLBOX_BACKEND_LABELS = {
 // existing hardcoded defaults already assume (`docker.io/kyuz0/amd-strix-
 // halo-toolboxes:...`), matching current behavior rather than guessing new
 // behavior. Revisit once Q1 lands real detection.
-const CURRENT_PLATFORM_ID = 'strix-halo';
+const CURRENT_PLATFORM_ID = '__CURRENT_PLATFORM_ID__';
 
 // PR3 §4: cockpit's own per-backend override (`config.json`'s
 // `backends.<id>.default_toolboxes.<platform>`) takes precedence; the
@@ -4214,6 +4251,161 @@ setInterval(refreshFast, 3000);
 setInterval(refreshHealth, 10000);
 setInterval(refreshBonsai, 10000);
 setInterval(refreshSlow, 30000);
+
+// ─── v2 L4: Engines (platform probe + swap supervisor) ──────────────────────
+function enginesSetMessage(text, color) {
+  const el = document.getElementById('engines-import-msg');
+  if (el) { el.textContent = text || ''; el.style.color = color || 'var(--textMute)'; }
+}
+async function enginesPost(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, body: j };
+}
+async function loadEngines() {
+  const view = document.getElementById('engines-view');
+  if (!view) return;
+  try {
+    const [pr, er] = await Promise.all([fetch('/api/platform'), fetch('/api/engines')]);
+    const platform = await pr.json();
+    const engines = await er.json();
+    const banner = document.getElementById('platform-banner');
+    if (banner) {
+      if (platform.known === false && platform.banner) {
+        banner.style.display = 'block';
+        banner.textContent = platform.banner;
+      } else {
+        banner.style.display = 'none';
+      }
+    }
+    const plat = document.getElementById('engines-platform');
+    if (plat) {
+      const gpus = (platform.facts && platform.facts.gpus || [])
+        .map(g => escHtml(g.arch || 'unknown') + (g.device ? ' (' + escHtml(g.device) + ')' : ''))
+        .join(', ') || 'none detected';
+      const offers = (platform.offers || []).map(o =>
+        '<div style="display:flex;gap:8px"><span style="color:' + (o.offered ? 'var(--green)' : 'var(--textMute)') + '">' + (o.offered ? '●' : '○') +
+        '</span><strong>' + escHtml(o.engine) + '</strong><span style="color:var(--textMute)">' + escHtml(o.reason) + '</span></div>'
+      ).join('');
+      plat.innerHTML =
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">' +
+        '<span><span style="color:var(--textMute)">platform</span> <strong>' + escHtml(platform.id) + '</strong>' +
+        (platform.known ? '' : ' <span style="color:var(--amber)">(unknown — fail-open)</span>') + '</span>' +
+        '<span><span style="color:var(--textMute)">budget</span> ' + Number(platform.budget_gib || 0).toFixed(0) + ' GiB</span>' +
+        '<span><span style="color:var(--textMute)">mem</span> ' + Number((platform.facts || {}).mem_total_gib || 0).toFixed(0) + ' GiB</span>' +
+        '<span><span style="color:var(--textMute)">feed</span> ' + escHtml(platform.feed_origin || '') + '</span>' +
+        '<span><span style="color:var(--textMute)">gpus</span> ' + gpus + '</span>' +
+        '</div><div style="display:flex;flex-direction:column;gap:3px">' + offers + '</div>';
+    }
+    const budget = engines.budget || {};
+    const bud = document.getElementById('engines-budget');
+    if (bud) {
+      const cap = Number(budget.cap_gib || 0);
+      const used = Number(budget.used_gib || 0);
+      const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+      const lines = (budget.residents || []).map(b =>
+        '<div>' + escHtml(b.model) + ' <span style="color:var(--textMute)">' + escHtml(b.source) + '</span> · ' + Number(b.gib).toFixed(1) + ' GiB</div>'
+      ).join('');
+      const pins = (budget.pins || []).map(b =>
+        '<div style="color:var(--amber)">pin ' + escHtml(b.model) + ' · ' + Number(b.gib).toFixed(1) + ' GiB</div>'
+      ).join('');
+      bud.innerHTML =
+        '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>' + used.toFixed(1) + ' / ' + cap.toFixed(1) + ' GiB</span>' +
+        '<span style="color:var(--textMute)">headroom ' + Number(budget.headroom_gib || 0).toFixed(1) + ' GiB · evictions today ' + Number(budget.evictions_today || 0) + '</span></div>' +
+        '<div style="height:8px;background:var(--bg3);border-radius:99px;overflow:hidden;margin-bottom:8px">' +
+        '<div style="height:8px;width:' + pct.toFixed(1) + '%;background:' + (pct > 90 ? 'var(--amber)' : 'var(--green)') + '"></div></div>' +
+        lines + pins;
+    }
+    const list = document.getElementById('engines-list');
+    if (list) {
+      const models = engines.models || [];
+      if (!models.length) {
+        list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Swap catalog is empty — import llama-swap or add a launch spec.</div>';
+      } else {
+        list.innerHTML = models.map(m => {
+          const color = m.state === 'ready' ? 'var(--green)' : (m.state === 'failed' ? 'var(--red,var(--amber))' : (m.state === 'loading' ? 'var(--amber)' : 'var(--textMute)'));
+          const progress = m.progress ? (m.progress.fraction != null
+            ? ' · ' + (m.progress.fraction * 100).toFixed(0) + '%'
+            : ' · ' + Number(m.progress.elapsed_ms || 0) + ' ms' + (m.progress.eta_ms != null ? ' (ETA ' + m.progress.eta_ms + ' ms)' : '')) : '';
+          const pin = m.pinned_gib != null ? ' · pin ' + Number(m.pinned_gib).toFixed(1) + ' GiB' : '';
+          return '<div style="display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:9px 12px">' +
+            '<span style="width:8px;height:8px;border-radius:50%;background:' + color + '"></span>' +
+            '<div style="flex:1;min-width:0">' +
+            '<div style="font-size:12px;font-weight:600">' + escHtml(m.id) +
+            (m.spec_stale ? ' <span style="color:var(--amber);font-size:10px">spec stale</span>' : '') + '</div>' +
+            '<div style="font-size:11px;color:var(--textMute);font-family:\'JetBrains Mono\',monospace">' +
+            escHtml(m.engine) + ' · ' + escHtml(m.state) + (m.source ? ' · ' + escHtml(m.source) : '') +
+            (m.endpoint ? ' · ' + escHtml(m.endpoint) : '') + progress + pin + '</div>' +
+            (m.last_error ? '<div style="font-size:11px;color:var(--amber)">' + escHtml(m.last_error) + '</div>' : '') +
+            '</div>' +
+            '<button class="br-btn" data-eng-action="ensure" data-model="' + escHtml(m.id) + '">Ensure</button>' +
+            '<button class="br-btn" data-eng-action="evict" data-model="' + escHtml(m.id) + '">Evict</button>' +
+            '<button class="br-btn" data-eng-action="pin" data-model="' + escHtml(m.id) + '">Pin</button>' +
+            '<button class="br-btn" data-eng-action="unpin" data-model="' + escHtml(m.id) + '">Unpin</button>' +
+            '</div>';
+        }).join('');
+      }
+    }
+    const q = document.getElementById('engines-queue');
+    if (q) {
+      const queue = engines.queue || [];
+      q.innerHTML = queue.length
+        ? queue.map(e => '<div style="display:flex;gap:10px;align-items:center">' +
+            '<span style="color:var(--textMute)">#' + e.position + '</span><span>' + escHtml(e.model) + '</span>' +
+            '<span style="color:var(--textMute)">' + Number(e.waited_ms || 0) + ' ms</span>' +
+            '<button class="br-btn" data-eng-action="cancel" data-queue-id="' + escHtml(String(e.id)) + '">Cancel</button></div>').join('')
+        : '<span style="color:var(--textMute)">empty (the queue is in-memory and resets on daemon restart)</span>';
+    }
+    if (engines.shim_error) enginesSetMessage('shim: ' + engines.shim_error, 'var(--amber)');
+  } catch (e) {
+    const list = document.getElementById('engines-list');
+    if (list) list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Failed to load engine state.</div>';
+  }
+}
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('[data-eng-action]');
+  if (!btn) return;
+  const action = btn.dataset.engAction;
+  const model = btn.dataset.model || '';
+  try {
+    if (action === 'ensure') {
+      enginesSetMessage('ensuring ' + model + '…');
+      const r = await enginesPost('/api/engines/ensure', { model: model });
+      enginesSetMessage(r.ok ? 'ready at ' + (r.body.endpoint || '') : ('failed: ' + ((r.body.error && r.body.error.message) || r.body.error || 'error')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'evict') {
+      const r = await enginesPost('/api/engines/evict', { model: model });
+      enginesSetMessage(r.ok ? 'stopped ' + model : 'evict failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'pin') {
+      const value = window.prompt('Reserved GiB to pin for ' + model, '10');
+      if (value === null) return;
+      const r = await enginesPost('/api/engines/pin', { model: model, reserved_gib: Number(value) });
+      enginesSetMessage(r.ok ? 'pinned ' + model : ('pin failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'unpin') {
+      const r = await enginesPost('/api/engines/unpin', { model: model });
+      enginesSetMessage(r.ok ? 'unpinned ' + model : 'unpin failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'cancel') {
+      const r = await fetch('/api/engines/queue/' + encodeURIComponent(btn.dataset.queueId || ''), { method: 'DELETE' });
+      enginesSetMessage(r.ok ? 'queue entry cancelled' : 'cancel failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'import-preview') {
+      const r = await fetch('/api/engines/import/preview');
+      const j = await r.json().catch(() => ({}));
+      const out = document.getElementById('engines-import-out');
+      if (out) out.textContent = r.ok ? (j.lines || []).join('\n') : (j.error || 'preview failed');
+      enginesSetMessage(r.ok ? (j.would_import + ' model(s) would import') : 'preview failed', r.ok ? 'var(--textMute)' : 'var(--amber)');
+    } else if (action === 'import-apply') {
+      const r = await enginesPost('/api/engines/import/apply', {});
+      enginesSetMessage(r.ok ? ('imported: +' + r.body.added + ' updated ' + r.body.updated + ' unchanged ' + r.body.unchanged) : ('import failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    }
+    if (action !== 'import-preview') await loadEngines();
+  } catch (e) {
+    enginesSetMessage('engine action failed: ' + e, 'var(--amber)');
+  }
+});
+
 </script>
 </body>
 </html>
