@@ -237,6 +237,42 @@ verb fires with zero settle after `/health`) and
 `sigterm_during_boot_does_not_orphan_plugin_children` (3 SIGTERM-during-boot
 rounds; scans for surviving fixture children).
 
+## Step 9 (roles review pass)
+
+- B1 (systematic, found by the L3 migration test's double-boot keeper): a
+  v1 config without a `bonsai:` block re-migrated on EVERY boot (cards
+  reset to the stale v1 profile, snapshots per boot). Fixed: the
+  migrated YAML always carries `decision_model:` (no bonsai ⇒ the
+  parity anchor `enabled: false, kind: heuristic`), snapshots moved to
+  one stable directory per phase, p3 snapshot captures `role_cards.json`
+  (restore rolls cards back), migrated YAML written atomically. Unit
+  coverage: `p3_without_bonsai_block_is_one_shot`.
+- B2: the prompt-rewrite gate now requires the decision slot enabled
+  (any kind); the HTTP health probe guards only the bonsai profile.
+  The heuristic anchor (decision off) keeps the v1 deny behavior.
+- I1: bridge `review` commands (Discord/Signal) set and read the review
+  role card (`/api/roles/set` + `/api/roles`); the old
+  `/api/review-config` posts used removed `forced_*` keys.
+- I2/I3: dashboard scope dropdown + model datalist escape option text;
+  the session review label shows the card snapshot (`review_selector`)
+  instead of the removed `forced_mode` fields.
+- I4: the per-request grace clock is a task-local
+  (`Router::scope_clock_scope`) — concurrent connections on the shared
+  Router can no longer clear each other's window.
+- I5: `brainrouter_bestpractice.md` (preset chooser, `routing-mode`,
+  `sync-omp`, `forced_mode` recipe) and the review docs moved to
+  cards/decision slot; UPGRADE documents the stable snapshot layout.
+- I6: Decisions panel gained the slot summary and a feature probe
+  (`GET /api/decision/features` — excerpt-free); the Credentials tab's
+  audit is real (`POST /api/credentials/audit`: masked records + grant
+  consumers); the proxy fast-fail contract (502 within 15 s, deferred-200
+  beyond) is recorded in the design doc; this log's "gate never edited"
+  line carries the honest plumbing-edit correction.
+- Nits: `peer_cwd` table scan unit tests (incl. the ephemeral-port
+  collision case), migrated-YAML atomic write, credential `--value`
+  argv-exposure documented, scoped-card hint refreshed on
+  replace/remove, `prepare_uds_path` ENOTDIR is a clean startup error.
+
 ## Flake fixed during verification
 
 `l3_webhook_features_no_excerpt_returns_decision` (and once
