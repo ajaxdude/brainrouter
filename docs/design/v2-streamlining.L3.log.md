@@ -226,7 +226,7 @@ parallel load (all in src/, no test changes):
      request, the probe walk runs on the request task (the default
      blocking pool saturates under suite load), and the window accounting
      charges queue time. Unresolvable cwds return instantly; the ceiling
-     (30 s) covers the kernel's `/proc/<pid>/cwd` republication after a
+     (120 s) covers the kernel's `/proc/<pid>/cwd` republication after a
      CLI chdir, which is unbounded under load.
 4. **ENOTDIR on a deleted state dir** during `prepare_uds_path` is now a
    clean startup error (previously a noisy startup-time crash variant).

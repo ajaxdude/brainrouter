@@ -20,20 +20,35 @@ use std::net::{IpAddr, SocketAddr};
 /// completely different process's LISTEN socket, and the inode of that
 /// socket yields the wrong process's cwd (the source of the project-scope
 /// flakes). Matching (local port, remote ip, remote port) identifies the
-/// client socket uniquely.
+/// client socket uniquely; the row's remote IP field is compared too, so a
+/// same-port row from a connection to a DIFFERENT host's daemon-port cannot
+/// win the scan (Bruce r2 nit 1).
 pub fn peer_cwd(peer_addr: &SocketAddr, local_addr: &SocketAddr) -> Option<String> {
     let peer_port = peer_addr.port();
     let local_port = local_addr.port();
+    let rem_hex = kernel_hex_addr(&local_addr.ip());
 
     let inode = match peer_addr.ip() {
         IpAddr::V4(_) => {
-            find_inode_for_client_port(peer_port, local_port, "/proc/net/tcp")
+            find_inode_for_client_port(peer_port, local_port, &rem_hex, "/proc/net/tcp")
         }
         IpAddr::V6(_) => {
-            find_inode_for_client_port(peer_port, local_port, "/proc/net/tcp6")
+            find_inode_for_client_port(peer_port, local_port, &rem_hex, "/proc/net/tcp6")
         }
     }?;
     find_cwd_for_inode(inode)
+}
+
+/// Encode an IP the way the kernel prints it in /proc/net/tcp{,6}: one
+/// little-endian u32 per 4-byte group, uppercase hex, no separators.
+fn kernel_hex_addr(ip: &IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("{:08X}", u32::from_le_bytes(v4.octets())),
+        IpAddr::V6(v6) => v6.octets()
+            .chunks(4)
+            .map(|g| format!("{:08X}", u32::from_le_bytes(g.try_into().unwrap())))
+            .collect(),
+    }
 }
 
 /// Resolve the cwd of a process given its PID.
@@ -46,13 +61,14 @@ pub fn cwd_from_pid(pid: i32) -> Option<String> {
 }
 
 /// Scan /proc/net/tcp (or tcp6) for the row where local_port == client_port
-/// AND remote == the daemon's listening socket. Returns the socket inode.
-fn find_inode_for_client_port(client_port: u16, local_port: u16, path: &str) -> Option<u64> {
+/// AND remote == the daemon's listening socket (IP hex AND port). Returns
+/// the socket inode.
+fn find_inode_for_client_port(client_port: u16, local_port: u16, rem_hex: &str, path: &str) -> Option<u64> {
     let data = std::fs::read_to_string(path).ok()?;
-    find_inode_in_table(client_port, local_port, &data)
+    find_inode_in_table(client_port, local_port, rem_hex, &data)
 }
 
-fn find_inode_in_table(client_port: u16, daemon_port: u16, data: &str) -> Option<u64> {
+fn find_inode_in_table(client_port: u16, daemon_port: u16, rem_hex: &str, data: &str) -> Option<u64> {
     for line in data.lines().skip(1) {
         // Fields are whitespace-separated; split_ascii_whitespace handles variable spacing.
         let mut cols = line.split_ascii_whitespace();
@@ -72,8 +88,11 @@ fn find_inode_in_table(client_port: u16, daemon_port: u16, data: &str) -> Option
         // and v6 (32-hex:PPPP) rows alike.
         let row_remote_port = rem_addr.rsplit(':').next()?;
         let row_remote_port = u16::from_str_radix(row_remote_port, 16).ok()?;
-
-        if row_local_port == client_port && row_remote_port == daemon_port {
+        let row_remote = rem_addr.rsplit(':').nth(1)?; // ip-hex part (v4 8 hex; v6 32 hex)
+        if row_local_port == client_port
+            && row_remote_port == daemon_port
+            && row_remote.eq_ignore_ascii_case(rem_hex)
+        {
             // Skip: st, tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout.
             for _ in 0..6 {
                 cols.next()?;
@@ -135,7 +154,7 @@ mod tests {
         let table = format!(
             "{HEADER}   0: 0100007F:C350 0100007F:238B 01 00000000:00000000 02:00000000 00000000  1000 0 424242 2 0000000000000000\n"
         );
-        assert_eq!(find_inode_in_table(0xC350, 0x238B, &table), Some(424242));
+        assert_eq!(find_inode_in_table(0xC350, 0x238B, "0100007F", &table), Some(424242));
     }
 
     #[test]
@@ -144,7 +163,10 @@ mod tests {
         let table = format!(
             "{HEADER}  12: 00000000000000000000000001000000:ABCD 00000000000000000000000001000000:1F90 01 00000000:00000000 00:00000000 00000000  1000 0 987654 1 0000000000000000\n"
         );
-        assert_eq!(find_inode_in_table(0xABCD, 0x1F90, &table), Some(987654));
+        assert_eq!(
+            find_inode_in_table(0xABCD, 0x1F90, "00000000000000000000000001000000", &table),
+            Some(987654)
+        );
     }
 
     #[test]
@@ -152,7 +174,7 @@ mod tests {
         let table = format!(
             "{HEADER}   0: 0100007F:C350 0100007F:238B 01 00000000:00000000 02:00000000 00000000  1000 0 424242\n"
         );
-        assert_eq!(find_inode_in_table(0xC351, 0x238B, &table), None);
+        assert_eq!(find_inode_in_table(0xC351, 0x238B, "0100007F", &table), None);
     }
 
     #[test]
@@ -163,6 +185,27 @@ mod tests {
             "{HEADER}   0: 0100007F:4444 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 111111 1 0000000000000000\n\
                 1: 0100007F:4444 0100007F:1F90 01 00000000:00000000 02:00000000 00000000  1000 0 222222 2 0000000000000000\n"
         );
-        assert_eq!(find_inode_in_table(0x4444, 0x1F90, &table), Some(222222));
+        assert_eq!(find_inode_in_table(0x4444, 0x1F90, "0100007F", &table), Some(222222));
+    }
+
+    #[test]
+    fn same_port_different_remote_ip_does_not_match() {
+        // Bruce r2 nit 1: a row for a connection to ANOTHER host's daemon
+        // port (same port, different remote IP) must not win the scan.
+        let table = format!(
+            "{HEADER}   0: 0100007F:4444 0200007F:1F90 01 00000000:00000000 02:00000000 00000000  1000 0 111111 1 0000000000000000\n\
+                1: 0100007F:4444 0100007F:1F90 01 00000000:00000000 02:00000000 00000000  1000 0 222222 2 0000000000000000\n"
+        );
+        assert_eq!(find_inode_in_table(0x4444, 0x1F90, "0100007F", &table), Some(222222));
+    }
+
+    #[test]
+    fn kernel_hex_addr_matches_proc_format() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(kernel_hex_addr(&v4), "0100007F");
+        let v4b: IpAddr = "192.168.1.10".parse().unwrap();
+        assert_eq!(kernel_hex_addr(&v4b), "0A01A8C0");
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(kernel_hex_addr(&v6), "00000000000000000000000001000000");
     }
 }

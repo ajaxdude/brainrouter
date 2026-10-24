@@ -1100,36 +1100,6 @@ function statusPill(status) {
   return `<span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:99px;font-size:11px;background:${x.c}20;color:${x.c};border:1px solid ${x.c}40;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${dot}${x.l}</span>`;
 }
 
-// ─── Mini flow HTML ───────────────────────────────────────────────────────────
-function miniFlowNode(label, color, sub) {
-  return `<div style="display:flex;align-items:center;gap:6px;padding:5px 9px;border-radius:6px;background:${color}14;border:1px solid ${color}40;color:${color}">
-    <span style="width:5px;height:5px;border-radius:99px;background:${color};box-shadow:0 0 5px ${color};flex-shrink:0"></span>
-    <span style="font-size:11px;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px">${label}</span>
-    ${sub ? `<span style="color:var(--textMute);font-size:10px">${sub}</span>` : ''}
-  </div>`;
-}
-
-function miniFlowArrow() {
-  return `<span style="color:var(--textMute);font-size:11px">→</span>`;
-}
-
-function miniFlowHtml(t) {
-  const src = SOURCES[t._source] || SOURCES.local;
-  const routeColor = (t._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
-  const modelColor = (t._route || '').includes('cloud') ? '#9d7bff' : '#3ec5ff';
-  const modelLabel = t._displayModel || '—';
-
-  let nodes = [miniFlowNode(src.label, src.color)];
-  nodes.push(miniFlowArrow());
-  nodes.push(miniFlowNode(modelLabel, modelColor, (t._route || '').includes('cloud') ? 'cloud' : 'local'));
-  if (t._session) {
-    const rev = t._session.review_model || '—';
-    nodes.push(miniFlowArrow());
-    nodes.push(miniFlowNode('rev: ' + rev, '#f5b14a'));
-  }
-  return `<div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">${nodes.join('')}</div>`;
-}
-
 // ─── Review section HTML ──────────────────────────────────────────────────────
 function parseReviewTurn(raw, fallbackIndex) {
   const match = String(raw || '').match(/^Iteration\s+(\d+):\nStatus:\s*([^\n]+)\nFeedback:\s*([\s\S]*)$/);

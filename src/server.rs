@@ -974,42 +974,32 @@ async fn handle_request_inner(
         ("POST", "/api/credentials/audit") => {
             // v2 L3 Step 9 I6: a usage audit — every masked record plus the
             // plugins (grants consumers) that reference it. No plaintext,
-            // ever: records are the store's own masked shape.
+            // ever: records are the store's own masked shape. Consumers are
+            // the credential record's OWN grants (plugin ids) intersected
+            // with registered plugin ids — NOT the manifests' RPC-method
+            // grants (disjoint vocabularies; Bruce r2 Finding 1).
             let plugins = state.plugins.list().unwrap_or_default();
+            let plugin_ids: Vec<String> = plugins
+                .iter()
+                .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect();
             let mut audit = state
                 .credentials
                 .list_masked()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|r| {
-                    let id = r
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let consumers: Vec<String> = plugins
-                        .iter()
-                        .filter(|c| {
-                            c.get("grants")
-                                .and_then(|g| g.as_array())
-                                .map(|arr| {
-                                    arr.iter().any(|g| {
-                                        g.as_str()
-                                            .map(|grant| {
-                                                grant == id || grant.starts_with(&format!("{id}:"))
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                })
-                                .unwrap_or(false)
+                    let consumers: Vec<String> = r
+                        .get("grants")
+                        .and_then(|g| g.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|g| g.as_str())
+                                .filter(|g| plugin_ids.iter().any(|p| p == g))
+                                .map(str::to_string)
+                                .collect()
                         })
-                        .map(|c| {
-                            c.get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        })
-                        .collect();
+                        .unwrap_or_default();
                     let mut v = r;
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert("consumers".into(), serde_json::json!(consumers));
@@ -1037,7 +1027,7 @@ async fn handle_request_inner(
 
         // v2 L3 Step 9 I6: the Decisions panel's feature summary (what the
         // slot sees per request shape; excerpt-free).
-        ("GET", "/api/decision/features") => {
+        ("POST", "/api/decision/features") => {
             #[derive(serde::Deserialize)]
             struct FeaturesProbe {
                 #[serde(default)]
@@ -4480,9 +4470,7 @@ pub async fn run_with_listeners(
             match tcp_listener.accept().await {
                 Ok((stream, addr)) => {
                     info!("New TCP connection from {}", addr);
-                    let local_addr = stream
-                        .local_addr()
-                        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+                    let local_addr = stream.local_addr().ok();
                     let io = TokioIo::new(stream);
                     let state = tcp_state.clone();
                     // Resolve the cwd of the connecting OMP process once per
@@ -4493,7 +4481,13 @@ pub async fn run_with_listeners(
                     // burned the project-scope grace window before the
                     // first probe ran (the scope flakes). The /proc scans
                     // are a few reads of hot pseudo-files.
-                    let conn_cwd = peer_cwd(&addr, &local_addr).unwrap_or_default();
+                    // Bruce r2 nit 2: a local_addr() error skips the scan
+                    // entirely (empty cwd) — a port-0 fallback would match
+                    // LISTEN rows, the exact collision class removed.
+                    let conn_cwd = local_addr
+                        .as_ref()
+                        .and_then(|la| peer_cwd(&addr, la))
+                        .unwrap_or_default();
                     tokio::spawn(async move {
                         if let Err(e) = http1::Builder::new()
                             .serve_connection(io, service_fn(move |req| handle_request(req, state.clone(), conn_cwd.clone(), addr, None)))
