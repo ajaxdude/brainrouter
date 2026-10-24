@@ -254,6 +254,14 @@ absent (`src/cli.rs`). 10 consecutive full-suite runs: 20/20.
   failures; the L2/L3 suites' deferred-stream keepalive tests pass
   unchanged — they exercise the slow path).
 - Migration p3 runs BEFORE p2 so `restore v2.0-p3` is byte-exact v1.
+- v2 L3 Step 9 B1: a v1 config WITHOUT a `bonsai:` block now also gets a
+  `decision_model:` section (the parity anchor: `enabled: false`,
+  `kind: heuristic`) — without it the p3 guard re-ran the migration on
+  EVERY boot (cards reset to the stale v1 profile, per-boot snapshots).
+  Snapshots are one directory per phase (`state/brainrouter/migrations/
+  <phase>/` — a stable path, not per-boot timestamps; the legacy
+  timestamped layout stays readable for restore); p3's snapshot now
+  includes `role_cards.json` so restore rolls the cards back too.
 - Launch-backend GGUF validation applies only when `launch:` is present
   (externally-managed classifier endpoints load clean).
 - `PluginKind` without the plugin subsystem degrades to heuristic.
