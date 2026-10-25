@@ -1,5 +1,11 @@
 # brainrouter
 
+> **⚠️ Under heavy development.** The v2 program (role cards, decision slot, plugins,
+> credentials store, swap supervisor, distributed roles) is landing leg by leg. Expect
+> breaking changes to configuration, CLI, and HTTP surfaces between releases; every
+> migrating release ships automatic config migration with a named restore point
+> (`brainrouter migration restore <phase>`), and v1-era configs keep booting.
+
 <p align="center">
   <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
 </p>
@@ -28,13 +34,13 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 - **Role cards.** Assign Main, Review, and Subagent cards from one selector grammar (`auto | local | cloud | cloud/<id> | <bare-key>`), globally or per Git repository; unpinned projects inherit the global card. `auto` runs the pluggable decision slot (heuristic / OpenAI-compatible / structured-schema / webhook / plugin) with privacy/quality guardrail clamps. Legacy `auto`, `local`, `cloud`, and `subs` aliases remain supported. Cloud and the decision model stay off by default.
 - **Off by default, opt in.** Fresh installs run fully local with a single hop — no Bonsai model download, no Manifest stack, no cloud API key required.
 
-- **Optional local prompt rewriting.** Managed local routes can use a lean system prompt. Rewriting is off at startup, requires a running healthy Bonsai to enable through the control API, and never rewrites explicit local model selections.
+- **Optional local prompt rewriting.** Managed local routes can use a lean system prompt. Rewriting is off at startup, requires the decision slot to be enabled (any brain; the Bonsai classifier profile additionally needs a healthy server), and never rewrites explicit local model selections.
 - **Subs pool routing.** `subs` / `brainrouter/subs` selects the separate local pool (initially `llama_swap.subs_model`). The pool is independent of Main and Reviewer; clearing it restores classifier/auto behavior, not the Main override.
 - **Manifest cloud failover.** When Manifest is enabled, `cloud` traffic goes through it (runs locally in Docker, picks the cloud provider) and falls back to llama-swap's `fallback_model` on failure.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). Runtime toggles control whether review runs, whether PR-structuring guidance is injected into agent requests, and whether HankNDory design-aware review must compare the diff with an approved design. The reviewer prompt is budgeted against a conservative local/cloud context window before any LLM call.
-- **Dashboard.** Overview, Models, Benchmarks, and Config are the primary destinations. A command strip keeps model scope/role controls, flush/restart/sync actions, health, and quality posture visible at `http://127.0.0.1:9099`.
+- **Dashboard.** Overview, Models, Roles, Credentials, Decisions, Benchmarks, and Config are the primary destinations. A command strip keeps model scope and card controls, flush/restart actions, health, and quality posture visible at `http://127.0.0.1:9099`.
 - **Benchmark explorer.** Import reproducible model/runtime/hardware results, compare throughput, memory, context scaling, quantizations, runtimes, speculation, and quality, inspect configurations, and export filtered CSV or JSONL at `http://127.0.0.1:9099/benchmarks`.
-- **Headless CLI.** `brainrouter cli` covers status, operations, routing profiles, and reviews. Use HTTP for benchmark and observability workflows without a dedicated CLI command. See [Headless CLI](#headless-cli-brainrouter-cli).
+- **Headless CLI.** `brainrouter cli` covers status, operations, role cards, credentials, plugins, migrations, and reviews. Use HTTP for benchmark and observability workflows without a dedicated CLI command. See [Headless CLI](#headless-cli-brainrouter-cli).
 - **Model observability.** `/models` shows exact local model activity, available metadata, uniquely correlated completed measurements, indicative rolling warnings, and explicit benchmark references. Missing measurements and unverified comparability are visible, not fabricated.
 - **VRAM control.** The dashboard or CLI can stop/start the Bonsai classifier and flush every model loaded in llama-swap — reclaim GPU memory without a reboot or a terminal.
 - **In-flight request tracker.** The dashboard shows every active request as it runs — elapsed, model, user agent, address, session, bytes received, PP progress, and a live activity label (tool calling / reasoning / asking a multiple choice question / generating) — with a per-row Cancel button. No need to open the llama-swap UI.
@@ -73,6 +79,40 @@ explicit boundary between shipped and future work.
 ---
 
 ## Install
+
+### From a clone — any Linux, single user
+
+Requirements: Rust (stable), an OpenAI-compatible local model server (llama-swap,
+llama-server, or any other), and optionally Docker+Manifest for cloud. No root needed.
+
+```bash
+git clone https://github.com/ajaxdude/brainrouter && cd brainrouter
+cargo build --release
+mkdir -p ~/.config/brainrouter
+cp brainrouter.example.yaml ~/.config/brainrouter/brainrouter.yaml   # edit model endpoints
+./target/release/brainrouter install omp --yes                       # point your harness at :9099
+./target/release/brainrouter serve --config ~/.config/brainrouter/brainrouter.yaml
+```
+
+Then point any harness at `http://127.0.0.1:9099/v1` (OpenAI) or `/v1/messages`
+(Anthropic) with model `brainrouter/auto` (role cards decide) or an explicit selector
+(`local`, `cloud`, `cloud/<id>`, a model key). For autostart, a systemd **user** service:
+
+```ini
+# ~/.config/systemd/user/brainrouter.service
+[Unit]
+Description=brainrouter
+[Service]
+ExecStart=%h/brainrouter/target/release/brainrouter serve --config %h/.config/brainrouter/brainrouter.yaml
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now brainrouter
+```
+
+### Fedora fleet — multi-user one script
 
 For Fedora Linux with multiple users, one script installs and configures everything.
 Run it as a user with sudo access:
