@@ -70,9 +70,17 @@ test('primary nav has four destinations plus Models subtabs and external Model a
   assert.equal(count(/id="nav-server-mode"/g), 0, 'Server Mode must not remain a primary nav item');
 });
 
+// v2 L3 retarget (spec: "Removals: routing_profile … dashboard role-chooser/
+// preset widgets" + "Add: role cards panel (3 cards selector pickers +
+// per-project) … policy chips"): the relocated strip controls are now the
+// card strip + policy chips; the nudge/review/bridge controls are unchanged.
 test('relocated controls retain ids and onclick handlers', () => {
-  for (const id of ['routing-preset','main-backend','main-model','reviewer-backend','reviewer-model','reviewer-model-select','subagent-model-select','save-routing-profile','routing-profile-message','routing-model-errors','routing-saved','routing-last-actual','routing-hint']) requireOneId(id);
-  assertOnclick('save-routing-profile', 'saveRoutingProfile()');
+  for (const id of ['role-scope','card-main','card-review','card-subagent','card-model','save-cards','roles-message',
+    'chip-privacy-cloud-ok','chip-privacy-local-only','chip-quality-fast','chip-quality-balanced','chip-quality-maximum',
+    'credentials-panel','decision-panel']) requireOneId(id);
+  assertOnclick('save-cards', 'saveRoleCards()');
+  assertOnclick('chip-privacy-local-only', "setPrivacy('local-only')");
+  assert.equal(count(/id="routing-preset"|id="save-routing-profile"/g), 0, 'v1 preset widgets removed');
   assertOnclick('toggle-nudge', 'toggleNudge()');
   assertOnclick('tier-auto', "setNudgeTier('auto')");
   assertOnclick('tier-light', "setNudgeTier('light')");
@@ -81,11 +89,12 @@ test('relocated controls retain ids and onclick handlers', () => {
   assertOnclick('toggle-prguidelines', 'togglePrGuidelines()');
   assertOnclick('toggle-hankndory', 'toggleHankndory()');
   assertOnclick('toggle-rewrite', 'togglePromptRewrite()');
-  assertOnclick('toggle-discord', "toggleBridge('discord')");
-  assertOnclick('toggle-signal', "toggleBridge('signal')");
+  // Bridge toggles left the dashboard with v2 L2 (plugin bridge replaced the
+  // direct Discord/Signal toggles); the stale assertions (red since that leg)
+  // are removed — the integrations-settings section id is checked below.
   for (const id of ['toolbox-list','cockpit-config-status','service-controls','quality-settings','integrations-settings','toolbox-management','review-ledger','review-hankndory-state']) requireOneId(id);
   for (const svc of ['llama-swap','llama-cpp','manifest','brainrouter']) assert.ok(html.includes(`restartService('${svc}')`), `${svc} restart missing`);
-  assert.ok(html.includes('onclick="syncModels()"'));
+  assert.ok(!html.includes('syncModels'), 'sync-omp removed (four points)');
   assert.ok(html.includes('onclick="flushModels()"'));
   assert.ok(html.includes('upgradeToolboxAll()'));
 });

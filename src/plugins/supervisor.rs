@@ -69,6 +69,12 @@ pub(crate) async fn supervisor_loop(inner: Arc<Inner>, id: String, mut rx: mpsc:
             }
         };
         let started = tokio::time::Instant::now();
+        // Shutdown-sweep ledger: record the pid as the SECOND operation
+        // (after the process exists), so shutdown() can always find and kill
+        // a child whose supervisor slips past the shutdown enumeration.
+        if let Some(pid) = child.id() {
+            super::register_child_pid(&inner, &id, pid);
+        }
         set_running(&inner, &id, child.id());
         // Monitor: child exit vs stop command.
         let outcome: Result<std::process::ExitStatus, StopReason> = loop {
@@ -305,6 +311,7 @@ fn finish(inner: &Arc<Inner>, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{register_child_pid, PluginManager};
 
     #[test]
     fn backoff_caps_at_60s() {
@@ -318,5 +325,35 @@ mod tests {
     #[test]
     fn crash_limit_is_five() {
         assert_eq!(CRASH_LIMIT, 5);
+    }
+
+    #[test]
+    fn sweep_ledger_records_spawned_pids() {
+        // The shutdown sweep reads `last_pids`; every spawn must land
+        // there, keyed by plugin id (boot-spawn race orphan guard).
+        let tmp = std::env::temp_dir().join(format!(
+            "br-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pm = PluginManager::new_at(
+            std::sync::Arc::new(
+                crate::credentials::CredentialStore::load(tmp.join("credentials.json")).unwrap(),
+            ),
+            tmp.join("state"),
+            tmp.join("run"),
+        )
+        .unwrap();
+        let inner = pm.inner.clone();
+        register_child_pid(&inner, "rayalive", 424242);
+        assert_eq!(*inner.last_pids.lock().unwrap().get("rayalive").unwrap(), 424242);
+        // Re-registration (restart) overwrites the dead pid with the live one.
+        register_child_pid(&inner, "rayalive", 424243);
+        assert_eq!(*inner.last_pids.lock().unwrap().get("rayalive").unwrap(), 424243);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

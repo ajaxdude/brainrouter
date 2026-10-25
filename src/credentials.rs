@@ -204,10 +204,7 @@ impl CredentialStore {
                         tracing::warn!(path = %path.display(), quarantined = %moved.display(),
                             error = %e,
                             "credentials store was corrupt; quarantined, booting with an empty store");
-                        (Self::load(path).map(|mut s| {
-                            // fresh empty store at the ORIGINAL path
-                            s
-                        }), Some(moved))
+                        (Self::load(path), Some(moved))
                     }
                     Err(ren) => (
                         Err(e.context(format!(

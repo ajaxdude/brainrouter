@@ -162,6 +162,18 @@ pub(crate) async fn serve_connection(inner: Arc<Inner>, plugin_id: String, strea
                 continue;
             }
         };
+        // Response frame to a server-initiated request (protocol v2,
+        // `decision.classify`): has result/error, no method. Route it to the
+        // pending correlation map instead of treating it as a request.
+        let is_response = msg.get("method").is_none()
+            && (msg.get("result").is_some() || msg.get("error").is_some());
+        if is_response {
+            let manager = PluginManager::from_inner(inner.clone());
+            if !manager.resolve_pending(&plugin_id, &msg) {
+                debug!(plugin = %plugin_id, "unmatched plugin response frame dropped");
+            }
+            continue;
+        }
         let Some(id) = msg.get("id").cloned() else {
             let _ = out_tx.send(rpc_error(
                 Value::Null,
@@ -196,13 +208,17 @@ pub(crate) async fn serve_connection(inner: Arc<Inner>, plugin_id: String, strea
                             })
                             .unwrap_or_default(),
                     );
+                    let negotiated = result
+                        .get("protocol_version")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1) as u32;
                     session = Some(Session {
                         plugin_id: plugin_id.clone(),
                         grants,
                     });
                     let _ = out_tx.send(rpc_result(id, result));
                     // Push notifications only reach authenticated sessions.
-                    manager.register_session(&plugin_id, out_tx.clone());
+                    manager.register_session(&plugin_id, out_tx.clone(), negotiated);
                 }
                 Err(e) => {
                     // Design: "auth failure closes the connection and is
@@ -289,13 +305,28 @@ fn handle_initialize(inner: &Arc<Inner>, socket_plugin: &str, params: &Value) ->
             min_version
         );
     }
-    info!(plugin = %socket_plugin, grants = ?grants, "plugin initialize accepted");
-    Ok(json!({
+    // Protocol negotiation (v2 L3): the plugin declares what it speaks
+    // (`protocol_version`, default 1 = L2 bridge); the daemon answers with
+    // the minimum. v2 adds server-initiated `decision.classify`; the
+    // manifest's `min_daemon_version` keeps a plugin that REQUIRES v2 from
+    // pairing with an old daemon.
+    let requested = params
+        .get("protocol_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .min(u32::MAX as u64) as u32;
+    let negotiated = requested.min(PROTOCOL_VERSION);
+    info!(plugin = %socket_plugin, grants = ?grants, protocol = negotiated, "plugin initialize accepted");
+    let mut result = json!({
         "plugin_id": socket_plugin,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": negotiated,
         "grants": grants,
         "daemon_version": daemon_version(),
-    }))
+    });
+    if negotiated >= 2 {
+        result["server_methods"] = json!(["decision.classify"]);
+    }
+    Ok(result)
 }
 
 async fn dispatch(

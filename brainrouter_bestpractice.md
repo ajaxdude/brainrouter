@@ -106,8 +106,9 @@ Higher budget = better on hard problems, slower. `light` is a good default for a
 
 ## 5. Code review (before you commit)
 
-Reviews route to **cloud** (`review.forced_mode: cloud`) to avoid spinning up a local model
-mid-inference (would thrash memory).
+Reviews route to **cloud** (the review role card: `brainrouter cli roles set
+review cloud`) to avoid spinning up a local model mid-inference (would thrash
+memory). The v1 `review.forced_mode`/`forced_model` YAML keys are gone.
 
 ```
 brainrouter cli review request <taskId> <summary> [--details ...] [--cwd ...]
@@ -126,9 +127,10 @@ brainrouter cli status          # health of all backends
 brainrouter cli inference       # what's loaded, live slot progress
 brainrouter cli models          # auto/local/cloud + llama-swap keys
 brainrouter cli events          # recent per-request routing decisions
-brainrouter cli routing-mode auto|local|cloud   # global override
+brainrouter cli roles get       # role cards (main/review/subagent, scopes)
+brainrouter cli roles set main local            # the v1 "routing-mode" replacement
 brainrouter cli flush-models    # unload loaded models, free memory
-brainrouter cli sync-omp        # push llama-swap models into OMP's models.yml
+# (v2 L3: `sync-omp` is gone — install templates carry one `auto` entry)
 brainrouter cli context         # llama-swap context size
 brainrouter cli restart llama-swap|brainrouter|manifest   # restart a service
 ```

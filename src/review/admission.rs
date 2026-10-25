@@ -124,7 +124,7 @@ pub fn read_meminfo_available_mb() -> Option<u64> {
 /// the whole run when admitted local, or a terminal `blocked` reason.
 pub enum AdmissionResult {
     Admitted {
-        choice: crate::routing_profile::ModelChoice,
+        choice: crate::roles::ModelChoice,
         /// Held for the entire review run when admitted local (bounds
         /// concurrent local reviews); `None` for cloud.
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -141,14 +141,14 @@ pub enum AdmissionResult {
 /// decision is local — so a cloud reviewer never briefly blocks a concurrent
 /// local one. `mem_available_mb` is injected for testability.
 pub fn admit(
-    configured: &crate::routing_profile::ModelChoice,
+    configured: &crate::roles::ModelChoice,
     manifest_enabled: bool,
     fallback_model: &str,
     cfg: &crate::config::ReviewAdmissionConfig,
     permits: &std::sync::Arc<tokio::sync::Semaphore>,
     mem_available_mb: Option<u64>,
 ) -> AdmissionResult {
-    use crate::routing_profile::ModelChoice;
+    use crate::roles::ModelChoice;
     let backend = configured.backend();
     let inputs = |permit_available: bool| AdmissionInputs {
         configured_backend: backend,
@@ -228,7 +228,7 @@ pub struct AdmissionCtx {
 
 impl AdmissionCtx {
     /// Resolve the backend for a run, reading live `/proc/meminfo`.
-    pub fn resolve(&self, configured: &crate::routing_profile::ModelChoice) -> AdmissionResult {
+    pub fn resolve(&self, configured: &crate::roles::ModelChoice) -> AdmissionResult {
         admit(
             configured,
             self.manifest_enabled,
@@ -354,7 +354,7 @@ mod tests {
 
     // ── admit() orchestration (backend decision + permit lifecycle) ──────────
     use crate::config::ReviewAdmissionConfig;
-    use crate::routing_profile::ModelChoice;
+    use crate::roles::ModelChoice;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
 

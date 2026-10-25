@@ -116,6 +116,10 @@ pub struct Session {
     /// Immutable reviewer policy for this session, including continuations.
     #[serde(default)]
     pub review_config: Option<crate::config::ReviewConfig>,
+    /// v2 L3: the review CARD record (assignment selector) this session
+    /// snapshotted at start — continuations reuse it, never re-resolve.
+    #[serde(default)]
+    pub review_selector: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Working directory of the process that started the review.
@@ -140,6 +144,7 @@ impl Session {
             reviewer_type: None,
             review_model: None,
             review_config: None,
+            review_selector: None,
             created_at: now.clone(),
             updated_at: now,
             cwd,
@@ -203,12 +208,20 @@ impl SessionManager {
     ) -> Session {
         let mut session = Session::new(task_id, summary, details, conversation_history, cwd);
         session.review_config = review_config;
+        session.review_selector = None;
         let mut map = self.sessions.lock().unwrap();
         map.insert(session.id.clone(), session.clone());
         session
     }
 
     /// Retrieve a session by ID.
+    /// v2 L3: store the review-card snapshot (selector) taken at start.
+    pub fn set_review_selector(&self, id: &str, selector: &str) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(id) {
+            session.review_selector = Some(selector.to_string());
+        }
+    }
+
     pub fn get_session(&self, id: &str) -> Option<Session> {
         self.sessions.lock().unwrap().get(id).cloned()
     }

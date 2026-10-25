@@ -294,4 +294,12 @@ impl BonsaiControl {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    /// Synchronous liveness view (no HTTP probe): the toggle gate uses this
+    /// for the running check; the async `healthy` probe guards it (a probe
+    /// in an `&&` chain only runs when the server is running, so a stopped
+    /// classifier never reaches the 1 s timeout).
+    pub fn running(&self) -> bool {
+        self.is_running()
+    }
 }

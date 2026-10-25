@@ -1,0 +1,61 @@
+This file is part of the design: the Map lives in `v2-streamlining.md`; this is leg L3's full spec. Version L3-v3 (2026-10-22): round-2 findings F1–F8 folded (pinned strictness per v1 selector semantics, subs pool source, v1-safe unavailable row, migration API citations, review-config survivors, tier→budget map, citation precision).
+
+# Leg L3 in full — One entry + role cards + decision slot + Credentials page
+
+Goal (R4): a harness is configured ONCE to brainrouter; the app owns the model decision. Four subsystems land together: harness one-entry, role cards, the decision-model slot, the Credentials page.
+
+## Role resolution
+
+- Store: `role_cards.json` (0600, atomic — `src/project_pins.rs` machinery) replaces `routing_profile` + `project_pins` via migration (snapshot; `--dry-run`; restore `v2.0-p3`). Records: `assignments`: `{scope: global|<canonical-git-root>, role: main|review|subagent, assignment: <selector string>}` where selector ∈ `auto | local | cloud | cloud/<id> | <bare-key>` — the SAME vocabulary the Selector-vocabulary contract preserves through L7, validated by the relocated selector validator (shared types — `ModelChoice` semantics, `validate_model_id`, `validate_iterations` — move from `src/routing_profile.rs` to `src/roles.rs`). Plus `policy`: `{scope → {privacy: cloud-ok|local-only, quality: fast|balanced|maximum}}`. Lookup: project → global → default (`main: auto`, `review: auto`, `subagent: auto`).
+- v1 → card migration table (exact, no inference): `Auto→auto`; `Local{Some(id)}→<bare-key>`; `Local{None}→local`; `Cloud{None}→cloud`; `Cloud{Some(id)}→cloud/<id>`. Per-project `main`/`reviewer` pins map identically (the owner's cloud-pinned reviewer lands on a `cloud/<id>` card, not re-pinned); `subagent` pin / `subagent_model` → subagent assignment; presets expand through the same table over `RoutingProfile::main`/`reviewer` (preset-constrained per `RoutingProfile::validate`) plus `subagent_model`. A v1 YAML with no `routing:` block migrates main to `local` (v1 default, `src/config.rs` Default for RoutingConfig) — the migration must not shift routing behavior at the boundary.
+- Role signal: `x-brainrouter-role: main|subagent|review` (default `main`). `subs`/`brainrouter/subs` NAMES the subagent role and overrides the header. Resolution: `subs` → subagent CARD (its assignment is the pool: `auto` → decision slot; selector → that route; v1's pool source chain — project subagent pin > `profile.subagent_model` > `config.subs_model` — collapses onto the card, whose migration carries the first two, `config.subs_model` stays as the auto-pool compatibility seed). Other explicit selectors (`local`/`cloud`/`cloud/<id>`/bare) bypass cards (role = header, events label), are NEVER policy-clamped (explicit = owner intent). Otherwise: card assignment compiles through the same selector path — `auto` → decision slot, any other selector → the v1 route for that selector.
+- Pinned-card strictness = v1 semantics PER SELECTOR: `<bare-key>` cards are direct picks — strict, no fallback, error surfaces (subs direct and reviewer strictness tests keep passing); `local` cards keep v1's managed hop (one `fallback_model` retry, `route_local(allow_fallback=true)`); `cloud`/`cloud/<id>` cards keep the managed local-fallback hop EXCEPT role `review`, where v1's role-specific strict rule (no local fallback; failure → escalate) is preserved. Chain fallback across candidates exists ONLY on the `auto` path.
+- Reviewer source-of-truth: the `review` card is the only reviewer-MODEL config. `review.forced_mode`/`forced_model` YAML migrate into it (table above; keys removed, snapshot). `/api/review-config` + CLI `review-config` SURVIVE, schema reduced to the non-model survivors: `max_iterations` (live-mutated, loop-driving) + `hankndory_integration` (seeded from YAML, persisted) now live on the review card record `{assignment, max_iterations, hankndory_integration}`; endpoint/CLI mutate the card via daemon. Session snapshot semantics unchanged (a session snapshots its card record at start, never re-resolves). Admission gates by the card's backend (`configured_backend` derived from the selector string; `auto`/unknown arm unchanged).
+- Review loop calls the router internally with role `review`.
+
+## Decision-model slot
+
+- `src/decision.rs`: `trait DecisionModel { kind(); available(); async classify(RequestFeatures) -> Result<Decision, DecisionError>; }`; `RequestFeatures = {role, selector, privacy, quality, project, msg_count, approx_prompt_tokens, has_tools, code_density, last_user_excerpt}` (excerpt ONLY for model kinds); `Decision = {route, tier, confidence, rationale}`, tier canon `fast|balanced|deep`. Vocabulary map: quality chips `fast→fast, balanced→balanced, maximum→deep`; v1 classifier words `local→fast, deep→deep`; nudge budget: `fast→Light, balanced→Light, deep→Deep` (injection stays in the route_auto local arm, applies to slot-routed locals).
+- `approx_prompt_tokens` = `(bytes+3)/4` on the raw body at route time (precedent `src/benchmark_lab.rs`); L4 replaces with measured data.
+- Kinds (`decision_model.kind`): `heuristic` (default, always available); `openai-compatible` (`{base_url, model, prompt_profile, timeout_ms}`; **Bonsai migrates to exactly this**, `prompt_profile: bonsai` preserving today's prompt + one-word grammar verbatim); `structured-schema` (typed question schema, strict JSON — the Clef contract); `webhook` (`{url}` POST features JSON, NO excerpt); `plugin` (`{plugin_id}`; server-initiated `decision.classify` REQUEST with request-id correlation + `timeout_ms` — a version-negotiated protocol bump at `initialize`, gated by `min_daemon_version`).
+- Failure-path matrix (binding): `prompt_profile: bonsai` — HTTP error, timeout, PARSE fail, empty/missing last message, AND server-down (connection error, v1's single failure mode) ⇒ `route=cloud` `fallback: v1-safe` (availability pre-check does NOT short-circuit the bonsai profile to heuristic — v1 has no pre-check); low confidence (<`min_confidence`, default 0.4) ⇒ heuristic `fallback: heuristic`. Fresh-config kinds (structured-schema/webhook/plugin): any failure incl. unavailable ⇒ heuristic `fallback: unavailable`. Continuity acceptance replays a GOLDEN CORPUS — recorded v1 (prompt, raw classifier word, v1 decision) triples captured from the `v1-classic` binary — over the success corpus + the named failure table.
+- Guardrail clamps (slot decisions only, never explicit selectors): privacy `local-only` ⇒ `route=local`; quality floor raises tier only. Pool-by-ctx applies only when ctx is KNOWN (llama-swap config `parameters.ctx`, read from the config brainrouter already consumes; unknown ctx = ranked last for large requests, clamp not applied, logged); L4's catalog replaces the source.
+- Auto-path selection: pool = llama-swap models (config keys + `/v1/models`) + server-mode identities; filter by route + known-ctx; rank by tier fit (catalog metadata where known); chain = next candidate on CONNECT/response-headline failure only, never mid-stream; `fallback_model` stays as chain seed (logged deprecated).
+- Config: `decision_model: {enabled, kind, base_url?, model?, prompt_profile?, timeout_ms?, plugin_id?, min_confidence}`; `bonsai.*` migrates (`bonsai_server.rs` stays as launch backend). Invariant: prompt-rewrite ⇒ `decision_model.enabled` (any kind; heuristic satisfies), enforced at the same handler.
+
+## Harness one-entry (install)
+
+- Templates (all harnesses): exactly ONE entry (`brainrouter/auto`); per-model listings removed. `sync-omp` deleted at all four points: CLI command, `/api/models/sync-omp` route, CSRF allowlist entry, daemon bootstrap auto-sync task. Bare-id selectors still route (compat).
+
+## Credentials page (L2 store → UI)
+
+- Credentials tab: list (id, kind, grants, created; masked store value), add/edit/delete (id, kind, value|env|file; plugin grant checkboxes), `Test` = BOOLEAN verdict only (record resolves non-empty / env resolves / file readable), usage audit. Writes loopback+CSRF-gated. `credentials.json` format unchanged from L2; L3 adds single-writer-at-daemon as L3's own contract (L2 states atomic owner-only writes).
+
+## Dashboard
+
+- Command strip → policy chips (`privacy`, `quality`; global + per-project, in the `policy` records) + flush + health. Role cards panel: 3 cards × (Auto | cloud | local | pinned model — selector picker) + per-project scope list; review card also shows max_iterations + hankndory_integration. Decisions panel (read-only): role, features summary, decision + rationale, fallback flag, chosen model. Sankey ROUTING: `role → route/tier → model`.
+
+## CLI
+
+- `brainrouter roles get|set <role> <selector> [--project <path>]`, `brainrouter decision show|test <text>`, `brainrouter credential list|add|remove|test <id>` — ALL mutations through the daemon HTTP (routing-profile precedent); daemon-down mutations REFUSE; reads may go direct-state.
+
+## Removals (one-way door)
+
+- `routing_profile.rs` + presets + CLI `routing-profile` + dashboard role-chooser/preset widgets; `sync-omp` (command, route, CSRF entry, daemon bootstrap task); per-model template listings; `project_pins` store (migrated); `review.forced_mode`/`forced_model` YAML keys (migrated; endpoint/CLI survive reduced per above, CSRF entry stays). Shared types relocate to `src/roles.rs`. Proxy selectors, review loop, `bonsai_server.rs` stay.
+
+## Contracts kept
+
+Proxy fast-fail contract (L3 implementation): a routing failure that lands
+within 15 s of the request returns a real HTTP status (502 + JSON error);
+failures after that keep the v1 deferred-200 streaming contract (the client
+sees the stream error), so slow model loads are unchanged.
+
+Selector vocabulary (L7 range; cards emit selector strings); event schema additive (`role`, `decision {route,tier,confidence}`, `rationale`, `decision_fallback`, `chosen_model`; `hop` lands with L6 LAN events); v1 configs boot (routing_profile/pins/bonsai/review-forced migrations — dry-run, snapshot, restore `v2.0-p3`); credentials format unchanged; plugins RPC additive via version-negotiated protocol bump.
+
+## Build order
+
+roles store + shared selector types + migration (cards + policy + review-forced) → decision.rs (trait + heuristic + openai-compatible + bonsai migration + golden-corpus harness) → router role resolution (header, subs alias, per-selector strictness, clamps) → structured-schema/webhook/plugin kinds (+ plugin protocol v2) → auto selection pipeline + chain → CLI (roles/decision/credential via daemon) → Credentials tab → policy chips + role cards + Decisions panel + Sankey node → install one-entry + sync-omp four-point removal → docs.
+
+## Acceptance (Ray)
+
+(1) Resolution matrix: header×card-selector×project-scope×explicit-bypass×subs-names-role×privacy(never clamps explicit, clamps auto). (2) Decision slot: heuristic parity table; bonsai golden corpus (success triples + failure table incl. server-down ⇒ cloud); structured-schema strict; webhook no-excerpt; plugin kind via protocol bump incl. timeout/absent ⇒ heuristic. (3) Credentials UI: CRUD + grants + boolean Test + masked-everywhere audit. (4) One-entry: templates 1 entry; sync-omp four-point grep. (5) Events additive; v1 consumers parse; Sankey renders decision. (6) Migrations exact per table (cloud-pinned reviewer preserved; default-local stays local; subagent + preset expansion rows; review-forced → card; max_iterations/hankndory_integration survive on card; restore round-trip; session snapshot semantics). (7) Strictness per selector: bare-key card surfaces error (no chain); local card retries fallback_model once; cloud card local-fallback hop; reviewer cloud strict + escalates; auto chain connect-only. (8) `cargo test --workspace` + Node + html-js green.

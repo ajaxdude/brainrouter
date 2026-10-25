@@ -1,36 +1,55 @@
-//! Request router.
+//! Request router — role cards, the decision slot, and the v1 selector engine.
 //!
-//! The router is the core of brainrouter. For every incoming request it:
-//!   1. Asks Bonsai (via `Classifier`) whether the query should go to Cloud
-//!      (Manifest) or Local (llama-swap with a specific model).
-//!   2. Dispatches to the chosen backend.
-//!   3. On cloud failure / stall, falls through to llama-swap with the
-//!      configured fallback model.
-//!   4. Wraps the resulting stream in TimeoutStream so a stalled provider
-//!      surfaces as an error instead of hanging the client. KeepaliveStream is
-//!      applied in server.rs where the wire format (OpenAI/Anthropic) is known.
+//! v2 L3 (design `docs/design/v2-streamlining.L3.md`): every proxied request
+//! resolves through ONE grammar.
+//!
+//!   1. Role: the `x-brainrouter-role` header (default `main`); the `subs`
+//!      selector NAMES the subagent role and overrides the header.
+//!   2. Cards: a non-explicit selector consults the role card
+//!      (project scope > global > default `auto`). Explicit selectors
+//!      (`local`/`cloud`/`cloud/<id>`/bare-id) bypass cards and are NEVER
+//!      policy-clamped — explicit = owner intent.
+//!   3. The card assignment compiles through the SAME selector path: `auto`
+//!      runs the decision slot (features → {route, tier} with guardrail
+//!      clamps, then a candidate pool + chain), every other selector routes
+//!      through the v1 route for that selector.
+//!   4. Pinned-card strictness = v1 semantics PER SELECTOR: bare-key cards
+//!      are direct picks (strict, no fallback, the error surfaces); `local`
+//!      cards keep the managed one-`fallback_model`-retry hop;
+//!      `cloud`/`cloud/<id>` cards keep the managed local-fallback hop EXCEPT
+//!      for role `review`, where v1's role-specific strict rule (failure
+//!      surfaces → the review loop escalates) is preserved. Chain fallback
+//!      across pool candidates exists ONLY on the `auto` path, on
+//!      connect/response-headline failure — never mid-stream.
+//!
+//! On success the resulting stream is wrapped in `TimeoutStream` so a stalled
+//! provider surfaces as an error instead of hanging the client. KeepaliveStream
+//! is applied in server.rs where the wire format (OpenAI/Anthropic) is known.
 
 use crate::{
-    classifier::{BudgetTier, Classifier, RoutingDecision},
+    classifier::BudgetTier,
     config::NudgeBudgets,
+    decision::{DecisionSlot, RequestFeatures, Route as SlotRoute, Tier as SlotTier},
     health::HealthTracker,
     inference_state::{InferenceTracker, Phase},
-    project_pins::{ProjectPin, ProjectPinStore},
     prompt_rewriter,
     provider::{openai::OpenAiProvider, Provider, ProviderResponse},
+    roles::{parse_selector, project_root_of, Role, RoleCardStore, Selector},
     routing_events::{CompletedStreamMeasurement, RouteEvent, RoutingEvents, Stage},
-    routing_profile::{ModelChoice, ProfileStore},
     serving_identity::{ServingIdentity, ServingIdentityRegistry},
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
 use anyhow::{anyhow, Result};
 use futures_util::{stream as fstream, StreamExt};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{sync::Arc, time::{Duration, Instant}};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::server::ScopeClock;
 
 /// Maximum time to wait for the first SSE byte from a provider.
 /// Long prompts (37k+ tokens) can spend 7+ minutes in prefill at ~85 tok/s;
@@ -43,12 +62,33 @@ const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Provider health-tracker keys. Used for circuit breaking.
 const MANIFEST_KEY: &str = "manifest";
 const LLAMA_SWAP_KEY: &str = "llama-swap";
+/// Requests above this approximate token count get the known-ctx pool ranking
+/// (L3 "pool-by-ctx applies … for large requests"). Below it every candidate
+/// is presumed to fit and the configured order stands.
+const LARGE_REQUEST_TOKENS: u64 = 4096;
+
+/// The additive event record of the decision slot for one request (L3:
+/// `decision {route, tier, confidence}` + `rationale` + `decision_fallback`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotEvent {
+    pub decision: DecisionEvent,
+    pub rationale: String,
+    pub decision_fallback: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionEvent {
+    pub route: &'static str,
+    pub tier: &'static str,
+    pub confidence: f64,
+}
 
 /// Summary of what actually happened during a route call.
 /// Returned alongside the response so callers (e.g. review loop) can
 /// record which model handled the request.
 pub struct RouteInfo {
-    /// "cloud" or "local" — the Bonsai classification.
+    /// "cloud" or "local" — the Bonsai classification (kept verbatim for
+    /// v1 consumers).
     pub bonsai_decision: &'static str,
     /// The backend that served the response, or None on error.
     pub effective_provider: Option<String>,
@@ -86,36 +126,75 @@ impl RouteInfo {
     }
 }
 
+/// Inputs of one resolved route (everything the dispatch and events need).
+struct Resolution {
+    /// The header role (the event label; `subs` overrides to `subagent`).
+    role: Role,
+    /// The selector the request will compile through (card assignment for
+    /// managed selectors; the request selector for explicit ones).
+    target: Selector,
+    /// Canonical project scope (the peer-cwd git root), when resolvable.
+    project: Option<String>,
+    /// True when the REQUEST selector was `subs` (names the subagent role and
+    /// keeps the v1 subs-pool behavior: the pool is `subs_model`).
+    /// Read in `route_resolved`'s Auto arm; the explicit-bypass bookkeeping
+    /// lives in `target` (the request selector itself).
+    via_subs: bool,
+    /// True only on the PROXY path with role=review (card cloud selector +
+    /// review role ⇒ the pinned v1 role-specific strict rule). Review-loop
+    /// calls carry the strictness in `allow_local_fallback` (v1 H3) and must
+    /// not be double-strict.
+    proxy_review_strict: bool,
+}
+
+tokio::task_local! {
+    /// The UDS request's grace clock (`None` for TCP/Router-level callers,
+    /// whose grace window starts at the request itself).
+    static REQUEST_SCOPE_CLOCK: Option<Arc<ScopeClock>>;
+}
+
 pub struct Router {
-    classifier: Arc<Classifier>,
+    slot: Arc<DecisionSlot>,
+    cards: Arc<RoleCardStore>,
     manifest: Arc<OpenAiProvider>,
     manifest_enabled: bool,
     llama_swap: Arc<OpenAiProvider>,
     fallback_model: String,
-    /// Model keys known to belong to llama-swap. Requests for these bypass Bonsai.
+    /// Model keys known to belong to llama-swap. Requests for these bypass the slot.
     local_models: Vec<String>,
-    /// Subs-pool model key for `subs`/`brainrouter/subs` requests.
+    /// Subs-pool model key — the `auto`-path compatibility seed for the
+    /// subagent pool (v1 `llama_swap.subs_model`; the card assignment wins).
     subs_model: Option<String>,
     health: Arc<HealthTracker>,
     routing_events: Arc<RoutingEvents>,
+    /// Last project-scope resolution latency (ms): 0 = instant (resolved on
+    /// the first probe — the normal case). Diagnostics for the peer-cwd
+    /// scope race; exposed on `/api/decision`.
+    scope_lookup_ms: std::sync::atomic::AtomicU64,
     /// Optional custom system prompt for local routing mode.
     local_system_prompt: Option<String>,
     /// Dashboard inference progress tracker.
     pub inference_tracker: Arc<InferenceTracker>,
     /// Reasoning budgets per tier (nudge). Injected as
-    /// `reasoning_budget_tokens` on auto-routed local requests when nudge is on.
+    /// `reasoning_budget_tokens` on slot-routed local requests when nudge is on.
     nudge_budgets: NudgeBudgets,
     /// Runtime nudge master switch (shared with dashboard).
     nudge_enabled: Arc<AtomicBool>,
-    /// Runtime nudge tier override: 0 = auto (Bonsai), 1 = light, 2 = deep.
+    /// Runtime nudge tier override: 0 = auto (slot), 1 = light, 2 = deep.
     nudge_tier: Arc<AtomicU8>,
+    /// llama-swap model key that runs the nudge fork (chain seed when the
+    /// nudge switch is on — v1 `Classifier::default_local_model` parity).
+    nudge_model_key: Option<String>,
+    /// (v2 L3 Step 9 I4: the per-request grace clock travels as a tokio
+    /// task-local — the Router is shared by every connection, and a slot
+    /// on it let a concurrent request clear/overwrite the window of the
+    /// request being resolved.)
     /// Runtime prompt-rewrite toggle. When off, local routes forward the
     /// incoming messages untouched (no system-prompt rewrite).
     prompt_rewrite: Arc<AtomicBool>,
-    profiles: Option<Arc<ProfileStore>>,
-    /// Per-project model pins (Phase 2). `None` or an empty store ⇒ every
-    /// project inherits the global profile (no routing change).
-    project_pins: Option<Arc<ProjectPinStore>>,
+    /// llama-swap's own config file, when known — the `parameters.ctx` source
+    /// for pool ranking (L3: "known-ctx pool ranking via llama-swap config").
+    llama_swap_config_path: Option<std::path::PathBuf>,
     /// Optional in-memory registry of running OpenAI-compatible Server-Mode
     /// backends. `None` preserves the pre-Feature-B llama-swap-only path.
     serving_identities: Option<Arc<ServingIdentityRegistry>>,
@@ -123,7 +202,8 @@ pub struct Router {
 }
 
 pub struct RouterArgs {
-    pub classifier: Arc<Classifier>,
+    pub slot: Arc<DecisionSlot>,
+    pub cards: Arc<RoleCardStore>,
     pub manifest: Arc<OpenAiProvider>,
     /// Whether the cloud backend (Manifest) is enabled. Off → cloud requests
     /// skip Manifest and fall straight back to llama-swap.
@@ -132,8 +212,7 @@ pub struct RouterArgs {
     pub fallback_model: String,
     /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
     pub local_models: Vec<String>,
-    /// Subs-pool model key for `subs`/`brainrouter/subs` requests. See
-    /// `LlamaSwapConfig::subs_model`.
+    /// Subs-pool model key. See `LlamaSwapConfig::subs_model`.
     pub subs_model: Option<String>,
     pub health: Arc<HealthTracker>,
     pub routing_events: Arc<RoutingEvents>,
@@ -142,14 +221,17 @@ pub struct RouterArgs {
     pub nudge_budgets: NudgeBudgets,
     pub nudge_enabled: Arc<AtomicBool>,
     pub nudge_tier: Arc<AtomicU8>,
+    pub nudge_model_key: Option<String>,
     pub prompt_rewrite: Arc<AtomicBool>,
+    pub llama_swap_config_path: Option<std::path::PathBuf>,
     pub serving_identities: Option<Arc<ServingIdentityRegistry>>,
 }
 
 impl Router {
     pub fn new(args: RouterArgs) -> Self {
         Self {
-            classifier: args.classifier,
+            slot: args.slot,
+            cards: args.cards,
             manifest: args.manifest,
             manifest_enabled: args.manifest_enabled,
             llama_swap: args.llama_swap,
@@ -158,32 +240,34 @@ impl Router {
             subs_model: args.subs_model,
             health: args.health,
             routing_events: args.routing_events,
+            scope_lookup_ms: std::sync::atomic::AtomicU64::new(0),
             local_system_prompt: args.local_system_prompt,
             inference_tracker: args.inference_tracker,
             nudge_budgets: args.nudge_budgets,
             nudge_enabled: args.nudge_enabled,
             nudge_tier: args.nudge_tier,
+            nudge_model_key: args.nudge_model_key,
             prompt_rewrite: args.prompt_rewrite,
-            profiles: None,
-            project_pins: None,
+            llama_swap_config_path: args.llama_swap_config_path,
             serving_identities: args.serving_identities,
             serving_providers: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn with_profiles(mut self, profiles: Arc<ProfileStore>) -> Self {
-        self.profiles = Some(profiles);
+    pub fn cards(&self) -> &Arc<RoleCardStore> {
+        &self.cards
+    }
+
+    /// Test/bench construction: swap the card store (integration tests seed
+    /// project-scope cards directly).
+    pub fn with_cards(mut self, cards: Arc<RoleCardStore>) -> Self {
+        self.cards = cards;
         self
     }
 
-    pub fn profiles(&self) -> Option<&Arc<ProfileStore>> { self.profiles.as_ref() }
-
-    pub fn with_project_pins(mut self, project_pins: Arc<ProjectPinStore>) -> Self {
-        self.project_pins = Some(project_pins);
-        self
+    pub fn slot(&self) -> &Arc<DecisionSlot> {
+        &self.slot
     }
-
-    pub fn project_pins(&self) -> Option<&Arc<ProjectPinStore>> { self.project_pins.as_ref() }
 
     /// Catalog discovery is metadata-only; never invokes inference or starts a model.
     pub async fn model_catalog(&self) -> serde_json::Value {
@@ -222,19 +306,19 @@ impl Router {
         prompt_rewriter::rewrite_for_local(messages, self.local_system_prompt.as_deref())
     }
 
-    /// Inject the per-request reasoning budget for auto-routed local requests
+    /// Inject the per-request reasoning budget for slot-routed local requests
     /// when nudge is enabled. The field flows through the request's flattened
     /// `extra` map into llama-swap and on to the nudge fork's
     /// `oaicompat_chat_params_parse`. A client-supplied value is never
     /// overridden, and direct/explicit model requests never reach this path.
-    fn inject_nudge_budget(&self, request: &mut ChatCompletionRequest, tier: BudgetTier) {
+    fn inject_nudge_budget(&self, request: &mut ChatCompletionRequest, tier: SlotTier) {
         if !self.nudge_enabled.load(Ordering::Relaxed) {
             return;
         }
         let tier = match self.nudge_tier.load(Ordering::Relaxed) {
             1 => BudgetTier::Light,
             2 => BudgetTier::Deep,
-            _ => tier,
+            _ => tier.budget_tier(),
         };
         let budget = match tier {
             BudgetTier::Light => self.nudge_budgets.light,
@@ -255,54 +339,167 @@ impl Router {
         }
     }
 
-    /// Resolve a per-project pin for this request, or `None`. Runs at most one
-    /// normalization, in `spawn_blocking`, and only when a pin store is present,
-    /// non-empty (`has_pins`), and the original selector consults a pin
-    /// (empty/auto/subs). Named/`local`/`cloud` selectors and an empty store do
-    /// zero filesystem work (R9).
-    async fn resolve_project_pin(&self, model: &str, cwd: &str) -> Option<ProjectPin> {
-        let store = self.project_pins.as_ref()?;
-        if !store.has_pins()
-            || !matches!(model, "" | "auto" | "brainrouter/auto" | "subs" | "brainrouter/subs")
-        {
+    /// Resolve a request's project scope: the peer cwd normalized to its
+    /// canonical git root (the relocated `project_key`). Gated: zero
+    /// filesystem work when the store has no scoped cards, and always cheap
+    /// (one canonicalize + walk).
+    /// Run one request's handling with its UDS grace clock installed (the
+    /// server sets this at request arrival on the connection's task; the
+    /// task-local propagates to the routing future, so concurrent requests
+    /// on the shared Router can never clear each other's window).
+    pub fn scope_clock_scope<F: std::future::Future>(
+        clock: Option<Arc<ScopeClock>>,
+        f: F,
+    ) -> F {
+        REQUEST_SCOPE_CLOCK.sync_scope(clock, || f)
+    }
+
+    async fn resolve_project(&self, cwd: &str) -> Option<String> {
+        // A UDS request owns its grace window (the CLI peer is alive for
+        // the request; the clock was stamped at arrival); Router-level
+        // callers (tests, the review loop) start the window at the request.
+        let window_start = REQUEST_SCOPE_CLOCK
+            .try_with(|c| c.as_ref().and_then(|c| c.elapsed()))
+            .ok()
+            .flatten();
+        self.resolve_project_with(cwd, std::time::Duration::from_secs(120), window_start)
+            .await
+    }
+
+    /// Retry budget for the canonicalize: the UDS peer's cwd (/proc/<pid>/cwd)
+    /// can change between connection accept and this resolution (a test
+    /// process that spawned the daemon then chdir'd), and `project_key`
+    /// returns None for a cwd it cannot canonicalize. Under parallel load
+    /// that race used to drop the project scope for one request. The window
+    /// is measured from the connection's ACCEPT time (`accept_elapsed`,
+    /// stamped by the UDS accept loop — a connection accepted at t has a
+    /// live peer, so a resolvable cwd cannot vanish mid-request; queueing
+    /// between accept and request handling does not burn the grace).
+    /// Unresolvable cwds (deleted dirs, tmpdirs) return at once.
+    async fn resolve_project_with(
+        &self,
+        cwd: &str,
+        grace: std::time::Duration,
+        window_start: Option<std::time::Duration>,
+    ) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if cwd.is_empty() {
             return None;
         }
-        let store = Arc::clone(store);
-        let cwd = cwd.to_owned();
-        tokio::task::spawn_blocking(move || store.resolve(&cwd))
-            .await
-            .unwrap_or(None)
+        // Synchronous probes on THIS task: a saturated default blocking
+        // pool (full-suite load: dozens of mocks + daemons per process)
+        // used to starve `spawn_blocking` probes for seconds each, burning
+        // the entire retry window before the first probe ran. The walk is
+        // 2-3 syscalls on a hot dentry (canonicalize + two .git checks).
+        // The grace window is absolute from UDS request arrival; the
+        // caller-side queue time before this resolution began is charged
+        // too, so the total stays bounded by `grace`.
+        let mut used = window_start.unwrap_or_default();
+        loop {
+            let probe_started = std::time::Instant::now();
+            let (key, probe_ok) = match std::fs::canonicalize(cwd) {
+                Ok(canonical) => {
+                    let key = project_root_of(&canonical).map(|p| p.display().to_string());
+                    (key, true)
+                }
+                Err(_) => (None, false),
+            };
+            used += probe_started.elapsed();
+            if key.is_some() {
+                self.scope_lookup_ms.store(used.as_millis() as u64, Relaxed);
+                return key;
+            }
+            if !probe_ok {
+                // The peer's cwd is gone from the filesystem (tmpdir cleanup
+                // of a finished test, a deleted checkout): no retry can make
+                // it a git root. Global scope.
+                return None;
+            }
+            if used >= grace {
+                // The peer's cwd exists and is a live process's directory,
+                // yet canonicalize has not seen it for the whole grace
+                // window (a CLI mid chdir-publish under full-suite load).
+                // The project-scope answer is not knowable: route GLOBAL —
+                // stalling the request further helps no one, and a
+                // never-resolving walk must not fail the request outright.
+                self.scope_lookup_ms.store(used.as_millis() as u64, Relaxed);
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            used += std::time::Duration::from_millis(25);
+        }
     }
 
     /// Route a request, returning the response and metadata about the routing decision.
     /// `session_id` tags the emitted RouteEvent (used by the review loop so events are
-    /// linkable to review sessions).
+    /// linkable to review sessions). `role` is the `x-brainrouter-role` header
+    /// value (default `main`; the `subs` selector overrides it to `subagent`).
     pub async fn route_tagged(
         &self,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         session_id: Option<String>,
         cwd: String,
         user_agent: String,
     ) -> Result<(ProviderResponse, RouteInfo)> {
-        // Resolve a per-project pin once (gated: non-empty store + a pin-consulting
-        // selector). Precedence for the main role: explicit request model >
-        // project pin > global profile > auto — the explicit case is the
-        // `matches!` guard below, which leaves a client-supplied model untouched.
-        let pin = self.resolve_project_pin(&request.model, &cwd).await;
-        if matches!(request.model.as_str(), "" | "auto" | "brainrouter/auto") {
-            request.model = pin.as_ref().and_then(|p| p.main.clone())
-                .or_else(|| self.profiles.as_ref().map(|store| store.profile().main))
-                .map(|choice| choice.selector())
-                .unwrap_or_else(|| "auto".into());
-        }
-        self.route_resolved(request, session_id, cwd, user_agent, true, true, pin, None).await
+        self.route_tagged_role(request, session_id, cwd, user_agent, "main").await
     }
 
-    /// Review calls use their session snapshot, never the live main or subs choice.
+    /// The L3 entry point: same as [`Self::route_tagged`] plus the role
+    /// header (L3 spec "Role signal").
+    pub async fn route_tagged_role(
+        &self,
+        request: ChatCompletionRequest,
+        session_id: Option<String>,
+        cwd: String,
+        user_agent: String,
+        role_header: &str,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let header_role = Role::parse(role_header).unwrap_or(Role::Main);
+        let selector = parse_selector(&request.model);
+        // `subs` NAMES the subagent role and overrides the header (L3 spec).
+        let role = if selector == Selector::Subs { Role::Subagent } else { header_role };
+
+        let explicit = selector.is_explicit();
+        let via_subs = selector == Selector::Subs;
+        let project = if explicit || !self.cards.has_scoped_cards() {
+            // No scoped cards exist: the git-root walk cannot change the
+            // card answer (every card is global), so skip it entirely.
+            None
+        } else {
+            self.resolve_project(&cwd).await
+        };
+        // Managed selectors (auto/subs) compile through the role card:
+        // project > global > default `auto`.
+        let target = if explicit {
+            selector
+        } else {
+            let assignment = self.cards.assignment(role, project.as_deref());
+            let compiled = parse_selector(&assignment);
+            if selector == Selector::Subs && compiled == Selector::Subs {
+                // A card must never carry `subs`; treat as auto (pool).
+                Selector::Auto
+            } else {
+                compiled
+            }
+        };
+        let resolution = Resolution {
+            role,
+            target,
+            project,
+            via_subs,
+            proxy_review_strict: role == Role::Review,
+        };
+        self.route_resolved(request, session_id, cwd, user_agent, resolution, true, true, None).await
+    }
+
+    /// Review calls use their session snapshot (the review CARD record taken
+    /// at session start), never the live cards. L3: the loop calls the router
+    /// with role `review` — the event label, and the cloud card's
+    /// role-specific strict rule.
     pub async fn route_with_choice(
         &self,
         mut request: ChatCompletionRequest,
-        choice: &ModelChoice,
+        choice: &crate::roles::ModelChoice,
         session_id: Option<String>,
         cwd: String,
         user_agent: String,
@@ -312,13 +509,37 @@ impl Router {
         request.model = choice.selector();
         // Reviewer path: never rewrite the local prompt (apply_local_rewrite=false)
         // so the review criteria survive; never fall back to local on a cloud
-        // failure (allow_local_fallback threaded from the caller). A reviewer pin
-        // is applied upstream into the per-run snapshot, so no pin is passed here.
-        self.route_resolved(request, session_id, cwd, user_agent, allow_local_fallback, false, None, None).await
+        // failure (allow_local_fallback threaded from the caller). The review
+        // card's project scope was applied upstream into the per-run snapshot.
+        self.route_card_choice(request, session_id, cwd, user_agent, choice, allow_local_fallback).await
     }
 
-    /// v2 L2 plugin RPC entry point. Full router path (classification,
-    /// fallbacks, health) identical to the proxy; events carry the additive
+    async fn route_card_choice(
+        &self,
+        request: ChatCompletionRequest,
+        session_id: Option<String>,
+        cwd: String,
+        user_agent: String,
+        choice: &crate::roles::ModelChoice,
+        allow_local_fallback: bool,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let target = parse_selector(&choice.selector());
+        let resolution = Resolution {
+            role: Role::Review,
+            target,
+            // The reviewer choice is the owner's card snapshot — explicit.
+            project: None,
+            via_subs: false,
+            proxy_review_strict: false,
+        };
+        // The reviewer's managed hop honors the caller's strictness flag
+        // (v1: `route_with_choice(..., allow_local_fallback=false)`).
+        self.route_resolved(request, session_id, cwd, user_agent, resolution, allow_local_fallback, false, None)
+            .await
+    }
+
+    /// v2 L2 plugin RPC entry point. Full router path (slot, fallbacks,
+    /// health) identical to the proxy; events carry the additive
     /// `source: "plugin <id>"` tag so the dashboard attributes the hop.
     pub async fn route_plugin(
         &self,
@@ -326,12 +547,9 @@ impl Router {
         source: String,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let ua = source.clone();
-        self.route_resolved(request, None, String::new(), ua, true, true, None, Some(source)).await
+        self.route_tagged(request, None, String::new(), ua).await
     }
 
-    // Two extra parameters (the resolved project pin, the L2 source tag)
-    // beyond clippy's arg threshold; the alternative is a params struct that
-    // would obscure the reviewer-vs-proxy call sites.
     #[allow(clippy::too_many_arguments)]
     async fn route_resolved(
         &self,
@@ -339,9 +557,9 @@ impl Router {
         session_id: Option<String>,
         cwd: String,
         user_agent: String,
+        resolution: Resolution,
         allow_local_fallback: bool,
         apply_local_rewrite: bool,
-        pin: Option<ProjectPin>,
         source: Option<String>,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let start = Instant::now();
@@ -351,12 +569,14 @@ impl Router {
         // messages (before any local rewrite) so every turn of one harness
         // conversation hashes identically.
         let conv_id = conversation_fingerprint(&request);
+        let role_str = resolution.role.as_str();
 
         let tracker = &self.inference_tracker;
         let max_tokens = request.max_tokens;
-        let (bonsai_decision, routing_class, result) = match requested_model.as_str() {
+        // (bonsai_decision, routing_class, slot record, result)
+        let (bonsai_decision, routing_class, slot, result) = match resolution.target {
             // Managed local token: route to the local/fallback model, rewrite prompt.
-            "local" | "brainrouter/local" => {
+            Selector::Local => {
                 info!("Direct local mode — rewriting system prompt");
                 tracker.set(Phase::LocalWaiting, Some(self.fallback_model.clone()), Some("llama-swap".into()), max_tokens);
                 // Reviewer calls (design H9/FR-B) pass apply_local_rewrite=false so
@@ -366,74 +586,76 @@ impl Router {
                     request.messages = self.maybe_rewrite_local(request.messages);
                 }
                 request.model = self.fallback_model.clone();
-                ("local-direct", "local", self.route_local(request, true).await)
+                ("local-direct", "local", None, self.route_local(request, true).await)
             }
-            // Direct cloud: skip Bonsai, go straight to Manifest
-            "cloud" | "brainrouter/cloud" => {
+            // Direct cloud: skip the slot, go straight to Manifest.
+            Selector::Cloud => {
                 info!("Direct cloud mode — routing to Manifest");
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                ("cloud-direct", "cloud", self.route_cloud(request, allow_local_fallback).await)
+                // v1's role-specific strict rule: a `review` cloud selector
+                // never hops to the local fallback (the failure surfaces and
+                // the review loop maps it to escalated).
+                (
+                    "cloud-direct",
+                    "cloud",
+                    None,
+                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                )
             }
-            model if model.starts_with("cloud/") => {
-                let model = model.strip_prefix("cloud/").unwrap();
-                crate::routing_profile::validate_model_id(model)?;
-                request.model = model.to_string();
-                tracker.set(Phase::CloudWaiting, Some(model.into()), Some("Manifest".into()), max_tokens);
-                ("cloud-direct", "cloud", self.route_cloud(request, allow_local_fallback).await)
+            Selector::CloudId(model) => {
+                crate::roles::validate_model_id(&model)?;
+                request.model = model.clone();
+                tracker.set(Phase::CloudWaiting, Some(model), Some("Manifest".into()), max_tokens);
+                (
+                    "cloud-direct",
+                    "cloud",
+                    None,
+                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                )
             }
-            // Managed routing: Bonsai classify + subs pool. Only these tokens get
-            // nudge/bonsai/subs treatment. Direct model keys are authoritative.
-            _ => {
-                // Subs pool: `subs` or `brainrouter/subs` → subs_model, bypassing
-                // Bonsai. Unconfigured → warn and fall back to auto below.
-                if requested_model == "subs" || requested_model == "brainrouter/subs" {
-                    // Subagent precedence: project pin > global subagent_model
-                    // (authoritative, including `None`) > config subs_model. The
-                    // fallback expression is preserved byte-for-byte from Phase 1,
-                    // so an unpinned request is unchanged (R9/B2).
-                    let subs = pin.as_ref().and_then(|p| p.subagent.clone())
-                        .or_else(|| self.profiles.as_ref().map(|store| store.profile().subagent_model)
-                            .unwrap_or_else(|| self.subs_model.clone()));
-                    if let Some(subs) = subs {
-                        info!(model = %subs, "Subs pool routing — direct to llama-swap");
-                        tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
-                        request.model = subs;
-                        ("local-subs", "local · subs", self.route_local(request, false).await)
-                    } else {
-                        warn!("Subs pool requested but llama_swap.subs_model is not configured — falling back to auto");
-                        self.route_auto(request, tracker, max_tokens).await
-                    }
-                } else if requested_model == "auto" || requested_model == "brainrouter/auto" {
-                    // Explicit "auto" — let the classifier decide (Bonsai off → local).
-                    self.route_auto(request, tracker, max_tokens).await
-                } else if let Some(specific) = requested_model.strip_prefix("brainrouter/") {
-                    if !specific.is_empty() {
-                        info!(model = specific, "Direct model mode — routing to llama-swap");
-                        tracker.set(Phase::LocalWaiting, Some(specific.to_string()), Some("llama-swap".into()), max_tokens);
-                        request.model = specific.to_string();
-                        ("local-specific", "local · selected model", self.route_local(request, false).await)
-                    } else {
-                        // Empty suffix, treat as auto — fall through to Bonsai
-                        self.route_auto(request, tracker, max_tokens).await
-                    }
-                } else if self.local_models.contains(&requested_model) {
-                    // Model is explicitly listed as a local model — route directly
-                    // to llama-swap without consulting Bonsai. The user's model
-                    // choice is authoritative.
-                    info!(model = %requested_model, "Known local model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
-                    tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    // request.model is already correct (it's the llama-swap model key)
-                    ("local-specific", "local · selected model", self.route_local(request, false).await)
+            Selector::Subs => {
+                // An unmanaged `subs` (only reachable when a card carried it,
+                // normalized above) — defensive: pool seed, strict local.
+                let subs = self.subs_model.clone().unwrap_or_else(|| self.fallback_model.clone());
+                info!(model = %subs, "Subs pool routing — direct to llama-swap");
+                tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
+                request.model = subs;
+                ("local-subs", "local · subs", None, self.route_local(request, false).await)
+            }
+            // The `auto` path: the decision slot, then pool + chain.
+            Selector::Auto => {
+                // `subs` + the auto card + a configured subs pool keeps v1
+                // subs-pool semantics: the POOL IS subs_model (direct,
+                // strict, `local-subs` tag) — v1 `route_resolved`'s subs arm.
+                if resolution.via_subs && self.subs_model.is_some() {
+                    let subs = self.subs_model.clone().unwrap();
+                    info!(model = %subs, "Subs pool routing — direct to llama-swap");
+                    tracker.set(Phase::LocalWaiting, Some(subs.clone()), Some("llama-swap".into()), max_tokens);
+                    request.model = subs;
+                    (
+                        "local-subs",
+                        "local · subs",
+                        None,
+                        self.route_local(request, false).await,
+                    )
                 } else {
-                    // A named model that isn't a reserved routing token (auto/local/
-                    // cloud/subs). The user picked it explicitly — route Local directly
-                    // to that model in llama-swap. Lets you select any llama-swap model
-                    // without a classifier hop; works even when Bonsai is off.
-                    info!(model = %requested_model, "Named model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
-                    tracker.set(Phase::LocalWaiting, Some(requested_model.clone()), Some("llama-swap".into()), max_tokens);
-                    ("local-specific", "local · selected model", self.route_local(request, false).await)
+                    let (tag, class, slot, result) =
+                        self.route_slot(request, tracker, max_tokens, &resolution, allow_local_fallback).await;
+                    (tag, class, slot, result)
                 }
+            }
+            // A bare key (card assignment or direct request). v1: direct picks
+            // are authoritative — strict, no fallback.
+            Selector::Bare(key) => {
+                if self.local_models.contains(&key) {
+                    info!(model = %key, "Known local model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
+                } else {
+                    info!(model = %key, "Named model — routing to local backend (llama-swap unless a running Server-Mode server serves this exact model)");
+                }
+                tracker.set(Phase::LocalWaiting, Some(key.clone()), Some("llama-swap".into()), max_tokens);
+                request.model = key;
+                ("local-specific", "local · selected model", None, self.route_local(request, false).await)
             }
         };
 
@@ -477,6 +699,11 @@ impl Router {
                         tg_tps: 0.0,
                         toolbox_backend,
                         compute_api,
+                        role: role_str.to_string(),
+                        decision: slot.as_ref().map(|s| s.decision.clone()),
+                        rationale: slot.as_ref().map(|s| s.rationale.clone()),
+                        decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
+                        chosen_model: Some(f.model_key.clone()),
                     });
                 }
                 let (toolbox_backend, compute_api) =
@@ -503,6 +730,11 @@ impl Router {
                     tg_tps: 0.0,
                     toolbox_backend,
                     compute_api,
+                    role: role_str.to_string(),
+                    decision: slot.as_ref().map(|s| s.decision.clone()),
+                    rationale: slot.as_ref().map(|s| s.rationale.clone()),
+                    decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
+                    chosen_model: Some(info.model_key.clone()),
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -539,6 +771,11 @@ impl Router {
                     tg_tps: 0.0,
                     toolbox_backend,
                     compute_api,
+                    role: role_str.to_string(),
+                    decision: slot.as_ref().map(|s| s.decision.clone()),
+                    rationale: slot.as_ref().map(|s| s.rationale.clone()),
+                    decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
+                    chosen_model: None,
                 });
                 return Err(e);
             }
@@ -547,36 +784,234 @@ impl Router {
         Ok((response, info))
     }
 
-    /// Auto path: consult the Bonsai classifier and route Cloud or Local.
-    /// Returns the internal decision tag, dashboard label, and provider result.
-    async fn route_auto(
+    /// The `auto` path: features → slot decision (guardrail-clamped) → pool
+    /// + chain (local) / Manifest with managed hop (cloud).
+    async fn route_slot(
         &self,
         mut request: ChatCompletionRequest,
         tracker: &Arc<InferenceTracker>,
         max_tokens: Option<u32>,
-    ) -> (&'static str, &'static str, Result<(ProviderResponse, RouteInfo)>) {
+        resolution: &Resolution,
+        allow_local_fallback: bool,
+    ) -> (
+        &'static str,
+        &'static str,
+        Option<SlotEvent>,
+        Result<(ProviderResponse, RouteInfo)>,
+    ) {
         tracker.set(Phase::Classifying, None, None, max_tokens);
-        let used_bonsai = self.classifier.is_enabled();
-        let decision = self.classifier.classify_async(request.clone()).await;
-        info!(?decision, "Bonsai routing decision");
-        match decision {
-            RoutingDecision::Cloud => {
+        let policy = self.cards.policy_for(resolution.project.as_deref());
+        let raw_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+        let features = RequestFeatures::extract(
+            &request,
+            raw_bytes,
+            resolution.role.as_str(),
+            "auto",
+            policy.privacy,
+            policy.quality,
+            resolution.project.as_deref().unwrap_or_default(),
+        );
+        let mut outcome = self.slot.decide(&features).await;
+        DecisionSlot::clamp(&mut outcome, policy.privacy, policy.quality);
+        let decision = outcome.decision.clone();
+        let slot_event = SlotEvent {
+            decision: DecisionEvent {
+                route: decision.route.as_str(),
+                tier: decision.tier.as_str(),
+                confidence: decision.confidence,
+            },
+            rationale: decision.rationale.clone(),
+            decision_fallback: outcome.fallback.map(|f| f.as_str()),
+        };
+        let used_model_kind = self.slot.kind() != "heuristic" && self.slot.config().enabled;
+        let routing_local = if used_model_kind { "slot → local" } else { "auto → local" };
+        let routing_cloud = if used_model_kind { "slot → cloud" } else { "auto → cloud" };
+        match decision.route {
+            SlotRoute::Cloud => {
                 tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
                 request.model = "auto".into();
-                // Managed auto/Bonsai path keeps the PRD cloud→local fallback
-                // guarantee. Reviewer calls never reach here (they route via
-                // explicit cloud/local with allow_local_fallback=false).
-                ("cloud", "bonsai → cloud", self.route_cloud(request, true).await)
+                // Managed auto path keeps the PRD cloud→local fallback
+                // guarantee (the review-role strictness is card-scoped, not
+                // slot-scoped).
+                let _ = allow_local_fallback;
+                (
+                    "cloud",
+                    routing_cloud,
+                    Some(slot_event),
+                    self.route_cloud(request, true).await,
+                )
             }
-            RoutingDecision::Local { model, tier } => {
-                tracker.set(Phase::LocalWaiting, Some(model.clone()), Some("llama-swap".into()), max_tokens);
-                request.model = model;
+            SlotRoute::Local => {
                 request.messages = self.maybe_rewrite_local(request.messages);
-                self.inject_nudge_budget(&mut request, tier);
-                let routing_class = if used_bonsai { "bonsai → local" } else { "auto → local" };
-                ("local", routing_class, self.route_local(request, true).await)
+                self.inject_nudge_budget(&mut request, decision.tier);
+                let candidates = self.chain_candidates(features.approx_prompt_tokens).await;
+                info!(?candidates, tier = decision.tier.as_str(), "Slot local chain");
+                let (class, tag) = (routing_local, "local");
+                tracker.set(
+                    Phase::LocalWaiting,
+                    Some(candidates.first().cloned().unwrap_or_else(|| self.fallback_model.clone())),
+                    Some("llama-swap".into()),
+                    max_tokens,
+                );
+                let result = self.route_chain(request, candidates).await;
+                (tag, class, Some(slot_event), result)
             }
         }
+    }
+
+    /// The auto-path candidate chain (L3 "Auto-path selection"): pool =
+    /// llama-swap models (config keys + `/v1/models`) + server-mode
+    /// identities; the chain seed is `fallback_model` (v1's compat seed;
+    /// logged deprecated in favor of the L4 catalog). Ranking: the seed, then
+    /// known-ctx fits (llama-swap `parameters.ctx` where readable, unknown
+    /// ctx ranked last for large requests — logged), then the rest in
+    /// configured order.
+    async fn chain_candidates(&self, approx_tokens: u64) -> Vec<String> {
+        let mut seed = None;
+        if self.nudge_enabled.load(Ordering::Relaxed) {
+            seed = self.nudge_model_key.clone();
+        }
+        let seed = seed.unwrap_or_else(|| self.fallback_model.clone());
+
+        let mut pool: Vec<String> = Vec::new();
+        pool.push(seed.clone());
+        for key in &self.local_models {
+            if key != &seed && !pool.contains(key) {
+                pool.push(key.clone());
+            }
+        }
+        if let Ok(models) = self.llama_swap.list_models().await {
+            for key in models {
+                if key != seed && !pool.contains(&key) {
+                    pool.push(key);
+                }
+            }
+        }
+        if let Some(registry) = &self.serving_identities {
+            for key in registry.openai_compatible_served_models().await {
+                if key != seed && !pool.contains(&key) {
+                    pool.push(key);
+                }
+            }
+        }
+        if pool.len() > 1 {
+            self.rank_by_ctx(&mut pool, &seed, approx_tokens);
+        }
+        pool
+    }
+
+    /// Pool ranking by KNOWN ctx only (L3 spec): "unknown ctx = ranked last
+    /// for large requests, clamp not applied, logged". The ctx source is
+    /// llama-swap's own config (`parameters.ctx`); when the file is
+    /// unreadable every ctx is unknown and the configured order stands.
+    fn rank_by_ctx(&self, pool: &mut Vec<String>, seed: &str, approx_tokens: u64) {
+        let Some(path) = &self.llama_swap_config_path else {
+            debug!("llama-swap config path unknown; ctx ranking skipped");
+            return;
+        };
+        let ctx = match read_llama_swap_ctx(path) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                debug!(error = %e, "llama-swap config unreadable; ctx ranking skipped");
+                return;
+            }
+        };
+        if ctx.is_empty() {
+            return;
+        }
+        let known = |key: &str| ctx.get(key).copied();
+        if approx_tokens < LARGE_REQUEST_TOKENS {
+            // Small requests fit anywhere: keep the configured order.
+            return;
+        }
+        let mut ranked: Vec<String> = Vec::with_capacity(pool.len());
+        ranked.push(seed.to_string());
+        let mut fits: Vec<String> = pool
+            .iter()
+            .filter(|k| k.as_str() != seed && known(k).is_some_and(|c| c >= approx_tokens))
+            .cloned()
+            .collect();
+        let known_small: Vec<String> = pool
+            .iter()
+            .filter(|k| k.as_str() != seed && known(k).is_some_and(|c| c < approx_tokens))
+            .cloned()
+            .collect();
+        let unknown: Vec<String> = pool
+            .iter()
+            .filter(|k| k.as_str() != seed && known(k).is_none())
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            info!(models = ?unknown, "Large request: unknown-ctx models ranked last (ctx clamp not applied)");
+        }
+        ranked.append(&mut fits);
+        ranked.extend(unknown);
+        ranked.extend(known_small);
+        *pool = ranked;
+    }
+
+    /// Chain over local candidates: connect/response-headline failure moves
+    /// to the NEXT candidate (never mid-stream — once a stream is returned it
+    /// is the caller's). The seed stage is LocalPrimary; retries LocalFallback
+    /// (v1 tags).
+    async fn route_chain(
+        &self,
+        mut request: ChatCompletionRequest,
+        candidates: Vec<String>,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let candidates = if candidates.is_empty() {
+            vec![self.fallback_model.clone()]
+        } else {
+            candidates
+        };
+        let mut failed: Vec<FailedAttempt> = Vec::new();
+        let mut last_error = None;
+        for (index, key) in candidates.iter().enumerate() {
+            let stage = if index == 0 { Stage::LocalPrimary } else { Stage::LocalFallback };
+            request.model = key.clone();
+            match self.try_local_once(request.clone(), stage).await {
+                Ok((resp, provider)) => {
+                    return Ok((
+                        resp,
+                        RouteInfo {
+                            bonsai_decision: "local",
+                            effective_provider: Some(provider),
+                            model_key: key.clone(),
+                            failed_attempts: failed,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    warn!(model = %key, error = %e, "Chain candidate failed; trying the next one");
+                    failed.push(FailedAttempt {
+                        stage,
+                        provider: "llama-swap".to_string(),
+                        model_key: key.clone(),
+                        error: e.to_string(),
+                    });
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("no local candidates")))
+    }
+
+    /// One local attempt: server-mode identity wins, then llama-swap.
+    async fn try_local_once(
+        &self,
+        request: ChatCompletionRequest,
+        stage: Stage,
+    ) -> Result<(ProviderResponse, String)> {
+        let requested = request.model.clone();
+        if let Some(identity) = self.find_server_mode_identity(&requested).await {
+            let provider_name = server_mode_provider_name(&identity);
+            let provider = self.server_mode_provider(&identity).await;
+            let resp = provider.chat_completion(request).await?;
+            return Ok((wrap_with_timeout_stream(resp)?, provider_name));
+        }
+        let (resp, model_key) = self.try_llama_swap(request, stage).await?;
+        let _ = model_key;
+        Ok((resp, "llama-swap".to_string()))
     }
 
     /// Cloud path: try Manifest first. On error/circuit-open, fall back to
@@ -648,7 +1083,7 @@ impl Router {
         // Cloud fallback → llama-swap with fallback_model
         request.model = self.fallback_model.clone();
         let model_key = self.fallback_model.clone();
-        let (resp, _) = self.try_llama_swap(request, Stage::CloudFallback).await?;
+        let (resp, _) = self.try_local_once(request, Stage::CloudFallback).await?;
         Ok((
             resp,
             RouteInfo {
@@ -665,49 +1100,22 @@ impl Router {
         ))
     }
 
-    /// Local path: go straight to llama-swap.
-    ///
-    /// `allow_fallback` gates the retry-with-fallback behavior. Direct model
-    /// selections pass `false` so a failed explicit pick surfaces the error
-    /// instead of silently switching to `fallback_model`. Managed routing
-    /// (auto/bonsai/local tokens) passes `true` to keep the fallback hop.
+    /// Managed local path (the `local` selector): v1 semantics — route to
+    /// `fallback_model` with the one-`fallback_model`-retry hop
+    /// (`allow_fallback`, short-circuited when requested == fallback).
     async fn route_local(
         &self,
         request: ChatCompletionRequest,
         allow_fallback: bool,
     ) -> Result<(ProviderResponse, RouteInfo)> {
         let requested = request.model.clone();
-        if let Some(identity) = self.find_server_mode_identity(&requested).await {
-            let provider_name = server_mode_provider_name(&identity);
-            let provider = self.server_mode_provider(&identity).await;
-            match provider.chat_completion(request).await {
-                Ok(ProviderResponse::Stream(stream)) => {
-                    info!(
-                        provider = %provider_name,
-                        model = %requested,
-                        endpoint = %identity.endpoint,
-                        "Server-Mode provider accepted request"
-                    );
-                    return Ok((
-                        wrap_with_timeout(stream),
-                        RouteInfo {
-                            bonsai_decision: "local",
-                            effective_provider: Some(provider_name),
-                            model_key: requested,
-                            failed_attempts: Vec::new(),
-                        },
-                    ));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        match self.try_llama_swap(request.clone(), Stage::LocalPrimary).await {
-            Ok((resp, model_key)) => Ok((
+        match self.try_local_once(request.clone(), Stage::LocalPrimary).await {
+            Ok((resp, provider)) => Ok((
                 resp,
                 RouteInfo {
                     bonsai_decision: "local",
-                    effective_provider: Some("llama-swap".to_string()),
-                    model_key,
+                    effective_provider: Some(provider),
+                    model_key: requested,
                     failed_attempts: Vec::new(),
                 },
             )),
@@ -723,13 +1131,14 @@ impl Router {
                 );
                 let mut fallback_req = request;
                 fallback_req.model = self.fallback_model.clone();
-                let (resp, model_key) = self.try_llama_swap(fallback_req, Stage::LocalFallback).await?;
+                let (resp, provider) =
+                    self.try_local_once(fallback_req, Stage::LocalFallback).await?;
                 Ok((
                     resp,
                     RouteInfo {
                         bonsai_decision: "local",
-                        effective_provider: Some("llama-swap".to_string()),
-                        model_key,
+                        effective_provider: Some(provider),
+                        model_key: self.fallback_model.clone(),
                         failed_attempts: vec![FailedAttempt {
                             stage: Stage::LocalPrimary,
                             provider: "llama-swap".to_string(),
@@ -819,6 +1228,42 @@ impl Router {
                 Err(e.into())
             }
         }
+    }
+}
+
+/// `parameters.ctx` per model id from llama-swap's config (best-effort:
+/// file YAML `models: [{name/id, parameters: {ctx}}]`). Missing file /
+/// unparseable = empty map (everything unknown, ranking skipped).
+pub fn read_llama_swap_ctx(path: &std::path::Path) -> Result<HashMap<String, u64>> {
+    let text = std::fs::read_to_string(path)?;
+    let root: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    let mut out = HashMap::new();
+    if let Some(models) = root.get("models").and_then(|m| m.as_sequence()) {
+        for model in models {
+            let id = model
+                .get("name")
+                .or_else(|| model.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(ctx) = model
+                .get("parameters")
+                .and_then(|p| p.get("ctx"))
+                .and_then(|c| c.as_u64())
+            {
+                out.insert(id, ctx);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn wrap_with_timeout_stream(resp: ProviderResponse) -> Result<ProviderResponse> {
+    match resp {
+        ProviderResponse::Stream(stream) => Ok(wrap_with_timeout(stream)),
     }
 }
 
@@ -1664,6 +2109,11 @@ mod tests {
             tg_tps: 0.0,
             toolbox_backend: Some("llama_cpp".to_string()),
             compute_api: Some("vulkan".to_string()),
+            role: "main".to_string(),
+            decision: None,
+            rationale: None,
+            decision_fallback: None,
+            chosen_model: None,
         });
         // Matching conversation backfills.
         assert!(events.update_tps("abc123", 41.5, 77.0));
@@ -1697,6 +2147,11 @@ mod tests {
             tg_tps: 0.0,
             toolbox_backend: Some("llama_cpp".to_string()),
             compute_api: Some("vulkan".to_string()),
+            role: "main".to_string(),
+            decision: None,
+            rationale: None,
+            decision_fallback: None,
+            chosen_model: None,
         }
     }
 

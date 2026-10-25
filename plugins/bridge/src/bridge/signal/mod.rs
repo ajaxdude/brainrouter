@@ -715,26 +715,38 @@ async fn handle_message(
         }
     }
 
-    // !br review [auto|local|cloud]
+    // !br review [auto|local|cloud|cloud/<id>] — v2 L3: writes the review
+    // role card (v1 forced_* review-config keys are gone; the reduced
+    // endpoint rejects them). No max_iterations side effect; `auto` removes
+    // the card (the card default).
     if let Some(rest) = text.strip_prefix(&format!("{prefix}br review ")) {
         let mode = rest.trim();
-        if mode != "auto" && mode != "local" && mode != "cloud" {
+        let valid = mode == "auto" || mode == "local" || mode == "cloud"
+            || (mode.starts_with("cloud/") && mode.len() > 6);
+        if !valid {
             let _ = send_message_to(
                 signal,
                 sender,
                 is_group,
-                "Usage: !br review auto|local|cloud",
+                "Usage: !br review auto|local|cloud|cloud/<model-id>",
             )
             .await;
             return;
         }
-        let body = serde_json::json!({"forced_mode": mode, "max_iterations": 5});
-        match reqwest::Client::new()
-            .post("http://127.0.0.1:9099/api/review-config")
-            .json(&body)
-            .send()
-            .await
-        {
+        let result = if mode == "auto" {
+            reqwest::Client::new()
+                .post("http://127.0.0.1:9099/api/roles/remove")
+                .json(&serde_json::json!({"role": "review"}))
+                .send()
+                .await
+        } else {
+            reqwest::Client::new()
+                .post("http://127.0.0.1:9099/api/roles/set")
+                .json(&serde_json::json!({"role": "review", "assignment": mode}))
+                .send()
+                .await
+        };
+        match result {
             Ok(resp) if resp.status().is_success() => {
                 let _ = send_message_to(
                     signal,
@@ -752,16 +764,27 @@ async fn handle_message(
         return;
     }
     if text == format!("{prefix}br review") {
-        match reqwest::get("http://127.0.0.1:9099/api/review-config").await {
+        match reqwest::get("http://127.0.0.1:9099/api/roles").await {
             Ok(resp) => {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     let mode = json
-                        .get("forced_mode")
-                        .and_then(|v| v.as_str())
+                        .get("assignments")
+                        .and_then(|a| a.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|c| {
+                                c.get("role").and_then(|r| r.as_str()) == Some("review")
+                                    && c.get("scope").and_then(|s| s.as_str()) == Some("global")
+                            })
+                        })
+                        .and_then(|c| c.get("assignment").and_then(|a| a.as_str()))
                         .unwrap_or("auto");
-                    let _ =
-                        send_message_to(signal, sender, is_group, &format!("Review mode: {mode}"))
-                            .await;
+                    let _ = send_message_to(
+                        signal,
+                        sender,
+                        is_group,
+                        &format!("Review mode: {mode}"),
+                    )
+                    .await;
                 }
             }
             _ => {

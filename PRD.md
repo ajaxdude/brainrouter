@@ -52,11 +52,11 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 
 A single Rust daemon that:
 
-1. **Separates routing roles.** The persisted Main choice handles `auto`, `brainrouter/auto`, and empty model selections; Reviewer has its own local/cloud/default choice; only `subs` or `brainrouter/subs` uses the separately selected local pool. Named presets configure compatible combinations without merging these roles. A per-project pin store can override Main, Reviewer, and Subagent for one canonical Git repository root while unpinned projects inherit the global profile.
+1. **Separates routing roles.** Role cards (`main`, `review`, `subagent`) at global and per-Git-root scope resolve every managed request through one selector grammar; explicit client selectors bypass cards. The `auto` path answers through the decision slot with guardrail clamps. v2 L3.
 2. **Preserves explicit choices and fallback semantics.** Bare model IDs and `brainrouter/<id>` select that local model with no rewrite or model substitution on failure. `cloud/<id>` sends the exact ID to Manifest. Explicit `local`/`cloud` aliases select backend defaults, not the Main override. Cloud requests retain the existing local fallback policy on disabled/unavailable Manifest; errors after streaming begins surface to the client rather than replaying output.
 3. **Reviews code with runtime policy controls**, with explicit local or cloud reviewer IDs, requested-versus-actual reporting, and a reviewer snapshot retained for the lifetime of each review and its continuations. Runtime state can disable review, enable PR-generation guidance injection, and enable HankNDory design-aware review. Review prompts are token-budgeted before dispatch and escalate instead of approving when required evidence is truncated.
 4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/gufo toolboxes, models, and detached servers** (halogen/vllm/r9v were v1 scope, removed by the v2 L1 purge; their catalog feed ids parse as browse-only data) — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
-5. **Keeps opt-ins explicit.** Bonsai and Manifest are disabled by default. A role set to Auto consults the classifier only when enabled; otherwise it selects local. Applying a cloud or hybrid preset does not enable Manifest.
+5. **Keeps opt-ins explicit.** The decision model and Manifest are disabled by default. An `auto` card with the slot off routes local (the v1 classifier-off anchor). Card writes never enable Manifest.
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal ship as the `bridge` sidecar plugin (v2 L2), shelling out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Presents a simplified dashboard IA.** The primary dashboard destinations are Overview, Models, Benchmarks, and Config; an always-visible command strip exposes model scope/role controls, flush/restart/sync actions, health, and quality posture.
@@ -111,9 +111,9 @@ When an agent requests a review, the service snapshots its Reviewer choice and i
 
 ### Per-project model pins
 
-`src/project_pins.rs` persists optional `{main, reviewer, subagent}` overrides keyed by the canonical absolute Git repository root of a request `cwd`. The store is loaded from `project_pins.json` beside the default config state, writes with owner-only atomic replacement, and treats missing/corrupt/unreadable files as empty so every project inherits the global profile by default. A lock-free `has_pins` flag keeps the proxy hot path from doing filesystem work when the store is empty or when the client sent a selector that never consults a pin.
+(v2 L3) `src/roles.rs` supersedes the pins store: project overrides are cards keyed by the canonical absolute Git repository root of a request `cwd`, in the same atomic owner-only `role_cards.json` as the global cards. The store treats missing/corrupt files as empty (defaults `auto` everywhere), and the hot path skips all filesystem work when the request selector is explicit.
 
-Role precedence is deliberately role-specific: Main uses **explicit request model > project pin > global profile > auto** for `auto`/empty selectors; Reviewer injects a reviewer pin into a fresh review's config snapshot before admission; Subagent consults the pin only for `subs`/`brainrouter/subs`. `GET /api/project-pin?path=...` normalizes a raw path for the dashboard, while `POST` is a strict full replacement (`path`, `main`, `reviewer`, and `subagent` all present; `null` means inherit) and `DELETE` removes by normalized key.
+Role precedence is deliberately role-specific (v2 L3): **explicit request selector > project card > global card > default (`auto`)** — every role resolves through one grammar (`auto | local | cloud | cloud/<id> | <bare-key>`) and the card assignment compiles through the same selector path. Explicit selectors bypass cards and are never policy-clamped. Review sessions snapshot the review card at start and never re-resolve; the review loop calls the router with role `review`. `GET /api/roles` returns cards + policy; `POST /api/roles/set` is `{role, assignment, scope?}` with strict selector validation; policy chips (`POST /api/policy/set` `{scope, privacy, quality}`) clamp slot decisions only. Mutations are loopback/CSRF-gated.
 
 ### Circuit breaker
 
@@ -168,8 +168,9 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | Classifier | `src/classifier.rs` | Bonsai-based cloud/local decision |
 | Bonsai server lifecycle | `src/bonsai_server.rs` | `BonsaiServer`: spawn, 60s health poll, SIGTERM→SIGKILL stop. `BonsaiControl`: runtime start/stop from the dashboard, shared enabled flag for the classifier |
 | Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
-| Routing preferences | `src/routing_profile.rs` | Typed role choices/presets, strict writes, atomic per-user state, legacy migration |
-| Project pins | `src/project_pins.rs` | Per-Git-repository role pins, canonical key resolution, atomic owner-only `project_pins.json` |
+| Role cards | `src/roles.rs` | Selector grammar + validation, per-scope cards, policy records, review-card extras, atomic 0600 state, the exact v1 migration table |
+| Decision slot | `src/decision.rs` | Features → {route, tier} with per-kind failure matrices, guardrail clamps, pool ranking |
+| Project cards | `src/roles.rs` (v2 L3; replaced `src/project_pins.rs`) | Per-Git-repository card scopes, canonical key resolution, atomic owner-only state |
 | Prompt rewriter | `src/prompt_rewriter.rs` | System prompt rewriting for local mode (strips OMP bloat, injects anti-loop prompt) |
 | Anthropic shim | `src/anthropic.rs` | `/v1/messages` to `/v1/chat/completions` translation; strict SSE state machine |
 | MCP server | `src/mcp_server.rs` | JSON-RPC stdio; forwards to daemon over UDS |
@@ -216,7 +217,7 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | Integration tests | `tests/failover_test.rs` | Circuit breaker and fallback behavior tests |
 | Integration tests | `tests/install_test.rs` | Harness installer tests |
 | Integration tests | `tests/review_test.rs` | Review loop and session lifecycle tests |
-| Role/upgrade tests | `tests/routing_profiles_test.rs`, `tests/daemon_availability_test.rs` | Exact roles, protocols, persistence, legacy upgrades, failure isolation, complete import/reference workflow |
+| Role/upgrade tests | `tests/routing_profiles_test.rs` (L3-retargeted to cards), `tests/daemon_availability_test.rs`, `tests/v2_l3_acceptance.rs` | Exact roles, protocols, persistence, legacy upgrades, failure isolation, complete import/reference workflow |
 | Browser-logic tests | `scripts/test-benchmark-ui.cjs` | Synthetic DOM/import/inspector/precision and asynchronous-state regressions |
 | System installer | `install.sh` | One-script Fedora system-wide installer: packages, bun, oh-my-pi, Bonsai, Manifest, llama-swap, brainrouter, toolbox container, shared `/etc/brainrouter/` config, per-user services with linger |
 
@@ -286,37 +287,47 @@ When installed via `install.sh` on a shared Fedora machine:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `max_iterations` | `u32` | `5` | Positive maximum LLM review iterations before escalation to human |
-| `forced_mode` | `String` | `"local"` | Legacy YAML/default reviewer choice: `auto`, `cloud`, or `local`. Role profiles and saved preferences can override it |
-| `forced_model` | `String?` | `None` | Exact local OR cloud provider ID; null selects that backend's default. New auto+model combinations are invalid |
+| (v2 L3) | — | — | The reviewer MODEL moved to the review role card; the v1 `forced_mode`/`forced_model` keys migrate once at boot (exact table) and are stripped from the YAML |
 | `hankndory_integration` | `bool` | `false` | YAML seed for design-aware review. Runtime `/api/review/hankndory` can override it without editing YAML |
 | `design_doc_path` | `String?` | `None` | Repo-relative design doc under `docs/design/` used when design-aware review is enabled |
 
-#### routing.*
+#### decision_model (v2 L3) + role cards
 
-Optional typed YAML defaults: `{preset, main, reviewer, subagent_model}`.
-Main/Reviewer are `{backend: auto}` or `{backend: local|cloud, model: null|"<explicit-id>"}`.
-Subagent is a local model ID or null. Presets are `auto`, `cloud`,
-`local_main_sub`, `local_custom`, `cloud_main_local_review`,
-`local_main_cloud_review`, and `custom`; role backends must match the preset.
-`local_custom` requires an explicit local Main model. Applying a preset preserves
-the independently selected subagent pool.
+The `routing:` YAML block and presets are REMOVED. Role configuration lives
+in role cards (`$XDG_STATE_HOME/brainrouter/role_cards.json`, 0600 atomic):
+`{scope, role, assignment}` records where `scope` is `global` or a canonical
+Git root and `assignment` is the selector grammar
+`auto | local | cloud | cloud/<id> | <bare-key>`. Lookup: project > global >
+default (`auto`). Policy records (privacy `cloud-ok|local-only`, quality
+`fast|balanced|maximum`) live in the same store and clamp slot decisions
+only. The review card carries the surviving non-model extras
+(`max_iterations`, `hankndory_integration`, `design_doc_path`).
 
-Without `routing`, Main defaults to local, Reviewer derives from `review`,
-and the pool derives from `llama_swap.subs_model`. Per-user
-`$XDG_CONFIG_HOME/brainrouter/routing_state.json` (otherwise under `~/.config`)
-takes precedence over YAML role defaults. Writes validate before committing
-runtime state and use atomic owner-only files. `review.max_iterations` is
-YAML-owned across restarts.
+The decision slot (`decision_model:` in YAML; kind
+`heuristic|openai-compatible|structured-schema|webhook|plugin`,
+`min_confidence` default 0.4) answers `auto` requests:
+features (role, privacy, quality, project, msg_count,
+`approx_prompt_tokens = (bytes+3)/4`, has_tools, code_density; prompt
+excerpt only for model kinds, never for webhooks) → `{route, tier,
+confidence, rationale}`. Failure matrix: the migrated bonsai profile
+(`kind: openai-compatible, prompt_profile: bonsai`) answers every model
+failure with cloud + `fallback=v1-safe` (v1 parity, no availability
+pre-check); low confidence ⇒ heuristic + `fallback=heuristic`; fresh-config
+kinds (structured-schema/webhook/plugin) ⇒ heuristic +
+`fallback=unavailable`. `auto` local selection uses the pool (llama-swap
+models + server-mode identities, `parameters.ctx` ranking when known, chain
+seed = `fallback_model`) and chains on connect/response-headline failure
+only — never mid-stream.
 
-When the new state file is absent, valid legacy `review_state.json` overrides
-migrate and persist once; the legacy file is not deleted. File reads alone
-normalize the old, ignored `forced_mode: auto` + `forced_model` combination,
-warning with the source path and removal guidance. New write APIs remain strict;
-local/cloud choices and other errors are not silently normalized. Migration
-errors identify their source/destination and cause.
-Resetting to YAML requires moving aside both new routing state and any retained
-legacy state while the daemon is stopped; removing only the new file can
-trigger legacy migration again.
+The `v2.0-p3` boot migration consumes v1 `routing:` blocks (presets
+expanded), `routing_state.json`, `project_pins.json`,
+`review.forced_mode/forced_model`, and `bonsai:` (→ `decision_model` incl.
+the launch backend) into cards via the exact table
+(`Auto→auto, Local{None}→local, Local{Some}→<bare-key>, Cloud{None}→cloud,
+Cloud{Some}→cloud/<id>`), strips the consumed YAML keys (snapshot + `.bak`
+first), and `brainrouter migration restore v2.0-p3` round-trips the
+pre-migration YAML byte-for-byte. `serve --dry-run` previews without
+writing.
 
 #### benchmarks.*
 
@@ -389,7 +400,9 @@ Thin client for core management, roles, and reviews. `--socket <path>` selects t
 | `prompt-rewrite status` / `enable` / `disable` | Local prompt-rewrite toggle |
 | `context status` / `set <tokens\|auto>` | Legacy CLI only: validates 2048..262144 (auto = 131072), but `/api/context` has no server handler at this baseline and returns 404 |
 | `routing-mode status` / `set <auto\|cloud\|local>` | Routing-mode override |
-| `routing-profile status` / `models` / `preset` / `choose` / `pool` / `set` | Inspect/replace typed preferences, choose exact Main/Reviewer models, and configure the independent local pool |
+| `roles get` / `roles set <role> <selector> [--project <path>]` / `roles remove` | Inspect and assign role cards (mutations via daemon HTTP; reads direct-state when the daemon is down) |
+| `decision show` / `decision test "<text>"` | Describe the decision slot; run one prompt through it (full Decision JSON incl. fallback) |
+| `credential list` / `add` / `remove` / `test` | Masked credentials CRUD + resolve-test verdicts (values never printed) |
 | `plugin install <dir>` / `list` / `enable` / `disable` / `remove` / `status [id]` | Sidecar plugin management (v2 L2) |
 | `plugin config set <id> k=v [...]` / `plugin config show <id>` | Plugin-namespaced config (v2 L2) |
 | `migration restore <phase>` | Restore a leg snapshot (e.g. `v2.0-p2`) |
@@ -397,11 +410,11 @@ Thin client for core management, roles, and reviews. `--socket <path>` selects t
 | `restart <llama-swap\|llama-cpp\|manifest\|brainrouter>` | Restart a service. `llama-cpp` is the dashboard's `llama.cpp` row; `toolbox` is the `toolboxes` image |
 | `upgrade <llama-swap\|manifest\|toolbox>` | Upgrade a component |
 | `flush-models` | Unload every model from llama-swap (frees VRAM) |
-| `sync-omp` | Push llama-swap models into OMP's models.yml (one-way) |
+| (removed, v2 L3) | `sync-omp` is gone: install templates carry exactly one `auto` entry; model lists are the L4 catalog's job |
 | `config-files` | List config files the daemon manages |
 | `brainrouter-config show` / `set <path\|->` | Read brainrouter.yaml; write one from a file or stdin (`-`). Alias: `config` |
 | `llama-swap-config show` / `set <path\|->` | Same for llama-swap's config.yaml |
-| `review-config status` / `update [--max-iterations N] [--forced-mode auto\|cloud\|local] [--forced-model KEY\|--clear-model]` | Current/new-session reviewer configuration; continuations keep the initial snapshot |
+| `review-config status` / `update [--max-iterations N]` | Review-card extras (v2 L3 reduced: the reviewer model lives on the review card); continuations keep the initial snapshot |
 | `review list` | All review sessions |
 | `review get <sessionId>` | One session's details |
 | `review request <taskId> <summary> [--details TEXT] [--cwd DIR] [--async]` | Request a review; blocks with progress (polls every 5 s, 30-min cap) unless `--async` |
@@ -475,7 +488,7 @@ Incoming request (OpenAI or Anthropic format)
   |           x-conv-id / x-conversation-id / x-client-session / x-request-conv)
   |           so the dashboard can group events per conversation
   |
-  v router.rs: default/auto aliases resolve Main with explicit > project pin > global > auto
+  v router.rs: default/auto aliases resolve Main with explicit > project card > global card > auto
   |           review calls instead use the session's Reviewer snapshot; fresh reviews
   |           first inject a project reviewer pin when one exists
   |
@@ -1110,8 +1123,11 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `GET` | `/api/versions` | Version information for brainrouter and dependencies |
 | `GET` | `/api/review-config` | Current review configuration (mode, model) |
 | `POST` | `/api/review-config` | Update review configuration |
-| `GET/POST` | `/api/routing-profile` | Read/replace `{preset,main,reviewer,subagent_model}`; strict role/preset validation, 16 KiB JSON body limit |
-| `GET/POST/DELETE` | `/api/project-pin` | Per-project role pins; `?path=` resolves an absolute path to a canonical Git-root key |
+| `GET` | `/api/roles` | Role cards + policy + review-card extras |
+| `POST` | `/api/roles/set`, `/api/roles/remove` | `{role, assignment, scope?}`; strict selector validation, 16 KiB JSON body limit |
+| `GET` / `POST` | `/api/policy` / `/api/policy/set` | Guardrail policy records `{scope, privacy, quality}` |
+| `GET` / `POST` | `/api/credentials*` | Masked list + add/update/remove/test (test answers `{ok}` only) |
+| `GET` / `POST` | `/api/decision` / `/api/decision/test` | Decision slot describe / classify one prompt |
 | `GET` | `/api/routing-models` | Authenticated local/cloud metadata catalogs, visible per-provider errors; disabled cloud skips discovery |
 | `GET` | `/api/models/llama-swap` | List models available in llama-swap |
 | `GET` | `/api/plugins` | Plugin registry + live status + notification toasts (v2 L2) |
@@ -1295,7 +1311,7 @@ Resolve a review session with feedback.
 | Review hits max iterations | Iteration counter | Escalate to human via dashboard UI |
 | Review disabled | `review_runtime_state.json` / `/api/review/enabled` | New review requests return `disabled` without contacting a model |
 | Review prompt would exceed safe budget or required evidence is truncated | `review/tokens.rs` budget planner | Terminal escalation rather than a confident approval |
-| Project pin path is non-absolute or not in a Git repo | `ProjectPinStore::set` / resolver | Reject pin write or inherit global profile |
+| Role-card project scope is non-absolute or not in a Git repo | `roles::validate_card_scope` (relocated `ProjectPinStore` checks) / resolver | Reject the assignment write or inherit the global card |
 | Peer CWD resolution fails | `/proc` read failure | Use a valid explicit review CWD; invalid/absent resolved review directories are rejected, not silently substituted |
 | Config validation failure at startup | Missing required fields, invalid URLs, missing GGUF | Daemon refuses to start with descriptive error |
 | Legacy auto reviewer retains an ignored model | YAML/legacy-state read normalization | Discard only that ignored field, warn with source/action, persist state migration once; keep new API writes strict |
@@ -1389,7 +1405,7 @@ normalization, not weakened validation for new writes.
 - **Not a conversation store.** Chat history is managed by the harness. brainrouter is stateless for proxy calls; review sessions are in-memory and lost on daemon restart.
 - **Not a chat application.** The Discord/Signal bridges are thin wrappers around the `omp` CLI, not standalone chat bots with their own reasoning.
 - **Not a benchmark executor or runtime attestation service.** Registered capabilities/hashes and imported metrics do not prove artifact integrity, runtime feature support, or controlled comparability.
-- **Not a persistent live-traffic monitor.** Samples and alert latches reset on restart; role preferences, project pins, benchmark records, toolbox ownership sidecars and explicit observation settings persist.
+- **Not a persistent live-traffic monitor.** Samples and alert latches reset on restart; role cards, policy records, benchmark records, toolbox ownership sidecars and explicit observation settings persist.
 
 ---
 

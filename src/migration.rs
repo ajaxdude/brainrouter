@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 /// The L2 phase tag: `brainrouter migration restore v2.0-p2`.
 pub const PHASE_V2_P2: &str = "v2.0-p2";
 
+/// The L3 phase tag: `brainrouter migration restore v2.0-p3`. Runs BEFORE
+/// the L2 phase so its snapshot holds the pristine pre-migration state and
+/// `restore v2.0-p3` round-trips the v1 YAML byte-for-byte.
+pub const PHASE_V2_P3: &str = "v2.0-p3";
+
 /// Credential id the Discord-token migration creates (stable, conventional
 /// id; the plugin resolves it via `secrets.get`).
 pub const DISCORD_TOKEN_CREDENTIAL_ID: &str = "discord_token";
@@ -65,6 +70,369 @@ pub fn run_v2_p2(
         config_path.display(),
         snapshot_dir.display()
     )])
+}
+
+// ── v2.0-p3: role cards + decision slot (L3) ────────────────────────────────
+
+/// Raw-YAML inspection of the v1 state the L3 migration consumes.
+#[derive(Debug, Default)]
+pub struct V1State {
+    pub has_routing_block: bool,
+    pub has_bonsai_block: bool,
+    pub has_decision_model: bool,
+    pub routing: Option<crate::roles::LegacyRoutingProfile>,
+    pub review: Option<crate::roles::ReviewExtras>,
+    pub forced_mode: Option<String>,
+    pub forced_model: Option<String>,
+    pub bonsai_enabled: bool,
+    pub bonsai_port: u16,
+    pub bonsai_fork_path: Option<String>,
+    pub bonsai_model_path: Option<String>,
+}
+
+/// Read the v1-relevant keys out of the config YAML (no validation — this
+/// runs BEFORE config::load so a v1 file always inspects).
+pub fn read_v1_state(config_path: &Path) -> Result<V1State> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {} for migration", config_path.display()))?;
+    let root: YamlValue = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} for migration", config_path.display()))?;
+    let mut out = V1State::default();
+    let Some(map) = root.as_mapping() else {
+        return Ok(out);
+    };
+    let get = |key: &str| map.get(YamlValue::String(key.into()));
+    out.has_decision_model = get("decision_model").is_some();
+    if let Some(routing) = get("routing") {
+        out.has_routing_block = true;
+        // The v1 `routing:` block is the serde shape of RoutingProfile; parse
+        // it through the relocated ModelChoice deserializer.
+        let json: serde_json::Value = serde_json::to_value(routing)
+            .context("converting routing block")?;
+        out.routing = Some(
+            serde_json::from_value(json)
+                .context("invalid v1 routing block in migration")?,
+        );
+    }
+    if let Some(review) = get("review").and_then(|r| r.as_mapping()) {
+        let g = |key: &str| review.get(YamlValue::String(key.into()));
+        let max_iterations = g("max_iterations")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.clamp(1, u32::MAX as i64) as u32);
+        let hankndory = g("hankndory_integration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let design_doc_path = g("design_doc_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.review = Some(crate::roles::ReviewExtras {
+            max_iterations: max_iterations.unwrap_or(5),
+            hankndory_integration: hankndory,
+            design_doc_path,
+        });
+        out.forced_mode = g("forced_mode").and_then(|v| v.as_str()).map(|s| s.to_string());
+        out.forced_model = g("forced_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    if let Some(bonsai) = get("bonsai").and_then(|b| b.as_mapping()) {
+        out.has_bonsai_block = true;
+        let g = |key: &str| bonsai.get(YamlValue::String(key.into()));
+        out.bonsai_enabled = g("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        out.bonsai_port = g("server_port")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.clamp(1, u16::MAX as i64) as u16)
+            .unwrap_or(9200);
+        out.bonsai_fork_path = g("fork_path").and_then(|v| v.as_str()).map(|s| s.to_string());
+        out.bonsai_model_path = g("model_path").and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    Ok(out)
+}
+
+impl V1State {
+    /// Whether this YAML is pre-L3 (no decision slot yet) — the migration
+    /// trigger. An L3-era YAML always carries `decision_model:`.
+    pub fn needs_l3_migration(&self) -> bool {
+        !self.has_decision_model
+    }
+
+    /// The effective v1 profile: YAML `routing:` block, else the v1 defaults
+    /// (`config.routing_profile()` @ v1-classic): main = Local{None} (the v1
+    /// default — "default-local stays local"), reviewer = review.forced_*
+    /// (`ReviewConfig::model_choice`), subagent ONLY from the profile block
+    /// (`config.subs_model` stays as the auto-pool compatibility seed).
+    pub fn effective_profile(&self) -> Result<crate::roles::LegacyRoutingProfile> {
+        if let Some(profile) = &self.routing {
+            return Ok(profile.clone());
+        }
+        // v1 read-parity (`ReviewConfig::model_choice`): mode `auto` ignores a
+        // leftover forced_model (the "legacy auto yaml" keeper).
+        let forced_model = if self.forced_mode.as_deref().unwrap_or("auto") == "auto" {
+            None
+        } else {
+            self.forced_model.clone()
+        };
+        let reviewer = crate::roles::ModelChoice::from_legacy(
+            self.forced_mode.as_deref().unwrap_or("auto"),
+            forced_model,
+        )?;
+        Ok(crate::roles::LegacyRoutingProfile {
+            preset: crate::roles::LegacyPreset::Custom,
+            main: crate::roles::ModelChoice::local(),
+            reviewer,
+            subagent_model: None,
+        })
+    }
+}
+
+/// The `v2.0-p3` migration (L3): v1 routing profile + project pins +
+/// `review.forced_*` + `bonsai.*` → role cards (`role_cards.json`) + a
+/// `decision_model:` block; the consumed YAML keys are stripped (snapshot +
+/// `.bak` first). Idempotent: an L3-era YAML (has `decision_model:`) is a
+/// no-op. Runs BEFORE the L2 phase so the snapshot is pristine v1 state.
+pub fn run_v2_p3(
+    config_path: &Path,
+    store: &CredentialStore,
+    state_root: &Path,
+    config_dir: &Path,
+    cards: &crate::roles::RoleCardStore,
+) -> Result<Vec<String>> {
+    let state = read_v1_state(config_path)?;
+    if !state.needs_l3_migration() {
+        return Ok(Vec::new());
+    }
+    let snapshot_dir = snapshot_with_v1_stores(config_path, store, state_root, config_dir, PHASE_V2_P3, cards)?;
+
+    // Profile precedence: persisted routing_state.json (UI overrides) > YAML
+    // routing block > v1 defaults.
+    let profile = match crate::roles::read_legacy_routing_state(
+        &config_dir.join("routing_state.json"),
+    ) {
+        Ok(profile) => profile,
+        Err(e) if e.root_cause().to_string().contains("No such file") => state.effective_profile()?,
+        Err(e) => return Err(e),
+    };
+    let pins_path = config_dir.join("project_pins.json");
+    let pins = match crate::roles::read_legacy_pins(&pins_path) {
+        Ok(pins) => pins,
+        Err(e) if e.root_cause().to_string().contains("No such file") => Default::default(),
+        Err(e) => return Err(e),
+    };
+    let output = crate::roles::migrate_v1(&profile, &pins, state.review.clone());
+
+    let data = crate::roles::StoreDataForMigration {
+        assignments: output.cards,
+        review_extras: output.review_extras,
+    };
+    cards.replace_from_migration(data)?;
+
+    strip_v1_keys_and_add_decision_model(config_path, &state)?;
+
+    let mut actions = vec![format!(
+        "migrated v1 routing profile + project pins + review.forced_* into {} (cards: {}); \
+         keys `routing:`, `review.forced_mode/forced_model` removed from {}",
+        cards
+            .path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "role cards".into()),
+        cards.assignments_snapshot().len(),
+        config_path.display()
+    )];
+    if state.has_bonsai_block {
+        actions.push(format!(
+            "migrated bonsai.* into the decision slot (kind openai-compatible, prompt_profile bonsai, enabled: {}); launch backend config preserved under decision_model.launch; key `bonsai:` removed (backup: {}.bak)",
+            state.bonsai_enabled,
+            config_path.display()
+        ));
+    }
+    actions.push(format!(
+        "pre-migration snapshot (config, credentials, project pins, routing state): {}",
+        snapshot_dir.display()
+    ));
+    Ok(actions)
+}
+
+/// `--dry-run` preview for `v2.0-p3` — describes actions, never writes.
+pub fn preview_v2_p3(
+    config_path: &Path,
+    state_root: &Path,
+    config_dir: &Path,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P3} (state untouched)"));
+    let state = match read_v1_state(config_path) {
+        Ok(state) => state,
+        Err(e) => {
+            lines.push(format!("  cannot inspect {}: {e}", config_path.display()));
+            return Ok(lines);
+        }
+    };
+    if !state.needs_l3_migration() {
+        lines.push(format!(
+            "  {} is an L3-era config (decision_model present) — migration {PHASE_V2_P3} has nothing to do",
+            config_path.display()
+        ));
+        return Ok(lines);
+    }
+    let profile = state.effective_profile();
+    match &profile {
+        Ok(profile) => {
+            lines.push(format!(
+                "  would migrate the v1 profile: main `{}` -> `{}`, reviewer `{}` -> `{}`, subagent {:?}",
+                profile.main.backend(),
+                profile.main.card_selector(),
+                profile.reviewer.backend(),
+                profile.reviewer.card_selector(),
+                profile.subagent_model
+            ));
+        }
+        Err(e) => lines.push(format!("  v1 profile unreadable: {e}")),
+    }
+    for file in ["project_pins.json", "routing_state.json"] {
+        if config_dir.join(file).exists() {
+            lines.push(format!("  would migrate v1 state store: {}", config_dir.join(file).display()));
+        }
+    }
+    lines.push(format!(
+        "  would snapshot pre-migration state under {}",
+        snapshot_root(state_root, PHASE_V2_P3).display()
+    ));
+    lines.push(format!(
+        "  would write role cards to {}",
+        crate::roles::RoleCardStore::default_path().display()
+    ));
+    if state.has_bonsai_block {
+        lines.push(
+            "  would migrate bonsai.* into decision_model (kind openai-compatible, prompt_profile bonsai)".to_string(),
+        );
+    }
+    lines.push(format!(
+        "  would remove routing/review.forced_*/bonsai keys from {} (backup: {}.bak)",
+        config_path.display(),
+        config_path.display()
+    ));
+    Ok(lines)
+}
+
+/// Snapshot that also captures the v1 state stores L3 replaces.
+fn snapshot_with_v1_stores(
+    config_path: &Path,
+    store: &CredentialStore,
+    state_root: &Path,
+    config_dir: &Path,
+    phase: &str,
+    cards: &crate::roles::RoleCardStore,
+) -> Result<PathBuf> {
+    let dir = snapshot(config_path, store, state_root, phase)?;
+    for (src, name) in [
+        (config_dir.join("project_pins.json"), SNAPSHOT_PINS_FILE),
+        (config_dir.join("routing_state.json"), SNAPSHOT_ROUTING_STATE_FILE),
+    ] {
+        if let Ok(text) = std::fs::read(&src) {
+            crate::plugins::store::atomic_write_0600(&dir.join(name), &text)?;
+        }
+    }
+    // v2 L3 Step 9 B1: capture the cards store too, when present, so a
+    // snapshot restore can roll the cards back (the daemon's own state file
+    // is passed in, not re-derived from env).
+    if let Some(cards_path) = cards.path() {
+        if cards_path.exists() {
+            if let Ok(text) = std::fs::read(cards_path) {
+                crate::plugins::store::atomic_write_0600(&dir.join(SNAPSHOT_ROLE_CARDS_FILE), &text)?;
+            }
+        }
+    }
+    Ok(dir)
+}
+
+/// Rewrite the YAML: strip the keys L3 consumed and insert the `decision_model`
+/// block (from `bonsai.*`). Leaves a `.bak` copy of the original.
+fn strip_v1_keys_and_add_decision_model(config_path: &Path, state: &V1State) -> Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    std::fs::write(bak_path(config_path), &text).context("writing config .bak backup")?;
+    let mut root: YamlValue = serde_yaml::from_str(&text).context("re-parsing config YAML")?;
+    let Some(map) = root.as_mapping_mut() else {
+        return Ok(());
+    };
+    map.remove(YamlValue::String("routing".into()));
+    if let Some(review) = map
+        .get_mut(YamlValue::String("review".into()))
+        .and_then(|r| r.as_mapping_mut())
+    {
+        review.remove(YamlValue::String("forced_mode".into()));
+        review.remove(YamlValue::String("forced_model".into()));
+    }
+    map.remove(YamlValue::String("bonsai".into()));
+    // v2 L3 Step 9 B1: the migrated YAML ALWAYS carries `decision_model:` —
+    // it is the marker that makes the p3 guard (`!has_decision_model`)
+    // one-shot. Gating the insertion on the bonsai block made every
+    // bonsai-less v1 config re-migrate on EVERY boot: cards reset to the
+    // (then-stale) v1 profile, snapshots and `.bak` rewritten per start.
+    // The no-bonsai case writes the behavior-neutral parity anchor
+    // (`enabled: false, kind: heuristic` = classifier-off v1 semantics).
+    let mut slot = serde_yaml::Mapping::new();
+    if state.has_bonsai_block {
+        slot.insert(
+            YamlValue::String("enabled".into()),
+            YamlValue::Bool(state.bonsai_enabled),
+        );
+        slot.insert(
+            YamlValue::String("kind".into()),
+            YamlValue::String("openai-compatible".into()),
+        );
+        slot.insert(
+            YamlValue::String("base_url".into()),
+            YamlValue::String(format!("http://127.0.0.1:{}", state.bonsai_port)),
+        );
+        slot.insert(
+            YamlValue::String("model".into()),
+            YamlValue::String("bonsai".into()),
+        );
+        slot.insert(
+            YamlValue::String("prompt_profile".into()),
+            YamlValue::String("bonsai".into()),
+        );
+        let mut launch = serde_yaml::Mapping::new();
+        launch.insert(
+            YamlValue::String("server_port".into()),
+            YamlValue::Number(serde_yaml::Number::from(state.bonsai_port as i64)),
+        );
+        if let Some(fork) = &state.bonsai_fork_path {
+            launch.insert(
+                YamlValue::String("fork_path".into()),
+                YamlValue::String(fork.clone()),
+            );
+        }
+        if let Some(model) = &state.bonsai_model_path {
+            launch.insert(
+                YamlValue::String("model_path".into()),
+                YamlValue::String(model.clone()),
+            );
+        }
+        slot.insert(
+            YamlValue::String("launch".into()),
+            YamlValue::Mapping(launch),
+        );
+    } else {
+        slot.insert(
+            YamlValue::String("enabled".into()),
+            YamlValue::Bool(false),
+        );
+        slot.insert(
+            YamlValue::String("kind".into()),
+            YamlValue::String("heuristic".into()),
+        );
+    }
+    map.insert(
+        YamlValue::String("decision_model".into()),
+        YamlValue::Mapping(slot),
+    );
+    let out = serde_yaml::to_string(&root).context("serializing migrated config YAML")?;
+    // v2 L3 Step 9 (nit): atomic write — the migrated YAML is the daemon's
+    // live config; a torn write here bricks every future boot. Byte-equality
+    // for `restore`: the `.bak`/snapshot copies above are the pristine bytes.
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+    Ok(())
 }
 
 /// `--dry-run` preview: describe exactly what the `v2.0-p2` migration would
@@ -117,6 +485,7 @@ pub fn restore(
     config_path: &Path,
     store: &CredentialStore,
     state_root: &Path,
+    config_dir: &Path,
 ) -> Result<String> {
     let latest = newest_snapshot(phase, state_root)?.with_context(|| {
         format!(
@@ -144,6 +513,33 @@ pub fn restore(
         let records = extract_records(&text)?;
         store.replace_all(records)?;
         restored.push("credentials store (pre-migration values + grants)");
+    }
+    // L3: restore the v1 state stores that role cards replaced, and drop the
+    // cards store so the next boot re-derives it from the restored v1 state.
+    let snap_pins = snap_dir.join(SNAPSHOT_PINS_FILE);
+    if snap_pins.exists() {
+        std::fs::copy(&snap_pins, config_dir.join("project_pins.json"))
+            .context("restoring v1 project pins")?;
+        restored.push("v1 project pins store");
+    }
+    let snap_profile = snap_dir.join(SNAPSHOT_ROUTING_STATE_FILE);
+    if snap_profile.exists() {
+        std::fs::copy(&snap_profile, config_dir.join("routing_state.json"))
+            .context("restoring v1 routing profile state")?;
+        restored.push("v1 routing profile state");
+    }
+    let cards = crate::roles::RoleCardStore::default_path();
+    let snap_cards = snap_dir.join(SNAPSHOT_ROLE_CARDS_FILE);
+    if snap_cards.exists() {
+        // v2 L3 Step 9 B1: the p3 snapshot captured the cards store —
+        // restore it (the re-derivation on next boot must see the
+        // pre-migration cards, not none).
+        std::fs::copy(&snap_cards, &cards).context("restoring role cards store")?;
+        restored.push("role cards store (pre-migration snapshot)");
+    } else if cards.exists() {
+        std::fs::remove_file(&cards)
+            .with_context(|| format!("removing {}", cards.display()))?;
+        restored.push("role cards store (removed)");
     }
     if restored.is_empty() {
         anyhow::bail!("snapshot {} contains no restorable files", snap_dir.display());
@@ -189,9 +585,20 @@ pub fn snapshot_root(state_root: &Path, phase: &str) -> PathBuf {
 /// Snapshot files (directly under the timestamp directory).
 pub const SNAPSHOT_CONFIG_FILE: &str = "snapshot-config.yaml";
 pub const SNAPSHOT_CREDENTIALS_FILE: &str = "snapshot-credentials.json";
+/// L3: the v1 state stores replaced by role cards.
+pub const SNAPSHOT_PINS_FILE: &str = "snapshot-project-pins.json";
+pub const SNAPSHOT_ROLE_CARDS_FILE: &str = "role_cards.json";
+pub const SNAPSHOT_ROUTING_STATE_FILE: &str = "snapshot-routing-state.json";
 
 pub fn newest_snapshot(phase: &str, state_root: &Path) -> Result<Option<PathBuf>> {
     let root = snapshot_root(state_root, phase);
+    // v2 L3 Step 9 B1: the snapshot is one directory per phase (no per-boot
+    // timestamps). Accept the legacy timestamped layout too (restore of a
+    // pre-B1 state dir): if the phase root directly contains a snapshot
+    // file, it IS the snapshot.
+    if root.join(SNAPSHOT_CONFIG_FILE).exists() {
+        return Ok(Some(root));
+    }
     let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
         Ok(rd) => rd
             .flatten()
@@ -214,9 +621,11 @@ pub fn snapshot(
     state_root: &Path,
     phase: &str,
 ) -> Result<PathBuf> {
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    // v2 L3 Step 9 B1: ONE snapshot directory per phase (was a per-boot
+    // UTC-second timestamp). A one-shot migration has one pre-state; per-boot
+    // duplicates only multiplied restore ambiguity.
     let migrations = state_root.join("migrations");
-    let dir = snapshot_root(state_root, phase).join(&ts);
+    let dir = snapshot_root(state_root, phase);
     std::fs::create_dir_all(&dir).context("creating migration snapshot directory")?;
     for d in [state_root, &migrations, &snapshot_root(state_root, phase)] {
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).ok();
@@ -277,7 +686,11 @@ fn strip_discord_token(config_path: &Path) -> Result<()> {
         }
     }
     let out = serde_yaml::to_string(&root).context("serializing migrated config YAML")?;
-    std::fs::write(config_path, out).context("writing migrated config YAML")?;
+    // v2 L3 Step 9 (nit): atomic write — the migrated YAML is the daemon's
+    // live config; a torn write here bricks every future boot. Byte-equality
+    // for `restore`: the `.bak`/snapshot copies above are the pristine bytes.
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
     Ok(())
 }
 
@@ -298,6 +711,57 @@ mod tests {
              bonsai:\n  enabled: false\n  fork_path: /nonexistent\n\
              bridge:\n  omp_path: /nonexistent/omp\n  discord:\n    enabled: false\n    token: {token}\n  signal:\n    enabled: false\n"
         )
+    }
+
+    /// v2 L3 Step 9 B1: a v1 config WITHOUT a `bonsai:` block must migrate
+    /// exactly ONCE: the migrated YAML carries the parity-anchor
+    /// `decision_model:` (enabled false, heuristic), the second run is a
+    /// no-op, cards survive, and exactly one snapshot directory exists.
+    #[test]
+    fn p3_without_bonsai_block_is_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            "manifest:\n  base_url: http://127.0.0.1:1/cloud/v1\n  enabled: false\n\
+             llama_swap:\n  base_url: http://127.0.0.1:1/v1\n  fallback_model: m\n\
+             routing:\n  main: {backend: local}\n  reviewer: {backend: cloud}\n",
+        )
+        .unwrap();
+        let store = CredentialStore::load(dir.path().join("credentials.json")).unwrap();
+        let cards = crate::roles::RoleCardStore::load(state.join("role_cards.json"));
+
+        let actions = run_v2_p3(&config, &store, &state, &config_dir, &cards).unwrap();
+        assert!(!actions.is_empty(), "v1 YAML migrates");
+        let after_first = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            after_first.contains("decision_model:")
+                && after_first.contains("kind: heuristic")
+                && after_first.contains("enabled: false"),
+            "no-bonsai v1 gets the parity anchor: {after_first}"
+        );
+        let cards_first = cards.assignments_snapshot().len();
+        assert!(cards_first > 0, "cards seeded");
+
+        // Second boot over the migrated YAML: complete no-op.
+        let actions = run_v2_p3(&config, &store, &state, &config_dir, &cards).unwrap();
+        assert!(actions.is_empty(), "the migrated YAML is a no-op: {actions:?}");
+        assert_eq!(cards.assignments_snapshot().len(), cards_first, "cards survive boot 2");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), after_first, "YAML untouched");
+
+        // Exactly ONE snapshot dir for the phase (no per-boot duplicates).
+        let snaps = snapshot_root(&state, PHASE_V2_P3);
+        let entries: Vec<_> = std::fs::read_dir(&snaps).unwrap().collect();
+        assert_eq!(entries.len(), 1, "one snapshot per phase: {entries:?}");
+
+        // Restore returns the pristine v1 YAML byte-for-byte.
+        std::fs::write(&config, "junk: true\n").unwrap();
+        let msg = restore(PHASE_V2_P3, &config, &store, &state, &config_dir).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        assert!(std::fs::read_to_string(&config).unwrap().contains("routing:"), "v1 keys back");
     }
 
     #[test]
@@ -334,7 +798,7 @@ mod tests {
         assert!(run_v2_p2(&config, &store, &state).unwrap().is_empty());
 
         // Restore puts the YAML key (and value) back from the snapshot.
-        let msg = restore(PHASE_V2_P2, &config, &store, &state).unwrap();
+        let msg = restore(PHASE_V2_P2, &config, &store, &state, dir.path()).unwrap();
         assert!(msg.contains("restored v2.0-p2"));
         assert!(std::fs::read_to_string(&config).unwrap().contains("PLAINTEXT-TOK-1234"));
         assert!(store.exists("discord_token").unwrap());
@@ -389,7 +853,7 @@ mod tests {
                 updated_at: String::new(),
             })
             .unwrap();
-        let msg = restore(PHASE_V2_P2, &config, &store, &state).unwrap();
+        let msg = restore(PHASE_V2_P2, &config, &store, &state, dir.path()).unwrap();
         assert!(msg.contains("credentials store"), "{msg}");
 
         // Every pre-migration credential + grant survives.
@@ -436,7 +900,7 @@ mod tests {
                 updated_at: String::new(),
             })
             .unwrap();
-        let err = restore(PHASE_V2_P2, &config, &store, &state).unwrap_err();
+        let err = restore(PHASE_V2_P2, &config, &store, &state, dir.path()).unwrap_err();
         assert!(err.to_string().contains("shape"), "{err}");
         assert!(store.exists("keep").unwrap(), "vault untouched after a failed restore");
     }

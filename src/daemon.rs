@@ -175,6 +175,17 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // state (snapshot layout, credentials store, YAML key removal).
     let credentials_path = brainrouter::credentials::CredentialStore::default_path();
     if args.dry_run {
+        let config_dir = config::default_config_path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(std::path::PathBuf::new);
+        for line in brainrouter::migration::preview_v2_p3(
+            &config_path,
+            &brainrouter::paths::brainrouter_state(),
+            &config_dir,
+        )? {
+            println!("{line}");
+        }
         for line in brainrouter::migration::preview_v2_p2(
             &config_path,
             &credentials_path,
@@ -201,6 +212,26 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         },
     );
+    // v2 L3 role cards: load first so the migration can seed them. Runs
+    // BEFORE the L2 phase so the v2.0-p3 snapshot is the pristine v1 state.
+    let config_dir = config::default_config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::path::PathBuf::new);
+    let cards = Arc::new(brainrouter::roles::RoleCardStore::load(
+        brainrouter::roles::RoleCardStore::default_path(),
+    ));
+    for action in brainrouter::migration::run_v2_p3(
+        &config_path,
+        &credentials_store,
+        &brainrouter::paths::brainrouter_state(),
+        &config_dir,
+        &cards,
+    )? {
+        // warn-level: operators on default RUST_LOG must see that their v1
+        // config was consumed (v1 logged the forced_model migration at warn).
+        warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P3);
+    }
     for action in brainrouter::migration::run_v2_p2(
         &config_path,
         &credentials_store,
@@ -213,22 +244,15 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let config = config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let profiles = Arc::new(brainrouter::routing_profile::ProfileStore::load(
-        config::default_config_path().with_file_name("routing_state.json"),
-        config.routing_profile()?,
-        &config.review,
-    )?);
-    let routing_mode = match profiles.profile().main.backend() {
+    let routing_mode = match brainrouter::roles::parse_selector(
+        &cards.assignment(brainrouter::roles::Role::Main, None),
+    )
+    .backend()
+    {
         "cloud" => 1,
         "local" => 2,
         _ => 0,
     };
-    // Per-project model pins (Phase 2): colocated with routing_state.json. An
-    // absent/corrupt file loads empty, so every project inherits the global
-    // profile — identical to pre-Phase-2 behavior.
-    let project_pins = Arc::new(brainrouter::project_pins::ProjectPinStore::load(
-        config::default_config_path().with_file_name("project_pins.json"),
-    ));
     // v2 R2: without the `benchmarks` cargo feature the explorer lab is not
     // compiled and the store is never opened — the routes answer the
     // documented 503 degradation envelope (`benchmark::unavailable_response`)
@@ -293,6 +317,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .parse()
         .with_context(|| format!("Invalid TCP address: {}", args.tcp_addr))?;
 
+    // v2 L3: bind the listeners before ANY heavy boot work (migration,
+    // plugin registry, decision-backend launch, model resolution) so
+    // `/health` never answers while the UDS socket file is still pending —
+    // the window that made a CLI invoked right after startup race the bind
+    // under parallel load ("Daemon socket not found" flakes).
+    let bound = server::bind_listeners(tcp_addr, socket.clone()).await?;
+
     info!(
         config_path = %config_path.display(),
         tcp_addr = %tcp_addr,
@@ -302,27 +333,28 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         fallback_model = %config.llama_swap.fallback_model,
         "Starting brainrouter daemon"
     );
-    let bonsai_control = if config.bonsai.enabled {
-        let model_path = config
-            .bonsai
-            .model_path
-            .clone()
-            .context("bonsai.enabled is true but bonsai.model_path is not set")?;
-        BonsaiControl::start(
-            config.bonsai.fork_path.clone(),
-            model_path,
-            config.bonsai.server_port,
-        )
-        .await
-        .context("Failed to start Bonsai llama-server")?
-    } else {
-        warn!("Bonsai classifier is disabled (bonsai.enabled: false) — auto-routed requests go straight to llama-swap. Enable it with `brainrouter cli bonsai on` or set bonsai.enabled: true in brainrouter.yaml.");
-        BonsaiControl::disabled(
-            config.bonsai.fork_path.clone(),
-            config.bonsai.model_path.clone(),
-            config.bonsai.server_port,
-        )
-        .await
+    // The Bonsai llama-server launch backend (L3: config moved under
+    // `decision_model.launch`; the server itself is unchanged).
+    let launch = config.decision_model.launch.clone();
+    let bonsai_control = match &launch {
+        Some(l) if config.decision_model.enabled && config.decision_model.is_bonsai_profile() => {
+            let model_path = l
+                .model_path
+                .clone()
+                .context("decision_model is enabled with prompt_profile bonsai but launch.model_path is not set")?;
+            BonsaiControl::start(l.fork_path.clone(), model_path, l.server_port)
+                .await
+                .context("Failed to start Bonsai llama-server")?
+        }
+        _ => {
+            warn!("decision slot classifier server is disabled — the slot answers per its kind (heuristic parity routes auto requests local). Enable with decision_model.enabled: true.");
+            BonsaiControl::disabled(
+                launch.as_ref().map(|l| l.fork_path.clone()).unwrap_or_default(),
+                launch.as_ref().and_then(|l| l.model_path.clone()),
+                launch.as_ref().map(|l| l.server_port).unwrap_or(9200),
+            )
+            .await
+        }
     };
 
     // Nudge (per-request reasoning budget) runtime state — shared between the
@@ -345,22 +377,44 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(code_review_flag));
     let pr_guidelines_enabled =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(pr_guidelines_flag));
-    // Apply the effective HankNDory value onto the live ProfileStore (its
-    // `review_config()` is what `run_loop` reads). ProfileStore::load already
-    // seeded the YAML value; override it only when the runtime file has a value.
+    // Apply the effective HankNDory value onto the live review card extras
+    // (what `run_loop` reads). The card seeded the YAML value at migration;
+    // override only when the runtime file has a value.
     let hankndory_effective = hankndory_override.unwrap_or(config.review.hankndory_integration);
-    profiles.set_hankndory_integration(hankndory_effective);
+    cards.set_hankndory_integration(hankndory_effective).ok();
 
-    // Create classifier pointing at the external server
-    let classifier = Classifier::new(
-        bonsai_control.url(),
+    // The decision slot (L3): an openai-compatible bonsai profile keeps the
+    // v1 wire + shared "server on" flag; any other kind carries its own
+    // endpoint config.
+    let slot_classifier_enabled = if config.decision_model.launch.is_some() {
+        bonsai_control.enabled()
+    } else {
+        Arc::new(std::sync::atomic::AtomicBool::new(true))
+    };
+    let slot_base_url = config
+        .decision_model
+        .base_url
+        .clone()
+        .unwrap_or_else(|| {
+            format!(
+                "http://127.0.0.1:{}",
+                config
+                    .decision_model
+                    .launch
+                    .as_ref()
+                    .map(|l| l.server_port)
+                    .unwrap_or(9200)
+            )
+        });
+    let slot_classifier = Arc::new(Classifier::for_slot(
+        slot_base_url,
         config.llama_swap.fallback_model.clone(),
-        bonsai_control.enabled(),
+        slot_classifier_enabled,
         Arc::clone(&nudge_enabled),
         config.llama_swap.nudge.model_key.clone(),
-    );
-    let classifier = Arc::new(classifier);
-    info!("Bonsai classifier ready");
+        std::time::Duration::from_millis(config.decision_model.timeout_ms.unwrap_or(15_000)),
+    ));
+    info!(kind = config.decision_model.kind.as_str(), enabled = config.decision_model.enabled, "Decision slot ready");
 
     // Manifest provider (cloud)
     let manifest_api_key = config.resolve_manifest_api_key();
@@ -420,29 +474,45 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let inference_tracker = Arc::new(InferenceTracker::new());
     let serving_identities = Arc::new(brainrouter::serving_identity::ServingIdentityRegistry::new());
 
-    // Router — shared between the proxy and the review service
-    let router = Arc::new(
-        Router::new(brainrouter::router::RouterArgs {
-            classifier,
-            manifest,
-            manifest_enabled: config.manifest.enabled,
-            llama_swap,
-            fallback_model: config.llama_swap.fallback_model.clone(),
-            local_models: config.llama_swap.local_models.clone(),
-            subs_model: config.llama_swap.subs_model.clone(),
-            health,
-            routing_events: Arc::clone(&routing_events),
-            local_system_prompt,
-            inference_tracker: Arc::clone(&inference_tracker),
-            nudge_budgets: config.llama_swap.nudge.budgets,
-            nudge_enabled: Arc::clone(&nudge_enabled),
-            nudge_tier: Arc::clone(&nudge_tier),
-            prompt_rewrite: Arc::clone(&prompt_rewrite),
-            serving_identities: Some(Arc::clone(&serving_identities)),
-        })
-        .with_profiles(profiles)
-        .with_project_pins(project_pins),
+    // v2 L2 plugin subsystem (registry + supervisor + per-plugin UDS RPC).
+    // Constructed before the router: the `plugin` decision kind speaks to it.
+    let plugins = Arc::new(
+        brainrouter::plugins::PluginManager::new(Arc::clone(&credentials_store))
+            .context("loading the plugin registry")?,
     );
+    let decision_slot = Arc::new(brainrouter::decision::DecisionSlot::new(
+        config.decision_model.clone(),
+        slot_classifier,
+        Some(Arc::clone(&plugins)),
+    ));
+
+    // Router — shared between the proxy and the review service
+    let llama_swap_config_path = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
+        std::fs::canonicalize(&p).ok()
+    };
+    let router = Arc::new(Router::new(brainrouter::router::RouterArgs {
+        slot: Arc::clone(&decision_slot),
+        cards: Arc::clone(&cards),
+        manifest,
+        manifest_enabled: config.manifest.enabled,
+        llama_swap,
+        fallback_model: config.llama_swap.fallback_model.clone(),
+        local_models: config.llama_swap.local_models.clone(),
+        subs_model: config.llama_swap.subs_model.clone(),
+        health,
+        routing_events: Arc::clone(&routing_events),
+        local_system_prompt,
+        inference_tracker: Arc::clone(&inference_tracker),
+        nudge_budgets: config.llama_swap.nudge.budgets,
+        nudge_enabled: Arc::clone(&nudge_enabled),
+        nudge_tier: Arc::clone(&nudge_tier),
+        nudge_model_key: config.llama_swap.nudge.model_key.clone(),
+        prompt_rewrite: Arc::clone(&prompt_rewrite),
+        llama_swap_config_path,
+        serving_identities: Some(Arc::clone(&serving_identities)),
+    }));
 
     // Session manager (in-memory; ephemeral per process lifetime)
     let session_manager = Arc::new(SessionManager::new());
@@ -452,6 +522,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let review_service = Arc::new(ReviewService::new(
         Arc::clone(&router),
         Arc::clone(&session_manager),
+        Arc::clone(&cards),
         review_config,
         config.review_admission.clone(),
         config.manifest.enabled,
@@ -494,12 +565,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .unwrap_or(&config.manifest.base_url)
         .to_string();
 
-    // v2 L2 plugin subsystem (registry + supervisor + per-plugin UDS RPC).
-    let plugins = Arc::new(
-        brainrouter::plugins::PluginManager::new(Arc::clone(&credentials_store))
-            .context("loading the plugin registry")?,
-    );
-
     // Seed with an empty object, not null: /api/versions and `brainrouter cli
     // versions` read this before the first compute completes (up to ~15 s).
     let (versions_tx, versions_rx) = tokio::sync::watch::channel(serde_json::json!({}));
@@ -509,7 +574,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         router,
         session_manager,
         review_service,
+        roles: Arc::clone(&cards),
+        decision: Arc::clone(&decision_slot),
+        credentials: Arc::clone(&credentials_store),
         routing_events,
+
         llama_swap_url,
         manifest_url,
         plugins: Arc::clone(&plugins),
@@ -520,6 +589,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
             std::fs::canonicalize(&p).unwrap_or(p)
         },
+        decision_config: config.decision_model.clone(),
         llama_swap_config_lock: Arc::new(tokio::sync::Mutex::new(())),
         tcp_addr: tcp_addr.to_string(),
         manifest_enabled: config.manifest.enabled,
@@ -554,11 +624,17 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     {
         let tx = Arc::clone(&versions_tx);
         tokio::spawn(async move {
-            let data = server::compute_versions_json(&config.bonsai.fork_path).await;
+            let fork_path = config
+                .decision_model
+                .launch
+                .as_ref()
+                .map(|l| l.fork_path.clone())
+                .unwrap_or_default();
+            let data = server::compute_versions_json(&fork_path).await;
             let _ = tx.send_replace(data);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
-                let data = server::compute_versions_json(&config.bonsai.fork_path).await;
+                let data = server::compute_versions_json(&fork_path).await;
                 let _ = tx.send_replace(data);
             }
         });
@@ -585,25 +661,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         });
     }
 
-    // Auto-sync OMP models.yml from live llama-swap model list.
-    // Runs in background — non-fatal if llama-swap is not yet up.
-    {
-        let ls_url = state.llama_swap_url.clone();
-        let own_addr = tcp_addr.to_string();
-        tokio::spawn(async move {
-            // Give llama-swap a moment to come up after boot.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            match server::sync_omp_models(&ls_url, &own_addr).await {
-                Ok(n) => tracing::info!(model_count = n, "Auto-synced OMP models.yml on startup"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to auto-sync OMP models.yml (llama-swap may not be ready)")
-                }
-            }
-        });
-    }
-
-    // Server (TCP + UDS)
-    server::run(tcp_addr, socket, state).await?;
+    // Server: the accept loops on the listeners bound at the very start.
+    server::run_with_listeners(bound.tcp, bound.uds_path, bound.uds, bound.uds_identity, bound.uds_lock, state).await?;
 
     Ok(())
 }
