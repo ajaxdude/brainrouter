@@ -4,6 +4,113 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L5: strixite + hipfire adapters (branch `v2-p3-roles`, pre-merge)
+
+The icon fleets become supervisor-managed engines. strixite (gfx1151) and
+hipfire (gfx1100) are L4 `EngineAdapter` implementations: generated confs own
+the port, readiness is a `/v1/models` stem assertion, and the cutover is
+pid-scoped (`SIGTERM` → pid-gone → settle → `MemAvailable` gate → spawn →
+stem poll). Icon-launched servers are now **visible** through a read-only
+`/proc` observer and are attach-only until `swap adopt`. Routed streams
+(proxy in-flight rows *and* router in-process streams the proxy never sees)
+protect their endpoint through an Active-Consumer Set with an idle grace, so a
+live session is never mid-swap.
+
+### Added
+
+- **Active-Consumer Set** (`src/active_consumers.rs`): per-endpoint/catalog-id
+  spans entered by the router around in-process streams and by proxy rows,
+  left on completion with a configurable idle grace
+  (`active_consumer_grace_s`, default 120 s, per-host fleet profile). The
+  scheduler consults it before every eviction; a protected model is skipped,
+  the block is recorded (`budget.json` kind `blocked`, reason
+  `blocked:active-consumer`), and `/api/engines/consumers` +
+  `/api/engines/events` expose the span. One-action bypass:
+  `swap ensure <model> --override` / dashboard **Swap anyway**, audit-logged.
+- **strixite adapter** (`src/engine_strixite.rs`): per-model generated confs
+  (profile template + supervisor-allocated port, `${PORT}` required,
+  `--print-config` validation opt-in), engine-validated launch args (conf-owned
+  flags rejected at spec build), port allocation that avoids every Residency
+  endpoint, imported explicit `--port` values and llama-swap's dynamic
+  `${PORT}` range, `/slots`-equivalent progress when exposed (indeterminate +
+  EWMA otherwise), exclusive device class, and `strix_server.service` as the
+  takeover unit.
+- **hipfire adapter** (`src/engine_hipfire.rs`): card registry (`*.mq4` + `.mtp`
+  sidecar, missing sidecar = warning), **version-keyed flag schema** re-derived
+  when the probed engine version changes (schema-drift badge; `--mtp` rejected
+  by construction), single-owner `:8080` with squat detection (foreign stems ⇒
+  Failed + banner, nothing signalled), stop = SIGTERM + port-free gate, context
+  math (`max_tokens` defaults to the engine's remaining context; a prompt that
+  does not fit is a typed shortfall the proxy surfaces as 400), and
+  `hipfire-serve.service` as the takeover unit.
+- **External-engine Residency observer** (`src/engine_observer.rs`): read-only
+  `/proc` scan for `strix_server`/`hipfire`, endpoint from argv `--port`
+  (hipfire default 8080), `/v1/models` stems resolved against the catalog.
+  Classification precedence: pids in the native registry/markers are never
+  double-listed as external. External residents are Ready-at-external
+  (attach-not-spawn), budget-counted, and a cutover never signals them.
+- **pid-scoped unit takeover** (`src/engine_systemd.rs`): unit state from
+  `systemctl --user show` (`ActiveState`, `MainPID`, `ControlGroup`), pids =
+  `MainPID` + control-group members only; `swap takeover <model>` attaches when
+  the unit already serves the model, adopts its pid, and otherwise requires the
+  single-action `--override` (`blocked:unit-owned` without it). `systemctl` is
+  replaceable (`BRAINROUTER_SYSTEMCTL`) and the runtime is injectable.
+- **`swap adopt <model> [--pid N]` / `swap adopt --endpoint <url>`**: registers
+  an observed icon-launched pid as a supervisor-owned resident with a
+  **port-less** adopted spec hash (no permanent `spec_stale` badge); only then
+  may a cutover signal it. The endpoint form resolves the model from the
+  observer (gguf or served stems) and names the missing catalog entry instead
+  of guessing.
+- **Unregistered external occupant refusal**: a spawning ensure on an
+  exclusive device whose matching external process resolves to no catalog
+  entry refuses with `blocked:external-occupant` (503, busy code, ledger
+  event) until the operator adopts or stops it; `--override` is the single
+  audited bypass. The pid is never signalled.
+- **Audit actor**: `budget.json` entries gain an `actor` field (ts = when,
+  model = target). API mutations carry `admin@<origin>` (or a sanitized
+  CLI-supplied `cli:uid=<uid>`); takeover reports surface the actor.
+- **Engine probe wiring**: adapters are probed at daemon registration and once
+  at the first ensure; the hipfire schema is derived from
+  `<program> --version` at construction, re-derived on every spawn/probe, and
+  refreshed (30 s TTL) for the Engines tab, so the version-keyed flag set is
+  live rather than aspirational.
+- **`min_mem_gib` gate**: after drain + settle the scheduler re-reads
+  `MemAvailable` (injectable) against the adapter floor; below the floor the
+  model is visible as `Waiting(gate)` with threshold + current value, fails
+  after the timeout with a named reason, and `--force-gate` bypasses it
+  (audit-logged).
+- **APIs**: `GET /api/engines` gains additive `external`, `units`,
+  `active_consumers`, `adapter_detail`; model rows gain `gate`, `port`,
+  `conf_path`, `active_consumer`. New `GET /api/engines/external`,
+  `GET /api/engines/consumers`, `GET /api/engines/events`,
+  `POST /api/engines/adopt`, `POST /api/engines/takeover` (loopback + CSRF
+  gated like the other engine mutations). Ensure/evict accept `override`,
+  `force_gate`, `attach_only`.
+- **Engines tab**: external residents with Adopt/Attach, takeover units,
+  Active-Consumer spans, `Waiting(gate)` and **Swap anyway** / **Takeover**
+  controls (escHtml, additive blocks).
+- **CLI**: `swap ensure --override --force-gate --attach-only`,
+  `swap evict --override`, `swap takeover --unit --override --force-gate`,
+  `swap adopt --pid`.
+- **Docs**: `docs/UPGRADE.md` host procedures (strix-halo live strixite pilot,
+  fedora1 hipfire unit migration incl. Q4 default user-service takeover and
+  rollback), plus `docs/design/v2-streamlining.L5.log.md`.
+
+### Changed
+
+- `EngineAdapter` gains defaulted L5 hooks (`min_mem_gib`, `exclusive_key`,
+  `allocate_port`, `takeover_unit`, `conf_path_for`, `describe`); existing
+  adapters (`fake`, `llama_cpp`, shim, external) are unchanged.
+- `Resident` gains an additive `engine` field (external residents).
+- The scheduler's admission order is now exclusive cutover → ACS-aware
+  budget eviction → memory gate → spawn, serialized by a per-device lock.
+- `swap_catalog::validate_entry` accepts the `strixite`/`hipfire` engines.
+
+### Host tier (owner-nod-gated, not executed by this build)
+
+Live strixite A→B swap on strix-halo and the fedora1 hipfire unit migration
+are pilots: procedures in `docs/UPGRADE.md`, no host action taken here.
+
 ## v2 L4 — Swap supervisor + platform probe (branch `v2-p4-l4`, pre-merge)
 
 brainrouter now owns engine processes and model lifecycle behind one

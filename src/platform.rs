@@ -501,6 +501,22 @@ fn meminfo_gib() -> (f64, f64) {
     (0.0, 0.0)
 }
 
+/// Current `MemAvailable` in GiB (the L5 `min_mem_gib` gate input, live).
+/// `BRAINROUTER_MEM_AVAILABLE_GIB` overrides it for fixtures.
+pub fn mem_available_gib() -> f64 {
+    if let Some(value) = std::env::var("BRAINROUTER_MEM_AVAILABLE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return value;
+    }
+    #[cfg(target_os = "linux")]
+    let value = meminfo_gib().1;
+    #[cfg(not(target_os = "linux"))]
+    let value = 0.0_f64;
+    value
+}
+
 /// GTT budget from the kernel (Strix Halo unified memory): `ttm.pages_limit`
 /// (pages of 4 KiB) or `amdgpu.gttsize` (MiB). Kernel cmdline wins over sysfs
 /// because it is what the running kernel actually applied.

@@ -331,7 +331,13 @@ fn engines_json(state: &AppState) -> serde_json::Value {
         "budget": status.budget,
         "adoption": status.adoption,
         "shim_error": status.shim_error,
+        // L4 consumers read `adapters` as the adapter-name list; the L5
+        // detail badges are additive under `adapter_detail`.
         "adapters": status.adapter_names,
+        "adapter_detail": status.adapters,
+        "external": status.external,
+        "units": status.units,
+        "active_consumers": status.active_consumers,
         "groups": state.swap.catalog().groups(),
         "pins": state.swap.catalog().pins(),
         "logs_dir": state.swap.logs_dir().display().to_string(),
@@ -657,7 +663,14 @@ async fn handle_request_inner(
                     &serde_json::json!({ "error": "model is required" }),
                 )));
             };
-            match state.swap.ensure(model).await {
+            // L5 one-action overrides (audit-logged by the scheduler).
+            let options = crate::swap_scheduler::EnsureOptions {
+                override_active_consumers: truthy(&val, &["override", "swap_anyway"]),
+                force_gate: truthy(&val, &["force_gate", "force-gate"]),
+                attach_only: truthy(&val, &["attach_only", "attach-only"]),
+                actor: request_actor(&val, peer_addr),
+            };
+            match state.swap.ensure_with_options(model, None, options).await {
                 Ok(outcome) => into_unsync(json_response(
                     StatusCode::OK,
                     &serde_json::json!({
@@ -666,6 +679,7 @@ async fn handle_request_inner(
                         },
                         "endpoint": outcome.endpoint(),
                         "spawned": outcome.spawned(),
+                        "attached": !outcome.spawned(),
                     }),
                 )),
                 Err(error) => into_unsync(swap_api_error(error)),
@@ -680,11 +694,112 @@ async fn handle_request_inner(
                     &serde_json::json!({ "error": "model is required" }),
                 )));
             };
-            match state.swap.evict(model, "explicit evict") {
+            let override_active = truthy(&val, &["override", "swap_anyway"]);
+            let actor = request_actor(&val, peer_addr);
+            match state.swap.evict_with_actor(
+                model,
+                "explicit evict",
+                override_active,
+                actor.as_deref(),
+            ) {
                 Ok(stopped) => into_unsync(json_response(
                     StatusCode::OK,
                     &serde_json::json!({ "model": model, "stopped": stopped }),
                 )),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        // ── v2 L5: external residents, takeover, ACS events ─────────────────
+        ("GET", "/api/engines/external") => {
+            let status = state.swap.status();
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "external": status.external,
+                    "units": status.units,
+                }),
+            ))
+        }
+
+        ("GET", "/api/engines/consumers") => {
+            let status = state.swap.status();
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "active_consumers": status.active_consumers,
+                }),
+            ))
+        }
+
+        ("GET", "/api/engines/events") => {
+            let limit = query_param(req.uri().query().unwrap_or(""), "limit")
+                .parse::<usize>()
+                .unwrap_or(200)
+                .min(2000);
+            let entries = state.swap.ledger().entries();
+            let start = entries.len().saturating_sub(limit);
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "events": &entries[start..] }),
+            ))
+        }
+
+        ("POST", "/api/engines/adopt") => {
+            let val = read_json_body(req).await;
+            let model = val
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let endpoint = val
+                .get("endpoint")
+                .or_else(|| val.get("url"))
+                .and_then(|e| e.as_str())
+                .map(str::trim)
+                .filter(|e| !e.is_empty());
+            let pid = val.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+            let actor = request_actor(&val, peer_addr);
+            // L5 adopt contract: `{model}` OR `{endpoint}` (the dashboard
+            // prefers the endpoint when the observer could not name the
+            // model).
+            let result = match (model, endpoint) {
+                (Some(model), _) => state
+                    .swap
+                    .adopt_external_as(model, pid, actor.as_deref()),
+                (None, Some(endpoint)) => {
+                    state.swap.adopt_endpoint(endpoint, pid, actor.as_deref())
+                }
+                (None, None) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": "model or endpoint is required" }),
+                    )))
+                }
+            };
+            match result {
+                Ok(report) => into_unsync(json_response(StatusCode::OK, &report)),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("POST", "/api/engines/takeover") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            let options = crate::swap_scheduler::TakeoverOptions {
+                unit: val.get("unit").and_then(|u| u.as_str()).map(String::from),
+                override_unit: truthy(&val, &["override", "override_unit"]),
+                force_gate: truthy(&val, &["force_gate", "force-gate"]),
+                override_active_consumers: truthy(&val, &["swap_anyway"]),
+                actor: request_actor(&val, peer_addr),
+            };
+            match state.swap.takeover(model, options).await {
+                Ok(report) => into_unsync(json_response(StatusCode::OK, &report)),
                 Err(error) => into_unsync(swap_api_error(error)),
             }
         }
@@ -2345,6 +2460,18 @@ async fn handle_chat_completion(
         }
         Ok(Ok(Err(error))) => {
             routing_task.abort();
+            // L5 hipfire context math: a prompt that cannot fit is a real
+            // 400 with the shortfall, not a 502.
+            if let Some(shortfall) = error
+                .downcast_ref::<crate::engine_hipfire::ContextShortfall>()
+            {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: shortfall.to_string(),
+                    },
+                )));
+            }
             if let Some(response) = swap_busy_response(&error) {
                 return Ok(into_unsync(response));
             }
@@ -4749,6 +4876,48 @@ fn plugins_reply(result: anyhow::Result<serde_json::Value>) -> Response<UnsyncBo
 
 /// Query-string parameter lookup (no percent-decoding needed for the plugin
 /// endpoints' numeric/id params).
+/// Audit identity for L5 mutations: the CLI sends `cli:uid=<uid>`; an
+/// API-driven loopback admin is `admin@<origin>`. Control characters are
+/// stripped so a hostile header cannot forge ledger lines.
+fn sanitize_actor(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn request_actor(value: &serde_json::Value, peer_addr: std::net::SocketAddr) -> Option<String> {
+    if let Some(explicit) = value
+        .get("actor")
+        .and_then(|actor| actor.as_str())
+        .and_then(sanitize_actor)
+    {
+        return Some(explicit);
+    }
+    Some(if peer_addr.port() == 0 {
+        "admin@unix-socket".to_string()
+    } else {
+        format!("admin@{peer_addr}")
+    })
+}
+
+/// Accept either a JSON boolean or a `"true"`/`"1"`/`"yes"` string for the
+/// L5 single-action flags (CLI/API ergonomics; no accidental truthiness).
+fn truthy(value: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| match value.get(*key) {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(text)) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => false,
+    })
+}
+
 fn query_param(query: &str, key: &str) -> String {
     query
         .split('&')

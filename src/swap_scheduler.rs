@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::active_consumers::{protection_keys, ActiveConsumers, ConsumerSpan};
+use crate::engine_observer::{ExternalObserver, ObservedEngine};
+use crate::engine_systemd::{UnitRuntime, UnitState};
 use crate::inflight::InflightRegistry;
 use crate::residency::{
     self, ExternalResidencyRegistry, Resident, ResidentSource, ResidencyView,
@@ -68,6 +71,26 @@ pub enum SwapError {
     SpawnFailed(String),
     Timeout { model: String, waited_ms: u64 },
     Cancelled(String),
+    /// A live (or grace-protected) consumer blocks the operation.
+    /// Block reason: `blocked:active-consumer`.
+    BlockedActiveConsumer { model: String, detail: String },
+    /// A systemd unit owns the engine and the caller did not pass the
+    /// single-action `--override`.
+    UnitOwned { unit: String },
+    /// `MemAvailable` is below the adapter's `min_mem_gib` floor.
+    GateBlocked {
+        model: String,
+        threshold_gib: f64,
+        available_gib: f64,
+    },
+    /// An unregistered external engine occupies the exclusive device. Only an
+    /// explicit operator action (adopt / stop it) or `--override` may proceed.
+    /// Block reason: `blocked:external-occupant`.
+    ExternalOccupant {
+        model: String,
+        pid: u32,
+        endpoint: String,
+    },
 }
 
 impl SwapError {
@@ -77,12 +100,20 @@ impl SwapError {
             Self::NoFit(_) | Self::QueueFull { .. } | Self::SpawnFailed(_) => 503,
             Self::Timeout { .. } => 504,
             Self::Cancelled(_) => 499,
+            Self::BlockedActiveConsumer { .. }
+            | Self::GateBlocked { .. }
+            | Self::ExternalOccupant { .. } => 503,
+            Self::UnitOwned { .. } => 409,
         }
     }
 
     pub fn code(&self) -> i32 {
         match self {
-            Self::NoFit(_) | Self::QueueFull { .. } => BUSY_CODE,
+            Self::NoFit(_)
+            | Self::QueueFull { .. }
+            | Self::BlockedActiveConsumer { .. }
+            | Self::GateBlocked { .. }
+            | Self::ExternalOccupant { .. } => BUSY_CODE,
             _ => 0,
         }
     }
@@ -102,6 +133,33 @@ impl std::fmt::Display for SwapError {
                 write!(f, "timed out waiting for `{model}` after {waited_ms} ms")
             }
             Self::Cancelled(model) => write!(f, "cancelled while waiting for `{model}`"),
+            Self::BlockedActiveConsumer { model, detail } => write!(
+                f,
+                "blocked:active-consumer: `{model}` has a live or grace-protected stream ({detail})"
+            ),
+            Self::UnitOwned { unit } => write!(
+                f,
+                "blocked:unit-owned: `{unit}` owns the engine; pass --override to take it over"
+            ),
+            Self::GateBlocked {
+                model,
+                threshold_gib,
+                available_gib,
+            } => write!(
+                f,
+                "blocked:min-mem-gate: `{model}` needs MemAvailable ≥ {threshold_gib:.1} GiB \
+                 (probe reports {available_gib:.1} GiB); pass --force-gate to override"
+            ),
+            Self::ExternalOccupant {
+                model,
+                pid,
+                endpoint,
+            } => write!(
+                f,
+                "blocked:external-occupant: `{model}` needs the device occupied by an \
+                 unregistered engine (pid {pid} at {endpoint}); run `swap adopt` or stop it, \
+                 or pass --override"
+            ),
         }
     }
 }
@@ -264,6 +322,39 @@ pub trait EngineAdapter: Send + Sync {
     fn capabilities(&self, entry: &CatalogEntry) -> Vec<String> {
         let _ = entry;
         Vec::new()
+    }
+    /// L5: `MemAvailable` floor for a spawning ensure. `None` = no gate
+    /// (llama.cpp/fake/shim behave exactly as L4).
+    fn min_mem_gib(&self) -> Option<f64> {
+        None
+    }
+    /// L5: exclusive device class: one resident per device. Ensures of a
+    /// second model in the same class evict-then-spawn, never co-reside.
+    fn exclusive_key(&self) -> Option<String> {
+        None
+    }
+    /// L5: adapter-owned port allocation (strixite conf scope, hipfire
+    /// single-owner port). `None` = the scheduler's generic free-port scan.
+    fn allocate_port(&self, avoid: &BTreeSet<u16>) -> Option<u16> {
+        let _ = avoid;
+        None
+    }
+    /// L5: the systemd user unit this engine may be taken over from.
+    fn takeover_unit(&self) -> Option<String> {
+        None
+    }
+    fn conf_path_for(&self, model: &str) -> Option<PathBuf> {
+        let _ = model;
+        None
+    }
+    /// L5: readiness poll budget (`/v1/models` stem assertion). `None` = the
+    /// scheduler's global `wait_timeout` (L4 behavior).
+    fn readiness_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// L5: adapter detail badge (schema/version/conf-dir) for the Engines tab.
+    fn describe(&self) -> Option<serde_json::Value> {
+        None
     }
 }
 
@@ -600,6 +691,11 @@ pub struct BudgetEntry {
     pub gib: f64,
     #[serde(default)]
     pub reason: String,
+    /// Who caused this entry (L5 audit: `who`, `when` = ts, `target` = model).
+    /// API mutations carry `admin@<origin>` (or the CLI-supplied `cli:uid=N`);
+    /// internal daemon actions leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -640,6 +736,18 @@ impl BudgetLedger {
     }
 
     pub fn record(&self, kind: &str, model: &str, gib: f64, reason: impl Into<String>) -> Result<()> {
+        self.record_as(kind, model, gib, reason, None)
+    }
+
+    /// Audit form: records the acting identity beside ts/kind/model/reason.
+    pub fn record_as(
+        &self,
+        kind: &str,
+        model: &str,
+        gib: f64,
+        reason: impl Into<String>,
+        actor: Option<&str>,
+    ) -> Result<()> {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         entries.push(BudgetEntry {
             ts: chrono::Utc::now().to_rfc3339(),
@@ -647,6 +755,7 @@ impl BudgetLedger {
             model: model.to_string(),
             gib,
             reason: reason.into(),
+            actor: actor.map(|value| value.to_string()),
         });
         let text = serde_json::to_string_pretty(&BudgetFile {
             entries: entries.clone(),
@@ -673,6 +782,8 @@ pub enum LifecycleState {
     Ready,
     Draining,
     Failed,
+    /// Admission is waiting on the `min_mem_gib` gate (`Waiting(gate)`).
+    Waiting,
 }
 
 impl LifecycleState {
@@ -683,8 +794,19 @@ impl LifecycleState {
             Self::Ready => "ready",
             Self::Draining => "draining",
             Self::Failed => "failed",
+            Self::Waiting => "waiting",
         }
     }
+}
+
+/// The visible `Waiting(gate)` payload: the threshold, the current probe value
+/// and the deadline (the Engines tab renders all three; spec binding).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateStatus {
+    pub threshold_gib: f64,
+    pub current_gib: f64,
+    pub waited_ms: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -713,6 +835,47 @@ pub struct ModelStatus {
     /// Adapter-reported progress for a loading model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<LoadProgress>,
+    /// `Waiting(gate)` admission details (L5 `min_mem_gib` gate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateStatus>,
+    /// Supervisor-allocated port for a managed child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Generated conf path (strixite: the port lives in the conf).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conf_path: Option<String>,
+    /// Active-consumer protection span (live stream or idle grace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_consumer: Option<ConsumerSpan>,
+}
+
+/// An externally-launched engine process (icon-era server): visible,
+/// budget-counted, attach-only until `swap adopt`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalEngineView {
+    pub pid: u32,
+    pub engine: String,
+    pub endpoint: String,
+    pub port: u16,
+    pub stems: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gguf: Option<String>,
+    /// True once the operator adopted the pid (marker written; the pid is then
+    /// supervisor-owned and a cutover may signal it).
+    pub adopted: bool,
+}
+
+/// One configured systemd unit (takeover surface).
+#[derive(Debug, Clone, Serialize)]
+pub struct UnitView {
+    pub engine: String,
+    pub unit: String,
+    pub active: bool,
+    pub main_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,6 +914,14 @@ pub struct EnginesStatus {
     pub adoption: AdoptionReport,
     pub shim_error: Option<String>,
     pub adapter_names: Vec<String>,
+    /// L5: icon-era engines observed read-only (attach-only until adopted).
+    pub external: Vec<ExternalEngineView>,
+    /// L5: configured systemd units + their state (takeover surface).
+    pub units: Vec<UnitView>,
+    /// L5: Active-Consumer Set spans (live in-process streams + idle grace).
+    pub active_consumers: Vec<ConsumerSpan>,
+    /// L5: adapter detail badges (hipfire version-keyed schema, strixite confs).
+    pub adapters: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -798,6 +969,59 @@ impl EnsureOutcome {
     }
 }
 
+/// Admission options. Both flags are single-action operator overrides
+/// (audit-logged); defaults are the safe behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnsureOptions {
+    /// `swap ensure <model> --override` / the dashboard "Swap anyway" button:
+    /// bypass the Active-Consumer span for this operation only.
+    pub override_active_consumers: bool,
+    /// `--force-gate`: proceed below the adapter's `min_mem_gib` floor.
+    pub force_gate: bool,
+    /// `swap adopt` / takeover: never spawn, only attach to an existing
+    /// resident (external observer or unit process).
+    pub attach_only: bool,
+    /// Audit identity for override/blocked entries (`admin@<origin>` or
+    /// `cli:uid=N`).
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TakeoverOptions {
+    pub unit: Option<String>,
+    pub override_unit: bool,
+    pub force_gate: bool,
+    pub override_active_consumers: bool,
+    /// Audit identity for the takeover/override ledger entries.
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TakeoverReport {
+    pub model: String,
+    pub endpoint: String,
+    pub attached: bool,
+    pub spawned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adopted_pid: Option<u32>,
+    /// Who performed the takeover (audit; surfaced to the Engines tab).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptReport {
+    pub model: String,
+    pub pid: u32,
+    pub endpoint: String,
+    pub gguf: Option<String>,
+    pub spec_hash: String,
+}
+
 // ── Scheduler ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -810,6 +1034,17 @@ pub struct SwapSchedulerConfig {
     pub port_min: u16,
     pub port_max: u16,
     pub llama_swap_url: String,
+    /// L5: idle grace after the last routed stream (Active-Consumer span).
+    pub active_consumer_grace: Duration,
+    /// L5: `MemAvailable` floor applied to spawning ensures (`0` = disabled).
+    pub min_mem_gib: f64,
+    /// L5: how long a below-floor admission stays `Waiting(gate)`.
+    pub gate_timeout: Duration,
+    pub gate_poll: Duration,
+    /// L5: settle sleep after the previous pid is gone (spec: 2 s).
+    pub settle: Duration,
+    /// L5: bounded single ACS re-check at the SIGTERM point.
+    pub cutover_recheck: Duration,
 }
 
 impl Default for SwapSchedulerConfig {
@@ -835,6 +1070,37 @@ impl Default for SwapSchedulerConfig {
             port_min: 5900,
             port_max: 5999,
             llama_swap_url: "http://127.0.0.1:8081".into(),
+            active_consumer_grace: Duration::from_secs(
+                std::env::var("BRAINROUTER_ACTIVE_CONSUMER_GRACE_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(crate::active_consumers::DEFAULT_GRACE_S),
+            ),
+            min_mem_gib: 0.0,
+            gate_timeout: Duration::from_millis(
+                std::env::var("BRAINROUTER_GATE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(600_000),
+            ),
+            gate_poll: Duration::from_millis(
+                std::env::var("BRAINROUTER_GATE_POLL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1_000),
+            ),
+            settle: Duration::from_millis(
+                std::env::var("BRAINROUTER_CUTOVER_SETTLE_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2_000),
+            ),
+            cutover_recheck: Duration::from_millis(
+                std::env::var("BRAINROUTER_CUTOVER_RECHECK_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5_000),
+            ),
         }
     }
 }
@@ -848,6 +1114,9 @@ struct ModelRuntime {
     restarts: u32,
     load_started_ms: u64,
     spec_stale: bool,
+    port: Option<u16>,
+    conf_path: Option<String>,
+    gate: Option<GateStatus>,
 }
 
 impl Default for ModelRuntime {
@@ -861,6 +1130,9 @@ impl Default for ModelRuntime {
             restarts: 0,
             load_started_ms: 0,
             spec_stale: false,
+            port: None,
+            conf_path: None,
+            gate: None,
         }
     }
 }
@@ -928,6 +1200,25 @@ pub struct SwapScheduler {
     evictions_today: AtomicU64,
     /// Monotonic counter the daemon poller uses to refresh shim residency.
     shim_refreshed_ms: AtomicU64,
+    /// L5 Active-Consumer Set (in-process streams + idle grace).
+    consumers: Mutex<Option<Arc<ActiveConsumers>>>,
+    /// L5 external-engine observer (read-only `/proc` scan + `/v1/models`).
+    external_observer: Mutex<Option<Arc<ExternalObserver>>>,
+    /// Last observation (Engines tab detail: pid/engine/stems/adopted).
+    observed_external: Mutex<Vec<ObservedEngine>>,
+    /// L5 systemd user-unit runtime (pid-scoped takeover).
+    unit_runtime: Mutex<Option<Arc<dyn UnitRuntime>>>,
+    /// engine → configured unit name (from the fleet profile).
+    takeover_units: Mutex<BTreeMap<String, String>>,
+    /// L5 injectable `MemAvailable` probe (fixtures); env wins over it.
+    mem_source: Mutex<Option<Arc<dyn Fn() -> f64 + Send + Sync>>>,
+    /// Serialized per-device swap locks (exclusive adapters).
+    device_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Adapters already probed (once per adapter, at the first spawn).
+    probed_adapters: Mutex<BTreeSet<String>>,
+    /// Unit probe cache (a `systemctl show` subprocess per configured unit;
+    /// `/api/engines` is polled by the dashboard, so keep it short-lived).
+    unit_cache: Mutex<Option<(u64, Vec<UnitView>)>>,
     /// Test-only hygiene: kill children when the scheduler is dropped. The
     /// daemon MUST leave this false — native children are scoped so they
     /// survive a daemon restart (that is what adoption relies on).
@@ -960,6 +1251,15 @@ impl SwapScheduler {
             adoption_dir: adoption_dir(),
             evictions_today: AtomicU64::new(0),
             shim_refreshed_ms: AtomicU64::new(0),
+            consumers: Mutex::new(None),
+            external_observer: Mutex::new(None),
+            observed_external: Mutex::new(Vec::new()),
+            unit_runtime: Mutex::new(None),
+            takeover_units: Mutex::new(BTreeMap::new()),
+            mem_source: Mutex::new(None),
+            device_locks: Mutex::new(BTreeMap::new()),
+            probed_adapters: Mutex::new(BTreeSet::new()),
+            unit_cache: Mutex::new(None),
             kill_children_on_drop: false,
         }
     }
@@ -975,6 +1275,100 @@ impl SwapScheduler {
     /// stream).
     pub fn attach_inflight(&self, inflight: Arc<InflightRegistry>) {
         *self.inflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(inflight);
+    }
+
+    /// L5: attach the Active-Consumer Set (router in-process streams + grace).
+    pub fn with_active_consumers(mut self, consumers: Arc<ActiveConsumers>) -> Self {
+        self.consumers = Mutex::new(Some(consumers));
+        self
+    }
+
+    pub fn consumers(&self) -> Option<Arc<ActiveConsumers>> {
+        self.consumers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// L5: attach the external-engine observer (icon-era servers).
+    pub fn with_external_observer(mut self, observer: Arc<ExternalObserver>) -> Self {
+        self.external_observer = Mutex::new(Some(observer));
+        self
+    }
+
+    /// L5: attach the systemd user-unit runtime (pid-scoped takeover).
+    pub fn with_unit_runtime(mut self, runtime: Arc<dyn UnitRuntime>) -> Self {
+        self.unit_runtime = Mutex::new(Some(runtime));
+        self
+    }
+
+    /// L5: register the unit an engine may be taken over from.
+    pub fn with_takeover_unit(self, engine: &str, unit: impl Into<String>) -> Self {
+        self.takeover_units
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(engine.to_string(), unit.into());
+        self
+    }
+
+    /// L5: injectable `MemAvailable` probe (fixtures). `BRAINROUTER_MEM_AVAILABLE_GIB`
+    /// still wins, so the fixture tier can hold one value for a whole run.
+    pub fn with_mem_source(mut self, source: Arc<dyn Fn() -> f64 + Send + Sync>) -> Self {
+        self.mem_source = Mutex::new(Some(source));
+        self
+    }
+
+    pub fn mem_available_gib(&self) -> f64 {
+        if let Some(value) = std::env::var("BRAINROUTER_MEM_AVAILABLE_GIB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            return value;
+        }
+        let source = self
+            .mem_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        source
+            .map(|f| f())
+            .unwrap_or_else(crate::platform::mem_available_gib)
+    }
+
+    /// Refresh the external-engine slot: `/proc` scan → Residency + detail rows.
+    /// Classification precedence is the observer's (markers/registry pids are
+    /// native, never double-listed).
+    pub fn refresh_external(&self) {
+        let observer = self
+            .external_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        let native_pids: Vec<u32> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner
+                .models
+                .values()
+                .filter_map(|runtime| runtime.handle.as_ref().map(|h| h.pid))
+                .collect()
+        };
+        observer.set_native_pids(native_pids);
+        let (residents, observed) = observer.snapshot();
+        self.external.replace(residents);
+        *self
+            .observed_external
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = observed;
+    }
+
+    pub fn observed_external(&self) -> Vec<ObservedEngine> {
+        self.observed_external
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Budget cap override for tests/daemon policy (beats the env var).
@@ -1072,6 +1466,12 @@ impl SwapScheduler {
                             .unwrap_or(0),
                         state: "ready".into(),
                         spec_stale: runtime.spec_stale,
+                        engine: Some(
+                            self.catalog
+                                .entry(id)
+                                .map(|e| e.engine)
+                                .unwrap_or_default(),
+                        ),
                     })
                 })
                 .collect()
@@ -1179,10 +1579,67 @@ impl SwapScheduler {
             .unwrap_or(false)
     }
 
+    /// The endpoint a model is serving at (runtime handle first, then the
+    /// Residency view, external residents included).
+    fn endpoint_for(&self, id: &str) -> Option<String> {
+        if let Some(runtime) = self.runtime(id) {
+            if let Some(endpoint) = runtime.endpoint {
+                return Some(endpoint);
+            }
+        }
+        self.residency()
+            .resident_for(id)
+            .map(|resident| resident.endpoint.clone())
+    }
+
+    /// Active-Consumer Set check for one model. `Some(detail)` = protected
+    /// (live proxy row, live in-process stream, or the idle grace window).
+    pub fn protection(&self, id: &str) -> Option<String> {
+        if self.is_inflight(id) {
+            return Some("proxy in-flight row".to_string());
+        }
+        let consumers = self.consumers()?;
+        let endpoint = self.endpoint_for(id);
+        for key in protection_keys(id, endpoint.as_deref()) {
+            if !consumers.protected(&key) {
+                continue;
+            }
+            let remaining = consumers.span_remaining_ms(&key);
+            return Some(if remaining == u64::MAX {
+                format!("live in-process stream on `{key}`")
+            } else {
+                format!("idle grace ({remaining} ms remaining) on `{key}`")
+            });
+        }
+        None
+    }
+
+    fn record_blocked_as(&self, model: &str, reason: &str, actor: Option<&str>) {
+        let gib = self
+            .catalog
+            .entry(model)
+            .map(|entry| self.need_gib(&entry))
+            .unwrap_or(0.0);
+        let _ = self
+            .ledger
+            .record_as("blocked", model, gib, reason, actor);
+        self.log(model, reason);
+    }
+
     /// Evict least-recent-STREAM-COMPLETED native children until `needed_gib`
-    /// fits. Never evicts pinned models or models with active streams.
+    /// fits. Never evicts pinned models or models inside the Active-Consumer
+    /// Set (unless the one-action override is set).
     fn evict_to_fit(&self, needed_gib: f64) -> Result<Vec<String>> {
+        self.evict_to_fit_with(needed_gib, &EnsureOptions::default())
+    }
+
+    fn evict_to_fit_with(
+        &self,
+        needed_gib: f64,
+        options: &EnsureOptions,
+    ) -> Result<Vec<String>> {
         let mut evicted = Vec::new();
+        let mut logged_blocked: BTreeSet<String> = BTreeSet::new();
         loop {
             let report = self.budget_report();
             if report.used_gib + needed_gib <= report.cap_gib + 1e-9 {
@@ -1190,13 +1647,25 @@ impl SwapScheduler {
             }
             let pins = self.catalog.pins();
             let data = self.catalog.snapshot();
+            let mut blocked: Vec<(String, String)> = Vec::new();
             let mut candidates: Vec<(u64, String, f64)> = report
                 .residents
                 .iter()
                 .filter(|line| line.source == "native")
                 .filter(|line| !pins.contains_key(&line.model))
-                .filter(|line| !self.is_inflight(&line.model))
                 .filter(|line| !evicted.contains(&line.model))
+                .filter(|line| {
+                    if options.override_active_consumers {
+                        return true;
+                    }
+                    match self.protection(&line.model) {
+                        Some(detail) => {
+                            blocked.push((line.model.clone(), detail));
+                            false
+                        }
+                        None => true,
+                    }
+                })
                 .map(|line| {
                     (
                         data.entries
@@ -1208,8 +1677,20 @@ impl SwapScheduler {
                     )
                 })
                 .collect();
+            for (model, detail) in &blocked {
+                if logged_blocked.insert(model.clone()) {
+                    self.record_blocked_as(
+                        model,
+                        &format!("blocked:active-consumer: skipped eviction ({detail})"),
+                        options.actor.as_deref(),
+                    );
+                }
+            }
             candidates.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
             let Some((_, model, _)) = candidates.first().cloned() else {
+                if let Some((model, detail)) = blocked.first().cloned() {
+                    return Err(SwapError::BlockedActiveConsumer { model, detail }.into());
+                }
                 let pins_total: f64 = pins.values().map(|p| p.reserved_gib).sum();
                 return Err(SwapError::NoFit(format!(
                     "need {needed_gib:.1} GiB but the platform budget is {:.1} GiB \
@@ -1272,13 +1753,27 @@ impl SwapScheduler {
     // ── Ensure ─────────────────────────────────────────────────────────────
 
     pub async fn ensure(&self, requested: &str) -> Result<EnsureOutcome> {
-        self.ensure_with_cancel(requested, None).await
+        self.ensure_with_options(requested, None, EnsureOptions::default())
+            .await
     }
 
     pub async fn ensure_with_cancel(
         &self,
         requested: &str,
         cancel: Option<&crate::inflight::InflightHandle>,
+    ) -> Result<EnsureOutcome> {
+        self.ensure_with_options(requested, cancel, EnsureOptions::default())
+            .await
+    }
+
+    /// The L5 admission path: Residency-first attach, then (for a would-spawn
+    /// ensure) exclusive cutover → drain/settle → `min_mem_gib` gate → budget
+    /// admission (ACS-aware) → spawn.
+    pub async fn ensure_with_options(
+        &self,
+        requested: &str,
+        cancel: Option<&crate::inflight::InflightHandle>,
+        options: EnsureOptions,
     ) -> Result<EnsureOutcome> {
         let resolved = self
             .catalog
@@ -1298,6 +1793,23 @@ impl SwapScheduler {
                 spawned: false,
             });
         }
+        if options.attach_only {
+            return Err(SwapError::SpawnFailed(format!(
+                "attach-only requested for `{}` but no resident serves it",
+                entry.id
+            ))
+            .into());
+        }
+
+        // Serialized per-device swap lock: two exclusive ensures never race
+        // their drain/spawn sequences on one device.
+        let _device_guard = match self
+            .adapter_for(&entry.engine)
+            .and_then(|adapter| adapter.exclusive_key())
+        {
+            Some(device) => Some(self.device_lock(&device).lock_owned().await),
+            None => None,
+        };
 
         let lock = self.spawn_lock(&entry.id);
         let mut is_spawner = false;
@@ -1333,7 +1845,7 @@ impl SwapScheduler {
                         spawned: false,
                     });
                 }
-                LifecycleState::Loading => {
+                LifecycleState::Loading | LifecycleState::Waiting => {
                     queue_entry = self.enqueue(&entry.id)?;
                 }
                 _ => {
@@ -1341,8 +1853,20 @@ impl SwapScheduler {
                     if self.runtime(&entry.id).map(|r| r.spec_stale).unwrap_or(false) {
                         self.stop_native(&entry.id, "spec_stale convergence")?;
                     }
+                    if options.override_active_consumers {
+                        let _ = self.ledger.record_as(
+                            "override",
+                            &entry.id,
+                            self.need_gib(&entry),
+                            "active-consumer override (ensure admission)",
+                            options.actor.as_deref(),
+                        );
+                    }
+                    // L5 cutover: exclusive drain → pid-gone → settle → gate.
+                    self.cutover_prepare(&entry, &options, cancel).await?;
                     // Budget admission applies ONLY here (would spawn).
-                    self.evict_to_fit(self.need_gib(&entry))?;
+                    self.evict_to_fit_with(self.need_gib(&entry), &options)?;
+                    self.wait_gate(&entry, &options, cancel).await?;
                     let gib = self.need_gib(&entry);
                     self.ledger.record("admit", &entry.id, gib, "ensure admitted")?;
                     handle = Some(self.start_spawn(&entry)?);
@@ -1361,6 +1885,294 @@ impl SwapScheduler {
             self.finish_spawn(&entry, handle, cancel).await
         } else {
             self.wait_ready(&entry.id, cancel).await
+        }
+    }
+
+    fn device_lock(&self, device: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .device_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            locks
+                .entry(device.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Ready models that share an exclusive device class with `entry`.
+    fn exclusive_predecessors(&self, entry: &CatalogEntry) -> Vec<(String, Option<u32>)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .models
+            .iter()
+            .filter(|(id, runtime)| runtime.state == LifecycleState::Ready && **id != entry.id)
+            .filter_map(|(id, runtime)| {
+                let engine = self.catalog.entry(id)?.engine.clone();
+                let device = self.adapter_for(&engine)?.exclusive_key()?;
+                Some((id.clone(), runtime.handle.as_ref().map(|h| h.pid), device))
+            })
+            .filter(|(_, _, device)| {
+                self.adapter_for(&entry.engine)
+                    .and_then(|adapter| adapter.exclusive_key())
+                    .as_deref()
+                    == Some(device.as_str())
+            })
+            .map(|(id, pid, _)| (id, pid))
+            .collect()
+    }
+
+    /// An unregistered (never adopted) external engine of this entry's engine
+    /// class. It owns the device but not the supervisor: the cutover must
+    /// refuse until the operator drains/adopts/stops it, and must never signal
+    /// its pid (start-ownership).
+    fn external_occupant(&self, entry: &CatalogEntry) -> Option<ObservedEngine> {
+        let markers = crate::engine_observer::marker_pids(&self.adoption_dir);
+        self.observed_external().into_iter().find(|engine| {
+            // "Unregistered" = the observer could not resolve the process to
+            // any catalog entry (no catalog_id). An external that DOES map to
+            // an entry is a known resident: ensure attaches to it when it is
+            // the target, and an operator can adopt/adopt-or-stop it through
+            // the normal catalog vocabulary.
+            engine.engine == entry.engine
+                && engine.catalog_id.is_none()
+                && !markers.contains(&engine.pid)
+        })
+    }
+
+    /// The L5 cutover sequence for an exclusive adapter: an unregistered
+    /// external occupant ⇒ `blocked:external-occupant` (unless `--override`);
+    /// at the SIGTERM point re-read the Active-Consumer Set (bounded single
+    /// re-check ⇒ `blocked:active-consumer`); SIGTERM **only**
+    /// supervisor-owned marker pids; wait for pid-gone; then the injectable
+    /// settle sleep. The memory gate and spawn follow in
+    /// [`Self::wait_gate`]/[`Self::start_spawn`].
+    async fn cutover_prepare(
+        &self,
+        entry: &CatalogEntry,
+        options: &EnsureOptions,
+        cancel: Option<&crate::inflight::InflightHandle>,
+    ) -> Result<()> {
+        let exclusive = self
+            .adapter_for(&entry.engine)
+            .and_then(|adapter| adapter.exclusive_key())
+            .is_some();
+        if !exclusive {
+            return Ok(());
+        }
+        if let Some(occupant) = self.external_occupant(entry) {
+            if options.override_active_consumers {
+                self.log(
+                    &entry.id,
+                    &format!(
+                        "cutover: --override: unregistered external pid {} at {} bypassed",
+                        occupant.pid, occupant.endpoint
+                    ),
+                );
+                let _ = self.ledger.record_as(
+                    "override",
+                    &entry.id,
+                    0.0,
+                    format!(
+                        "external occupant override (pid {} at {})",
+                        occupant.pid, occupant.endpoint
+                    ),
+                    options.actor.as_deref(),
+                );
+            } else {
+                self.record_blocked_as(
+                    &entry.id,
+                    &format!(
+                        "blocked:external-occupant: unregistered {} pid {} at {};                          run `swap adopt` or stop it, or pass --override",
+                        occupant.engine, occupant.pid, occupant.endpoint
+                    ),
+                    options.actor.as_deref(),
+                );
+                return Err(SwapError::ExternalOccupant {
+                    model: entry.id.clone(),
+                    pid: occupant.pid,
+                    endpoint: occupant.endpoint,
+                }
+                .into());
+            }
+        }
+        let predecessors = self.exclusive_predecessors(entry);
+        if predecessors.is_empty() {
+            return Ok(());
+        }
+        for (model, pid) in predecessors {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(SwapError::Cancelled(entry.id.clone()).into());
+                }
+            }
+            if options.override_active_consumers {
+                self.log(&model, "cutover: --override: protection span bypassed");
+                let _ = self.ledger.record_as(
+                    "override",
+                    &model,
+                    0.0,
+                    "active-consumer override (cutover)",
+                    options.actor.as_deref(),
+                );
+            } else if let Some(detail) = self.protection(&model) {
+                self.log(
+                    &model,
+                    &format!("cutover: active consumer at SIGTERM point ({detail}); re-check queued"),
+                );
+                tokio::time::sleep(self.config.cutover_recheck).await;
+                if let Some(detail) = self.protection(&model) {
+                    self.record_blocked_as(
+                        &model,
+                        &format!("blocked:active-consumer: cutover re-check still protected ({detail})"),
+                        options.actor.as_deref(),
+                    );
+                    return Err(SwapError::BlockedActiveConsumer { model, detail }.into());
+                }
+                self.log(&model, "cutover: re-check passed");
+            }
+            self.set_state(&model, LifecycleState::Draining, None);
+            self.log(
+                &model,
+                &format!(
+                    "cutover: SIGTERM pid={}",
+                    pid.map(|p| p.to_string()).unwrap_or_else(|| "adopted".into())
+                ),
+            );
+            self.stop_native(&model, "exclusive cutover")?;
+            if let Some(pid) = pid {
+                match crate::engine_process::wait_pid_gone(pid, self.config.stop_grace) {
+                    Some(ms) => self.log(&model, &format!("cutover: pid gone after {ms} ms")),
+                    None => self.log(
+                        &model,
+                        "cutover: pid still alive after the stop grace (escalated to SIGKILL)",
+                    ),
+                }
+            }
+        }
+        if !self.config.settle.is_zero() {
+            self.log(
+                &entry.id,
+                &format!("cutover: settle {} ms", self.config.settle.as_millis()),
+            );
+            tokio::time::sleep(self.config.settle).await;
+        }
+        Ok(())
+    }
+
+    fn set_gate(&self, id: &str, gate: GateStatus) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = inner.models.entry(id.to_string()).or_default();
+        runtime.state = LifecycleState::Waiting;
+        runtime.gate = Some(gate);
+    }
+
+    fn clear_gate(&self, id: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(runtime) = inner.models.get_mut(id) {
+            runtime.gate = None;
+            if runtime.state == LifecycleState::Waiting {
+                runtime.state = LifecycleState::Stopped;
+            }
+        }
+    }
+
+    /// `MemAvailable ≥ adapter.min_mem_gib` (spec: after drain + settle;
+    /// 10-minute timeout ⇒ Failed with reason + `--force-gate`).
+    async fn wait_gate(
+        &self,
+        entry: &CatalogEntry,
+        options: &EnsureOptions,
+        cancel: Option<&crate::inflight::InflightHandle>,
+    ) -> Result<()> {
+        let Some(adapter) = self.adapter_for(&entry.engine) else {
+            return Ok(());
+        };
+        let threshold = adapter.min_mem_gib().unwrap_or(self.config.min_mem_gib);
+        if threshold <= 0.0 {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let mut announced = false;
+        loop {
+            let available = self.mem_available_gib();
+            if available + 1e-9 >= threshold {
+                self.clear_gate(&entry.id);
+                self.log(
+                    &entry.id,
+                    &format!(
+                        "cutover: mem gate ok (available {available:.1} ≥ {threshold:.1} GiB)"
+                    ),
+                );
+                return Ok(());
+            }
+            if options.force_gate {
+                let _ = self.ledger.record_as(
+                    "override",
+                    &entry.id,
+                    threshold,
+                    format!(
+                        "force-gate: MemAvailable {available:.1} GiB < {threshold:.1} GiB floor"
+                    ),
+                    options.actor.as_deref(),
+                );
+                self.log(&entry.id, "gate: --force-gate override (audit-logged)");
+                let _ = self.ledger.record_as(
+                    "gate",
+                    &entry.id,
+                    threshold,
+                    format!("gate bypassed by force-gate at {available:.1} GiB"),
+                    options.actor.as_deref(),
+                );
+                self.clear_gate(&entry.id);
+                return Ok(());
+            }
+            let waited = started.elapsed().as_millis() as u64;
+            self.set_gate(
+                &entry.id,
+                GateStatus {
+                    threshold_gib: threshold,
+                    current_gib: available,
+                    waited_ms: waited,
+                    timeout_ms: self.config.gate_timeout.as_millis() as u64,
+                },
+            );
+            if !announced {
+                announced = true;
+                self.record_blocked_as(
+                    &entry.id,
+                    &format!(
+                        "blocked:min-mem-gate: needs MemAvailable ≥ {threshold:.1} GiB \
+                         (probe reports {available:.1} GiB)"
+                    ),
+                    options.actor.as_deref(),
+                );
+            }
+            if started.elapsed() >= self.config.gate_timeout {
+                self.clear_gate(&entry.id);
+                let reason = format!(
+                    "min_mem gate: `{}` needs MemAvailable ≥ {threshold:.1} GiB but the probe \
+                     reports {available:.1} GiB after {} ms (pass --force-gate to override)",
+                    entry.id,
+                    self.config.gate_timeout.as_millis()
+                );
+                self.log(&entry.id, &format!("gate: failed: {reason}"));
+                self.set_state(&entry.id, LifecycleState::Failed, Some(reason.clone()));
+                let _ = self.ledger.record("gate-fail", &entry.id, threshold, reason);
+                return Err(SwapError::GateBlocked {
+                    model: entry.id.clone(),
+                    threshold_gib: threshold,
+                    available_gib: available,
+                }
+                .into());
+            }
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    self.clear_gate(&entry.id);
+                    return Err(SwapError::Cancelled(entry.id.clone()).into());
+                }
+            }
+            tokio::time::sleep(self.config.gate_poll).await;
         }
     }
 
@@ -1437,9 +2249,33 @@ impl SwapScheduler {
                 entry.engine
             ))
         })?;
-        let port = free_port(self.config.port_min, self.config.port_max).ok_or_else(|| {
-            SwapError::SpawnFailed("no free port in the swap port range".into())
-        })?;
+        // L5: probe each adapter once (engine install marker / version-keyed
+        // schema derivation). A probe failure is logged, never fatal: the
+        // spawn attempt itself is the authority (L4 behavior preserved).
+        if self
+            .probed_adapters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(adapter.name().to_string())
+        {
+            if let Err(error) = adapter.probe() {
+                self.log(
+                    &entry.id,
+                    &format!("adapter `{}` probe failed: {error}", adapter.name()),
+                );
+            }
+        }
+        // L5: adapter-owned allocation (strixite conf scope, hipfire
+        // single-owner port) avoids every Residency endpoint, imported
+        // explicit ports and llama-swap's dynamic range; otherwise the L4
+        // generic free-port scan.
+        let avoid = self.avoided_ports();
+        let port = adapter
+            .allocate_port(&avoid)
+            .or_else(|| free_port(self.config.port_min, self.config.port_max))
+            .ok_or_else(|| {
+                SwapError::SpawnFailed("no free port in the swap port range".into())
+            })?;
         let endpoint = format!("http://127.0.0.1:{port}");
         let gguf = entry.canonical_gguf();
         let scope_name = Some(format!(
@@ -1518,6 +2354,11 @@ impl SwapScheduler {
                     restarts,
                     load_started_ms: now_ms(),
                     spec_stale: false,
+                    port: Some(port),
+                    conf_path: adapter
+                        .conf_path_for(&entry.id)
+                        .map(|path| path.display().to_string()),
+                    gate: None,
                 },
             );
         }
@@ -1535,6 +2376,18 @@ impl SwapScheduler {
         Ok(handle)
     }
 
+    /// Ports that must never be allocated for a managed child: every
+    /// Residency endpoint, imported explicit `--port` values and llama-swap's
+    /// configured dynamic `${PORT}` range.
+    fn avoided_ports(&self) -> BTreeSet<u16> {
+        let mut ports = crate::engine_strixite::avoidance_from_catalog(&self.catalog.snapshot());
+        let view = self.residency();
+        ports.extend(crate::engine_strixite::endpoint_ports(
+            view.residents.iter().map(|resident| resident.endpoint.as_str()),
+        ));
+        ports
+    }
+
     async fn finish_spawn(
         &self,
         entry: &CatalogEntry,
@@ -1544,6 +2397,7 @@ impl SwapScheduler {
         let adapter = self
             .adapter_for(&entry.engine)
             .ok_or_else(|| SwapError::SpawnFailed("adapter disappeared".into()))?;
+        let readiness_timeout = adapter.readiness_timeout().unwrap_or(self.config.wait_timeout);
         let started = std::time::Instant::now();
         loop {
             if let Some(cancel) = cancel {
@@ -1610,7 +2464,7 @@ impl SwapScheduler {
                         .await;
                 }
             }
-            if started.elapsed() > self.config.wait_timeout {
+            if started.elapsed() > readiness_timeout {
                 self.stop_native(&entry.id, "load timeout")?;
                 return Err(SwapError::Timeout {
                     model: entry.id.clone(),
@@ -1649,6 +2503,9 @@ impl SwapScheduler {
                 runtime.handle = None;
             }
             let _ = self.evict_to_fit(self.need_gib(entry));
+            // Hung/assert-failed starts release their memory before the retry:
+            // re-run the `min_mem_gib` gate (spec: "re-run gate").
+            self.wait_gate(entry, &EnsureOptions::default(), cancel).await?;
             let handle = self.start_spawn(entry)?;
             return Box::pin(self.finish_spawn(entry, handle, cancel)).await;
         }
@@ -1712,10 +2569,53 @@ impl SwapScheduler {
 
     /// Explicit eviction (`swap evict` / dashboard). Refuses an unknown model.
     pub fn evict(&self, id: &str, reason: &str) -> Result<bool> {
+        self.evict_with_options(id, reason, false)
+    }
+
+    /// Explicit eviction. Refuses a protected consumer unless the one-action
+    /// override is set (block reason `blocked:active-consumer`).
+    pub fn evict_with_options(
+        &self,
+        id: &str,
+        reason: &str,
+        override_active_consumers: bool,
+    ) -> Result<bool> {
+        self.evict_with_actor(id, reason, override_active_consumers, None)
+    }
+
+    pub fn evict_with_actor(
+        &self,
+        id: &str,
+        reason: &str,
+        override_active_consumers: bool,
+        actor: Option<&str>,
+    ) -> Result<bool> {
         let resolved = self
             .catalog
             .resolve_alias(id)
             .ok_or_else(|| SwapError::UnknownModel(id.to_string()))?;
+        if !override_active_consumers {
+            if let Some(detail) = self.protection(&resolved) {
+                self.record_blocked_as(
+                    &resolved,
+                    &format!("blocked:active-consumer: explicit evict refused ({detail})"),
+                    actor,
+                );
+                return Err(SwapError::BlockedActiveConsumer {
+                    model: resolved,
+                    detail,
+                }
+                .into());
+            }
+        } else {
+            let _ = self.ledger.record_as(
+                "override",
+                &resolved,
+                0.0,
+                format!("active-consumer override ({reason})"),
+                actor,
+            );
+        }
         let had = self
             .inner
             .lock()
@@ -1739,6 +2639,9 @@ impl SwapScheduler {
             restarts: r.restarts,
             load_started_ms: r.load_started_ms,
             spec_stale: r.spec_stale,
+            port: r.port,
+            conf_path: r.conf_path.clone(),
+            gate: r.gate.clone(),
         })
     }
 
@@ -1805,9 +2708,19 @@ impl SwapScheduler {
                 .catalog
                 .entry(&marker.model)
                 .map(|e| crate::swap_catalog::launch_spec_hash(&e));
+            // An adopted icon-era external carries the PORT-LESS hash
+            // (profile template + weights); it must not wear a permanent
+            // `spec_stale` badge (L5 binding).
+            let adopted_hash = self
+                .catalog
+                .entry(&marker.model)
+                .map(|e| crate::swap_catalog::adopted_spec_hash(&e));
             let stale = expected_hash
                 .as_deref()
-                .is_some_and(|hash| hash != marker.spec_hash);
+                .is_some_and(|hash| hash != marker.spec_hash)
+                && adopted_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash != marker.spec_hash);
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 inner.models.insert(
@@ -1826,6 +2739,15 @@ impl SwapScheduler {
                         restarts: 0,
                         load_started_ms: 0,
                         spec_stale: stale,
+                        port: Some(
+                            crate::engine_strixite::endpoint_ports([marker.endpoint.as_str()])
+                                .into_iter()
+                                .next()
+                                .unwrap_or(0),
+                        )
+                        .filter(|port| *port > 0),
+                        conf_path: None,
+                        gate: None,
                     },
                 );
             }
@@ -1909,42 +2831,80 @@ impl SwapScheduler {
                 if stems_ok {
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(r) = inner.models.get_mut(&id) {
-                        r.state = LifecycleState::Ready;
-                        r.last_error = None;
+                        // Re-check under the same lock: a cutover may have
+                        // drained this model between the health probe and here.
+                        if r.state == LifecycleState::Loading {
+                            r.state = LifecycleState::Ready;
+                            r.last_error = None;
+                        }
                     }
                     self.log(&id, "recovered ready state after a dropped ensure future");
                 }
             }
-            if runtime.state == LifecycleState::Ready && !healthy {
-                let restarts = {
-                    let mut inner =
-                        self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(r) = inner.models.get_mut(&id) {
-                        r.restarts += 1;
-                        r.state = LifecycleState::Stopped;
-                        r.handle = None;
-                        r.last_error = Some("crashed; restarting".into());
-                        r.restarts
-                    } else {
-                        0
-                    }
-                };
-                self.remove_marker(&id);
-                self.log(&id, "crash detected; bounded restart");
-                if restarts <= self.config.max_restarts {
-                    if let Some(entry) = self.catalog.entry(&id) {
-                        if let Ok(handle) = self.start_spawn(&entry) {
-                            // Validate in the background; ensure callers that
-                            // race this still see Loading → Ready.
-                            let this = Arc::clone(self);
-                            tokio::spawn(async move {
-                                let _ = this.finish_spawn(&entry, handle, None).await;
-                            });
-                        }
-                    }
+            if runtime.state != LifecycleState::Ready || healthy {
+                continue;
+            }
+            // Crash restart is serialized like an admission: the per-device
+            // lock and the model's spawn lock are taken in the same order as
+            // `ensure`, then the state is re-read. Without this, a cutover
+            // that drained the model while the health probe ran could be
+            // resurrected here (co-residency on an exclusive device).
+            let engine = self
+                .catalog
+                .entry(&id)
+                .map(|e| e.engine)
+                .unwrap_or_else(|| "llama_cpp".into());
+            let _device_guard = match self
+                .adapter_for(&engine)
+                .and_then(|adapter| adapter.exclusive_key())
+            {
+                Some(device) => Some(self.device_lock(&device).lock_owned().await),
+                None => None,
+            };
+            let lock = self.spawn_lock(&id);
+            let _guard = lock.lock().await;
+            let current = match self.runtime(&id) {
+                Some(r) => r,
+                None => continue,
+            };
+            if current.state != LifecycleState::Ready {
+                continue;
+            }
+            if current
+                .handle
+                .as_ref()
+                .is_some_and(|handle| pid_alive(handle.pid))
+            {
+                continue; // the probe raced a recovery
+            }
+            let restarts = {
+                let mut inner =
+                    self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(r) = inner.models.get_mut(&id) {
+                    r.restarts += 1;
+                    r.state = LifecycleState::Stopped;
+                    r.handle = None;
+                    r.last_error = Some("crashed; restarting".into());
+                    r.restarts
                 } else {
-                    self.set_state(&id, LifecycleState::Failed, Some("restart budget exhausted".into()));
+                    0
                 }
+            };
+            self.remove_marker(&id);
+            self.log(&id, "crash detected; bounded restart");
+            if restarts <= self.config.max_restarts {
+                if let Some(entry) = self.catalog.entry(&id) {
+                    if let Ok(handle) = self.start_spawn(&entry) {
+                        // Validate in the background; ensure callers that
+                        // race this still see Loading → Ready.
+                        let this = Arc::clone(self);
+                        tokio::spawn(async move {
+                            let _ = this.finish_spawn(&entry, handle, None).await;
+                        });
+                    }
+                }
+            } else {
+                self.set_state(&id, LifecycleState::Failed, Some("restart budget exhausted".into()));
             }
         }
     }
@@ -2026,8 +2986,46 @@ impl SwapScheduler {
                     vram_estimate_gib: entry.vram_estimate_gib,
                     pinned_gib: data.pins.get(&entry.id).map(|p| p.reserved_gib),
                     progress,
+                    gate: runtime.as_ref().and_then(|r| r.gate.clone()),
+                    port: runtime.as_ref().and_then(|r| r.port),
+                    conf_path: runtime
+                        .as_ref()
+                        .and_then(|r| r.conf_path.clone())
+                        .or_else(|| {
+                            self.adapter_for(&entry.engine)
+                                .and_then(|adapter| adapter.conf_path_for(&entry.id))
+                                .map(|path| path.display().to_string())
+                        }),
+                    active_consumer: self.consumer_span(&entry.id),
                 }
             })
+            .collect();
+        let external = {
+            let observed = self.observed_external();
+            let markers = crate::engine_observer::marker_pids(&self.adoption_dir);
+            observed
+                .iter()
+                .map(|engine| ExternalEngineView {
+                    pid: engine.pid,
+                    engine: engine.engine.clone(),
+                    endpoint: engine.endpoint.clone(),
+                    port: engine.port,
+                    stems: engine.stems.clone(),
+                    catalog_id: engine.catalog_id.clone(),
+                    gguf: engine.gguf.clone(),
+                    adopted: markers.contains(&engine.pid),
+                })
+                .collect()
+        };
+        let units = self.probe_units();
+        let active_consumers = self
+            .consumers()
+            .map(|consumers| consumers.snapshot())
+            .unwrap_or_default();
+        let adapters = self
+            .adapters
+            .values()
+            .filter_map(|adapter| adapter.describe())
             .collect();
         EnginesStatus {
             models,
@@ -2040,7 +3038,76 @@ impl SwapScheduler {
                 .clone(),
             shim_error: view.shim_error,
             adapter_names: self.adapters.keys().cloned().collect(),
+            external,
+            units,
+            active_consumers,
+            adapters,
         }
+    }
+
+    /// The ACS span for one model (live in-process stream or grace window).
+    pub fn consumer_span(&self, id: &str) -> Option<ConsumerSpan> {
+        let consumers = self.consumers()?;
+        let endpoint = self.endpoint_for(id);
+        for key in protection_keys(id, endpoint.as_deref()) {
+            if let Some(span) = consumers
+                .snapshot()
+                .into_iter()
+                .find(|span| span.key == key)
+            {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    /// Configured units, probed pid-scoped (never by name pattern). Cached for
+    /// two seconds (`/api/engines` is polled; one `systemctl show` per unit
+    /// per poll is wasteful).
+    pub fn probe_units(&self) -> Vec<UnitView> {
+        if let Some((at, units)) = self
+            .unit_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if now_ms().saturating_sub(*at) < 2_000 {
+                return units.clone();
+            }
+        }
+        let units = self.probe_units_now();
+        *self.unit_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((now_ms(), units.clone()));
+        units
+    }
+
+    pub fn probe_units_now(&self) -> Vec<UnitView> {
+        let runtime = self
+            .unit_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(runtime) = runtime else {
+            return Vec::new();
+        };
+        let units: BTreeMap<String, String> = self
+            .takeover_units
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        units
+            .into_iter()
+            .map(|(engine, unit)| {
+                let state: UnitState = runtime.probe(&unit);
+                UnitView {
+                    engine,
+                    unit,
+                    active: state.active,
+                    main_pid: state.main_pid,
+                    error: state.error,
+                }
+            })
+            .collect()
     }
 
     /// LRU clock: a completed stream for the model id (called from the
@@ -2050,6 +3117,353 @@ impl SwapScheduler {
         let _ = self
             .catalog
             .record_stream_completed(&resolved, now_ms());
+    }
+
+    // ── Takeover / adopt (L5) ──────────────────────────────────────────────
+
+    /// Register an observed external pid as a supervisor-owned resident:
+    /// marker with the PORT-LESS adopted hash (no permanent `spec_stale`),
+    /// runtime Ready at the external endpoint. Never signals the pid.
+    fn adopt_pid(
+        &self,
+        entry: &CatalogEntry,
+        pid: u32,
+        endpoint: &str,
+        gguf: Option<String>,
+        actor: Option<&str>,
+    ) -> Result<AdoptReport> {
+        if pid == 0 || !pid_alive(pid) {
+            return Err(SwapError::SpawnFailed(format!(
+                "cannot adopt pid {pid} for `{}`: process is not running",
+                entry.id
+            ))
+            .into());
+        }
+        let gguf = gguf.or_else(|| {
+            entry
+                .canonical_gguf()
+                .map(|path| path.display().to_string())
+        });
+        let spec_hash = crate::swap_catalog::adopted_spec_hash(entry);
+        let marker = AdoptionMarker {
+            model: entry.id.clone(),
+            pid,
+            gguf: gguf.clone().unwrap_or_default(),
+            start_time: process_start_time(pid).unwrap_or(0),
+            spec_hash: spec_hash.clone(),
+            scope_name: None,
+            endpoint: endpoint.to_string(),
+        };
+        self.write_marker(&marker)?;
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.models.insert(
+                entry.id.clone(),
+                ModelRuntime {
+                    state: LifecycleState::Ready,
+                    endpoint: Some(endpoint.to_string()),
+                    handle: Some(EngineHandle {
+                        pid,
+                        endpoint: endpoint.to_string(),
+                        started_at: now_ms(),
+                        scope_name: None,
+                    }),
+                    source: Some(ResidentSource::Native),
+                    last_error: None,
+                    restarts: 0,
+                    load_started_ms: 0,
+                    spec_stale: false,
+                    port: crate::engine_strixite::endpoint_ports([endpoint])
+                        .into_iter()
+                        .next(),
+                    conf_path: None,
+                    gate: None,
+                },
+            );
+        }
+        let _ = self.ledger.record_as(
+            "adopt",
+            &entry.id,
+            0.0,
+            format!("pid {pid} adopted from an external engine at {endpoint}"),
+            actor,
+        );
+        self.log(
+            &entry.id,
+            &format!("adopt: external pid {pid} at {endpoint} (marker port-less hash)"),
+        );
+        Ok(AdoptReport {
+            model: entry.id.clone(),
+            pid,
+            endpoint: endpoint.to_string(),
+            gguf,
+            spec_hash,
+        })
+    }
+
+    /// `swap adopt <model> [--pid N]`: register an icon-launched resident so a
+    /// later cutover may signal it (start-ownership transfers explicitly).
+    pub fn adopt_external(&self, model: &str, pid: Option<u32>) -> Result<AdoptReport> {
+        self.adopt_external_as(model, pid, None)
+    }
+
+    pub fn adopt_external_as(
+        &self,
+        model: &str,
+        pid: Option<u32>,
+        actor: Option<&str>,
+    ) -> Result<AdoptReport> {
+        let resolved = self
+            .catalog
+            .resolve_alias(model)
+            .ok_or_else(|| SwapError::UnknownModel(model.to_string()))?;
+        let entry = self
+            .catalog
+            .entry(&resolved)
+            .ok_or_else(|| SwapError::UnknownModel(resolved.clone()))?;
+        let observed = self.observed_external();
+        let served_alias = entry.served_alias();
+        let target = observed.iter().find(|engine| {
+            if let Some(pid) = pid {
+                return engine.pid == pid;
+            }
+            engine.catalog_id.as_deref() == Some(resolved.as_str())
+                || engine.stems.iter().any(|stem| {
+                    stem == &resolved || stem == &served_alias || stem == &entry.id
+                })
+                || engine.gguf.as_deref().is_some_and(|gguf| {
+                    entry
+                        .files
+                        .iter()
+                        .any(|file| file == gguf || file.ends_with(gguf))
+                })
+        });
+        let Some(engine) = target.cloned() else {
+            return Err(SwapError::SpawnFailed(format!(
+                "no observed external engine serves `{model}` (refresh /api/engines/external)"
+            ))
+            .into());
+        };
+        self.adopt_pid(&entry, engine.pid, &engine.endpoint, engine.gguf.clone(), actor)
+    }
+
+    /// `swap adopt --endpoint <http://...>`: adopt whatever the observer sees
+    /// at that endpoint. The catalog id comes from the observer's own
+    /// resolution (gguf or served stems); an unregistered endpoint with no
+    /// catalog entry is a named error, never a guessed model.
+    pub fn adopt_endpoint(
+        &self,
+        endpoint: &str,
+        pid: Option<u32>,
+        actor: Option<&str>,
+    ) -> Result<AdoptReport> {
+        let normalized = endpoint.trim_end_matches('/');
+        let observed = self.observed_external();
+        let target = observed.iter().find(|engine| {
+            engine.endpoint.trim_end_matches('/') == normalized
+                || pid.is_some_and(|pid| engine.pid == pid)
+        });
+        let Some(engine) = target.cloned() else {
+            return Err(SwapError::SpawnFailed(format!(
+                "no observed external engine at `{endpoint}` (refresh /api/engines/external)"
+            ))
+            .into());
+        };
+        let id = engine
+            .catalog_id
+            .clone()
+            .or_else(|| engine.stems.first().cloned())
+            .ok_or_else(|| {
+                SwapError::SpawnFailed(format!(
+                    "observed external pid {} at {} serves no resolvable model;                      add a catalog entry first",
+                    engine.pid, engine.endpoint
+                ))
+            })?;
+        if self.catalog.resolve_alias(&id).is_none() {
+            return Err(SwapError::SpawnFailed(format!(
+                "observed external pid {} at {} serves `{id}`, which is not in the                  swap catalog; add the entry first",
+                engine.pid, engine.endpoint
+            ))
+            .into());
+        }
+        self.adopt_external_as(&id, Some(engine.pid), actor)
+    }
+
+    /// `swap takeover <model>` / the dashboard takeover action. Attach-not-spawn
+    /// when a resident (external observer or unit process) already serves the
+    /// model; otherwise take over the operator unit pid-scoped (requires
+    /// `--override`) and spawn through the normal admission path.
+    pub async fn takeover(
+        &self,
+        requested: &str,
+        options: TakeoverOptions,
+    ) -> Result<TakeoverReport> {
+        let resolved = self
+            .catalog
+            .resolve_alias(requested)
+            .ok_or_else(|| SwapError::UnknownModel(requested.to_string()))?;
+        let entry = self
+            .catalog
+            .entry(&resolved)
+            .ok_or_else(|| SwapError::UnknownModel(resolved.clone()))?;
+
+        // 1. Attach-not-spawn: anything already serving this model.
+        if let Some(resident) = self.resident_ready(&entry) {
+            self.log(
+                &entry.id,
+                &format!("takeover: attach at {} (no spawn)", resident.endpoint),
+            );
+            return Ok(TakeoverReport {
+                model: entry.id.clone(),
+                endpoint: resident.endpoint,
+                attached: true,
+                spawned: false,
+                unit: None,
+                stopped_unit: None,
+                adopted_pid: None,
+                actor: options.actor.clone(),
+            });
+        }
+
+        // 2. Unit owned by the operator: attach, adopt, or (override) stop.
+        let adapter = self.adapter_for(&entry.engine);
+        let unit = options
+            .unit
+            .clone()
+            .or_else(|| adapter.as_ref().and_then(|adapter| adapter.takeover_unit()))
+            .or_else(|| {
+                self.takeover_units
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&entry.engine)
+                    .cloned()
+            });
+        let runtime = self
+            .unit_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut stopped_unit = None;
+        let mut adopted_pid = None;
+        if let (Some(unit), Some(runtime)) = (unit.clone(), runtime) {
+            let state = runtime.probe(&unit);
+            if state.active {
+                let pids = runtime.pids(&unit);
+                let endpoint = pids.iter().find_map(|pid| {
+                    crate::engine_observer::parse_port(&process_cmdline(*pid))
+                        .map(|port| format!("http://127.0.0.1:{port}"))
+                });
+                let serves_expected = endpoint.as_deref().is_some_and(|endpoint| {
+                    crate::engine_process::probe_stems(endpoint, Duration::from_millis(800))
+                        .is_some_and(|stems| {
+                            stems.iter().any(|stem| {
+                                stem == &entry.id || stem == &entry.served_alias()
+                            })
+                        })
+                });
+                if serves_expected {
+                    let pid = pids
+                        .first()
+                        .copied()
+                        .or(state.main_pid)
+                        .ok_or_else(|| {
+                            SwapError::SpawnFailed(format!(
+                                "unit `{unit}` serves `{}` but exposes no pid to adopt",
+                                entry.id
+                            ))
+                        })?;
+                    let endpoint = endpoint.expect("serves_expected implies an endpoint");
+                    let report = self.adopt_pid(
+                        &entry,
+                        pid,
+                        &endpoint,
+                        None,
+                        options.actor.as_deref(),
+                    )?;
+                    self.log(
+                        &entry.id,
+                        &format!("takeover: adopted unit pid {pid} at {endpoint} (attach)"),
+                    );
+                    let _ = self.ledger.record_as(
+                        "takeover",
+                        &entry.id,
+                        0.0,
+                        format!("unit `{unit}` adopted pid {pid} at {endpoint}"),
+                        options.actor.as_deref(),
+                    );
+                    return Ok(TakeoverReport {
+                        model: entry.id.clone(),
+                        endpoint: report.endpoint,
+                        attached: true,
+                        spawned: false,
+                        unit: Some(unit),
+                        stopped_unit: None,
+                        adopted_pid: Some(pid),
+                        actor: options.actor.clone(),
+                    });
+                }
+                if !options.override_unit {
+                    self.record_blocked_as(
+                        &entry.id,
+                        &format!("blocked:unit-owned: `{unit}` is active and not serving `{}`", entry.id),
+                        options.actor.as_deref(),
+                    );
+                    return Err(SwapError::UnitOwned { unit }.into());
+                }
+                // Single-action takeover: pid-scoped SIGTERM to the pids the
+                // unit itself reports, then stop the unit as cleanup.
+                self.log(
+                    &entry.id,
+                    &format!(
+                        "takeover: --override: stopping unit `{unit}` pid-scoped ({pids:?})"
+                    ),
+                );
+                for pid in &pids {
+                    crate::engine_process::terminate(*pid, self.config.stop_grace);
+                    let _ = crate::engine_process::wait_pid_gone(*pid, self.config.stop_grace);
+                }
+                if let Err(error) = runtime.stop(&unit) {
+                    self.log(
+                        &entry.id,
+                        &format!("takeover: systemctl stop `{unit}` reported: {error}"),
+                    );
+                }
+                let _ = self.ledger.record_as(
+                    "takeover",
+                    &entry.id,
+                    0.0,
+                    format!("unit `{unit}` taken over (pids {pids:?})"),
+                    options.actor.as_deref(),
+                );
+                stopped_unit = Some(unit);
+                adopted_pid = None;
+            }
+        }
+
+        // 3. Normal admission (spawn under our own scope).
+        let outcome = self
+            .ensure_with_options(
+                &entry.id,
+                None,
+                EnsureOptions {
+                    override_active_consumers: options.override_active_consumers
+                        || options.override_unit,
+                    force_gate: options.force_gate,
+                    attach_only: false,
+                    actor: options.actor.clone(),
+                },
+            )
+            .await?;
+        Ok(TakeoverReport {
+            model: entry.id.clone(),
+            endpoint: outcome.endpoint().to_string(),
+            attached: !outcome.spawned(),
+            spawned: outcome.spawned(),
+            unit,
+            stopped_unit,
+            adopted_pid,
+            actor: options.actor.clone(),
+        })
     }
 
     // ── Markers + logs ─────────────────────────────────────────────────────
@@ -2192,6 +3606,12 @@ mod tests {
             port_min: 12500,
             port_max: 12550,
             llama_swap_url: "http://127.0.0.1:1".into(),
+            // Fixtures: no settle sleep, zero grace (L5 seams are injectable).
+            settle: Duration::ZERO,
+            cutover_recheck: Duration::from_millis(50),
+            gate_poll: Duration::from_millis(10),
+            gate_timeout: Duration::from_millis(200),
+            ..SwapSchedulerConfig::default()
         };
         let mut builder = SwapScheduler::new(catalog, ledger, config, adapters)
             .with_state_root(root.clone())
@@ -2346,6 +3766,7 @@ mod tests {
                 last_stream_completed: 0,
                 state: "ready".into(),
                 spec_stale: false,
+                engine: None,
             }],
             shim_error: None,
             observed_at: String::new(),
@@ -2635,6 +4056,8 @@ mod tests {
                     port_min: 12600,
                     port_max: 12650,
                     llama_swap_url: "http://127.0.0.1:1".into(),
+                    settle: Duration::ZERO,
+                    ..SwapSchedulerConfig::default()
                 },
                 adapters,
             )
@@ -2683,6 +4106,7 @@ mod tests {
                     last_stream_completed: 0,
                     state: "ready".into(),
                     spec_stale: false,
+                    engine: None,
                 },
                 Resident {
                     catalog_id: "m".into(),
@@ -2693,6 +4117,7 @@ mod tests {
                     last_stream_completed: 0,
                     state: "ready".into(),
                     spec_stale: false,
+                    engine: None,
                 },
             ],
             shim_error: None,

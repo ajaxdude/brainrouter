@@ -933,12 +933,41 @@ pub fn launch_spec_hash(entry: &CatalogEntry) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Port-less launch hash for an ADOPTED icon-era external: the marker records
+/// profile/template + weights, EXCLUDING the allocated port, so an adopted
+/// resident never carries a permanent `spec_stale` badge (L5 binding).
+pub fn adopted_spec_hash(entry: &CatalogEntry) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"adopted\x00");
+    hasher.update(entry.engine.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(entry.launch_spec.program.as_bytes());
+    hasher.update(b"\x00");
+    if let Some(gguf) = entry.canonical_gguf() {
+        hasher.update(gguf.display().to_string().as_bytes());
+    }
+    for file in &entry.files {
+        hasher.update(b"\x04");
+        hasher.update(file.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Cheap sanity checks for adapter-owned launch specs (engine-validated flags
 /// are the adapter's job; this rejects structurally unusable entries).
 pub fn validate_entry(entry: &CatalogEntry) -> Result<()> {
     anyhow::ensure!(!entry.id.is_empty(), "entry id must not be empty");
     anyhow::ensure!(
-        ["llama_cpp", "fake", "ds4", "gufo", "external"].contains(&entry.engine.as_str()),
+        [
+            "llama_cpp",
+            "fake",
+            "ds4",
+            "gufo",
+            "external",
+            "strixite",
+            "hipfire"
+        ]
+        .contains(&entry.engine.as_str()),
         "unknown engine `{}`",
         entry.engine
     );

@@ -677,6 +677,14 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <div id="engines-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px"></div>
       <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Queue</div>
       <div id="engines-queue" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <!-- v2 L5: external (icon-launched) residents + takeover units + the
+           Active-Consumer Set. Additive: attach/adopt/takeover only. -->
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">External engines (attach-only until adopted)</div>
+      <div id="engines-external" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Takeover units</div>
+      <div id="engines-units" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Active consumers</div>
+      <div id="engines-consumers" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
       <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Import from llama-swap</div>
       <div id="engines-import" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;display:flex;flex-direction:column;gap:8px">
         <div style="display:flex;gap:8px;align-items:center">
@@ -4299,7 +4307,18 @@ async function loadEngines() {
         '<span><span style="color:var(--textMute)">mem</span> ' + Number((platform.facts || {}).mem_total_gib || 0).toFixed(0) + ' GiB</span>' +
         '<span><span style="color:var(--textMute)">feed</span> ' + escHtml(platform.feed_origin || '') + '</span>' +
         '<span><span style="color:var(--textMute)">gpus</span> ' + gpus + '</span>' +
-        '</div><div style="display:flex;flex-direction:column;gap:3px">' + offers + '</div>';
+        '</div><div style="display:flex;flex-direction:column;gap:3px">' + offers + '</div>' +
+        ((engines.adapter_detail || []).length
+          ? '<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">' +
+            (engines.adapter_detail || []).map(function(a) {
+              var schema = a.schema ? (' · schema ' + escHtml(a.schema.version || 'unknown')) : '';
+              var drift = (a.schema && a.schema_drift) ? ' <span style="color:var(--amber)">(drift: re-derived)</span>' : '';
+              var cards = a.cards ? (' · ' + Number(a.cards.length) + ' card(s)') : '';
+              var warn = (a.warnings && a.warnings.length) ? (' <span style="color:var(--amber)">' + escHtml(a.warnings.join('; ')) + '</span>') : '';
+              return '<div><span style="color:var(--textMute)">adapter</span> <strong>' + escHtml(a.engine || '') + '</strong>' +
+                schema + drift + cards + warn + '</div>';
+            }).join('') + '</div>'
+          : '');
     }
     const budget = engines.budget || {};
     const bud = document.getElementById('engines-budget');
@@ -4342,7 +4361,11 @@ async function loadEngines() {
             (m.endpoint ? ' · ' + escHtml(m.endpoint) : '') + progress + pin + '</div>' +
             (m.last_error ? '<div style="font-size:11px;color:var(--amber)">' + escHtml(m.last_error) + '</div>' : '') +
             '</div>' +
+            (m.gate ? '<div style="font-size:11px;color:var(--amber)">waiting(gate): needs ' + Number(m.gate.threshold_gib || 0).toFixed(1) + ' GiB, have ' + Number(m.gate.current_gib || 0).toFixed(1) + ' GiB</div>' : '') +
+            (m.active_consumer && m.active_consumer.protected ? '<div style="font-size:11px;color:var(--amber)">active consumer' + (m.active_consumer.active ? ' (live)' : ' (grace)') + '</div>' : '') +
             '<button class="br-btn" data-eng-action="ensure" data-model="' + escHtml(m.id) + '">Ensure</button>' +
+            '<button class="br-btn" data-eng-action="ensure-override" data-model="' + escHtml(m.id) + '">Swap anyway</button>' +
+            '<button class="br-btn" data-eng-action="takeover" data-model="' + escHtml(m.id) + '">Takeover</button>' +
             '<button class="br-btn" data-eng-action="evict" data-model="' + escHtml(m.id) + '">Evict</button>' +
             '<button class="br-btn" data-eng-action="pin" data-model="' + escHtml(m.id) + '">Pin</button>' +
             '<button class="br-btn" data-eng-action="unpin" data-model="' + escHtml(m.id) + '">Unpin</button>' +
@@ -4360,6 +4383,40 @@ async function loadEngines() {
             '<button class="br-btn" data-eng-action="cancel" data-queue-id="' + escHtml(String(e.id)) + '">Cancel</button></div>').join('')
         : '<span style="color:var(--textMute)">empty (the queue is in-memory and resets on daemon restart)</span>';
     }
+    const ext = document.getElementById('engines-external');
+    if (ext) {
+      const rows = (engines.external || []).map(x =>
+        '<div style="display:flex;align-items:center;gap:8px;padding:4px 0">' +
+        '<span style="width:8px;height:8px;border-radius:50%;background:' + (x.adopted ? 'var(--green)' : 'var(--amber)') + '"></span>' +
+        '<div style="flex:1;min-width:0"><div>' + escHtml(x.engine) + ' · pid ' + escHtml(String(x.pid)) +
+        (x.catalog_id ? ' · ' + escHtml(x.catalog_id) : ' · unregistered') +
+        (x.adopted ? ' · adopted' : ' · attach-only') + '</div>' +
+        '<div style="font-size:11px;color:var(--textMute);font-family:\'JetBrains Mono\',monospace">' + escHtml(x.endpoint) +
+        (x.stems && x.stems.length ? ' · ' + escHtml(x.stems.join(',')) : '') + '</div></div>' +
+        '<button class="br-btn" data-eng-action="adopt" data-model="' + escHtml(x.catalog_id || '') + '" data-endpoint="' + escHtml(x.endpoint || '') + '" data-pid="' + escHtml(String(x.pid)) + '">Adopt</button>' +
+        (x.catalog_id ? '<button class="br-btn" data-eng-action="ensure" data-model="' + escHtml(x.catalog_id) + '">Attach</button>' : '') +
+        '</div>').join('');
+      ext.innerHTML = rows || '<span style="color:var(--textMute)">none observed (read-only /proc scan every 2 s)</span>';
+    }
+    const units = document.getElementById('engines-units');
+    if (units) {
+      const rows = (engines.units || []).map(u =>
+        '<div style="display:flex;gap:8px;align-items:center">' +
+        '<span style="width:8px;height:8px;border-radius:50%;background:' + (u.active ? 'var(--green)' : 'var(--textMute)') + '"></span>' +
+        '<strong>' + escHtml(u.unit) + '</strong><span style="color:var(--textMute)">' + escHtml(u.engine) + '</span>' +
+        '<span style="color:var(--textMute)">' + (u.active ? 'active' : 'inactive') + (u.main_pid ? ' · pid ' + escHtml(String(u.main_pid)) : '') + '</span>' +
+        (u.error ? '<span style="color:var(--amber)">' + escHtml(u.error) + '</span>' : '') +
+        '</div>').join('');
+      units.innerHTML = rows || '<span style="color:var(--textMute)">no units configured for this fleet profile</span>';
+    }
+    const consumers = document.getElementById('engines-consumers');
+    if (consumers) {
+      const rows = (engines.active_consumers || []).filter(c => c.protected).map(c =>
+        '<div>' + escHtml(c.key) + ' <span style="color:var(--textMute)">' +
+        (c.active ? c.active + ' live stream(s)' : 'grace until ' + new Date(Number(c.protected_until_ms || 0)).toLocaleTimeString()) +
+        '</span></div>').join('');
+      consumers.innerHTML = rows || '<span style="color:var(--textMute)">none (evictions are never blocked)</span>';
+    }
     if (engines.shim_error) enginesSetMessage('shim: ' + engines.shim_error, 'var(--amber)');
   } catch (e) {
     const list = document.getElementById('engines-list');
@@ -4372,10 +4429,21 @@ document.addEventListener('click', async (ev) => {
   const action = btn.dataset.engAction;
   const model = btn.dataset.model || '';
   try {
-    if (action === 'ensure') {
-      enginesSetMessage('ensuring ' + model + '…');
-      const r = await enginesPost('/api/engines/ensure', { model: model });
+    if (action === 'ensure' || action === 'ensure-override') {
+      enginesSetMessage((action === 'ensure-override' ? 'swap anyway: ' : 'ensuring ') + model + '…');
+      const body = { model: model };
+      if (action === 'ensure-override') body.override = true;
+      const r = await enginesPost('/api/engines/ensure', body);
       enginesSetMessage(r.ok ? 'ready at ' + (r.body.endpoint || '') : ('failed: ' + ((r.body.error && r.body.error.message) || r.body.error || 'error')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'adopt') {
+      const body = { pid: Number(btn.dataset.pid || 0) };
+      if (model) body.model = model; else body.endpoint = btn.dataset.endpoint || '';
+      const r = await enginesPost('/api/engines/adopt', body);
+      enginesSetMessage(r.ok ? ('adopted pid ' + r.body.pid + ' at ' + r.body.endpoint) : ('adopt failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'takeover') {
+      enginesSetMessage('taking over ' + model + '…');
+      const r = await enginesPost('/api/engines/takeover', { model: model });
+      enginesSetMessage(r.ok ? (r.body.attached ? 'attached at ' + r.body.endpoint : 'spawned at ' + r.body.endpoint) : ('takeover failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
     } else if (action === 'evict') {
       const r = await enginesPost('/api/engines/evict', { model: model });
       enginesSetMessage(r.ok ? 'stopped ' + model : 'evict failed', r.ok ? 'var(--green)' : 'var(--amber)');

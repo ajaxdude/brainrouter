@@ -566,24 +566,86 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         "llama_cpp".into(),
         native_adapter as Arc<dyn brainrouter::swap_scheduler::EngineAdapter>,
     );
-    let swap_scheduler = Arc::new(
-        brainrouter::swap_scheduler::SwapScheduler::new(
-            Arc::clone(&swap_catalog),
-            budget_ledger,
-            brainrouter::swap_scheduler::SwapSchedulerConfig {
-                llama_swap_url: config
-                    .llama_swap
-                    .base_url
-                    .trim_end_matches('/')
-                    .strip_suffix("/v1")
-                    .unwrap_or(&config.llama_swap.base_url)
-                    .to_string(),
-                ..Default::default()
-            },
-            swap_adapters,
-        )
-        .with_serving_identities(Arc::clone(&serving_identities)),
-    );
+    // v2 L5: per-host fleet profile decides which icon-fleet engines become
+    // supervisor-managed here (strixite on gfx1151, hipfire on gfx1100).
+    let fleet = brainrouter::fleet_profile::FleetProfile::for_probe(&platform);
+    if let Some(strixite) = &fleet.strixite {
+        let adapter = Arc::new(brainrouter::engine_strixite::StrixiteAdapter::new(
+            strixite.clone(),
+        ));
+        adapter.reserve_ports(brainrouter::engine_strixite::avoidance_from_catalog(
+            &swap_catalog.snapshot(),
+        ));
+        swap_adapters.insert(
+            "strixite".into(),
+            adapter as Arc<dyn brainrouter::swap_scheduler::EngineAdapter>,
+        );
+    }
+    if let Some(hipfire) = &fleet.hipfire {
+        let adapter = Arc::new(brainrouter::engine_hipfire::HipfireAdapter::new(
+            hipfire.clone(),
+        ));
+        swap_adapters.insert(
+            "hipfire".into(),
+            adapter as Arc<dyn brainrouter::swap_scheduler::EngineAdapter>,
+        );
+    }
+    // L5: probe each registered adapter once at boot (install marker +
+    // version-keyed schema derivation). Non-fatal, same as the L4 adapters.
+    for (name, adapter) in &swap_adapters {
+        if let Err(error) = adapter.probe() {
+            warn!(adapter = %name, %error, "engine adapter probe failed");
+        }
+    }
+    let active_consumers = Arc::new(brainrouter::active_consumers::ActiveConsumers::from_env_or(
+        std::time::Duration::from_secs(fleet.active_consumer_grace_s),
+    ));
+    let mut scheduler_config = brainrouter::swap_scheduler::SwapSchedulerConfig {
+        llama_swap_url: config
+            .llama_swap
+            .base_url
+            .trim_end_matches('/')
+            .strip_suffix("/v1")
+            .unwrap_or(&config.llama_swap.base_url)
+            .to_string(),
+        active_consumer_grace: active_consumers.grace(),
+        gate_timeout: std::time::Duration::from_millis(fleet.gate_timeout_ms),
+        gate_poll: std::time::Duration::from_millis(fleet.gate_poll_ms),
+        settle: std::time::Duration::from_millis(fleet.settle_ms),
+        cutover_recheck: std::time::Duration::from_millis(fleet.cutover_recheck_ms),
+        ..Default::default()
+    };
+    if fleet.strixite.is_some() || fleet.hipfire.is_some() {
+        scheduler_config.min_mem_gib = 0.0; // the adapter profile owns the floor
+    }
+    let external_observer = Arc::new(brainrouter::engine_observer::ExternalObserver::new(
+        Arc::new(brainrouter::engine_observer::ProcFsSource),
+        brainrouter::swap_scheduler::adoption_dir(),
+        Arc::clone(&swap_catalog),
+    ));
+    let mut scheduler_builder = brainrouter::swap_scheduler::SwapScheduler::new(
+        Arc::clone(&swap_catalog),
+        budget_ledger,
+        scheduler_config,
+        swap_adapters,
+    )
+    .with_serving_identities(Arc::clone(&serving_identities))
+    .with_active_consumers(Arc::clone(&active_consumers))
+    .with_external_observer(external_observer)
+    .with_unit_runtime(Arc::new(
+        brainrouter::engine_systemd::SystemdUnitRuntime::cli(),
+    ));
+    if let Some(strixite) = &fleet.strixite {
+        if let Some(unit) = &strixite.unit {
+            scheduler_builder = scheduler_builder.with_takeover_unit("strixite", unit.clone());
+        }
+    }
+    if let Some(hipfire) = &fleet.hipfire {
+        if let Some(unit) = &hipfire.unit {
+            scheduler_builder = scheduler_builder.with_takeover_unit("hipfire", unit.clone());
+        }
+    }
+    let swap_scheduler = Arc::new(scheduler_builder);
     let adoption = swap_scheduler.scan_adoption();
     if !adoption.adopted.is_empty() {
         warn!(
@@ -634,6 +696,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         serving_identities: Some(Arc::clone(&serving_identities)),
     });
     router_builder.install_swap(Arc::clone(&swap_scheduler));
+    router_builder.install_active_consumers(Arc::clone(&active_consumers));
     let router = Arc::new(router_builder);
 
     // Session manager (in-memory; ephemeral per process lifetime)
@@ -696,8 +759,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     swap_scheduler.attach_inflight(Arc::clone(&inflight));
     {
         let scheduler = Arc::clone(&swap_scheduler);
+        let consumers = Arc::clone(&active_consumers);
         inflight.set_completion_hook(Arc::new(move |catalog_id: &str| {
             scheduler.record_stream_completed(catalog_id);
+            // L5: a completed proxy stream opens the Active-Consumer grace
+            // window (the live span is covered by the in-flight row itself).
+            consumers.note_completion(catalog_id);
         }));
     }
     let state = Arc::new(AppState {
@@ -802,6 +869,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 swap.refresh_residency(&client).await;
+                // L5: read-only /proc observation of icon-era engines.
+                swap.refresh_external();
                 swap.maintenance().await;
             }
         });

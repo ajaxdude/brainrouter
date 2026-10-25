@@ -358,9 +358,49 @@ pub enum SwapAction {
     /// Lifecycle + budget snapshot (daemon when up, state-file summary otherwise)
     Status,
     /// Ensure a model is ready (spawns/queues through the daemon)
-    Ensure { model: String },
+    Ensure {
+        model: String,
+        /// Single-action Active-Consumer bypass (audit-logged)
+        #[arg(long)]
+        r#override: bool,
+        /// Proceed below the engine's min_mem_gib floor (audit-logged)
+        #[arg(long = "force-gate")]
+        force_gate: bool,
+        /// Never spawn; attach only to an already-resident engine
+        #[arg(long = "attach-only")]
+        attach_only: bool,
+    },
     /// Evict a native child
-    Evict { model: String },
+    Evict {
+        model: String,
+        /// Single-action Active-Consumer bypass (audit-logged)
+        #[arg(long)]
+        r#override: bool,
+    },
+    /// Take over an operator systemd unit pid-scoped (attach-not-spawn when it
+    /// already serves the model)
+    Takeover {
+        model: String,
+        /// Unit name (default: the fleet profile's unit for the engine)
+        #[arg(long)]
+        unit: Option<String>,
+        /// Required to stop a unit that does not serve the requested model
+        #[arg(long)]
+        r#override: bool,
+        #[arg(long = "force-gate")]
+        force_gate: bool,
+    },
+    /// Adopt an observed icon-launched engine (marker written; supervisor-owned)
+    Adopt {
+        /// Catalog id (or omit when using --endpoint)
+        model: Option<String>,
+        /// Target the observed engine at this endpoint instead of by model
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Target a specific observed pid
+        #[arg(long)]
+        pid: Option<u32>,
+    },
     /// Catalog reads (direct; no daemon required)
     Catalog {
         #[command(subcommand)]
@@ -1106,6 +1146,12 @@ async fn run_plugin_direct(action: PluginAction) -> Result<()> {
     Ok(())
 }
 
+/// Audit identity sent with L5 mutations (`who`): the invoking uid.
+fn cli_actor() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("cli:uid={uid}")
+}
+
 fn swap_state_root(args_state: &Option<PathBuf>) -> PathBuf {
     args_state
         .clone()
@@ -1170,14 +1216,86 @@ pub async fn run_swap_standalone(args: SwapArgs) -> Result<()> {
             }
             Ok(())
         }
-        SwapAction::Ensure { model } => {
+        SwapAction::Ensure {
+            model,
+            r#override,
+            force_gate,
+            attach_only,
+        } => {
             ensure_daemon_up(&client).await?;
-            print_json(&client.post_json("/api/engines/ensure", json!({ "model": model })).await?);
+            print_json(
+                &client
+                    .post_json(
+                        "/api/engines/ensure",
+                        json!({
+                            "model": model,
+                            "override": r#override,
+                            "force_gate": force_gate,
+                            "attach_only": attach_only,
+                            "actor": cli_actor(),
+                        }),
+                    )
+                    .await?,
+            );
             Ok(())
         }
-        SwapAction::Evict { model } => {
+        SwapAction::Evict { model, r#override } => {
             ensure_daemon_up(&client).await?;
-            print_json(&client.post_json("/api/engines/evict", json!({ "model": model })).await?);
+            print_json(
+                &client
+                    .post_json(
+                        "/api/engines/evict",
+                        json!({ "model": model, "override": r#override, "actor": cli_actor() }),
+                    )
+                    .await?,
+            );
+            Ok(())
+        }
+        SwapAction::Takeover {
+            model,
+            unit,
+            r#override,
+            force_gate,
+        } => {
+            ensure_daemon_up(&client).await?;
+            print_json(
+                &client
+                    .post_json(
+                        "/api/engines/takeover",
+                        json!({
+                            "model": model,
+                            "unit": unit,
+                            "override": r#override,
+                            "force_gate": force_gate,
+                            "actor": cli_actor(),
+                        }),
+                    )
+                    .await?,
+            );
+            Ok(())
+        }
+        SwapAction::Adopt {
+            model,
+            endpoint,
+            pid,
+        } => {
+            ensure_daemon_up(&client).await?;
+            if model.is_none() && endpoint.is_none() {
+                anyhow::bail!("adopt needs a model id or --endpoint");
+            }
+            print_json(
+                &client
+                    .post_json(
+                        "/api/engines/adopt",
+                        json!({
+                            "model": model,
+                            "endpoint": endpoint,
+                            "pid": pid,
+                            "actor": cli_actor(),
+                        }),
+                    )
+                    .await?,
+            );
             Ok(())
         }
         SwapAction::ImportLlamaswap { dry_run, config } => {

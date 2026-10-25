@@ -60,6 +60,10 @@ pub struct Resident {
     /// catalog (upgrade changed args) — badge only, never killed.
     #[serde(default)]
     pub spec_stale: bool,
+    /// L5: the engine adapter vocabulary for external residents
+    /// (`strixite` | `hipfire`); `None` for shim/native/container rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 impl Resident {
@@ -189,6 +193,7 @@ pub fn observe_shim(running: &serde_json::Value, catalog: &SwapCatalog) -> Vec<R
                     .unwrap_or(0),
                 state,
                 spec_stale: false,
+                engine: None,
             })
         })
         .collect()
@@ -249,6 +254,7 @@ pub fn observe_containers(identities: &[ServingIdentityView]) -> Vec<Resident> {
             last_stream_completed: 0,
             state: "ready".into(),
             spec_stale: false,
+            engine: None,
         })
         .collect()
 }
@@ -433,6 +439,7 @@ models:
             last_stream_completed: 0,
             state: "ready".into(),
             spec_stale: false,
+            engine: Some("hipfire".into()),
         }]);
         assert_eq!(registry.snapshot().len(), 1);
         assert_eq!(registry.snapshot()[0].catalog_id, "hipfire-model");

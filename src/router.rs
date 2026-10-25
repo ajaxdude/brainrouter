@@ -204,6 +204,10 @@ pub struct Router {
     swap: Option<Arc<crate::swap_scheduler::SwapScheduler>>,
     /// Direct providers for native/external residents (outside llama-swap).
     native_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
+    /// v2 L5: the Active-Consumer Set. In-process streams (the review loop)
+    /// never create proxy in-flight rows, so the router enters/leaves the
+    /// span around its own response stream.
+    active_consumers: Option<Arc<crate::active_consumers::ActiveConsumers>>,
 }
 
 pub struct RouterArgs {
@@ -258,6 +262,7 @@ impl Router {
             serving_providers: Mutex::new(HashMap::new()),
             swap: None,
             native_providers: Mutex::new(HashMap::new()),
+            active_consumers: None,
         }
     }
 
@@ -269,6 +274,14 @@ impl Router {
 
     pub fn swap(&self) -> Option<&Arc<crate::swap_scheduler::SwapScheduler>> {
         self.swap.as_ref()
+    }
+
+    /// v2 L5: install the Active-Consumer Set (in-process stream protection).
+    pub fn install_active_consumers(
+        &mut self,
+        consumers: Arc<crate::active_consumers::ActiveConsumers>,
+    ) {
+        self.active_consumers = Some(consumers);
     }
 
     pub fn cards(&self) -> &Arc<RoleCardStore> {
@@ -1056,7 +1069,60 @@ impl Router {
                     let provider = self.native_provider(&endpoint).await;
                     sanitize_for_llama_family(&mut request);
                     request.model = served;
-                    let resp = provider.chat_completion(request).await?;
+                    // v2 L5 hipfire context math (pre-forward): `max_tokens`
+                    // defaults to the engine's remaining context; a prompt
+                    // that cannot fit is a typed 400 shortfall.
+                    if entry.as_ref().map(|e| e.engine.as_str()) == Some("hipfire") {
+                        let bytes =
+                            serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+                        let measured =
+                            crate::decision::RequestFeatures::approx_tokens_of_body(bytes);
+                        let ctx = entry
+                            .as_ref()
+                            .and_then(|e| e.ctx)
+                            .unwrap_or(crate::engine_hipfire::DEFAULT_MAX_SEQ);
+                        match crate::engine_hipfire::shape_max_tokens(
+                            request.max_tokens,
+                            ctx,
+                            measured,
+                        ) {
+                            Ok(tokens) => request.max_tokens = Some(tokens),
+                            Err(shortfall) => return Err(anyhow::Error::new(shortfall)),
+                        }
+                    }
+                    // v2 L5: an in-process route creates no proxy in-flight
+                    // row: enter the Active-Consumer Set before the upstream
+                    // call so a concurrent ensure cannot drain this engine
+                    // mid-stream, and release on drop/error.
+                    let keys = crate::active_consumers::protection_keys(
+                        &resolved,
+                        Some(&endpoint),
+                    );
+                    let consumers = self.active_consumers.clone();
+                    if let Some(consumers) = &consumers {
+                        for key in &keys {
+                            consumers.enter(key);
+                        }
+                    }
+                    let resp = match provider.chat_completion(request).await {
+                        Ok(resp) => resp,
+                        Err(error) => {
+                            if let Some(consumers) = &consumers {
+                                for key in &keys {
+                                    consumers.leave(key);
+                                }
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    let resp = match consumers {
+                        Some(consumers) => {
+                            crate::active_consumers::wrap_held_with_active_consumer(
+                                resp, consumers, keys,
+                            )
+                        }
+                        None => resp,
+                    };
                     return Ok((wrap_with_timeout_stream(resp)?, "native".to_string()));
                 }
                 // Shim/other resident: the existing llama-swap/identity path
