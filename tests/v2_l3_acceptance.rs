@@ -27,9 +27,11 @@
 //!   * `l3_bonsai_profile_failure_table_v1_safe`
 //!   * `l3_structured_schema_strict_json_fallbacks`
 //!   * `l3_webhook_features_no_excerpt_returns_decision`
+//!   * `l3_decision_features_probe_shape_and_post_only_route`
 //! - (3) Credentials UI:
 //!   * `l3_credentials_ui_crud_test_verdicts_grants_masked`
 //!   * `l3_credentials_plugin_secrets_get_after_ui_add`
+//!   * `l3_credentials_audit_consumers_intersect_registered_plugins`
 //! - (4) One-entry:
 //!   * `l3_install_single_auto_entry_per_harness`
 //!   * `l3_sync_omp_removed_at_four_points`
@@ -2063,6 +2065,78 @@ async fn l3_webhook_features_no_excerpt_returns_decision() {
     let _ = child.wait();
 }
 
+
+/// Features probe (Bruce r2 fix round): `POST /api/decision/features`
+/// {text, role, selector} answers 200 with the RequestFeatures summary —
+/// EXCERPT-FREE (`to_json(false)`: no `last_user_excerpt` key, no echo of
+/// the prompt text), and the route is POST-only (GET 404).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l3_decision_features_probe_shape_and_post_only_route() {
+    let _gate = suite_gate().lock().await;
+    let env = TestEnv::new("features");
+    let local = spawn_mock(MockCfg::default());
+    let cloud = spawn_mock(MockCfg::default());
+    let cfg = l3_config_yaml(
+        &local.url,
+        &cloud.url,
+        "ray-l3-fallback",
+        &[],
+        None,
+        json!({"enabled": true, "kind": "heuristic"}),
+    );
+    let mut d = Daemon::start(&env, &cfg);
+    d.ready().await;
+
+    let marker = "rayl3-features-probe-ZQ7x must-not-be-echoed";
+    let (status, text) = d
+        .post_json(
+            "/api/decision/features",
+            json!({"text": marker, "role": "review", "selector": "auto"}),
+        )
+        .await;
+    assert_eq!(status, 200, "features probe: {status}: {text}");
+    let v = parse_json_from(&text).unwrap_or_else(|| panic!("features probe not JSON: {text}"));
+    // Shape (src/decision.rs RequestFeatures::to_json(false)).
+    assert_eq!(v["role"], json!("review"), "role echoes the probe: {v}");
+    assert_eq!(v["selector"], json!("auto"), "selector echoes the probe: {v}");
+    assert!(v["privacy"].is_string() && v["quality"].is_string(), "policy enums: {v}");
+    assert!(v["project"].is_string(), "project key: {v}");
+    assert_eq!(v["msg_count"], json!(1), "one message: {v}");
+    assert!(
+        v["approx_prompt_tokens"].as_u64().is_some_and(|t| t > 0),
+        "approx_prompt_tokens is a token estimate: {v}"
+    );
+    assert_eq!(v["has_tools"], json!(false), "no tools in the probe: {v}");
+    assert!(v["code_density"].is_number(), "code_density: {v}");
+    // Excerpt-free: the feature summary for non-model consumers carries no
+    // prompt text (L3 spec: excerpt ONLY for model kinds; security: "prompt
+    // content sent to classifiers = feature summary").
+    assert!(
+        v.get("last_user_excerpt").is_none(),
+        "features probe must be excerpt-free: {v}"
+    );
+    assert!(
+        !text.contains(marker),
+        "features probe echoes prompt content: {text}"
+    );
+
+    // Defaults on an empty probe (every field is optional).
+    let (status, text) = d.post_json("/api/decision/features", json!({})).await;
+    assert_eq!(status, 200, "empty features probe: {status}: {text}");
+    let v = parse_json_from(&text).unwrap_or_else(|| panic!("empty probe not JSON: {text}"));
+    assert_eq!(v["role"], json!("main"), "role default: {v}");
+    assert_eq!(v["selector"], json!("auto"), "selector default: {v}");
+
+    // POST-only route.
+    let (status, _) = d.request("GET", "/api/decision/features", None).await;
+    assert!(
+        status == 404 || status == 405,
+        "GET /api/decision/features must not answer (route is POST-only), got {status}"
+    );
+    assert_eq!(status, 404, "the v1 server contract is 404 for unlisted /api GETs");
+    d.stop();
+
+}
 // ── (3) Credentials page ────────────────────────────────────────────────────
 
 /// CRUD through the daemon HTTP (writes loopback-gated), masked list,
@@ -2224,6 +2298,79 @@ async fn l3_credentials_plugin_secrets_get_after_ui_add() {
     d.stop();
 }
 
+
+/// Usage audit (Bruce r2 Finding 1): `POST /api/credentials/audit` lists
+/// masked records with `consumers` = the CREDENTIAL's own grants intersected
+/// with REGISTERED plugin ids — not the manifests' RPC-method grants (a
+/// disjoint vocabulary; under the old matching every list was empty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l3_credentials_audit_consumers_intersect_registered_plugins() {
+    let _gate = suite_gate().lock().await;
+    let env = TestEnv::new("audit");
+    let local = spawn_mock(MockCfg::default());
+    let cloud = spawn_mock(MockCfg::default());
+    // v1 seed: the discord token migrates to credential `discord_token`
+    // granted to plugin id `bridge` (L2 contract).
+    let seed = v1_seed_yaml(&local.url, &cloud.url, true);
+    let mut d = Daemon::start(&env, &seed);
+    d.ready().await;
+
+    // Register `bridge` (installed plugin => registry listing; no spawn
+    // needed for the audit's id set).
+    let dir = write_plugin_fixture(&env, "bridge", &[]);
+    let run = d.cli(&["plugin", "install", dir.to_str().unwrap()]);
+    assert!(run.code == 0, "plugin install bridge failed: {}", run.out());
+
+    // Non-granted credential + grants-with-unregistered-member credential.
+    cred_add(
+        &d,
+        json!({"id": "rayl3-audit-none", "kind": "store", "value": L3_SECRET, "grants": []}),
+    )
+    .await;
+    cred_add(
+        &d,
+        json!({"id": "rayl3-audit-ghost", "kind": "store", "value": L3_SECRET_ROTATED,
+               "grants": ["bridge", "ghost-plug-not-registered"]}),
+    )
+    .await;
+
+    let (status, text) = d.post_json("/api/credentials/audit", json!({})).await;
+    assert_eq!(status, 200, "audit: {status}: {text}");
+    let audit = parse_json_from(&text).expect("audit JSON");
+    let records: Vec<Value> = audit["credentials"]
+        .as_array()
+        .unwrap_or_else(|| panic!("records: {audit}"))
+        .clone();
+    let record = |id: &str| -> Value {
+        records
+            .iter()
+            .find(|r| r["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("audit record {id} missing: {audit}"))
+            .clone()
+    };
+    assert_eq!(
+        record("discord_token")["consumers"],
+        json!(["bridge"]),
+        "granted credential lists its own granted, registered plugin"
+    );
+    assert_eq!(
+        record("rayl3-audit-none")["consumers"],
+        json!([]),
+        "non-granted credential lists no consumers"
+    );
+    assert_eq!(
+        record("rayl3-audit-ghost")["consumers"],
+        json!(["bridge"]),
+        "consumers are the grants INTERSECTED with registered plugin ids (the ghost id must drop)"
+    );
+    // Masked shape: the audit carries no plaintext values.
+    assert!(
+        !text.contains(L3_SECRET) && !text.contains(L3_SECRET_ROTATED) && !text.contains(DISCORD_TOKEN),
+        "audit response leaks plaintext: {text}"
+    );
+    d.stop();
+
+}
 // ── (4) One entry + sync-omp removal ───────────────────────────────────────
 
 /// `brainrouter install <harness>` in a temp HOME yields EXACTLY ONE entry
