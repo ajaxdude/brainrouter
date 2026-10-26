@@ -72,7 +72,7 @@ pub async fn run_loop(
     // through the relocated ModelChoice (admission gate reads its backend).
     let configured = crate::roles::ModelChoice::from_selector(&review_selector)?;
     let (choice, _admission_permit) = match admission.resolve(&configured) {
-        admission::AdmissionResult::Admitted { choice, permit } => (choice, permit),
+        admission::AdmissionResult::Admitted { choice, permit, .. } => (choice, permit),
         admission::AdmissionResult::Blocked { reason } => {
             let feedback = format!(
                 "Code review blocked: {reason}. Set review_admission.local_model_budget_mb \

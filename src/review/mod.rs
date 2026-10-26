@@ -67,7 +67,7 @@ impl ReviewService {
         cards: Arc<RoleCardStore>,
         config: ReviewConfig,
         admission_config: crate::config::ReviewAdmissionConfig,
-        manifest_enabled: bool,
+        providers: Arc<crate::providers::ProviderStore>,
         fallback_model: String,
     ) -> Self {
         // Seed the card extras from the YAML the first time (v1 boot order
@@ -92,7 +92,8 @@ impl ReviewService {
             active_reviews: Arc::new(Mutex::new(HashSet::new())),
             admission: Arc::new(admission::AdmissionCtx {
                 config: admission_config,
-                manifest_enabled,
+                cloud_available: providers.cloud_available(),
+                providers,
                 fallback_model,
                 permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             }),

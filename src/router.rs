@@ -40,7 +40,7 @@ use crate::{
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{stream as fstream, StreamExt};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -59,8 +59,7 @@ const TTFT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Maximum silence between consecutive SSE chunks once generation has started.
 /// 180 s is generous but still catches genuinely hung connections.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
-/// Provider health-tracker keys. Used for circuit breaking.
-const MANIFEST_KEY: &str = "manifest";
+/// Local llama-swap health-tracker key (v1 breaker semantics preserved).
 const LLAMA_SWAP_KEY: &str = "llama-swap";
 /// Requests above this approximate token count get the known-ctx pool ranking
 /// (L3 "pool-by-ctx applies … for large requests"). Below it every candidate
@@ -100,6 +99,13 @@ pub struct RouteInfo {
     /// The dashboard emits one RouteEvent per entry so multi-hop routes
     /// render as a hop chain instead of a single collapsed card.
     pub failed_attempts: Vec<FailedAttempt>,
+    /// v2 L6: the provider registry id that served the route (additive event
+    /// field; `effective_provider` keeps v1 spellings).
+    pub provider: Option<String>,
+    /// v2 L6: the LAN hop for a non-loopback provider.
+    pub hop: Option<crate::routing_events::HopInfo>,
+    /// v2 L6: the budget guard's verdict for this request (warn badge).
+    pub budget: Option<crate::routing_events::BudgetEvent>,
 }
 
 /// One failed hop in a fallback chain.
@@ -109,6 +115,8 @@ pub struct FailedAttempt {
     pub provider: String,
     pub model_key: String,
     pub error: String,
+    /// v2 L6: the LAN hop of the failed provider attempt, when any.
+    pub hop: Option<crate::routing_events::HopInfo>,
 }
 
 impl RouteInfo {
@@ -120,7 +128,13 @@ impl RouteInfo {
                 format!("{} → manifest ({})", self.bonsai_decision, model)
             }
             Some("llama-swap") => format!("{} → llama-swap ({})", self.bonsai_decision, self.model_key),
-            Some(other) => format!("{} → {}", self.bonsai_decision, other),
+            Some(other) => {
+                if self.model_key.is_empty() {
+                    format!("{} → {}", self.bonsai_decision, other)
+                } else {
+                    format!("{} → {} ({})", self.bonsai_decision, other, self.model_key)
+                }
+            }
             None => format!("{} → error", self.bonsai_decision),
         }
     }
@@ -147,6 +161,63 @@ struct Resolution {
     proxy_review_strict: bool,
 }
 
+/// v2 L6: one outbound adapter (wire family + resolved credential).
+#[derive(Clone)]
+enum ProviderAdapter {
+    OpenAi(Arc<OpenAiProvider>),
+    Anthropic(Arc<crate::provider::anthropic::AnthropicProvider>),
+}
+
+impl ProviderAdapter {
+    async fn chat(
+        &self,
+        request: ChatCompletionRequest,
+        forwarded_role: Option<&str>,
+    ) -> Result<ProviderResponse, crate::provider::ProviderError> {
+        match self {
+            Self::OpenAi(provider) => {
+                provider.chat_completion_with_role(request, forwarded_role).await
+            }
+            Self::Anthropic(provider) => provider.chat_completion(request).await,
+        }
+    }
+}
+
+struct CachedAdapter {
+    /// Hash of (kind, base_url, credential) — rebuild on rotation/rebind.
+    fingerprint: String,
+    adapter: ProviderAdapter,
+}
+
+fn fingerprint_of(record: &crate::providers::ProviderRecord, secret: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    record.kind.as_str().hash(&mut hasher);
+    record.base_url.hash(&mut hasher);
+    secret.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// v2 L6: the additive hop descriptor for a provider route (absent for
+/// loopback base_urls — the spec's `hop {host, endpoint}`).
+fn hop_of(base_url: &str) -> Option<crate::routing_events::HopInfo> {
+    let parsed = reqwest::Url::parse(base_url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let loopback = host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if loopback {
+        return None;
+    }
+    Some(crate::routing_events::HopInfo {
+        host,
+        endpoint: base_url.to_string(),
+    })
+}
+
 tokio::task_local! {
     /// The UDS request's grace clock (`None` for TCP/Router-level callers,
     /// whose grace window starts at the request itself).
@@ -156,8 +227,16 @@ tokio::task_local! {
 pub struct Router {
     slot: Arc<DecisionSlot>,
     cards: Arc<RoleCardStore>,
-    manifest: Arc<OpenAiProvider>,
-    manifest_enabled: bool,
+    /// v2 L6: the provider registry replaces the hardcoded Manifest backend.
+    providers: Arc<crate::providers::ProviderStore>,
+    /// Credential vault (provider keys resolve per dispatch — rotation is
+    /// immediate).
+    credentials: Arc<crate::credentials::CredentialStore>,
+    /// Monthly per-provider budget guard.
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    /// Cached outbound adapters keyed by provider id (rebuilt when the
+    /// resolved credential changes).
+    provider_adapters: Mutex<HashMap<String, CachedAdapter>>,
     llama_swap: Arc<OpenAiProvider>,
     fallback_model: String,
     /// Model keys known to belong to llama-swap. Requests for these bypass the slot.
@@ -213,10 +292,11 @@ pub struct Router {
 pub struct RouterArgs {
     pub slot: Arc<DecisionSlot>,
     pub cards: Arc<RoleCardStore>,
-    pub manifest: Arc<OpenAiProvider>,
-    /// Whether the cloud backend (Manifest) is enabled. Off → cloud requests
-    /// skip Manifest and fall straight back to llama-swap.
-    pub manifest_enabled: bool,
+    /// v2 L6 provider registry (cloud/LAN endpoints; `cloud_available` is
+    /// derived from it — the v1 manifest-only availability flag is gone).
+    pub providers: Arc<crate::providers::ProviderStore>,
+    pub credentials: Arc<crate::credentials::CredentialStore>,
+    pub budget: Arc<crate::provider_budget::ProviderBudget>,
     pub llama_swap: Arc<OpenAiProvider>,
     pub fallback_model: String,
     /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
@@ -241,8 +321,10 @@ impl Router {
         Self {
             slot: args.slot,
             cards: args.cards,
-            manifest: args.manifest,
-            manifest_enabled: args.manifest_enabled,
+            providers: args.providers,
+            credentials: args.credentials,
+            budget: args.budget,
+            provider_adapters: Mutex::new(HashMap::new()),
             llama_swap: args.llama_swap,
             fallback_model: args.fallback_model,
             local_models: args.local_models,
@@ -302,8 +384,34 @@ impl Router {
     /// Catalog discovery is metadata-only; never invokes inference or starts a model.
     pub async fn model_catalog(&self) -> serde_json::Value {
         let local = self.llama_swap.list_models().await;
-        let cloud = if self.manifest_enabled {
-            self.manifest.list_models().await
+        let cloud_available = self.providers.cloud_available();
+        let cloud = if cloud_available {
+            let mut models: Vec<String> = Vec::new();
+            for provider in self
+                .providers
+                .snapshot()
+                .into_iter()
+                .filter(|p| p.enabled && !p.lan_peer)
+            {
+                // Registry entries are the curated menu; OpenAI-compatible
+                // providers additionally answer `/models` (authenticated
+                // metadata only — never inference).
+                for model in &provider.models {
+                    if !models.contains(&model.id) {
+                        models.push(model.id.clone());
+                    }
+                }
+                if let Ok(ProviderAdapter::OpenAi(adapter)) = self.adapter_for(&provider).await {
+                    if let Ok(list) = adapter.list_models().await {
+                        for model in list {
+                            if !models.contains(&model) {
+                                models.push(model);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(models)
         } else {
             Err(anyhow!("Cloud is disabled; discovery was not attempted"))
         };
@@ -315,7 +423,7 @@ impl Router {
         }
         serde_json::json!({
             "local": entry(local), "cloud": entry(cloud),
-            "cloud_enabled": self.manifest_enabled,
+            "cloud_enabled": cloud_available,
             "local_default": self.fallback_model,
             "unknown_model_policy": "Explicit IDs are accepted without discovery; the provider validates availability. Explicit local failures are errors. Cloud failure or disabled cloud uses the existing local fallback.",
         })
@@ -620,9 +728,8 @@ impl Router {
             }
             // Direct cloud: skip the slot, go straight to Manifest.
             Selector::Cloud => {
-                info!("Direct cloud mode — routing to Manifest");
-                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                request.model = "auto".into();
+                info!("Direct cloud mode — resolving the provider registry");
+                tracker.set(Phase::CloudWaiting, None, Some("Cloud".into()), max_tokens);
                 // v1's role-specific strict rule: a `review` cloud selector
                 // never hops to the local fallback (the failure surfaces and
                 // the review loop maps it to escalated).
@@ -630,18 +737,31 @@ impl Router {
                     "cloud-direct",
                     "cloud",
                     None,
-                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                    self.route_cloud(
+                        request,
+                        allow_local_fallback && !resolution.proxy_review_strict,
+                        role_str,
+                        None,
+                        None,
+                    )
+                    .await,
                 )
             }
             Selector::CloudId(model) => {
                 crate::roles::validate_model_id(&model)?;
-                request.model = model.clone();
-                tracker.set(Phase::CloudWaiting, Some(model), Some("Manifest".into()), max_tokens);
+                tracker.set(Phase::CloudWaiting, Some(model.clone()), Some("Cloud".into()), max_tokens);
                 (
                     "cloud-direct",
                     "cloud",
                     None,
-                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                    self.route_cloud(
+                        request,
+                        allow_local_fallback && !resolution.proxy_review_strict,
+                        role_str,
+                        Some(model),
+                        None,
+                    )
+                    .await,
                 )
             }
             Selector::Subs => {
@@ -736,6 +856,9 @@ impl Router {
                         chosen_model: Some(f.model_key.clone()),
                         swap_state: None,
                         swap_source: None,
+                        provider: Some(f.provider.clone()),
+                        hop: f.hop.clone(),
+                        budget: None,
                     });
                 }
                 let (toolbox_backend, compute_api) =
@@ -770,6 +893,9 @@ impl Router {
                     chosen_model: Some(info.model_key.clone()),
                     swap_state,
                     swap_source,
+                    provider: info.provider.clone(),
+                    hop: info.hop.clone(),
+                    budget: info.budget.clone(),
                 });
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
@@ -813,6 +939,9 @@ impl Router {
                     chosen_model: None,
                     swap_state: None,
                     swap_source: None,
+                    provider: None,
+                    hop: None,
+                    budget: None,
                 });
                 return Err(e);
             }
@@ -865,17 +994,25 @@ impl Router {
         let routing_cloud = if used_model_kind { "slot → cloud" } else { "auto → cloud" };
         match decision.route {
             SlotRoute::Cloud => {
-                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                request.model = "auto".into();
+                tracker.set(Phase::CloudWaiting, None, Some("Cloud".into()), max_tokens);
                 // Managed auto path keeps the PRD cloud→local fallback
                 // guarantee (the review-role strictness is card-scoped, not
-                // slot-scoped).
+                // slot-scoped). Chain widening is NOT applied: the managed
+                // shape stays the v1 two-step (primary → fallback_model).
                 let _ = allow_local_fallback;
+                let tier = decision.tier.as_str().to_string();
                 (
                     "cloud",
                     routing_cloud,
                     Some(slot_event),
-                    self.route_cloud(request, true).await,
+                    self.route_cloud(
+                        request,
+                        true,
+                        resolution.role.as_str(),
+                        None,
+                        Some(tier.as_str()),
+                    )
+                    .await,
                 )
             }
             SlotRoute::Local => {
@@ -1015,6 +1152,9 @@ impl Router {
                             effective_provider: Some(provider),
                             model_key: key.clone(),
                             failed_attempts: failed,
+                            provider: None,
+                            hop: None,
+                            budget: None,
                         },
                     ));
                 }
@@ -1025,6 +1165,7 @@ impl Router {
                         provider: "llama-swap".to_string(),
                         model_key: key.clone(),
                         error: e.to_string(),
+                        hop: None,
                     });
                     last_error = Some(e);
                 }
@@ -1167,90 +1308,446 @@ impl Router {
         (Some("ready".to_string()), Some(source.to_string()))
     }
 
-    /// Cloud path: try Manifest first. On error/circuit-open, fall back to
-    /// llama-swap with the configured fallback model.
+    /// v2 L6 cloud path: resolve the provider registry, try the cloud target
+    /// ONCE, then the single `fallback_model` hop (v1 managed shape — chain
+    /// widening applies only to the auto pool, never here).
     async fn route_cloud(
+        &self,
+        request: ChatCompletionRequest,
+        allow_local_fallback: bool,
+        role: &str,
+        cloud_model: Option<String>,
+        tier: Option<&str>,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let query = self.pool_query(&request, tier);
+        let records = self.providers.snapshot();
+        let resolved = match crate::providers::resolve_cloud_target(
+            &records,
+            cloud_model.as_deref(),
+            &query,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // v1 parity: no usable cloud target is a MANAGED PRIMARY
+                // failure (the `fallback_model` hop fires; a reviewer
+                // escalates) — EXCEPT an explicit selector ambiguity, which
+                // is a 4xx naming the providers (rule (c)).
+                let explicit = cloud_model.is_some();
+                if explicit && self.providers.cloud_available() {
+                    return Err(anyhow::Error::new(error));
+                }
+                let requested = cloud_model
+                    .clone()
+                    .unwrap_or_else(|| "auto".to_string());
+                let disabled = crate::providers::ProviderRecord {
+                    id: "cloud".to_string(),
+                    kind: crate::providers::ProviderKind::Manifest,
+                    base_url: String::new(),
+                    credential_id: None,
+                    auto: false,
+                    models: Vec::new(),
+                    lan_peer: false,
+                    enabled: false,
+                    monthly_budget_usd: None,
+                    budget_mode: crate::providers::BudgetMode::Warn,
+                };
+                return self
+                    .cloud_fallback(
+                        request,
+                        allow_local_fallback,
+                        &disabled,
+                        requested,
+                        format!("cloud unavailable: {error}"),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        };
+        let Some(record) = records
+            .iter()
+            .find(|p| p.id == resolved.provider_id && p.enabled)
+            .cloned()
+        else {
+            anyhow::bail!(
+                "provider `{}` is no longer enabled",
+                resolved.provider_id
+            );
+        };
+        let requested_cloud_model = resolved.model.clone();
+        let hop = hop_of(&record.base_url);
+        let price = record
+            .models
+            .iter()
+            .find(|m| m.id == resolved.model)
+            .and_then(|m| m.price);
+        let budget_event = self.budget_event(&record);
+
+        let mut primary_error: Option<String> = None;
+        if self
+            .budget
+            .stop_exhausted(&record.id, record.monthly_budget_usd, record.budget_mode)
+        {
+            warn!(
+                provider = %record.id,
+                "Provider over its monthly budget (stop mode) — managed primary failure"
+            );
+            primary_error = Some(format!(
+                "provider `{}` is over its monthly budget ({} mode); refused before dispatch",
+                record.id,
+                record.budget_mode.as_str()
+            ));
+        } else if !self.health.is_healthy(&record.id) {
+            warn!(provider = %record.id, "Provider circuit open, skipping");
+            primary_error = Some(format!("provider `{}` circuit open", record.id));
+        }
+
+        let mut model_key = requested_cloud_model.clone();
+        let mut accepted: Option<crate::provider::SseStream> = None;
+        if primary_error.is_none() {
+            match self
+                .dispatch_provider(&record, &request, role, &resolved.model)
+                .await
+            {
+                Ok(ProviderResponse::Stream(stream)) => match record.kind {
+                    crate::providers::ProviderKind::Manifest => {
+                        match peek_manifest_model(stream).await {
+                            ManifestPeek::Accepted { stream, model } => {
+                                if let Some(model) = model {
+                                    model_key = model;
+                                }
+                                self.health.report_success(&record.id);
+                                accepted = Some(stream);
+                            }
+                            ManifestPeek::PseudoError => {
+                                // Reachable but cannot fulfill (credits/auth):
+                                // fall back WITHOUT a breaker failure report.
+                                warn!(
+                                    provider = %record.id,
+                                    "Manifest returned pseudo-success (model=manifest) — falling back without a breaker failure"
+                                );
+                                primary_error =
+                                    Some("manifest pseudo-success sentinel".to_string());
+                            }
+                            ManifestPeek::Failed(error) => {
+                                warn!(provider = %record.id, error = %error, "Manifest stream failed before metadata, falling back");
+                                self.health.report_failure(&record.id);
+                                primary_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        self.health.report_success(&record.id);
+                        accepted = Some(stream);
+                    }
+                },
+                Err(e) => {
+                    warn!(provider = %record.id, error = %e, "Provider failed, falling back");
+                    if e.is_backend_fault {
+                        self.health.report_failure(&record.id);
+                    }
+                    primary_error = Some(e.message);
+                }
+            }
+        }
+
+        if let Some(stream) = accepted {
+            let request_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+            let response = wrap_with_budget_capture(
+                wrap_with_timeout(stream),
+                Arc::clone(&self.budget),
+                record.id.clone(),
+                price,
+                request_bytes,
+            );
+            return Ok((
+                response,
+                RouteInfo {
+                    bonsai_decision: "cloud",
+                    effective_provider: Some(record.id.clone()),
+                    model_key,
+                    failed_attempts: Vec::new(),
+                    provider: Some(record.id.clone()),
+                    hop,
+                    budget: budget_event,
+                },
+            ));
+        }
+
+        self.cloud_fallback(
+            request,
+            allow_local_fallback,
+            &record,
+            requested_cloud_model,
+            primary_error.unwrap_or_else(|| "provider unavailable".to_string()),
+            hop,
+            budget_event,
+        )
+        .await
+    }
+
+    /// The v1 managed second step: one `fallback_model` hop, one
+    /// FailedAttempt event, then stop on a second failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn cloud_fallback(
         &self,
         mut request: ChatCompletionRequest,
         allow_local_fallback: bool,
+        record: &crate::providers::ProviderRecord,
+        requested_cloud_model: String,
+        error: String,
+        hop: Option<crate::routing_events::HopInfo>,
+        budget_event: Option<crate::routing_events::BudgetEvent>,
     ) -> Result<(ProviderResponse, RouteInfo)> {
-        // Callers normalize managed aliases to auto; exact cloud IDs pass through.
-        let requested_cloud_model = request.model.clone();
+        // Reviewer calls pass allow_local_fallback=false so a cloud reviewer
+        // never silently executes on a local model (wrong rubric; review loop
+        // maps the surfaced failure to `escalated`).
+        {
+            if !allow_local_fallback {
+                anyhow::bail!(
+                    "cloud reviewer route: provider `{}` unavailable ({}); local fallback is disabled",
+                    record.id,
+                    error
+                );
+            }
+            request.model = self.fallback_model.clone();
+            let model_key = self.fallback_model.clone();
+            let (resp, _) = self
+                .try_local_once(request, Stage::CloudFallback)
+                .await?;
+            Ok((
+                resp,
+                RouteInfo {
+                    bonsai_decision: "cloud",
+                    effective_provider: Some("llama-swap".to_string()),
+                    model_key,
+                    failed_attempts: vec![FailedAttempt {
+                        stage: Stage::CloudPrimary,
+                        provider: record.id.clone(),
+                        model_key: requested_cloud_model,
+                        error,
+                        hop,
+                    }],
+                    provider: None,
+                    hop: None,
+                    budget: budget_event,
+                },
+            ))
+        }
+    }
 
-        if !self.manifest_enabled {
-            warn!(
-                provider = MANIFEST_KEY,
-                "Manifest is disabled (manifest.enabled: false) — cloud request falls back to llama-swap"
-            );
-        } else if self.health.is_healthy(MANIFEST_KEY) {
-            info!(provider = MANIFEST_KEY, "Attempting Manifest");
-            match self.manifest.chat_completion(request.clone()).await {
-                Ok(ProviderResponse::Stream(stream)) => {
-                    match peek_manifest_model(stream).await {
-                        ManifestPeek::Accepted { stream, model } => {
-                            let model_key = model.unwrap_or_else(|| requested_cloud_model.clone());
-                            self.health.report_success(MANIFEST_KEY);
-                            info!(provider = MANIFEST_KEY, model = %model_key, "Manifest accepted request");
-                            return Ok((
-                                wrap_with_timeout(stream),
-                                RouteInfo {
-                                    bonsai_decision: "cloud",
-                                    effective_provider: Some("manifest".to_string()),
-                                    model_key,
-                                    failed_attempts: Vec::new(),
-                                },
-                            ));
-                        }
-                        ManifestPeek::PseudoError => {
-                        warn!(provider = MANIFEST_KEY, "Manifest returned pseudo-success (model=manifest) — likely credits exhausted or auth error, falling back");
-                        // Don't report health failure — Manifest is reachable, just can't fulfill.
-                        }
-                        ManifestPeek::Failed(error) => {
-                            warn!(provider = MANIFEST_KEY, error = %error, "Manifest stream failed before metadata, falling back");
-                            self.health.report_failure(MANIFEST_KEY);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back to llama-swap");
-                    if e.is_backend_fault {
-                        self.health.report_failure(MANIFEST_KEY);
-                    }
-                    // Always fall through to llama-swap — PRD guarantees automatic fallback.
+    /// Pool-relevant features of one request (ctx/tools/tier + stop-mode
+    /// budget exclusions).
+    fn pool_query(
+        &self,
+        request: &ChatCompletionRequest,
+        tier: Option<&str>,
+    ) -> crate::providers::PoolQuery {
+        let approx_tokens = request
+            .messages
+            .iter()
+            .chain(std::iter::empty())
+            .map(|m| {
+                serde_json::to_vec(&m.content)
+                    .map(|v| (v.len() as u64).div_ceil(4))
+                    .unwrap_or(0)
+            })
+            .sum::<u64>()
+            .max(serde_json::to_vec(request).map(|v| v.len() as u64).unwrap_or(0).div_ceil(4));
+        let needs_tools = request
+            .extra
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        let records = self.providers.snapshot();
+        crate::providers::PoolQuery {
+            approx_tokens,
+            needs_tools,
+            tier: tier.and_then(crate::providers::ModelTier::parse),
+            over_budget: self.budget.stop_excluded(&records),
+        }
+    }
+
+    /// The budget badge/event for a provider route (None when the provider has
+    /// no configured budget).
+    fn budget_event(
+        &self,
+        record: &crate::providers::ProviderRecord,
+    ) -> Option<crate::routing_events::BudgetEvent> {
+        let budget = record.monthly_budget_usd?;
+        let spent = self.budget.spent(&record.id);
+        Some(crate::routing_events::BudgetEvent {
+            provider: record.id.clone(),
+            mode: record.budget_mode.as_str().to_string(),
+            state: if spent >= budget { "over" } else { "ok" }.to_string(),
+            month: self.budget.month(),
+            spent_usd: spent,
+            monthly_budget_usd: budget,
+        })
+    }
+
+    /// Resolve a provider credential id (`env:NAME` / `file:PATH` references
+    /// from the v1 migration, or a credentials-store record id).
+    fn resolve_provider_credential(&self, credential_id: &str) -> Result<String> {
+        if let Some(var) = credential_id.strip_prefix("env:") {
+            return std::env::var(var).with_context(|| {
+                format!("provider credential env var `{var}` is unset")
+            });
+        }
+        if let Some(path) = credential_id.strip_prefix("file:") {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading provider credential file `{path}`"))?;
+            return Ok(text.trim().to_string());
+        }
+        // The vault file is authoritative: an owner/CLI write that lands
+        // after boot (or a rotation on another path) is observed immediately.
+        // Fall back to the daemon's in-memory copy when the file is absent
+        // (in-memory test stores).
+        let path = self.credentials.path();
+        if !path.as_os_str().is_empty() && path.exists() {
+            if let Ok(fresh) =
+                crate::credentials::CredentialStore::load(path.to_path_buf())
+            {
+                if let Ok(secret) = fresh.resolve(credential_id) {
+                    return Ok(secret.expose().to_string());
                 }
             }
-        } else {
-            warn!(provider = MANIFEST_KEY, "Manifest circuit open, skipping");
         }
+        let secret = self.credentials.resolve(credential_id)?;
+        Ok(secret.expose().to_string())
+    }
 
-        // Cloud fallback → llama-swap with fallback_model.
-        // Reviewer calls (design H3) pass allow_local_fallback=false so a cloud
-        // reviewer never silently executes on a local model (which would use
-        // the wrong rubric and could load an unadmitted model / OOM). The
-        // failure surfaces and the review loop maps it to `escalated`.
-        if !allow_local_fallback {
-            anyhow::bail!(
-                "cloud reviewer route: Manifest unavailable (disabled, circuit open, or error) and local fallback is disabled"
-            );
+    /// Build (or reuse) the outbound adapter for one provider. The cache key
+    /// includes a credential fingerprint so rotation takes over immediately.
+    async fn adapter_for(
+        &self,
+        record: &crate::providers::ProviderRecord,
+    ) -> Result<ProviderAdapter> {
+        let secret = match record.credential_id.as_deref() {
+            Some(id) => Some(self.resolve_provider_credential(id)?),
+            None => None,
+        };
+        let fingerprint = fingerprint_of(record, secret.as_deref());
+        {
+            let cache = self.provider_adapters.lock().await;
+            if let Some(cached) = cache.get(&record.id) {
+                if cached.fingerprint == fingerprint {
+                    return Ok(cached.adapter.clone());
+                }
+            }
         }
-        // Cloud fallback → llama-swap with fallback_model
-        request.model = self.fallback_model.clone();
-        let model_key = self.fallback_model.clone();
-        let (resp, _) = self.try_local_once(request, Stage::CloudFallback).await?;
-        Ok((
-            resp,
-            RouteInfo {
-                bonsai_decision: "cloud",
-                effective_provider: Some("llama-swap".to_string()),
-                model_key,
-                failed_attempts: vec![FailedAttempt {
-                    stage: Stage::CloudPrimary,
-                    provider: "manifest".to_string(),
-                    model_key: requested_cloud_model,
-                    error: "manifest unavailable (disabled, circuit open, or error)".to_string(),
-                }],
+        let adapter = match record.kind {
+            crate::providers::ProviderKind::Anthropic => {
+                ProviderAdapter::Anthropic(Arc::new(
+                    crate::provider::anthropic::AnthropicProvider::new(
+                        record.id.clone(),
+                        record.base_url.clone(),
+                        secret,
+                    ),
+                ))
+            }
+            _ => ProviderAdapter::OpenAi(Arc::new(OpenAiProvider::new(
+                record.id.clone(),
+                record.base_url.clone(),
+                secret,
+            ))),
+        };
+        let mut cache = self.provider_adapters.lock().await;
+        cache.insert(
+            record.id.clone(),
+            CachedAdapter {
+                fingerprint,
+                adapter: adapter.clone(),
             },
-        ))
+        );
+        Ok(adapter)
+    }
+
+    /// One provider dispatch. Only `lan_peer` providers receive the forwarded
+    /// effective `x-brainrouter-role` header (distributed roles).
+    async fn dispatch_provider(
+        &self,
+        record: &crate::providers::ProviderRecord,
+        request: &ChatCompletionRequest,
+        role: &str,
+        model: &str,
+    ) -> Result<ProviderResponse, crate::provider::ProviderError> {
+        let adapter = self.adapter_for(record).await.map_err(|error| {
+            crate::provider::ProviderError {
+                message: format!("provider `{}`: {error}", record.id),
+                is_backend_fault: false,
+            }
+        })?;
+        let mut request = request.clone();
+        request.model = model.to_string();
+        let forwarded = record.lan_peer.then_some(role);
+        adapter.chat(request, forwarded).await
+    }
+
+    /// v2 L6 provider Test: one cheap completion probe with the provider's
+    /// kind-specific auth headers.
+    pub async fn probe_provider(&self, id: &str) -> Result<serde_json::Value> {
+        let record = self
+            .providers
+            .get(id)
+            .with_context(|| format!("unknown provider `{id}`"))?;
+        let adapter = self.adapter_for(&record).await?;
+        let model = record
+            .models
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| if record.kind == crate::providers::ProviderKind::Manifest {
+                "auto".to_string()
+            } else {
+                "probe".to_string()
+            });
+        let request = match record.kind {
+            crate::providers::ProviderKind::Anthropic => {
+                crate::provider::anthropic::AnthropicProvider::probe_request(&model)
+            }
+            _ => ChatCompletionRequest {
+                model: model.clone(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(serde_json::Value::String("ping".to_string())),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: Some(true),
+                temperature: None,
+                max_tokens: Some(16),
+                top_p: None,
+                stop: None,
+                extra: serde_json::Value::Null,
+            },
+        };
+        adapter.chat(request, None).await.map_err(|e| anyhow!(e.message))?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "provider": record.id,
+            "kind": record.kind.as_str(),
+            "model": model,
+        }))
+    }
+
+    /// v2 L6: `cloud_available` replaces the v1 manifest-only flag at every
+    /// admission consumer.
+    pub fn cloud_available(&self) -> bool {
+        self.providers.cloud_available()
+    }
+
+    pub fn providers(&self) -> &Arc<crate::providers::ProviderStore> {
+        &self.providers
+    }
+
+    pub fn budget(&self) -> &Arc<crate::provider_budget::ProviderBudget> {
+        &self.budget
+    }
+
+    /// Live per-provider breaker state (`healthy|degraded|open`).
+    pub fn health_state(&self, provider_id: &str) -> &'static str {
+        self.health.state(provider_id)
     }
 
     /// Managed local path (the `local` selector): v1 semantics — route to
@@ -1270,6 +1767,9 @@ impl Router {
                     effective_provider: Some(provider),
                     model_key: requested,
                     failed_attempts: Vec::new(),
+                    provider: None,
+                    hop: None,
+                    budget: None,
                 },
             )),
             Err(e) => {
@@ -1297,7 +1797,11 @@ impl Router {
                             provider: "llama-swap".to_string(),
                             model_key: requested,
                             error: e.to_string(),
+                            hop: None,
                         }],
+                        provider: None,
+                        hop: None,
+                        budget: None,
                     },
                 ))
             }
@@ -1592,6 +2096,133 @@ fn wrap_with_timeout(
 ) -> ProviderResponse {
     let timeout_stream = TimeoutStream::new(stream, TTFT_TIMEOUT, STREAM_STALL_TIMEOUT);
     ProviderResponse::Stream(Box::pin(timeout_stream))
+}
+
+/// v2 L6 budget guard: accrue the provider's monthly spend when the stream
+/// ends (or is dropped). Usage tokens from the SSE `usage` frame are exact;
+/// absent usage accrues the spec's `(bytes+3)/4` estimator, flagged
+/// `estimated`.
+fn wrap_with_budget_capture(
+    resp: ProviderResponse,
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    provider_id: String,
+    price: Option<crate::providers::Price>,
+    request_bytes: usize,
+) -> ProviderResponse {
+    match resp {
+        ProviderResponse::Stream(stream) => {
+            ProviderResponse::Stream(Box::pin(BudgetCaptureStream {
+                inner: stream,
+                budget,
+                provider_id,
+                price,
+                request_bytes,
+                response_bytes: 0,
+                prompt_tokens: None,
+                completion_tokens: None,
+                buffer: Vec::new(),
+                recorded: false,
+            }))
+        }
+    }
+}
+
+struct BudgetCaptureStream {
+    inner: crate::provider::SseStream,
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    provider_id: String,
+    price: Option<crate::providers::Price>,
+    request_bytes: usize,
+    response_bytes: usize,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    buffer: Vec<u8>,
+    recorded: bool,
+}
+
+impl BudgetCaptureStream {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.response_bytes += bytes.len();
+        const MAX_BUFFER: usize = 1024 * 1024;
+        self.buffer.extend_from_slice(bytes);
+        while let Some(index) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=index).collect();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Some(payload) = text.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+                continue;
+            };
+            if let Some(usage) = value.get("usage") {
+                if let Some(tokens) = usage.get("prompt_tokens").and_then(serde_json::Value::as_u64) {
+                    self.prompt_tokens = Some(tokens);
+                }
+                if let Some(tokens) = usage.get("completion_tokens").and_then(serde_json::Value::as_u64) {
+                    self.completion_tokens = Some(tokens);
+                }
+            }
+        }
+        if self.buffer.len() > MAX_BUFFER {
+            self.buffer.clear();
+        }
+    }
+
+    fn record(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let (input, output, estimated) = match (self.prompt_tokens, self.completion_tokens) {
+            (Some(input), Some(output)) => (input, output, false),
+            _ => (
+                crate::provider_budget::estimate_tokens(self.request_bytes),
+                crate::provider_budget::estimate_tokens(self.response_bytes),
+                true,
+            ),
+        };
+        let cost = crate::provider_budget::cost_of(self.price, input, output);
+        if let Err(error) = self
+            .budget
+            .record(&self.provider_id, cost, estimated, input, output)
+        {
+            debug!(provider = %self.provider_id, %error, "budget accrual failed");
+        }
+    }
+}
+
+impl futures_util::Stream for BudgetCaptureStream {
+    type Item = anyhow::Result<bytes::Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                this.observe(&chunk);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.record();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.record();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for BudgetCaptureStream {
+    fn drop(&mut self) {
+        self.record();
+    }
 }
 
 /// Wrap a ProviderResponse stream so the inference tracker is cleared when
@@ -1917,9 +2548,12 @@ fn delta_has_generated_output(delta: &serde_json::Value) -> bool {
 /// stage precisely, but here we reconstruct for the error path.
 fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str) -> Stage {
     match (bonsai_decision, effective_provider.as_deref()) {
-        ("cloud", Some("manifest")) | ("cloud-direct", Some("manifest")) => Stage::CloudPrimary,
-        ("cloud", Some("llama-swap")) | ("cloud-direct", Some("llama-swap")) => Stage::CloudFallback,
-        ("local-direct", Some("llama-swap")) | ("local", Some("llama-swap")) => Stage::LocalPrimary,
+        // v2 L6: any provider id on a cloud decision is the cloud PRIMARY
+        // (the migrated `manifest` key included); llama-swap is the v1
+        // managed second step.
+        (decision, Some("llama-swap")) if decision.starts_with("cloud") => Stage::CloudFallback,
+        (decision, Some(_)) if decision.starts_with("cloud") => Stage::CloudPrimary,
+        ("local-direct", Some(_)) | ("local", Some(_)) => Stage::LocalPrimary,
         _ => Stage::LocalPrimary,
     }
 }
@@ -1934,9 +2568,20 @@ fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str)
 /// and fallbacks. FNV-1a 64-bit: identity only, no security relevance.
 /// "" when the request carries no user message.
 pub(crate) fn conversation_fingerprint(request: &ChatCompletionRequest) -> String {
-    let sys = request.messages.iter().find(|m| m.role == "system").map(|m| message_text(&m.content));
-    let first_user = request.messages.iter().find(|m| m.role == "user").map(|m| message_text(&m.content));
-    let (Some(sys), Some(first_user)) = (sys, first_user) else {
+    // A system message is NOT required (bare harness requests still group);
+    // the first user message is the conversation anchor.
+    let sys = request
+        .messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| message_text(&m.content))
+        .unwrap_or_default();
+    let Some(first_user) = request
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| message_text(&m.content))
+    else {
         return String::new();
     };
     if first_user.is_empty() {
@@ -2316,6 +2961,9 @@ mod tests {
             chosen_model: None,
             swap_state: None,
             swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         });
         // Matching conversation backfills.
         assert!(events.update_tps("abc123", 41.5, 77.0));
@@ -2356,6 +3004,9 @@ mod tests {
             chosen_model: None,
             swap_state: None,
             swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 

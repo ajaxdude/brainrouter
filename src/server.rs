@@ -147,10 +147,14 @@ pub struct AppState {
 
     /// llama-swap root URL (without /v1 suffix) for status polling.
     pub llama_swap_url: String,
-    /// Manifest base URL for health checking.
+    /// Manifest base URL for health checking (empty post-`v2.0-p6`; the
+    /// provider registry owns cloud endpoints).
     pub manifest_url: String,
-    /// Whether the cloud backend (Manifest) is enabled from config.
-    pub manifest_enabled: bool,
+    /// v2 L6: the provider registry (cloud + LAN peers). `cloud_available`
+    /// replaces the v1 manifest-only flag at every admission consumer.
+    pub providers: Arc<crate::providers::ProviderStore>,
+    /// v2 L6: the monthly per-provider budget ledger.
+    pub budget: Arc<crate::provider_budget::ProviderBudget>,
     /// v2 L2 plugin subsystem: registry, supervisor, RPC UDS servers.
     pub plugins: Arc<crate::plugins::PluginManager>,
     /// Path to brainrouter's own config file (used by the config UI and
@@ -437,6 +441,7 @@ fn request_is_destructive(method: &str, path: &str, _has_query: bool) -> bool {
             || path == "/api/open-editor"
             || path == "/api/routing-mode" || path == "/api/review-config"
             || path.starts_with("/api/plugins")
+            || path.starts_with("/api/providers")
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
             // Review API is destructive too: it spawns reviews (arbitrary
@@ -549,6 +554,16 @@ async fn handle_request_inner(
 
     if path == "/models" || path == "/models/" || path.starts_with("/api/observability/") {
         return crate::observability::handle_request(req, &state).await;
+    }
+
+    // ── v2 L6: provider registry API (Credentials-page Providers section) ──
+    // Route spellings are unpinned by the design; the assignment's probe list
+    // (`/api/providers[/add|/upsert|/list]`, `PUT|DELETE /api/providers/{id}`,
+    // `POST /api/providers/{id}/test`) is supported verbatim and kept stable.
+    if path.starts_with("/api/providers") {
+        let method = method.to_string();
+        let path = path.to_string();
+        return Ok(handle_providers_api(&method, &path, req, state).await);
     }
 
     let response = match (method, path) {
@@ -1034,7 +1049,7 @@ async fn handle_request_inner(
                 &state.llama_swap_url,
                 &state.manifest_url,
                 &state.routing_events,
-                state.manifest_enabled,
+                state.providers.cloud_available(),
             )
             .await;
             into_unsync(resp)
@@ -2247,7 +2262,7 @@ async fn handle_request_inner(
 /// The dashboard uses this (plus a stable hash of the conversation prefix)
 /// to group events per conversation so each one renders as a single card.
 /// If a client ever adds a session header, this picks it up with no code change.
-fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
+pub(crate) fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
     const CANDIDATES: [&str; 6] = [
         "x-omp-session",
         "x-session-id",
@@ -2475,6 +2490,18 @@ async fn handle_chat_completion(
             if let Some(response) = swap_busy_response(&error) {
                 return Ok(into_unsync(response));
             }
+            // v2 L6 rule (c): a multi-match/no-provider selector resolution is
+            // an explicit client error (naming the providers), not a backend
+            // failure.
+            if error
+                .downcast_ref::<crate::providers::CloudSelectorError>()
+                .is_some()
+            {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse { error: error.to_string() },
+                )));
+            }
             return Ok(into_unsync(json_response(
                 StatusCode::BAD_GATEWAY,
                 &ErrorResponse { error: format!("routing failed: {error}") },
@@ -2526,6 +2553,20 @@ async fn handle_anthropic_messages(
     role: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
+    anthropic_messages_from_bytes(state, body_bytes, cwd, session_id, user_agent, peer_addr, role).await
+}
+
+/// The body-bytes entry point shared by the primary `/v1/messages` route and
+/// the v2 L6 LAN listener (which must enforce `lan.expose` before routing).
+pub(crate) async fn anthropic_messages_from_bytes(
+    state: Arc<AppState>,
+    body_bytes: Bytes,
+    cwd: String,
+    session_id: Option<String>,
+    user_agent: String,
+    peer_addr: SocketAddr,
+    role: String,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
     let model = anthropic_req.model.clone();
     let mut oai_request = anthropic_to_openai(anthropic_req);
@@ -2710,7 +2751,7 @@ async fn service_health(
     llama_swap_url: &str,
     manifest_url: &str,
     routing_events: &RoutingEvents,
-    manifest_enabled: bool,
+    cloud_available: bool,
 ) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
@@ -2791,7 +2832,7 @@ async fn service_health(
 
     json_response(StatusCode::OK, &serde_json::json!({
         "llama_swap": if swap_ok { "healthy" } else { "unhealthy" },
-        "manifest": if !manifest_enabled {
+        "manifest": if !cloud_available {
             "disabled"
         } else if manifest_ok { "healthy" } else { "unhealthy" },
         "llama_cpp": llama_cpp_state,
@@ -5228,6 +5269,223 @@ pub(crate) async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
     }
 }
 
+
+// ── v2 L6: provider registry API ─────────────────────────────────────────────
+
+/// Provider records with the live breaker state and the budget badge (the
+/// Credentials-page Providers section renders both). Credential ids only —
+/// values never appear here.
+fn providers_json(state: &AppState) -> serde_json::Value {
+    let records = state.providers.snapshot();
+    let month = state.budget.month();
+    let providers: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| {
+            let mut value = serde_json::to_value(record).unwrap_or_else(|_| serde_json::json!({}));
+            value["breaker"] = serde_json::json!(state.router.health_state(&record.id));
+            let spent = state.budget.spent(&record.id);
+            let budget = record.monthly_budget_usd;
+            value["budget"] = serde_json::json!({
+                "month": month,
+                "mode": record.budget_mode.as_str(),
+                "monthly_budget_usd": budget,
+                "spent_usd": spent,
+                "state": budget
+                    .map(|budget| if spent >= budget { "over" } else { "ok" })
+                    .unwrap_or("none"),
+            });
+            value
+        })
+        .collect();
+    serde_json::json!({ "providers": providers })
+}
+
+fn provider_api_error(status: StatusCode, message: impl std::fmt::Display) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    into_unsync(json_response(status, &serde_json::json!({ "error": message.to_string() })))
+}
+
+async fn handle_providers_api(
+    method: &str,
+    path: &str,
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    let record_body = |value: serde_json::Value, id: Option<String>| {
+        let value = value.get("provider").cloned().unwrap_or(value);
+        let mut record: crate::providers::ProviderRecord = serde_json::from_value(value)?;
+        if let Some(id) = id {
+            record.id = id;
+        }
+        anyhow::Ok(record)
+    };
+
+    match (method, path) {
+        ("GET", "/api/providers") | ("GET", "/api/providers/list") => {
+            into_unsync(json_response(StatusCode::OK, &providers_json(&state)))
+        }
+        ("POST", "/api/providers") | ("POST", "/api/providers/add") | ("POST", "/api/providers/upsert") => {
+            let body = read_json_body(req).await;
+            let record = match record_body(body, None) {
+                Ok(record) => record,
+                Err(error) => return provider_api_error(StatusCode::BAD_REQUEST, error),
+            };
+            if let Some(credential) = record.credential_id.as_deref() {
+                let is_ref = credential.starts_with("env:") || credential.starts_with("file:");
+                if !is_ref && !state.credentials.exists(credential).unwrap_or(false) {
+                    return provider_api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("credential `{credential}` does not exist in the credentials store"),
+                    );
+                }
+            }
+            match state.providers.upsert(record) {
+                Ok(()) => into_unsync(json_response(StatusCode::OK, &providers_json(&state))),
+                Err(error) => provider_api_error(StatusCode::BAD_REQUEST, error),
+            }
+        }
+        ("POST", "/api/providers/remove") => {
+            let body = read_json_body(req).await;
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing id");
+            };
+            match state.providers.remove(id) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"removed": removed, "providers": providers_json(&state)["providers"]}),
+                )),
+                Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+        // v2 L6 provider-editor discovery feed: ask a LAN peer brainrouter for
+        // `/api/peer-info` and hand the exposed menu to the Providers form.
+        ("POST", "/api/providers/peer-info") => {
+            let body = read_json_body(req).await;
+            let Some(base_url) = body
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+            else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing base_url");
+            };
+            let credential = body
+                .get("credential_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let token = match credential {
+                Some(credential) => {
+                    let resolved = if let Some(var) = credential.strip_prefix("env:") {
+                        std::env::var(var).map_err(|_| format!("env var {var} is unset"))
+                    } else if let Some(path) = credential.strip_prefix("file:") {
+                        std::fs::read_to_string(path)
+                            .map(|v| v.trim().to_string())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        state
+                            .credentials
+                            .resolve(credential)
+                            .map(|secret| secret.expose().to_string())
+                            .map_err(|e| e.to_string())
+                    };
+                    match resolved {
+                        Ok(token) => Some(token),
+                        Err(error) => {
+                            return provider_api_error(
+                                StatusCode::BAD_REQUEST,
+                                format!("credential `{credential}`: {error}"),
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            let root = base_url
+                .trim_end_matches('/')
+                .strip_suffix("/v1")
+                .unwrap_or(base_url.trim_end_matches('/'))
+                .to_string();
+            let mut request = reqwest::Client::new()
+                .get(format!("{root}/api/peer-info"))
+                .timeout(std::time::Duration::from_secs(5));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(info) => into_unsync(json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({"peer_info": info}),
+                        )),
+                        Err(error) => {
+                            provider_api_error(StatusCode::BAD_GATEWAY, error)
+                        }
+                    }
+                }
+                Ok(response) => provider_api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("peer-info -> HTTP {}", response.status()),
+                ),
+                Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+            }
+        }
+        ("POST", "/api/providers/test") => {
+            let body = read_json_body(req).await;
+            let Some(id) = body.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing id");
+            };
+            match state.router.probe_provider(&id).await {
+                Ok(result) => into_unsync(json_response(StatusCode::OK, &result)),
+                Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+            }
+        }
+        ("POST", p) | ("PUT", p) if p.starts_with("/api/providers/") => {
+            let rest = &p["/api/providers/".len()..];
+            if let Some(id) = rest.strip_suffix("/test") {
+                let id = id.to_string();
+                return match state.router.probe_provider(&id).await {
+                    Ok(result) => into_unsync(json_response(StatusCode::OK, &result)),
+                    Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+                };
+            }
+            if let Some(id) = rest.strip_suffix("/remove") {
+                let id = id.to_string();
+                return match state.providers.remove(&id) {
+                    Ok(removed) => into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({"removed": removed}),
+                    )),
+                    Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+                };
+            }
+            if method == "PUT" {
+                let body = read_json_body(req).await;
+                let record = match record_body(body, Some(rest.to_string())) {
+                    Ok(record) => record,
+                    Err(error) => return provider_api_error(StatusCode::BAD_REQUEST, error),
+                };
+                return match state.providers.upsert(record) {
+                    Ok(()) => into_unsync(json_response(StatusCode::OK, &providers_json(&state))),
+                    Err(error) => provider_api_error(StatusCode::BAD_REQUEST, error),
+                };
+            }
+            provider_api_error(StatusCode::NOT_FOUND, "unknown providers route")
+        }
+        ("DELETE", p) if p.starts_with("/api/providers/") => {
+            let id = &p["/api/providers/".len()..];
+            match state.providers.remove(id) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"removed": removed}),
+                )),
+                Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+        _ => provider_api_error(StatusCode::NOT_FOUND, "unknown providers route"),
+    }
+}
 
 #[cfg(test)]
 mod tests {

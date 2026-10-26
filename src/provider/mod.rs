@@ -45,4 +45,5 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 }
 
+pub mod anthropic;
 pub mod openai;

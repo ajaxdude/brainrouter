@@ -61,12 +61,25 @@ impl OpenAiProvider {
     }
 }
 
-impl Provider for OpenAiProvider {
-    fn chat_completion(
+impl OpenAiProvider {
+    /// L6 federation: forward the request's effective `x-brainrouter-role`
+    /// header verbatim (only `lan_peer` providers are called this way — the
+    /// peer applies its OWN role cards to the named role).
+    pub fn chat_completion_with_role(
+        &self,
+        request: ChatCompletionRequest,
+        role: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + '_>> {
+        let role = role.map(str::to_string);
+        Box::pin(async move { self.send(request, role.as_deref()).await })
+    }
+
+    async fn send(
         &self,
         mut request: ChatCompletionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + '_>> {
-        Box::pin(async move {
+        role: Option<&str>,
+    ) -> Result<ProviderResponse, ProviderError> {
+        {
             // Force streaming mode
             request.stream = Some(true);
 
@@ -83,6 +96,10 @@ impl Provider for OpenAiProvider {
                 .client
                 .post(&url)
                 .header("Content-Type", "application/json");
+
+            if let Some(role) = role {
+                req_builder = req_builder.header("x-brainrouter-role", role);
+            }
 
             if let Some(ref api_key) = self.api_key {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
@@ -134,7 +151,16 @@ impl Provider for OpenAiProvider {
             );
 
             Ok(ProviderResponse::Stream(stream))
-        })
+        }
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + '_>> {
+        Box::pin(async move { self.send(request, None).await })
     }
 
     fn name(&self) -> &str {

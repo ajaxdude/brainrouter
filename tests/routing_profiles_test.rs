@@ -173,6 +173,23 @@ fn cards() -> Arc<RoleCardStore> {
     store
 }
 
+fn provider_store(enabled: bool) -> Arc<brainrouter::providers::ProviderStore> {
+    Arc::new(brainrouter::providers::ProviderStore::in_memory_with(vec![
+        brainrouter::providers::ProviderRecord {
+            id: "manifest".into(),
+            kind: brainrouter::providers::ProviderKind::Manifest,
+            base_url: "http://127.0.0.1:1/cloud/v1".into(),
+            credential_id: None,
+            auto: true,
+            models: Vec::new(),
+            lan_peer: false,
+            enabled,
+            monthly_budget_usd: None,
+            budget_mode: brainrouter::providers::BudgetMode::Warn,
+        },
+    ]))
+}
+
 fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> RouterArgs {
     let classifier = Arc::new(Classifier::new(
         format!("{}/classifier", upstream.url),
@@ -197,12 +214,37 @@ fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> 
     RouterArgs {
         slot,
         cards: Arc::new(RoleCardStore::memory(Default::default())),
-        manifest: Arc::new(OpenAiProvider::new(
-            "manifest".into(),
-            format!("{}/cloud/v1", upstream.url),
-            Some("synthetic-test-key".into()),
-        )),
-        manifest_enabled: enabled,
+        providers: Arc::new(brainrouter::providers::ProviderStore::in_memory_with(vec![
+            brainrouter::providers::ProviderRecord {
+                id: "manifest".into(),
+                kind: brainrouter::providers::ProviderKind::Manifest,
+                base_url: format!("{}/cloud/v1", upstream.url),
+                credential_id: Some("synthetic-test-key".into()),
+                auto: true,
+                models: Vec::new(),
+                lan_peer: false,
+                enabled,
+                monthly_budget_usd: None,
+                budget_mode: brainrouter::providers::BudgetMode::Warn,
+            },
+        ])),
+        credentials: {
+            let store = brainrouter::credentials::CredentialStore::in_memory();
+            store
+                .put(brainrouter::credentials::CredentialRecord {
+                    id: "synthetic-test-key".into(),
+                    description: String::new(),
+                    kind: brainrouter::credentials::CredentialKind::Store {
+                        value: brainrouter::credentials::SecretString::new("synthetic-test-key"),
+                    },
+                    grants: Vec::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            Arc::new(store)
+        },
+        budget: Arc::new(brainrouter::provider_budget::ProviderBudget::in_memory()),
         llama_swap: Arc::new(OpenAiProvider::new(
             "llama-swap".into(),
             format!("{}/local/v1", upstream.url),
@@ -357,7 +399,7 @@ async fn project_reviewer_pin_enters_the_snapshot_and_continuations_keep_it() {
         store.clone(),
         ReviewConfig::default(),
         Default::default(),
-        true,
+        provider_store(true),
         "default-local".to_string(),
     ));
 
@@ -411,7 +453,7 @@ async fn cloud_ids_survive_review_and_continuation_snapshots() {
         store.clone(),
         ReviewConfig::default(),
         Default::default(),
-        false,
+        provider_store(false),
         "default-local".to_string(),
     ));
     let id = service.start_review_async(

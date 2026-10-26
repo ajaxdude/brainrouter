@@ -4,6 +4,122 @@ Per-phase upgrade/rollback procedures. Phase tags + the per-leg restore
 contract live in `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback"); the change list is in `CHANGELOG.md`.
 
+## v2.0-p6 (L6): providers, Manifest absorbed, LAN federation
+
+L6 replaces the hardcoded Manifest backend with a provider registry. New
+state under `$XDG_STATE_HOME/brainrouter/`:
+
+- `providers.json` (0600) — `{providers: [record]}`; `credential_id` names a
+  credential in the L2 vault (or `env:VAR` for the migrated v1 indirection).
+  Key VALUES never live here.
+- `provider_budget.json` (0600) — the monthly provider accumulator, keyed
+  `YYYY-MM`. The L4 swap `budget.json` is a separate ledger (unrelated).
+
+### First boot (automatic)
+
+The `v2.0-p6` migration consumes exactly
+`manifest.enabled` + `manifest.base_url` + `manifest.api_key_env` and creates:
+
+```json
+{"id": "manifest", "kind": "manifest", "base_url": "<v1 url>",
+ "credential_id": "env:<api_key_env>", "auto": true, "models": [],
+ "lan_peer": false, "enabled": true, "budget_mode": "warn"}
+```
+
+`models: []` is intentional: the v1 gateway accepts ids it did not advertise,
+so `cloud/<id>` passes through verbatim (v1 parity). The `manifest:` block is
+then removed from the YAML; `config.yaml.bak` and
+`migrations/v2.0-p6/config.yaml` hold the pre-migration bytes. Preview with:
+
+```sh
+brainrouter serve --dry-run          # includes the v2.0-p6 preview
+brainrouter migration restore v2.0-p6 # round-trips YAML, removes providers+ledger
+```
+
+Use the CLI (mutations go through the daemon) or the dashboard Credentials →
+Providers section:
+
+```sh
+# Bare `cloud` = the enabled manifest-auto provider (v1 behavior).
+brainrouter cli provider list
+
+# Reference deployment: DeepInfra (OpenAI-compatible) as the reviewer cloud.
+brainrouter cli credential add deepinfra-key --kind store --value '<paste>'
+brainrouter cli provider add deepinfra --kind openai-compatible \
+  --base-url https://api.deepinfra.com/v1/openai --credential deepinfra-key \
+  --model deepseek-ai/DeepSeek-V4-Flash
+brainrouter cli provider test deepinfra
+brainrouter cli roles set review cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash
+
+# Anthropic wire provider (x-api-key + anthropic-version, never Bearer):
+brainrouter cli provider add anthropic-cloud --kind anthropic \
+  --base-url https://api.anthropic.com/v1 --credential anthropic-key \
+  --model claude-sonnet-4-5
+```
+
+Manual provider fields: `kind` (`openai-compatible|anthropic|manifest`),
+`base_url`, `credential_id` (omit = auth-less local gateway), `auto`
+(manifest kind only), `models[{id, alias?, ctx, tools, tier,
+price:{in,out}}]`, `lan_peer`, `enabled`, `monthly_budget_usd`,
+`budget_mode` (`warn|stop`). Tier is `fast|balanced|deep` and drives pool
+ranking; price is `$/1K` in/out and feeds the budget guard.
+
+Selector forms: `cloud` (manifest-auto or pool top), `cloud/<id>` (unique
+id/alias match → else manifest passthrough; multi-match is a 4xx naming the
+providers), `cloud/<provider>/<model>` (qualified; only when the first segment
+names an enabled provider — otherwise the remainder cascades). A `cloud/`
+prefix never reaches llama-swap.
+
+### LAN federation (opt-in; second listener)
+
+Default off: no listener exists and the loopback surface is byte-identical to
+v1. To enable, add to `brainrouter.yaml` and restart:
+
+```yaml
+lan:
+  enabled: true
+  bind: "0.0.0.0:9099"         # second listener, dedicated to inference
+  token_credential: lan-token  # credential id in the vault
+  expose: [qwen3-8b, cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash]
+  rate: {burst: 20, per_sec: 4}
+```
+
+```sh
+brainrouter cli credential add lan-token --kind store --value "$(openssl rand -hex 32)"
+```
+
+Boot logs a plaintext-LAN risk marker (accepted risk: bearer over HTTP on a
+trusted LAN; `peer-info` enumerates exposed models to any token holder). The
+LAN route table is only `/v1/chat/completions`, `/v1/messages`, `/v1/models`
+(filtered), `/api/peer-info`; admin/dashboard/roles/credentials return 404 at
+listener level.
+
+- **Rotation**: `brainrouter cli credential add lan-token --kind store --value
+  '<new>'` — the old token stops working on the next request (constant-time
+  compare against the resolved vault value; no restart).
+- **Expose double-enforcement**: the RAW requested string AND the RESOLVED
+  model must both be listed. An exposed alias resolving to a hidden model is
+  refused (no cloud-spend escape).
+- **Peer provider** (federation): register the peer's `http://host:9099/v1`
+  with `lan_peer: true` and the peer's LAN token as its credential. Only peers
+  receive the forwarded `x-brainrouter-role` header, so the peer applies its
+  own Review/Main/Subagent cards to the named role.
+- **Budget**: set `monthly_budget_usd` + `budget_mode` per provider.
+  `warn` badges + events; `stop` refuses as a primary failure (the managed
+  `fallback_model` hop fires; a review escalates) and excludes the provider
+  from the auto pool. The ledger rolls over on the calendar month and survives
+  restarts.
+- **Revert path**: `brainrouter credential export --env-line
+  /etc/brainrouter/env --force` writes `NAME=VALUE` lines for `store`
+  credentials (0600, atomic; `env`/`file` references become comments) so a
+  reverted v1 can consume them via `EnvironmentFile=`.
+
+### fedora hosts
+
+The Manifest binary is untouched; brainrouter simply no longer requires it.
+On fedora1/fedora2 keep `manifest.base_url` pointing at the local gateway
+during migration, or register the cloud provider directly and drop Manifest.
+
 ## v2.0-p4 (L4): swap catalog + platform probe
 
 L4 introduces two owner-visible state files under

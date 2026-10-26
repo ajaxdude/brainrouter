@@ -93,11 +93,17 @@ pub enum CliCommand {
         #[command(subcommand)]
         action: DecisionAction,
     },
-    /// Credentials vault (v2 L3 UI surface): list/add/remove/test; mutations
-    /// go through the running daemon, values are never printed.
+    /// Credentials vault (v2 L3 UI surface): list/add/remove/test/export;
+    /// mutations go through the running daemon, values are never printed.
     Credential {
         #[command(subcommand)]
         action: CredentialAction,
+    },
+    /// Provider registry (v2 L6): add/list/remove/test. Mutations go through
+    /// the running daemon (single-writer); `add`/`test` never print key values.
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
     },
     /// Manage sidecar plugins (v2 L2): install/list/enable/disable/remove/
     /// status/config. Talks to the running daemon; falls back to direct
@@ -277,6 +283,52 @@ pub enum CredentialAction {
     Remove { id: String },
     /// Resolve-test a credential ({ok: bool}) — the value is never printed
     Test { id: String },
+    /// Export the vault as NAME=VALUE env lines (owner command, 0600 atomic,
+    /// refuse-if-exists without --force; env/file refs become comments)
+    Export {
+        #[arg(long = "env-line")]
+        env_line: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProviderAction {
+    /// Register or update a provider (mutations via the running daemon)
+    Add {
+        id: String,
+        /// openai-compatible | anthropic | manifest
+        #[arg(long, default_value = "openai-compatible")]
+        kind: String,
+        #[arg(long = "base-url")]
+        base_url: String,
+        /// Credential id from the vault (`store` record, or `env:NAME`)
+        #[arg(long)]
+        credential: Option<String>,
+        /// Manifest kind only: answer the v1 wire value model:"auto"
+        #[arg(long)]
+        auto: bool,
+        /// Federation peer: forward the role header; never pooled as cloud
+        #[arg(long = "lan-peer")]
+        lan_peer: bool,
+        /// Model id served by this provider (repeatable)
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Register the provider as disabled (enabled is the default)
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long = "monthly-budget-usd")]
+        monthly_budget_usd: Option<f64>,
+        #[arg(long, default_value = "warn")]
+        budget_mode: String,
+    },
+    /// List providers with live breaker state and budget badges
+    List,
+    /// Remove a provider
+    Remove { id: String },
+    /// One cheap completion probe with the provider's kind-specific auth
+    Test { id: String },
 }
 
 #[derive(Subcommand)]
@@ -334,6 +386,33 @@ pub enum MigrationAction {
         /// Phase tag, e.g. v2.0-p2
         phase: String,
     },
+}
+
+/// `brainrouter credential ...` (v2 L6 owner commands; no daemon required).
+#[derive(Args)]
+pub struct CredentialDirectArgs {
+    #[command(subcommand)]
+    pub action: CredentialDirectAction,
+}
+
+#[derive(Subcommand)]
+pub enum CredentialDirectAction {
+    /// Write the vault as NAME=VALUE env lines (0600 atomic; env/file refs
+    /// become comments; refuse-if-exists without --force)
+    Export {
+        #[arg(long = "env-line")]
+        env_line: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+pub fn run_credential_direct(args: CredentialDirectArgs) -> Result<()> {
+    match args.action {
+        CredentialDirectAction::Export { env_line, force } => {
+            export_env_lines_direct(&env_line, force)
+        }
+    }
 }
 
 /// `brainrouter swap ...` (v2 L4): reads are direct (state files); mutations
@@ -666,6 +745,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
         CliCommand::Roles { action } => run_roles(&client, action).await?,
         CliCommand::Decision { action } => run_decision(&client, action).await?,
         CliCommand::Credential { action } => run_credential(&client, action).await?,
+        CliCommand::Provider { action } => run_provider(&client, action).await?,
         CliCommand::Plugin { action } => run_plugin(&client, action).await?,
         CliCommand::Migration { action } => run_migration(action)?,
         CliCommand::Toolboxes => {
@@ -944,6 +1024,100 @@ async fn run_credential(client: &DaemonClient, action: CredentialAction) -> Resu
         }
         CredentialAction::Test { id } => {
             print_json(&client.post_json("/api/credentials/test", json!({ "id": id })).await?);
+        }
+        CredentialAction::Export { env_line, force } => {
+            export_env_lines_direct(&env_line, force)?;
+        }
+    }
+    Ok(())
+}
+
+/// `brainrouter credential export --env-line <file>`: owner command; reads
+/// the vault directly (no daemon needed), writes 0600 atomic, refuses an
+/// existing file without `--force`.
+pub fn export_env_lines_direct(path: &std::path::Path, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite (0600 atomic write)",
+            path.display()
+        );
+    }
+    let store = brainrouter::credentials::CredentialStore::load(
+        brainrouter::credentials::CredentialStore::default_path(),
+    )
+    .context("loading the credentials store")?;
+    let text = store.env_line_export()?;
+    brainrouter::plugins::store::atomic_write_0600(path, text.as_bytes())
+        .with_context(|| format!("writing the env-line export to {}", path.display()))?;
+    // Audited event: the owner explicitly moved vault values to a file.
+    tracing::info!(
+        path = %path.display(),
+        "credential vault exported to env-line form (owner command)"
+    );
+    println!("exported credentials to {} (0600)", path.display());
+    Ok(())
+}
+
+async fn run_provider(client: &DaemonClient, action: ProviderAction) -> Result<()> {
+    use ProviderAction::*;
+    match action {
+        List => {
+            print_json(&client.get_json("/api/providers").await?);
+        }
+        Test { id } => {
+            let response = client
+                .request("POST", &format!("/api/providers/{id}/test"), None)
+                .await?;
+            if !(200..300).contains(&response.status) {
+                bail!("provider test `{id}` failed ({}): {}", response.status, response.body);
+            }
+            print_json(&response.json()?);
+        }
+        Remove { id } => {
+            let response = client
+                .request("DELETE", &format!("/api/providers/{id}"), None)
+                .await?;
+            if !(200..300).contains(&response.status) {
+                bail!("provider remove `{id}` failed ({}): {}", response.status, response.body);
+            }
+            print_json(&response.json()?);
+        }
+        Add {
+            id,
+            kind,
+            base_url,
+            credential,
+            auto,
+            lan_peer,
+            models,
+            disabled,
+            monthly_budget_usd,
+            budget_mode,
+        } => {
+            let enabled = !disabled;
+            let models: Vec<Value> = models
+                .into_iter()
+                .map(|model| {
+                    json!({"id": model, "ctx": 0, "tools": true, "tier": "balanced"})
+                })
+                .collect();
+            let mut record = json!({
+                "id": id,
+                "kind": kind,
+                "base_url": base_url,
+                "auto": auto,
+                "lan_peer": lan_peer,
+                "models": models,
+                "enabled": enabled,
+                "budget_mode": budget_mode,
+            });
+            if let Some(credential) = credential {
+                record["credential_id"] = json!(credential);
+            }
+            if let Some(budget) = monthly_budget_usd {
+                record["monthly_budget_usd"] = json!(budget);
+            }
+            print_json(&client.post_json("/api/providers/add", record).await?);
         }
     }
     Ok(())
@@ -1414,6 +1588,25 @@ pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {
             if let Some(state) = &args.state {
                 candidates.push(state.clone());
             }
+            let mut config_adjacent: Vec<PathBuf> = Vec::new();
+            for probe in [
+                config_dir.join("state/brainrouter"),
+                config_dir.join("../state/brainrouter"),
+                config_dir.join("brainrouter-state"),
+            ] {
+                let probe = probe.canonicalize().unwrap_or(probe.clone());
+                if !config_adjacent.contains(&probe) {
+                    config_adjacent.push(probe);
+                }
+            }
+            // An explicitly-named `--config` identifies an isolated
+            // deployment: its config-adjacent state tree wins over the
+            // caller's ambient XDG state (a plain-shell invocation inherits
+            // the REAL state root, whose same-phase snapshot belongs to a
+            // different deployment).
+            if args.config.is_some() {
+                candidates.extend(config_adjacent.iter().cloned());
+            }
             candidates.push(brainrouter::paths::brainrouter_state());
             let derived = [
                 brainrouter::paths::env_dir("XDG_STATE_HOME", "", ".local/state"),
@@ -1424,14 +1617,7 @@ pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {
                     candidates.push(cand);
                 }
             }
-            // Config-adjacent probes: <config-dir>/../state/brainrouter and
-            // <config-dir>/brainrouter-state (isolated-deployment layouts).
-            for probe in [
-                config_dir.join("state/brainrouter"),
-                config_dir.join("../state/brainrouter"),
-                config_dir.join("brainrouter-state"),
-            ] {
-                let probe = probe.canonicalize().unwrap_or(probe.clone());
+            for probe in config_adjacent {
                 if !candidates.contains(&probe) {
                     candidates.push(probe);
                 }

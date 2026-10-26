@@ -945,10 +945,86 @@ pub fn start(state: &Arc<crate::server::AppState>) {
             snapshot["measurement_definitions"] =
                 json!(crate::routing_events::STREAM_MEASUREMENT_DEFINITION);
             snapshot["service_versions"] = state.versions_cache.borrow().clone();
+            // v2 L6: the provider fan-out — every enabled registry entry is
+            // reported with its breaker state, budget badge, and a cheap
+            // metadata probe (never inference). Read-only and additive.
+            snapshot["providers"] =
+                poll_providers(&client, &state, &state.routing_events).await;
             *state.observability.snapshot.lock().unwrap() = snapshot;
             tokio::time::sleep(Duration::from_secs(POLL_SECONDS)).await;
         }
     });
+}
+
+/// v2 L6 provider fan-out: registry state + breaker + budget + a cheap
+/// `/models` metadata probe per enabled provider (no inference).
+async fn poll_providers(
+    client: &reqwest::Client,
+    state: &Arc<crate::server::AppState>,
+    _events: &Arc<crate::routing_events::RoutingEvents>,
+) -> Value {
+    let records = state.providers.snapshot();
+    let month = state.budget.month();
+    let mut out = Vec::new();
+    for provider in records {
+        let spent = state.budget.spent(&provider.id);
+        let mut reachable: Option<bool> = None;
+        let mut probe_error: Option<String> = None;
+        if provider.enabled && provider.kind != crate::providers::ProviderKind::Anthropic {
+            let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+            let mut request = client.get(&url).timeout(Duration::from_millis(1500));
+            if let Some(credential) = provider.credential_id.as_deref() {
+                let resolved = if let Some(var) = credential.strip_prefix("env:") {
+                    std::env::var(var).ok()
+                } else if let Some(path) = credential.strip_prefix("file:") {
+                    std::fs::read_to_string(path).ok().map(|v| v.trim().to_string())
+                } else {
+                    state
+                        .credentials
+                        .resolve(credential)
+                        .ok()
+                        .map(|secret| secret.expose().to_string())
+                };
+                if let Some(secret) = resolved {
+                    request = request.bearer_auth(secret);
+                }
+            }
+            match request.send().await {
+                Ok(response) => reachable = Some(response.status().is_success()),
+                Err(error) => {
+                    reachable = Some(false);
+                    probe_error = Some(error.to_string());
+                }
+            }
+        }
+        out.push(serde_json::json!({
+            "id": provider.id,
+            "kind": provider.kind.as_str(),
+            "base_url": provider.base_url,
+            "lan_peer": provider.lan_peer,
+            "enabled": provider.enabled,
+            "breaker": state.router.health_state(&provider.id),
+            "reachable": reachable,
+            "probe_error": probe_error,
+            "models": provider.models.iter().map(|m| serde_json::json!({
+                "id": m.id,
+                "alias": m.alias,
+                "ctx": m.ctx,
+                "tools": m.tools,
+                "tier": m.tier.as_str(),
+            })).collect::<Vec<_>>(),
+            "budget": {
+                "month": month,
+                "mode": provider.budget_mode.as_str(),
+                "monthly_budget_usd": provider.monthly_budget_usd,
+                "spent_usd": spent,
+                "state": provider.monthly_budget_usd
+                    .map(|budget| if spent >= budget { "over" } else { "ok" })
+                    .unwrap_or("none"),
+            },
+        }));
+    }
+    Value::Array(out)
 }
 
 fn validate_configuration(configuration: &Value) -> Result<(), String> {
@@ -1340,6 +1416,9 @@ mod tests {
             chosen_model: None,
             swap_state: None,
             swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 

@@ -114,11 +114,20 @@ fn make_router(
         llama_swap_url.to_string(),
         None,
     ));
-    let manifest = Arc::new(OpenAiProvider::new(
-        "manifest".to_string(),
-        "http://127.0.0.1:1".to_string(), // dead — must never be called
-        None,
-    ));
+    let providers = Arc::new(brainrouter::providers::ProviderStore::in_memory_with(vec![
+        brainrouter::providers::ProviderRecord {
+            id: "manifest".into(),
+            kind: brainrouter::providers::ProviderKind::Manifest,
+            base_url: "http://127.0.0.1:1".to_string(), // dead — must never be called
+            credential_id: None,
+            auto: true,
+            models: Vec::new(),
+            lan_peer: false,
+            enabled: true,
+            monthly_budget_usd: None,
+            budget_mode: brainrouter::providers::BudgetMode::Warn,
+        },
+    ]));
 
     let health = Arc::new(HealthTracker::new());
     // Pre-open the Manifest circuit: any cloud attempt would fail as a backend
@@ -135,8 +144,9 @@ fn make_router(
     Router::new(RouterArgs {
         slot,
         cards: Arc::new(RoleCardStore::memory(Default::default())),
-        manifest,
-        manifest_enabled: true,
+        providers,
+        credentials: Arc::new(brainrouter::credentials::CredentialStore::in_memory()),
+        budget: Arc::new(brainrouter::provider_budget::ProviderBudget::in_memory()),
         llama_swap,
         fallback_model: FALLBACK_KEY.to_string(),
         local_models: local_models.into_iter().map(|s| s.to_string()).collect(),

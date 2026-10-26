@@ -127,6 +127,39 @@ pub struct RouteEvent {
     /// `container`/`external`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_source: Option<String>,
+    /// v2 L6 additive: the provider registry id that served (or was
+    /// attempted for) this route. `effective_provider` keeps the v1 spelling
+    /// for the migrated manifest (`manifest`) and llama-swap (`llama-swap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// v2 L6 additive: the LAN hop for provider routes with a non-loopback
+    /// base_url (`{host, endpoint}`); absent for loopback providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<HopInfo>,
+    /// v2 L6 additive: the budget guard's state for this request
+    /// (`warn`-mode over-budget badge/event; `stop` refusals).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetEvent>,
+}
+
+/// v2 L6: a provider route's network hop (Sankey renders it).
+#[derive(Debug, Clone, Serialize)]
+pub struct HopInfo {
+    pub host: String,
+    pub endpoint: String,
+}
+
+/// v2 L6: the budget guard's record for one request.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetEvent {
+    pub provider: String,
+    /// `warn` or `stop`.
+    pub mode: String,
+    /// `ok` or `over`.
+    pub state: String,
+    pub month: String,
+    pub spent_usd: f64,
+    pub monthly_budget_usd: f64,
 }
 
 fn is_zero_f64(f: &f64) -> bool {
@@ -421,6 +454,9 @@ mod tests {
             chosen_model: None,
             swap_state: None,
             swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 

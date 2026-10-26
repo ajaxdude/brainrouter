@@ -4,6 +4,96 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L6: providers, Manifest absorbed, LAN federation (branch `v2-p3-roles`, pre-merge)
+
+Cloud is brainrouter's own decision. The hardcoded Manifest backend is
+replaced by a provider registry (`providers.json`, 0600 atomic) that binds
+credentials from the vault, pools enabled non-peer providers for the `cloud`
+route, and speaks both OpenAI-compatible and Anthropic wires. v1 configs boot
+unchanged: `manifest.*` migrates one-shot into a `manifest`-kind provider
+(snapshot + `.bak` + `migration restore v2.0-p6`) and the v1 `cloud` /
+`cloud/<id>` behavior is byte-identical (parity corpus replayed against mock
+gateways). LAN federation adds a SECOND, opt-in listener with a bearer token,
+per-token rate limit, expose double-enforcement, and role-header forwarding —
+the distributed-role mechanism.
+
+### Added
+
+- **Provider registry** (`src/providers.rs`): record `{id, kind:
+  openai-compatible|anthropic|manifest, base_url, credential_id?, auto,
+  models: [{id, alias?, ctx, tools, tier, price?}], lan_peer, enabled,
+  monthly_budget_usd?, budget_mode}`. CRUD API (`GET/POST /api/providers*`,
+  `PUT|DELETE /api/providers/{id}`, `POST /api/providers/{id}/test`) and CLI
+  `provider add|list|remove|test`. Two enabled `auto: true` manifest providers
+  is refused at add time (rule (b) uniqueness).
+- **Selector resolution matrix** (L6 spec (a)-(d)):
+  `cloud` → enabled manifest-auto provider, else the auto pool's top candidate;
+  `cloud/<id>` → unique id/alias match, else the single manifest-auto
+  passthrough (verbatim v1 parity), multi-match = explicit 4xx naming the
+  providers; `cloud/<provider>/<model>` is taken only when the first segment
+  names an ENABLED provider (otherwise the whole remainder cascades to rule
+  (a)/(b)). A `cloud/` prefix can never resolve to a local llama-swap key.
+- **Anthropic outbound adapter** (`src/provider/anthropic.rs`):
+  canonical OpenAI request → Messages body (`system` extraction, tools,
+  stop_sequences), auth via `x-api-key` + `anthropic-version` (never Bearer),
+  SSE translation back to OpenAI chunks (text/thinking/tool deltas,
+  `message_stop` → `[DONE]`).
+- **Cloud auto pool** (`route=cloud`): enabled non-peer providers' models,
+  ctx/tools filtered, tier-fit ranked, deterministic tie-break = provider
+  record order then model list order. `lan_peer` models never join the cloud
+  pool; `privacy: local-only` treats peers as local-trusted.
+- **Per-provider breakers**: `HealthTracker::state()` (`healthy`/`degraded`/
+  `open`), keyed by provider id (the migrated Manifest provider keeps the v1
+  literal `manifest`). 429 is a backend fault; 3 faults open, 60 s cooldown
+  heals.
+- **v2.0-p6 migration** (`src/migration.rs`): exact v1 keys
+  `manifest.{enabled,base_url,api_key_env}` → provider `{id: "manifest",
+  kind: manifest, base_url, credential: env:<api_key_env>, auto: true,
+  models: []}`; env-var indirection kept (values never enter the record);
+  `manifest.*` YAML removed after `.bak` + snapshot; monthly budget ledger
+  created; `serve --dry-run` previews; `brainrouter migration restore v2.0-p6`
+  restores config + removes providers/ledger. Idempotent (no manifest block =
+  no writes).
+- **LAN federation** (`src/lan.rs`, config `lan: {enabled, bind,
+  token_credential, expose, rate:{burst,per_sec}}`): a second listener whose
+  route table is ONLY `/v1/chat/completions`, `/v1/messages`, `/v1/models`
+  (expose-filtered), `/api/peer-info`. Bearer compared constant-time against
+  the resolved vault credential (rotation immediate), per-token bucket
+  (defaults 20 burst / 4 per second) with 429 on excess, expose
+  double-enforcement (raw + resolved; alias/qualified escapes refused),
+  admin/dashboard 404 at listener level, plaintext-LAN risk logged at boot.
+  `peer-info` = `{host_id, version, models:[{key,ctx,tools,tier,state}],
+  serving}` read-only.
+- **Role-header forwarding**: only `lan_peer` providers receive the request's
+  effective `x-brainrouter-role` verbatim (distributed roles: the peer applies
+  its OWN role cards). Non-peer providers never see it.
+- **Budget guard** (`src/provider_budget.rs`, `provider_budget.json`, 0600):
+  per-provider monthly ledger keyed `YYYY-MM` (calendar rollover, survives
+  restart), cost = price × usage tokens or the `(bytes+3)/4` estimator flagged
+  `estimated`; `warn` records + badges, `stop` refuses as a PRIMARY failure
+  (managed fallback fires; review escalates) and excludes the provider from
+  the auto pool.
+- **Credential env-line export**: `brainrouter credential export --env-line
+  <file> [--force]` (0600 atomic, refuse-if-exists) — `store` credentials as
+  `NAME=VALUE`, `env`/`file` references as comments, masked lists unchanged.
+- **Events (additive)**: `provider` (`{host, endpoint}` hop on non-loopback
+  provider routes), and `budget` (`{provider, mode, state, month, spent_usd,
+  monthly_budget_usd}`). Sankey ROUTING renders the LAN hop.
+- **Dashboard**: Providers section on the Credentials page (add/update, Test,
+  Remove, live breaker state, budget badge, declared models) and per-provider
+  model lists (grouped, with qualified selector hints) on the Models page.
+- **Admission**: `cloud_available` (≥1 enabled non-peer provider) replaces
+  `manifest_enabled` everywhere; `AdmittedBackend::Peer` / `BackendDecision::
+  Peer` — a qualified `cloud/<lan-peer>/...` review card is peer-admitted with
+  cloud-parity strictness and no local memory gate.
+
+### Removed
+
+- `config.manifest` as a required block (the migrated provider owns the URL;
+  the struct stays parse-compatible and optional); `AdmissionInputs.
+  manifest_enabled`; the Manifest-only router special case
+  (`Router.manifest`/`manifest_enabled`); manifest-only breaker naming.
+
 ## v2 L5: strixite + hipfire adapters (branch `v2-p3-roles`, pre-merge)
 
 The icon fleets become supervisor-managed engines. strixite (gfx1151) and

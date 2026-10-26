@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 /// Top-level brainrouter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainrouterConfig {
+    /// v1 cloud gateway. Migrated into a `manifest`-kind provider record by
+    /// `v2.0-p6`, which REMOVES this block from the YAML post-migration; the
+    /// field stays parse-compatible so pre-migration files boot.
+    #[serde(default)]
     pub manifest: ManifestConfig,
     pub llama_swap: LlamaSwapConfig,
     /// v2 L3: the decision-model slot (R4). Replaces the v1 `bonsai:` block
@@ -28,6 +32,68 @@ pub struct BrainrouterConfig {
     /// Persistent imported benchmark results and explorer.
     #[serde(default)]
     pub benchmarks: BenchmarkConfig,
+    /// v2 L6: LAN federation listener (default off = v1 attack surface).
+    #[serde(default)]
+    pub lan: LanConfig,
+}
+
+/// v2 L6 LAN federation config (spec "LAN federation").
+///
+/// Default `enabled: false` means the listener is never created; the primary
+/// loopback surface is byte-unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address for the SECOND listener, e.g. `0.0.0.0:9099`.
+    #[serde(default)]
+    pub bind: String,
+    /// Credential id holding the bearer token (store-managed, rotate + revoke).
+    #[serde(default)]
+    pub token_credential: String,
+    /// Model keys a token holder may address (double-enforced: raw + resolved).
+    #[serde(default)]
+    pub expose: Vec<String>,
+    #[serde(default)]
+    pub rate: LanRate,
+}
+
+impl Default for LanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: String::new(),
+            token_credential: String::new(),
+            expose: Vec::new(),
+            rate: LanRate::default(),
+        }
+    }
+}
+
+/// Per-token token bucket (spec defaults: burst 20, 4 requests/second).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanRate {
+    #[serde(default = "default_lan_burst")]
+    pub burst: u64,
+    #[serde(default = "default_lan_per_sec")]
+    pub per_sec: u64,
+}
+
+fn default_lan_burst() -> u64 {
+    20
+}
+
+fn default_lan_per_sec() -> u64 {
+    4
+}
+
+impl Default for LanRate {
+    fn default() -> Self {
+        Self {
+            burst: default_lan_burst(),
+            per_sec: default_lan_per_sec(),
+        }
+    }
 }
 
 /// Storage settings for the benchmark explorer.
@@ -151,7 +217,7 @@ fn default_plumebench_thinking() -> String {
 /// Configuration for the Manifest cloud LLM router.
 /// Manifest exposes an OpenAI-compatible endpoint; brainrouter delegates all
 /// managed cloud routing decisions to Manifest with model="auto"; explicit IDs pass through.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManifestConfig {
     /// Master switch for the cloud backend. Off by default: `model=cloud` and
     /// Bonsai-classified cloud requests skip Manifest and fall back to
@@ -160,6 +226,8 @@ pub struct ManifestConfig {
     pub enabled: bool,
 
     /// Base URL of the Manifest instance. Example: "http://localhost:2099".
+    /// Optional post-`v2.0-p6` (the migrated provider record owns it).
+    #[serde(default)]
     pub base_url: String,
 
     /// Name of the environment variable holding the Manifest API key (mnfst_*).
@@ -613,17 +681,43 @@ pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
         }
     }
 
-    // Validate manifest.base_url
+    // Validate manifest.base_url. Post-`v2.0-p6` the YAML block is removed
+    // (the provider record owns the URL), so only a present value is checked;
+    // an enabled block still requires one.
     if config.manifest.base_url.is_empty() {
-        bail!("manifest.base_url must not be empty");
-    }
-    if !config.manifest.base_url.starts_with("http://")
+        if config.manifest.enabled {
+            bail!("manifest.base_url must not be empty when manifest.enabled is true");
+        }
+    } else if !config.manifest.base_url.starts_with("http://")
         && !config.manifest.base_url.starts_with("https://")
     {
         bail!(
             "manifest.base_url must start with http:// or https://, got: {}",
             config.manifest.base_url
         );
+    }
+    // v2 L6: the LAN second listener is opt-in; when enabled every field it
+    // needs must be present so a typo cannot silently bind an unauthenticated
+    // or rate-unlimited surface.
+    if config.lan.enabled {
+        if config.lan.bind.trim().is_empty() {
+            bail!("lan.bind must not be empty when lan.enabled is true");
+        }
+        if config.lan.bind.parse::<std::net::SocketAddr>().is_err() {
+            bail!(
+                "lan.bind must be a socket address (ip:port), got: {}",
+                config.lan.bind
+            );
+        }
+        if config.lan.token_credential.trim().is_empty() {
+            bail!("lan.token_credential must not be empty when lan.enabled is true");
+        }
+        if config.lan.rate.burst == 0 {
+            bail!("lan.rate.burst must be greater than zero");
+        }
+        if config.lan.rate.per_sec == 0 {
+            bail!("lan.rate.per_sec must be greater than zero");
+        }
     }
 
     // Validate llama_swap.base_url

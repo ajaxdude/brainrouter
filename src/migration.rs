@@ -437,6 +437,267 @@ fn strip_v1_keys_and_add_decision_model(config_path: &Path, state: &V1State) -> 
 
 // ── v2.0-p4: swap catalog import (L4) ───────────────────────────────────────
 
+/// The L6 phase tag: `brainrouter migration restore v2.0-p6`. Migrates the
+/// v1 `manifest.*` YAML block into a `manifest`-kind provider record and
+/// creates the monthly provider budget accumulator.
+pub const PHASE_V2_P6: &str = "v2.0-p6";
+
+/// The exact v1 manifest keys (there is NO `manifest.model` key).
+#[derive(Debug, Clone)]
+pub struct V1Manifest {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key_env: Option<String>,
+}
+
+/// Read the v1 manifest block from raw YAML (no validation — runs BEFORE
+/// `config::load` so a v1 file always inspects).
+pub fn read_v1_manifest(config_path: &Path) -> Result<Option<V1Manifest>> {
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading config for v2.0-p6"),
+    };
+    let root: YamlValue = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} for v2.0-p6", config_path.display()))?;
+    let Some(manifest) = root.get("manifest") else {
+        return Ok(None);
+    };
+    let enabled = manifest
+        .get("enabled")
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(false);
+    let base_url = manifest
+        .get("base_url")
+        .and_then(YamlValue::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let api_key_env = manifest
+        .get("api_key_env")
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(Some(V1Manifest {
+        enabled,
+        base_url,
+        api_key_env,
+    }))
+}
+
+/// `--dry-run` preview for `v2.0-p6` — describes the migration, never writes.
+pub fn preview_v2_p6(
+    config_path: &Path,
+    state_root: &Path,
+    providers_path: &Path,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P6} (state untouched)"));
+    match read_v1_manifest(config_path)? {
+        Some(manifest) => {
+            lines.push(format!(
+                "  would migrate manifest.enabled={} base_url={} api_key_env={} into provider \
+                 'manifest' (kind manifest, auto: true, models: [], enabled: {})",
+                manifest.enabled,
+                if manifest.base_url.is_empty() { "<unset>" } else { &manifest.base_url },
+                manifest
+                    .api_key_env
+                    .as_deref()
+                    .map(|var| format!("env:{var}"))
+                    .unwrap_or_else(|| "<none>".to_string()),
+                manifest.enabled,
+            ));
+            lines.push(format!(
+                "  would snapshot the pre-migration config under {}",
+                snapshot_root(state_root, PHASE_V2_P6).display()
+            ));
+            lines.push(format!(
+                "  would remove the manifest.* block from {} (backup: {}.bak)",
+                config_path.display(),
+                config_path.display()
+            ));
+        }
+        None => lines.push(format!(
+            "  no manifest.* block in {} — migration {PHASE_V2_P6} has nothing to do",
+            config_path.display()
+        )),
+    }
+    lines.push(format!(
+        "  providers store: {}",
+        if providers_path.exists() {
+            format!("{} (existing records preserved)", providers_path.display())
+        } else {
+            format!("would create {}", providers_path.display())
+        }
+    ));
+    lines.push(format!(
+        "  would create the monthly provider budget accumulator {}",
+        crate::provider_budget::default_path().display()
+    ));
+    Ok(lines)
+}
+
+/// The `v2.0-p6` migration: `manifest.*` ⇒ provider `{id: "manifest", kind:
+/// manifest, base_url, credential: env:<api_key_env> if set, auto: true,
+/// models: []}`, `manifest.*` YAML removed, budget ledger created. Snapshot +
+/// `.bak` first (the `v2.0-p3` machinery). Idempotent: no manifest block = no
+/// writes.
+pub fn run_v2_p6(
+    config_path: &Path,
+    state_root: &Path,
+    providers_path: &Path,
+    budget_path: &Path,
+) -> Result<Vec<String>> {
+    let Some(manifest) = read_v1_manifest(config_path)? else {
+        return Ok(Vec::new());
+    };
+    if manifest.base_url.is_empty() && manifest.enabled {
+        anyhow::bail!(
+            "v2.0-p6: manifest.enabled is true but manifest.base_url is empty in {}",
+            config_path.display()
+        );
+    }
+    let original = std::fs::read(config_path)
+        .with_context(|| format!("reading {} for v2.0-p6", config_path.display()))?;
+
+    // Snapshot the pre-migration state (stable per-phase directory): the
+    // config verbatim plus whichever state files exist.
+    let root = snapshot_root(state_root, PHASE_V2_P6);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating {}", root.display()))?;
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    crate::plugins::store::atomic_write_0600(&root.join("config.yaml"), &original)?;
+    for (source, name) in [
+        (providers_path, crate::providers::PROVIDERS_FILE),
+        (budget_path, crate::provider_budget::LEDGER_FILE),
+    ] {
+        if source.exists() {
+            let bytes = std::fs::read(source)
+                .with_context(|| format!("reading {} for snapshot", source.display()))?;
+            crate::plugins::store::atomic_write_0600(&root.join(name), &bytes)?;
+        }
+    }
+
+    // `.bak` sidecar (byte-for-byte pre-migration YAML). Never clobber an
+    // earlier phase's backup: `.bak` is the ROLLBACK copy of the oldest
+    // pre-migration state (an L1 keeper asserts the v1 legacy shape survives
+    // there), while this phase's exact pre-state lives in the snapshot dir.
+    if !bak_path(config_path).exists() {
+        std::fs::write(bak_path(config_path), &original).context("writing config .bak backup")?;
+    }
+
+    // Provider record (env-var indirection kept: the value never enters the
+    // record or the providers file).
+    let record = crate::providers::ProviderRecord {
+        id: "manifest".to_string(),
+        kind: crate::providers::ProviderKind::Manifest,
+        base_url: manifest.base_url.clone(),
+        credential_id: manifest
+            .api_key_env
+            .as_deref()
+            .map(|var| format!("env:{var}")),
+        auto: true,
+        models: Vec::new(),
+        lan_peer: false,
+        enabled: manifest.enabled,
+        monthly_budget_usd: None,
+        budget_mode: crate::providers::BudgetMode::Warn,
+    };
+    // A missing file is an empty registry; the upsert creates it (0600
+    // atomic) with the migrated record, preserving any existing providers.
+    // A disabled v1 block without a URL has nothing to preserve as an
+    // endpoint: strip the YAML but record no provider.
+    let store = crate::providers::ProviderStore::load(providers_path.to_path_buf())?;
+    let recorded = if manifest.base_url.is_empty() {
+        false
+    } else {
+        store.upsert(record)?;
+        true
+    };
+
+    // Budget accumulator (0600; restart cannot reset it, calendar rollover).
+    crate::provider_budget::ProviderBudget::ensure_file(budget_path)?;
+
+    // Strip `manifest.*` from the YAML.
+    let mut yaml: YamlValue =
+        serde_yaml::from_str(&String::from_utf8_lossy(&original)).context("re-parsing config YAML")?;
+    if let Some(map) = yaml.as_mapping_mut() {
+        map.remove(YamlValue::String("manifest".into()));
+    }
+    let out = serde_yaml::to_string(&yaml).context("serializing migrated config YAML")?;
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+
+    Ok(vec![format!(
+        "migrated manifest.* into provider 'manifest' ({}, auto: true, models: [],          credential {}); key block removed from {} (backup: {}.bak); monthly budget ledger at          {}; pre-migration snapshot: {}",
+        if recorded {
+            "kind manifest"
+        } else {
+            "no URL in the disabled v1 block; no record created"
+        },
+        manifest
+            .api_key_env
+            .map(|var| format!("env:{var}"))
+            .unwrap_or_else(|| "none".to_string()),
+        config_path.display(),
+        config_path.display(),
+        budget_path.display(),
+        root.display()
+    )])
+}
+
+/// Restore `v2.0-p6`: put the pre-migration YAML back and return
+/// `providers.json` / the budget ledger to their pre-migration state.
+pub fn restore_v2_p6(
+    state_root: &Path,
+    config_path: &Path,
+    providers_path: &Path,
+    budget_path: &Path,
+) -> Result<String> {
+    let root = snapshot_root(state_root, PHASE_V2_P6);
+    let snapshot_config = root.join("config.yaml");
+    if !snapshot_config.exists() {
+        anyhow::bail!(
+            "no {PHASE_V2_P6} migration snapshot found under {}",
+            root.display()
+        );
+    }
+    let bytes = std::fs::read(&snapshot_config)
+        .with_context(|| format!("reading {}", snapshot_config.display()))?;
+    std::fs::write(config_path, &bytes)
+        .with_context(|| format!("restoring config to {}", config_path.display()))?;
+    let mut restored = vec!["config YAML (v1 manifest.* block)".to_string()];
+    for (name, target, label) in [
+        (
+            crate::providers::PROVIDERS_FILE,
+            providers_path,
+            "providers store",
+        ),
+        (
+            crate::provider_budget::LEDGER_FILE,
+            budget_path,
+            "monthly budget ledger",
+        ),
+    ] {
+        let snapshot = root.join(name);
+        if snapshot.exists() {
+            std::fs::copy(&snapshot, target)
+                .with_context(|| format!("restoring {label} to {}", target.display()))?;
+            restored.push(label.to_string());
+        } else if target.exists() {
+            std::fs::remove_file(target)
+                .with_context(|| format!("removing {}", target.display()))?;
+            restored.push(format!("{label} (removed: absent before the migration)"));
+        }
+    }
+    Ok(format!(
+        "restored {PHASE_V2_P6} from {} ({})",
+        root.display(),
+        restored.join(", ")
+    ))
+}
+
 /// The L4 phase tag: `brainrouter migration restore v2.0-p4`. On first boot it
 /// imports the live llama-swap `config.yaml` into `swap_catalog.json`
 /// (snapshot + dry-run + restore, one stable snapshot directory per phase —
@@ -634,6 +895,15 @@ pub fn restore(
     state_root: &Path,
     config_dir: &Path,
 ) -> Result<String> {
+    // v2 L6: p6 owns the config YAML + providers.json + the monthly ledger.
+    if phase == PHASE_V2_P6 {
+        return restore_v2_p6(
+            state_root,
+            config_path,
+            &crate::providers::default_path(),
+            &crate::provider_budget::default_path(),
+        );
+    }
     // v2 L4: the p4 snapshot holds swap state only (no config/credentials/
     // cards); restoring it must not touch those unrelated files.
     if phase == PHASE_V2_P4 {

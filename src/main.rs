@@ -37,6 +37,9 @@ enum Command {
     Plugin(cli::PluginCliArgs),
     /// Config migration controls (`migration restore <phase>`).
     Migration(cli::MigrationArgs),
+    /// Credential owner commands that read the vault directly
+    /// (`credential export --env-line <file>`).
+    Credential(cli::CredentialDirectArgs),
     /// Swap supervisor control (v2 L4): status/ensure/evict/catalog/import/pin
     Swap(cli::SwapArgs),
     /// Platform probe (v2 L4): detected hardware, budgets, engine offers
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
         Command::Cli(args) => cli::run(args).await,
         Command::Plugin(args) => cli::run_plugin_standalone(args).await,
         Command::Migration(args) => cli::run_migration_standalone(args),
+        Command::Credential(args) => cli::run_credential_direct(args),
         Command::Swap(args) => cli::run_swap_standalone(args).await,
         Command::Platform(args) => cli::run_platform_standalone(args),
         Command::Install(args) => {

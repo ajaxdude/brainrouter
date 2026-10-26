@@ -203,6 +203,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         )? {
             println!("{line}");
         }
+        for line in brainrouter::migration::preview_v2_p6(
+            &config_path,
+            &brainrouter::paths::brainrouter_state(),
+            &brainrouter::providers::default_path(),
+        )? {
+            println!("{line}");
+        }
         println!("dry-run complete: no state written");
         return Ok(());
     }
@@ -264,6 +271,17 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         )? {
             warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P4);
         }
+    }
+
+    // v2 L6: absorb the v1 manifest block into a provider record (one-shot;
+    // the YAML keys are removed, the `.bak` + snapshot hold the pre-state).
+    for action in brainrouter::migration::run_v2_p6(
+        &config_path,
+        &brainrouter::paths::brainrouter_state(),
+        &brainrouter::providers::default_path(),
+        &brainrouter::provider_budget::default_path(),
+    )? {
+        warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P6);
     }
 
     // Config
@@ -442,13 +460,32 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     ));
     info!(kind = config.decision_model.kind.as_str(), enabled = config.decision_model.enabled, "Decision slot ready");
 
-    // Manifest provider (cloud)
-    let manifest_api_key = config.resolve_manifest_api_key();
-    let manifest = Arc::new(OpenAiProvider::new(
-        "manifest".to_string(),
-        config.manifest.base_url.clone(),
-        manifest_api_key,
-    ));
+    // v2 L6: providers replace the hardcoded Manifest backend. A corrupt
+    // registry is quarantined and boot continues with an empty one (cloud
+    // simply reports unavailable until healed).
+    let providers_path = brainrouter::providers::default_path();
+    let providers = Arc::new(
+        match brainrouter::providers::ProviderStore::load(providers_path.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                let quarantine = providers_path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&providers_path, &quarantine);
+                warn!(%error, quarantine = %quarantine.display(),
+                    "providers.json unreadable; quarantined and starting empty");
+                brainrouter::providers::ProviderStore::load(providers_path.clone())
+                    .unwrap_or_else(|_| brainrouter::providers::ProviderStore::in_memory())
+            }
+        },
+    );
+    let provider_budget = Arc::new(
+        brainrouter::provider_budget::ProviderBudget::load(
+            brainrouter::provider_budget::default_path(),
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "provider budget ledger unreadable; starting a fresh in-memory ledger");
+            brainrouter::provider_budget::ProviderBudget::in_memory()
+        }),
+    );
 
     // llama-swap provider (local)
     let llama_swap = Arc::new(OpenAiProvider::new(
@@ -677,8 +714,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let mut router_builder = Router::new(brainrouter::router::RouterArgs {
         slot: Arc::clone(&decision_slot),
         cards: Arc::clone(&cards),
-        manifest,
-        manifest_enabled: config.manifest.enabled,
+        providers: Arc::clone(&providers),
+        credentials: Arc::clone(&credentials_store),
+        budget: Arc::clone(&provider_budget),
         llama_swap,
         fallback_model: config.llama_swap.fallback_model.clone(),
         local_models: config.llama_swap.local_models.clone(),
@@ -710,7 +748,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         Arc::clone(&cards),
         review_config,
         config.review_admission.clone(),
-        config.manifest.enabled,
+        Arc::clone(&providers),
         config.llama_swap.fallback_model.clone(),
     ));
 
@@ -742,13 +780,25 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .unwrap_or(&config.llama_swap.base_url)
         .to_string();
 
-    let manifest_url = config
-        .manifest
-        .base_url
-        .trim_end_matches('/')
-        .strip_suffix("/v1")
-        .unwrap_or(&config.manifest.base_url)
-        .to_string();
+    // Prefer the migrated provider's URL; fall back to the live YAML value
+    // (pre-migration) or an empty string (no cloud provider at all).
+    let manifest_url = {
+        let registry_url = providers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == "manifest")
+            .map(|p| p.base_url)
+            .unwrap_or_default();
+        let url = if registry_url.is_empty() {
+            config.manifest.base_url.clone()
+        } else {
+            registry_url
+        };
+        url.trim_end_matches('/')
+            .strip_suffix("/v1")
+            .unwrap_or(&url)
+            .to_string()
+    };
 
     // Seed with an empty object, not null: /api/versions and `brainrouter cli
     // versions` read this before the first compute completes (up to ~15 s).
@@ -789,7 +839,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         decision_config: config.decision_model.clone(),
         llama_swap_config_lock: Arc::new(tokio::sync::Mutex::new(())),
         tcp_addr: tcp_addr.to_string(),
-        manifest_enabled: config.manifest.enabled,
+        providers: Arc::clone(&providers),
+        budget: Arc::clone(&provider_budget),
         routing_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(routing_mode)),
         versions_cache: Arc::new(versions_rx),
         nudge_enabled,
@@ -813,6 +864,28 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     });
 
     brainrouter::observability::start(&state);
+
+    // v2 L6: LAN federation listener (second bound socket; the primary
+    // loopback surface is untouched). Default off = v1 attack surface.
+    if config.lan.enabled {
+        let listener = brainrouter::lan::bind(&config.lan).await?;
+        let lan_addr = listener.addr;
+        // Named accepted risk (design Q3 + Map Security): bearer over
+        // plaintext HTTP on a trusted LAN; peer-info enumerates exposed
+        // models to any token holder.
+        warn!(
+            %lan_addr,
+            expose = ?config.lan.expose,
+            "LAN listener enabled: bearer-authenticated plaintext HTTP on the LAN \
+             (trusted-LAN assumption; peer-info enumerates exposed models to token holders)"
+        );
+        let app = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(error) = brainrouter::lan::serve(listener, app).await {
+                tracing::error!(%error, "LAN listener ended");
+            }
+        });
+    }
 
     // v2 L2: wire the plugin subsystem to the live state, bind per-plugin
     // UDS sockets, and spawn the enabled plugins (supervisor).
