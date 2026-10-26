@@ -308,22 +308,36 @@ no budget gate. Shim-mode routing stays byte-identical.
   `Stopped|Loading|Ready|Draining|Failed`; `ensure` = Residency → queue →
   budget admission → LRU evict-to-fit → spawn; in-memory queue with cap +
   cancel; pins counted once as `max(vram_estimate, reserved_gib)`; append-only
-  `budget.json` ledger; in-flight-aware LRU keyed on last **stream
-  completion**; child-held per-GGUF `flock` (inherited fd, CLOEXEC cleared);
+  `budget.json` ledger (rotated at write, newest 5000 rows; one aggregate
+  evict row per LRU pass); in-flight-aware LRU keyed on last **stream
+  completion**, with pins/active streams re-checked under the model's spawn
+  lock immediately before signalling; child-held per-GGUF `flock` (inherited fd, CLOEXEC cleared);
   adoption markers (`adoption/<model>.json` with pid/start_time/spec_hash)
-  written before spawn and scanned at boot — live+match ⇒ adopt, mismatch ⇒
-  adopt + `spec_stale` (never killed), dead ⇒ clean; bounded restart.
+  written before spawn and scanned at boot — live pid + recorded start_time +
+  the GGUF as a FULL argv element ⇒ adopt, spec mismatch ⇒ adopt +
+  `spec_stale` (never killed), dead ⇒ clean, unprovable identity ⇒ refuse
+  (marker kept), missing catalog entry ⇒ adopt as an unnamed resident
+  (`catalog_missing` warning, never killed). A failed stop keeps the marker
+  and restores the live row. Managed ports are reserved per spawn; bounded
+  restart resets its budget on Ready.
   `FakeAdapter` is the scripted acceptance substrate (load ms, stem set,
   crash, progress) with a real child process.
 - **Native llama.cpp adapter** (`src/engine_native.rs`): spawns through
   `systemd-run --user --scope --quiet --collect -p KillMode=control-group`
   (cgroup escape — adoption needs the child outside the daemon's cgroup),
   plain `setsid` fallback where systemd is absent (documented best-effort
-  adoption); SIGTERM → grace → KILL plus scope stop; `/health` + `/v1/models`
-  status; load progress indeterminate + elapsed (EWMA ETA from the registry).
+  adoption). The tracked pid is the ENGINE: the resolver walks the transient
+  scope's `cgroup.procs`, an exec'd `systemd-run` wrapper, or
+  `/proc/<pid>/task/*/children`, and refuses the spawn if it cannot prove
+  which process is the engine. Daemon shutdown never kills engines (adapter
+  `Drop` is inert); `stop` is group TERM (`systemctl --user stop --no-block
+  <scope>.scope`) then SIGTERM → grace → SIGKILL on the engine pid, erroring
+  if it survives. `/health` + `/v1/models` status; load progress
+  indeterminate + elapsed (EWMA ETA from the registry).
 - **Shared llama-server shaping**: `sanitize_for_llama_family` (developer→
   system, single system block, assistant content fix) is applied to the shim
-  and native paths identically; a golden-body test pins byte equality.
+  and native paths identically (both call the same function; its merge tests
+  remain).
 - **Engines tab + API**: `GET /api/engines` (models/queue/budget/adoption),
   `/api/engines/{ensure,evict,pin,unpin,import/preview,import/apply,logs,
   catalog/add,catalog/rm}`, `GET /api/platform`; loopback+CSRF gated
@@ -340,8 +354,12 @@ no budget gate. Shim-mode routing stays byte-identical.
   `--dry-run` previews and `migration restore v2.0-p4` round-trips the
   pre-migration catalog + budget ledger.
 - **Events + in-flight (additive)**: `RouteEvent.swap_state` /
-  `swap_source`; in-flight rows gain `catalog_id` (stamped at route time)
-  and a clean-stream-completion hook that writes the LRU clock.
+  `swap_source` (true residency source: `shim`/`native`/`container`/
+  `external`); in-flight rows gain `catalog_id` (stamped at route time) and a
+  clean-stream-completion hook that writes the LRU clock. Routing runs under
+  the request's in-flight row, so a routed queue/load wait is cancellable
+  from `DELETE /api/engines/queue/<id>`; a direct `ensure` owns its request
+  and completes.
 
 ### Revert
 

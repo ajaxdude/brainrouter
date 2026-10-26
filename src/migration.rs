@@ -644,8 +644,16 @@ pub fn run_v2_p6(
     // atomic) with the migrated record, preserving any existing providers.
     // A disabled v1 block without a URL has nothing to preserve as an
     // endpoint: strip the YAML but record no provider.
+    // L6-4: a `.done` marker under the snapshot root records that this
+    // migration completed once. If the marker exists, the `manifest:` block
+    // can only be here because the operator RE-ADDED it after the
+    // migration: their provider record is authoritative — never clobber
+    // the existing `manifest` entry (its models/budget edits survive).
+    let marker = root.join(".done");
+    let rerun = marker.exists();
     let store = crate::providers::ProviderStore::load(providers_path.to_path_buf())?;
-    let recorded = if manifest.base_url.is_empty() {
+    let preserved = rerun && store.get("manifest").is_some();
+    let recorded = if manifest.base_url.is_empty() || preserved {
         false
     } else {
         store.upsert(record)?;
@@ -663,11 +671,17 @@ pub fn run_v2_p6(
     let out = remove_manifest_block(&source);
     crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
         .context("writing migrated config YAML")?;
+    // Completion marker: a later boot that finds `manifest:` again sees a
+    // re-added block, not a first migration (see the record-preservation
+    // guard above). Written only after every other write succeeded.
+    std::fs::write(&marker, "v2.0-p6\n").with_context(|| format!("writing {}", marker.display()))?;
 
     Ok(vec![format!(
-        "migrated manifest.* into provider 'manifest' ({}, auto: true, models: [],          credential {}); key block removed from {} (backup: {}.bak); monthly budget ledger at          {}; pre-migration snapshot: {}",
-        if recorded {
-            "kind manifest"
+        "migrated manifest.* ({}, auto: true, models: [],          credential {}); key block removed from {} (backup: {}.bak); monthly budget ledger at          {}; pre-migration snapshot: {}",
+        if preserved {
+            "re-added after migration: existing provider 'manifest' record preserved"
+        } else if recorded {
+            "provider 'manifest' recorded"
         } else {
             "no URL in the disabled v1 block; no record created"
         },
@@ -700,7 +714,7 @@ pub fn restore_v2_p6(
     }
     let bytes = std::fs::read(&snapshot_config)
         .with_context(|| format!("reading {}", snapshot_config.display()))?;
-    std::fs::write(config_path, &bytes)
+    crate::plugins::store::atomic_write_0600(config_path, &bytes)
         .with_context(|| format!("restoring config to {}", config_path.display()))?;
     let mut restored = vec!["config YAML (v1 manifest.* block)".to_string()];
     for (name, target, label) in [
@@ -717,7 +731,9 @@ pub fn restore_v2_p6(
     ] {
         let snapshot = root.join(name);
         if snapshot.exists() {
-            std::fs::copy(&snapshot, target)
+            let bytes = std::fs::read(&snapshot)
+                .with_context(|| format!("reading {}", snapshot.display()))?;
+            crate::plugins::store::atomic_write_0600(target, &bytes)
                 .with_context(|| format!("restoring {label} to {}", target.display()))?;
             restored.push(label.to_string());
         } else if target.exists() {
@@ -726,6 +742,11 @@ pub fn restore_v2_p6(
             restored.push(format!("{label} (removed: absent before the migration)"));
         }
     }
+    // The restore returns the config to its pre-migration shape, so the
+    // completion marker goes with it: a re-run of the first migration must
+    // snapshot and record afresh.
+    let _ = std::fs::remove_file(root.join(".done"));
+
     Ok(format!(
         "restored {PHASE_V2_P6} from {} ({})",
         root.display(),
@@ -1005,7 +1026,7 @@ pub fn restore_v2_p7(state_root: &Path, config_path: &Path) -> Result<String> {
     }
     let bytes = std::fs::read(&snapshot_config)
         .with_context(|| format!("reading {}", snapshot_config.display()))?;
-    std::fs::write(config_path, &bytes)
+    crate::plugins::store::atomic_write_0600(config_path, &bytes)
         .with_context(|| format!("restoring config to {}", config_path.display()))?;
     Ok(format!(
         "restored {PHASE_V2_P7} from {} (config YAML: llama_swap: section + base_url)",
@@ -1953,6 +1974,43 @@ models:
             read_swap_mode(&config).unwrap(),
             Some(crate::config::SwapMode::Native)
         );
+    }
+
+    /// L6-4: after p6 ran once, a RE-ADDED `manifest:` block must not
+    /// clobber the operator's edited `manifest` provider record, and the
+    /// restore must remove the completion marker.
+    #[test]
+    fn p6_readded_manifest_preserves_the_operator_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let config = dir.path().join("config.yaml");
+        let providers = dir.path().join("providers.json");
+        let budget = dir.path().join("budget.json");
+        let v1 = "manifest:\n  base_url: http://127.0.0.1:3001/v1\n  enabled: true\n";
+        std::fs::write(&config, v1).unwrap();
+
+        run_v2_p6(&config, &state, &providers, &budget).unwrap();
+        assert!(snapshot_root(&state, PHASE_V2_P6).join(".done").exists(), "marker written");
+
+        // The operator edits the migrated record (models + budget).
+        let mut text = std::fs::read_to_string(&providers).unwrap();
+        text = text.replace(
+            "\"models\": []",
+            "\"models\": [{\"id\": \"opus-4.5\"}]",
+        );
+        std::fs::write(&providers, text).unwrap();
+
+        // The operator re-adds the manifest block; boot re-runs p6.
+        std::fs::write(&config, v1).unwrap();
+        run_v2_p6(&config, &state, &providers, &budget).unwrap();
+        let kept = std::fs::read_to_string(&providers).unwrap();
+        assert!(kept.contains("opus-4.5"), "operator record survives the re-add: {kept}");
+        assert!(!std::fs::read_to_string(&config).unwrap().contains("manifest:"), "block stripped again");
+
+        // Restore: pre-migration YAML back, marker gone.
+        restore_v2_p6(&state, &config, &providers, &budget).unwrap();
+        assert!(std::fs::read_to_string(&config).unwrap().contains("manifest:"), "v1 back");
+        assert!(!snapshot_root(&state, PHASE_V2_P6).join(".done").exists(), "marker removed");
     }
 
     #[test]

@@ -252,15 +252,24 @@ Operational notes:
 
 - Native spawns go through a transient systemd user scope
   (`systemd-run --user --scope`) so engines survive daemon restarts and can
-  be adopted. Without systemd the daemon falls back to `setsid`; adoption is
-  best-effort and the Engines tab says so. Do not run the daemon with
+  be adopted. The daemon tracks the ENGINE pid (resolved from the scope's
+  `cgroup.procs`), never the `systemd-run` wrapper, and daemon shutdown never
+  kills engines. Without systemd the daemon falls back to `setsid`; adoption
+  is best-effort and the Engines tab says so. Do not run the daemon with
   `KillMode=control-group` expecting native children to die with it — that
   is the point of the scope.
+- Cancelling a queue row aborts a ROUTED request's wait (the harness request
+  carrying an in-flight row). A direct `POST /api/engines/ensure` caller owns
+  its request: dropping the client connection is its cancel, and the queue
+  row is informational.
 - A running engine is never killed by an upgrade. If the resolved launch spec
   changed, it is adopted and badged `spec_stale`; `swap ensure <model>`
   converges it explicitly.
 - The swap queue is in-memory and resets on daemon restart (clients retry;
   adopted loads keep serving).
+- `budget.json` is append-only but bounded: it rotates at write, keeping the
+  newest 5000 rows. An LRU pass records one aggregate row (a single victim
+  keeps its model id).
 - `BRAINROUTER_BUDGET_GIB` overrides the probe-reported budget (GiB);
   `BRAINROUTER_SWAP_QUEUE_CAP`, `BRAINROUTER_SWAP_WAIT_MS`,
   `BRAINROUTER_SWAP_STOP_GRACE_MS`, and `BRAINROUTER_SWAP_NO_SYSTEMD=1` are

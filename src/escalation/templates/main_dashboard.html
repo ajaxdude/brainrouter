@@ -4605,6 +4605,22 @@ async function loadEngines() {
       consumers.innerHTML = rows || '<span style="color:var(--textMute)">none (evictions are never blocked)</span>';
     }
     if (engines.shim_error) enginesSetMessage('shim: ' + engines.shim_error, 'var(--amber)');
+    const adoption = engines.adoption || {};
+    const missing = adoption.catalog_missing || [];
+    if (missing.length) {
+      const list = document.getElementById('engines-list');
+      if (list) {
+        list.insertAdjacentHTML(
+          'afterbegin',
+          '<div style="background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:8px;padding:8px 12px;font-size:12px">' +
+            'Unnamed native resident(s) ' + missing.map(escHtml).join(', ') +
+            ' — serving without a catalog entry; never killed, but no spec comparison is possible.</div>'
+        );
+      }
+    }
+    if ((adoption.warnings || []).length) {
+      enginesSetMessage(adoption.warnings.join(' · '), 'var(--amber)');
+    }
   } catch (e) {
     const list = document.getElementById('engines-list');
     if (list) list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Failed to load engine state.</div>';

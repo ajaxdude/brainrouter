@@ -2458,8 +2458,14 @@ async fn handle_chat_completion(
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
+        let cancel_row = Arc::clone(&handle);
         let result = tokio::select! {
-            result = state.router.route_tagged_role(request, session_id, cwd, user_agent, &role) => result,
+            // v2 L4: the in-flight row travels into `ensure_with_cancel`, so
+            // a routed queue/load wait aborts when the row is cancelled.
+            result = crate::router::with_request_cancel(
+                Some(cancel_row),
+                state.router.route_tagged_role(request, session_id, cwd, user_agent, &role),
+            ) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {
@@ -2613,8 +2619,12 @@ pub(crate) async fn anthropic_messages_from_bytes(
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
+        let cancel_row = Arc::clone(&handle);
         let result = tokio::select! {
-            result = state.router.route_tagged_role(oai_request, session_id, cwd, user_agent, &role) => result,
+            result = crate::router::with_request_cancel(
+                Some(cancel_row),
+                state.router.route_tagged_role(oai_request, session_id, cwd, user_agent, &role),
+            ) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {

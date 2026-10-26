@@ -380,18 +380,40 @@ struct TestEnv {
     runtime: PathBuf,
     owned: bool,
 }
-
-/// Where a test's isolated HOME/XDG tree lives.
-///
-/// `/tmp` is a tmpfs on this box, so anything written there is RAM. The daemon under
-/// test can materialize a rootless-podman store inside `$XDG_DATA_HOME` (one pulled
-/// toolbox image is ~1.9 GiB), and a leaked test root is therefore 1.9 GiB of RAM per
-/// run — enough to OOM-kill the model server next to the tests. Keep it on disk: Cargo
-/// hands integration tests the path `target/tmp/<binary>` via `CARGO_TARGET_TMPDIR`.
-fn test_root() -> PathBuf {
-    match option_env!("CARGO_TARGET_TMPDIR") {
+/// Where a test's isolated HOME/XDG tree lives: on DISK (not tmpfs — a
+/// leaked rootless-podman store is ~1.9 GiB of RAM per run), but reached
+/// through a SHORT path. The readable fixture name (`brainrouter-l6-{tag}-…`,
+/// up to ~90 bytes) plus `/d.sock` overruns the `SUN_LEN` cap once the base
+/// is deeper than `/tmp` — and `CARGO_TARGET_TMPDIR` is far deeper. So the
+/// readable name is hashed into a short deterministic leaf on disk, exposed
+/// through a per-boot `/tmp` symlink: every UDS/config path the daemon binds
+/// stays short while the payload bytes stay on disk.
+fn test_root(tag: &str) -> PathBuf {
+    let readable = format!("brainrouter-l6-{tag}-{}", unique_suffix());
+    // FNV-1a 64 over the unique readable name.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in readable.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let leaf = format!("{hash:016x}");
+    let base = match option_env!("CARGO_TARGET_TMPDIR") {
         Some(dir) => PathBuf::from(dir),
         None => std::env::temp_dir(),
+    };
+    let real = base.join(&leaf);
+    fs::create_dir_all(&real).unwrap();
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let link = std::env::temp_dir().join(format!(
+        "br{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    match std::os::unix::fs::symlink(&real, &link) {
+        // The caller treats the returned path as the root directly (it does
+        // NOT append a fixture name), so the symlink path is the short root.
+        Ok(()) => link,
+        Err(_) => real,
     }
 }
 
@@ -402,24 +424,31 @@ fn test_root() -> PathBuf {
 /// `remove_dir_all` fails with EACCES and silently leaks the whole root. Retry inside
 /// that namespace (`podman unshare`), where those files are removable.
 fn remove_test_root(root: &Path) {
-    if !root.exists() {
+    // The helper may hand out a `/tmp` symlink: remove the REAL tree on
+    // disk first, then the link itself.
+    let target = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !target.exists() {
+        let _ = fs::remove_file(root);
         return;
     }
-    if fs::remove_dir_all(root).is_ok() {
-        return;
+    let removed = fs::remove_dir_all(&target).is_ok();
+    if !removed {
+        let _ = Command::new("podman")
+            .arg("unshare")
+            .args(["rm", "-rf"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let _ = Command::new("podman")
-        .arg("unshare")
-        .args(["rm", "-rf"])
-        .arg(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if root.is_symlink() {
+        let _ = fs::remove_file(root);
+    }
 }
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
-        let root = test_root().join(format!("brainrouter-l6-{tag}-{}", unique_suffix()));
+        let root = test_root(tag);
         let env = Self {
             home: root.join("home"),
             config_home: root.join("config"),

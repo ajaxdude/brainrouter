@@ -60,45 +60,56 @@ worktree carried the parent's stable-snapshot migration shape).
    completion hook (LRU clock written on clean EOF), loading/queued rows
    stamped at route time; `RouteEvent.swap_state`/`swap_source`.
 
-## Evidence (final battery)
+## Evidence (final battery, after the fix round)
 
-- `cargo test` (default features, all targets) — **exit 0**: lib 438,
+- `cargo test` (default features, all targets) — **exit 0**: lib 444,
   main 6, anthropic 12, daemon_availability 4, failover 3, install 10,
   review 9, routing_profiles 18, stream 4, subs_routing 10, v2_l1 6,
-  v2_l2 14, v2_l2_fixpass 3, v2_l3 21, v2_l3_plugin_decision 7.
-- `cargo test --features benchmarks` — **exit 0** (lib 455 + same suites).
+  v2_l2 14, v2_l2_fixpass 3, v2_l3 21, v2_l3_plugin_decision 7,
+  v2_l4_acceptance 17.
+- `cargo test --features benchmarks` — lib 461 green; Ray's L4 suite serial
+  (`--test-threads=1`) 17/17 and the same suites green. Parallel benchmarks
+  runs intermittently lose a test's daemon (`GET /api/engines: error sending
+  request`, a different test each run): Ray's harness picks a free port by
+  bind-then-drop and, under benchmarks-mode load, two daemons can be handed
+  the same port, so `ready()` may succeed against the neighbour and the real
+  process exits on bind. Default parallel and benchmarks serial are green;
+  the harness is untouched.
 - `cargo clippy --all-targets` and `--features benchmarks` — **exit 0**;
-  zero warnings in the new modules (the remaining 57 warnings are baseline,
-  chiefly `plugins::Inner` visibility; pre-existing `private_interfaces`).
-- `plugins/bridge` crate — 26/26.
-- Node UI suites (nav 7/7, roles/credentials 7/7, benchmark 38,
-  gufo 6, hf-preflight 5, llama-swap-register 3) — green; `check-html-js.sh`
-  green across 4 templates.
-- Live llama-swap config import (owner's real
-  `~/.config/llama-swap/config.yaml`): `swap import --dry-run` imports 12
-  models / 2 groups; the macro chain is fully expanded (zero `${ls}` /
-  `${common}` left), per-model macro shadowing wins (`ctx=196608` from the
-  model's `ctx` override), 57 resolved args on the q8-vision entry, group
-  metadata `dirk-dual` (swap=false, exclusive=false) / `non-dual`
-  (swap=true, exclusive=true); two dry-runs are byte-identical.
-- Isolated live smoke (`HOME`/`XDG_*` temp, port 19100/19101): p4 boot
-  import wrote `swap_catalog.json` + `migrations/v2.0-p4` and recorded the
-  `pair` group; `platform` resolved `strix-halo`, known, 124 GiB budget,
-  offers strixite/gufo/llama.cpp (hipfire reason: APU); `ensure` (fake
-  adapter) spawned at :5900 → second ensure attached (`spawned:false`);
-  pin 6 GiB counted ONCE (used 6.0, not estimate+pin); evict stopped it;
-  dashboard `CURRENT_PLATFORM_ID` rendered `strix-halo`; Engines tab
-  rendered platform/offers/lifecycle/queue/budget/pins with working
-  action buttons (browser-verified, no page errors); CLI
-  `swap status|catalog list|pin|import --dry-run` work, daemon-down
-  mutation exits 1, direct status falls back to state files; explicit
-  import path outside `$HOME`/state refused.
-- Flake notes: (1) the old `start_spawn` pre-check acquired the flock and
-  then the adapter acquired it again — removed; (2) the pre-existing
-  `stale_uds_is_removed_before_binding` unit test raced a concurrent
-  fork's inherited (pre-exec) listener fd under the full parallel suite —
-  the test now waits for the kernel to report the socket dead before
-  calling `prepare_uds_path`. Six consecutive full-lib runs green.
+  zero warnings in the L4 modules (59 baseline warnings remain).
+- `plugins/bridge` 26/26; Node UI suites green; `check-html-js.sh` green.
+
+## Host-tier adoption evidence (this box: systemd 258 user scope, Linger=yes)
+
+(Final binary, run twice, including after the wrapper-pid fix.)
+
+- `ensure native-smoke` (stub engine, catalog `engine=llama_cpp`, program
+  `/tmp/l4host2/engine.py`) → `spawned:true` at `:5900`; the marker pid is a
+  member of the transient scope's `cgroup.procs` and its cmdline is
+  `python3 …/engine.py --model …/native.gguf --port 5900`.
+- `flock -n native.gguf` fails while serving; graceful `SIGTERM` of the daemon
+  → daemon exits, engine alive, marker intact, flock held. (SIGKILL run
+  earlier: same.)
+- Boot 2: `adoption.adopted=["native-smoke"]`, `source=native`,
+  `spec_stale=false`; `ensure` → `spawned:false`, same endpoint (no second
+  process).
+- `evict` → engine gone, marker removed, scope gone, `flock -n` succeeds.
+
+### Host-tier adoption evidence (this box: systemd 258 user scope, Linger=yes)
+
+- `ensure native-smoke` (stub engine, catalog `engine=llama_cpp`, program
+  `/tmp/l4host/engine.py`) → `spawned:true` at `:5900`; marker pid `35514`
+  appears in the scope's `cgroup.procs` and its cmdline is
+  `python3 …/engine.py --model …/native.gguf --port 5900` (exec-mode wrapper;
+  the resolver accepts both modes).
+- `flock -n native.gguf` fails while serving; `SIGKILL` the daemon → engine
+  alive, marker intact, flock still held.
+- Boot 2: `adoption.adopted=["native-smoke"]`, `source=native`,
+  `spec_stale=false`; `ensure` → `spawned:false`, same endpoint (no second
+  process).
+- `evict` → engine gone, marker removed, scope gone, `flock -n` succeeds.
+- Graceful `SIGTERM` shutdown: daemon exits, engine alive, marker intact,
+  flock held.
 
 ## Conflicts / risks
 

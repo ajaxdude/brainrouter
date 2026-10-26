@@ -82,6 +82,113 @@ pub fn build_command_line(
     }
 }
 
+/// Resolve the scope's ENGINE pid. `systemd-run --scope` has two behaviors
+/// across systemd versions: it may `exec` the command (the pid we spawned IS
+/// the engine), or fork and wait (the spawned pid is a `systemd-run` wrapper
+/// and the engine is its child). Track either correctly — killing/health-
+/// checking a transient wrapper would leave the engine and its GGUF flock
+/// behind. Resolution order:
+///   1. the scope's cgroup (`cgroup.procs`), skipping the wrapper;
+///   2. an exec'd wrapper (its argv is no longer `systemd-run`);
+///   3. `/proc/<wrapper>/children`.
+pub fn resolve_scope_engine_pid(
+    scope: &str,
+    wrapper_pid: u32,
+    timeout: Duration,
+) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(pids) = scope_pids(scope) {
+            if let Some(engine) = pids
+                .iter()
+                .copied()
+                .find(|pid| *pid != wrapper_pid && pid_alive(*pid))
+            {
+                return Some(engine);
+            }
+            if pids.contains(&wrapper_pid) && wrapper_is_exec(wrapper_pid) {
+                return Some(wrapper_pid);
+            }
+        }
+        // A scope that has already exec'd: the spawned pid is the engine.
+        if wrapper_is_exec(wrapper_pid) {
+            return Some(wrapper_pid);
+        }
+        if let Some(pid) = proc_children(wrapper_pid).into_iter().next() {
+            return Some(pid);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The unit name systemd actually created (`systemd-run --unit foo` creates
+/// `foo.scope`; `systemctl` without the suffix looks for a service).
+pub fn scope_unit_name(scope: &str) -> String {
+    if scope.ends_with(".scope") || scope.ends_with(".service") {
+        scope.to_string()
+    } else {
+        format!("{scope}.scope")
+    }
+}
+
+fn wrapper_is_exec(pid: u32) -> bool {
+    let args = crate::swap_scheduler::process_args(pid);
+    match args.first() {
+        Some(first) => !first
+            .rsplit('/')
+            .next()
+            .unwrap_or(first)
+            .starts_with("systemd-run"),
+        None => false,
+    }
+}
+
+/// PIDs in the transient scope's cgroup (cgroup v2 path under /sys/fs/cgroup).
+fn scope_pids(scope: &str) -> Option<Vec<u32>> {
+    let unit = scope_unit_name(scope);
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "ControlGroup", "--value", &unit])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let group = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if group.is_empty() {
+        return None;
+    }
+    let path = if group.starts_with('/') {
+        format!("/sys/fs/cgroup{group}")
+    } else {
+        format!("/sys/fs/cgroup/{group}")
+    };
+    let text = std::fs::read_to_string(format!("{path}/cgroup.procs")).ok()?;
+    Some(
+        text.split_whitespace()
+            .filter_map(|p| p.parse::<u32>().ok())
+            .collect(),
+    )
+}
+
+fn proc_children(pid: u32) -> Vec<u32> {
+    // A multi-threaded parent forks from any thread: scan every task, not
+    // just the thread-group leader (the daemon spawns from tokio workers).
+    let mut children = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            children.extend(
+                text.split_whitespace().filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    children
+}
+
 pub struct NativeLlamaCppAdapter {
     /// Path to the llama-server binary when the catalog entry leaves
     /// `launch_spec.program` empty (config/env default).
@@ -133,17 +240,14 @@ impl NativeLlamaCppAdapter {
 
 impl Drop for NativeLlamaCppAdapter {
     fn drop(&mut self) {
-        let children: Vec<std::process::Child> = self
+        // Deliberately NO kill: a daemon shutdown/upgrade must leave the
+        // engine serving (that is what adoption relies on). The wrapper is
+        // reaped by init; the engine lives in its own scope or session.
+        let _ = self
             .children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .drain()
-            .map(|(_, child)| child)
-            .collect();
-        for mut child in children {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+            .drain();
     }
 }
 
@@ -229,7 +333,35 @@ impl EngineAdapter for NativeLlamaCppAdapter {
         let child = cmd
             .spawn()
             .with_context(|| format!("spawning `{command}` for {}", effective.model_id))?;
-        let pid = child.id();
+        let wrapper_pid = child.id();
+        // The tracked pid is the ENGINE, never the systemd-run wrapper.
+        let pid = if use_scope {
+            match effective.scope_name.as_deref().and_then(|scope| {
+                resolve_scope_engine_pid(scope, wrapper_pid, Duration::from_secs(3))
+            }) {
+                Some(pid) => pid,
+                None => {
+                    if let Some(scope) = &effective.scope_name {
+                        let unit = scope_unit_name(scope);
+                        let _ = std::process::Command::new("systemctl")
+                            .args(["--user", "stop", &unit])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "systemd scope `{}` started but its MainPID could not be resolved; refusing to track the wrapper pid (adoption/stop would target the wrong process)",
+                        effective.scope_name.as_deref().unwrap_or("<unnamed>")
+                    );
+                }
+            }
+        } else {
+            wrapper_pid
+        };
         self.children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -245,34 +377,58 @@ impl EngineAdapter for NativeLlamaCppAdapter {
     }
 
     fn stop(&self, handle: &EngineHandle) -> Result<()> {
-        // Stop the scope first (kills every process in it), then the leader.
+        // Preferred: group TERM through the scope (KillMode=control-group).
+        // `--no-block` keeps the call bounded; we then apply the spec's
+        // SIGTERM → grace → SIGKILL to the ENGINE pid and reap the wrapper.
         if let Some(scope) = &handle.scope_name {
+            let unit = scope_unit_name(scope);
             let _ = std::process::Command::new("systemctl")
-                .args(["--user", "stop", scope])
+                .args(["--user", "stop", "--no-block", &unit])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        let child = self
+        terminate(handle.pid, Duration::from_secs(10));
+        if pid_alive(handle.pid) {
+            anyhow::bail!("engine pid {} survived SIGTERM+grace+SIGKILL", handle.pid);
+        }
+        // Reap our wrapper (scope: systemd-run; setsid: the engine itself).
+        if let Some(mut child) = self
             .children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle.endpoint);
-        if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
-        } else {
-            terminate(handle.pid, Duration::from_secs(10));
+            .remove(&handle.endpoint)
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    _ if std::time::Instant::now() > deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
         }
         Ok(())
     }
 
     fn health(&self, endpoint: &str, handle: &EngineHandle) -> Result<HealthReport> {
-        if let Some(_status) = self.reaped(endpoint) {
-            anyhow::bail!("engine pid {} exited", handle.pid);
-        }
-        let alive = unsafe { libc::kill(handle.pid as i32, 0) == 0 };
+        // A reaped own-child is authoritative (setsid fallback: pid == child).
+        // In scope mode the tracked pid is the ENGINE, so probe it directly;
+        // the wrapper's exit alone does not prove the engine is gone.
+        let owned_reaped = self.reaped(endpoint).is_some()
+            && self
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(endpoint)
+                .map(|child| child.id() == handle.pid)
+                .unwrap_or(false);
+        let alive = !owned_reaped && unsafe { libc::kill(handle.pid as i32, 0) == 0 };
         let Some((status, body)) = http_get(endpoint, "/health", Duration::from_millis(800)) else {
             if alive {
                 // Boot window: the process is up but not accepting yet.
@@ -312,6 +468,10 @@ impl EngineAdapter for NativeLlamaCppAdapter {
             eta_ms: None,
         }
     }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 fn terminate(pid: u32, grace: Duration) {
@@ -426,6 +586,33 @@ mod tests {
         request.spec.args = vec!["--model".into(), "/models/m.gguf".into()];
         let args = request.resolved_args();
         assert_eq!(&args[args.len() - 2..], &["--port".to_string(), "5911".to_string()]);
+    }
+
+    #[test]
+    fn scope_unit_name_has_the_scope_suffix() {
+        assert_eq!(scope_unit_name("brainrouter-swap-m-abc"), "brainrouter-swap-m-abc.scope");
+        assert_eq!(scope_unit_name("x.scope"), "x.scope");
+        assert_eq!(scope_unit_name("x.service"), "x.service");
+    }
+
+    #[test]
+    fn proc_children_lists_a_spawned_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut found = false;
+        for _ in 0..100 {
+            if proc_children(std::process::id()).contains(&child.id()) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found, "the child pid must appear in /proc/<self>/children");
     }
 
     #[test]

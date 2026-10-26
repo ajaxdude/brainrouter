@@ -40,6 +40,9 @@ use crate::swap_catalog::{CatalogEntry, LaunchSpec, SwapCatalog};
 
 /// Budget ledger state file (under `$XDG_STATE_HOME/brainrouter`).
 pub const BUDGET_FILE: &str = "budget.json";
+/// Append-only, but bounded: the newest N entries survive a rotation at write
+/// (5000 rows ≈ months of admissions/spawns at this box's rate).
+pub const LEDGER_MAX_ENTRIES: usize = 5000;
 /// Adoption markers directory (under the state root).
 pub const ADOPTION_DIR: &str = "adoption";
 /// JSON-RPC-style busy code reused from the plugin convention (Hank ruling
@@ -68,6 +71,9 @@ pub enum SwapError {
     UnknownModel(String),
     NoFit(String),
     QueueFull { model: String, cap: usize },
+    /// Refused a stop because the model is protected (active stream or a
+    /// sized pin) or another actor currently owns its spawn lock.
+    Busy(String),
     SpawnFailed(String),
     Timeout { model: String, waited_ms: u64 },
     Cancelled(String),
@@ -98,6 +104,7 @@ impl SwapError {
         match self {
             Self::UnknownModel(_) => 404,
             Self::NoFit(_) | Self::QueueFull { .. } | Self::SpawnFailed(_) => 503,
+            Self::Busy(_) => 409,
             Self::Timeout { .. } => 504,
             Self::Cancelled(_) => 499,
             Self::BlockedActiveConsumer { .. }
@@ -126,8 +133,9 @@ impl std::fmt::Display for SwapError {
             Self::NoFit(message) => write!(f, "no-fit ({BUSY_CODE} busy): {message}"),
             Self::QueueFull { model, cap } => write!(
                 f,
-                "{BUSY_CODE} busy: the swap queue for `{model}` is full (cap {cap})"
+                "{BUSY_CODE} busy: the swap queue is full (cap {cap}, global) — `{model}` refused"
             ),
+            Self::Busy(reason) => write!(f, "refused: {reason}"),
             Self::SpawnFailed(message) => write!(f, "spawn failed: {message}"),
             Self::Timeout { model, waited_ms } => {
                 write!(f, "timed out waiting for `{model}` after {waited_ms} ms")
@@ -372,6 +380,20 @@ fn process_start_time(pid: u32) -> Option<u64> {
     fields.nth(19)?.parse::<u64>().ok()
 }
 
+/// The argv as NUL-separated on the wire — adoption matches a FULL argument
+/// (never a substring: `/models/a.gguf` must not match `/models/a.gguf.bak`).
+pub(crate) fn process_args(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|b| *b == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn process_cmdline(pid: u32) -> String {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|bytes| {
@@ -433,6 +455,7 @@ impl FakeScript {
 
 struct FakeProc {
     child: std::process::Child,
+    endpoint: String,
     model: String,
     spawned_ms: u64,
     script: FakeScript,
@@ -443,8 +466,13 @@ struct FakeProc {
 /// same as a native engine. Health, stems, load duration, progress, and crashes
 /// are scripted.
 pub struct FakeAdapter {
-    inner: Mutex<BTreeMap<String, FakeProc>>,
+    /// Keyed by PID: fake engines do not bind their endpoint, so two models
+    /// can be handed the same probe-free port; the pid is the identity.
+    inner: Mutex<BTreeMap<u32, FakeProc>>,
     spawns: AtomicU64,
+    /// Test knob: make `stop` fail (verifies marker retention + state
+    /// restoration on a failed stop).
+    fail_stop: AtomicBool,
 }
 
 impl Default for FakeAdapter {
@@ -452,6 +480,7 @@ impl Default for FakeAdapter {
         Self {
             inner: Mutex::new(BTreeMap::new()),
             spawns: AtomicU64::new(0),
+            fail_stop: AtomicBool::new(false),
         }
     }
 }
@@ -459,6 +488,11 @@ impl Default for FakeAdapter {
 impl FakeAdapter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test knob: `stop` returns an error (child stays alive).
+    pub fn set_fail_stop(&self, fail: bool) {
+        self.fail_stop.store(fail, Ordering::SeqCst);
     }
 
     /// Number of child processes actually spawned (concurrency assertions).
@@ -471,7 +505,8 @@ impl FakeAdapter {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(endpoint)
+            .values()
+            .find(|p| p.endpoint == endpoint)
             .map(|p| p.script.clone())
     }
 }
@@ -540,9 +575,10 @@ impl EngineAdapter for FakeAdapter {
         self.spawns.fetch_add(1, Ordering::SeqCst);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.insert(
-            request.endpoint.clone(),
+            pid,
             FakeProc {
                 child,
+                endpoint: request.endpoint.clone(),
                 model: request.model_id.clone(),
                 spawned_ms: now_ms(),
                 script: script.clone(),
@@ -567,11 +603,14 @@ impl EngineAdapter for FakeAdapter {
     }
 
     fn stop(&self, handle: &EngineHandle) -> Result<()> {
+        if self.fail_stop.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated stop failure for pid {}", handle.pid);
+        }
         let child = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle.endpoint)
+            .remove(&handle.pid)
             .map(|p| p.child);
         if let Some(mut child) = child {
             let _ = child.kill();
@@ -579,19 +618,26 @@ impl EngineAdapter for FakeAdapter {
         } else {
             terminate_pid(handle.pid, Duration::from_millis(500));
         }
+        if pid_alive(handle.pid) {
+            let cmd = process_cmdline(handle.pid);
+            anyhow::bail!(
+                "fake engine pid {} is still alive after stop (cmdline={cmd:?})",
+                handle.pid
+            );
+        }
         Ok(())
     }
 
-    fn health(&self, endpoint: &str, _handle: &EngineHandle) -> Result<HealthReport> {
+    fn health(&self, endpoint: &str, handle: &EngineHandle) -> Result<HealthReport> {
         let proc = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.get_mut(endpoint).map(|p| {
+            inner.get_mut(&handle.pid).map(|p| {
                 let exited = matches!(p.child.try_wait(), Ok(Some(_)));
                 (exited, p.child.id(), p.model.clone(), p.spawned_ms, p.script.clone())
             })
         };
         let Some((exited, pid, model, spawned_ms, script)) = proc else {
-            anyhow::bail!("unknown fake endpoint {endpoint}")
+            anyhow::bail!("unknown fake engine pid {} for {endpoint}", handle.pid)
         };
         if exited {
             anyhow::bail!("fake engine pid {pid} exited");
@@ -611,13 +657,12 @@ impl EngineAdapter for FakeAdapter {
         })
     }
 
-    fn progress(&self, endpoint: &str, handle: &EngineHandle) -> LoadProgress {
-        let _ = handle;
+    fn progress(&self, _endpoint: &str, handle: &EngineHandle) -> LoadProgress {
         let proc = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(endpoint)
+            .get(&handle.pid)
             .map(|p| (p.spawned_ms, p.script.clone()));
         let Some((spawned_ms, script)) = proc else {
             return LoadProgress::indeterminate();
@@ -704,6 +749,14 @@ struct BudgetFile {
     entries: Vec<BudgetEntry>,
 }
 
+/// Keep the newest `max` rows (append-only semantics, bounded file size).
+fn push_bounded(entries: &mut Vec<BudgetEntry>, max: usize) {
+    if entries.len() > max {
+        let excess = entries.len() - max;
+        entries.drain(0..excess);
+    }
+}
+
 pub struct BudgetLedger {
     path: PathBuf,
     inner: Mutex<Vec<BudgetEntry>>,
@@ -757,6 +810,7 @@ impl BudgetLedger {
             reason: reason.into(),
             actor: actor.map(|value| value.to_string()),
         });
+        push_bounded(&mut entries, LEDGER_MAX_ENTRIES);
         let text = serde_json::to_string_pretty(&BudgetFile {
             entries: entries.clone(),
         })
@@ -929,6 +983,14 @@ pub struct AdoptionReport {
     pub adopted: Vec<String>,
     pub spec_stale: Vec<String>,
     pub cleaned: Vec<String>,
+    /// Adopted children with no catalog entry (unnamed residents): they run
+    /// and are never killed, but cannot be spec-hashed; surfaced as warnings.
+    #[serde(default)]
+    pub catalog_missing: Vec<String>,
+    /// Human-readable refusals (e.g. a live marker with no recorded
+    /// start_time — identity cannot be proven, so adoption is refused).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1202,6 +1264,10 @@ pub struct SwapScheduler {
     logs_dir: PathBuf,
     adoption_dir: PathBuf,
     evictions_today: AtomicU64,
+    /// Ports assigned to live/pending engines. A managed port is reserved
+    /// before spawn so concurrent spawns (and fake engines, which never bind)
+    /// cannot share an endpoint.
+    reserved_ports: Mutex<BTreeSet<u16>>,
     /// Monotonic counter the daemon poller uses to refresh shim residency.
     shim_refreshed_ms: AtomicU64,
     /// L5 Active-Consumer Set (in-process streams + idle grace).
@@ -1254,6 +1320,7 @@ impl SwapScheduler {
             logs_dir: crate::swap_catalog::logs_dir(),
             adoption_dir: adoption_dir(),
             evictions_today: AtomicU64::new(0),
+            reserved_ports: Mutex::new(BTreeSet::new()),
             shim_refreshed_ms: AtomicU64::new(0),
             consumers: Mutex::new(None),
             external_observer: Mutex::new(None),
@@ -1459,7 +1526,7 @@ impl SwapScheduler {
         };
         let mut stopped = Vec::new();
         for id in ids {
-            if let Err(error) = self.stop_native(&id, reason) {
+            if let Err(error) = self.stop_native_inner(&id, reason, true) {
                 tracing::warn!(model = %id, %error, "swap shutdown: could not stop native child");
             } else {
                 stopped.push(id);
@@ -1674,11 +1741,37 @@ impl SwapScheduler {
         needed_gib: f64,
         options: &EnsureOptions,
     ) -> Result<Vec<String>> {
-        let mut evicted = Vec::new();
+        let mut evicted: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         let mut logged_blocked: BTreeSet<String> = BTreeSet::new();
         loop {
             let report = self.budget_report();
             if report.used_gib + needed_gib <= report.cap_gib + 1e-9 {
+                // One aggregate ledger row per evict pass (never one row per
+                // candidate; a single-victim pass keeps the victim's model id
+                // so the sequence stays greppable).
+                if !evicted.is_empty() {
+                    let gib: f64 = evicted
+                        .iter()
+                        .map(|id| {
+                            self.catalog
+                                .entry(id)
+                                .map(|e| self.need_gib(&e))
+                                .unwrap_or(0.0)
+                        })
+                        .sum();
+                    let model = if evicted.len() == 1 {
+                        evicted[0].clone()
+                    } else {
+                        "*".to_string()
+                    };
+                    let _ = self.ledger.record(
+                        "evict",
+                        &model,
+                        gib,
+                        format!("lru eviction pass: {}", evicted.join(", ")),
+                    );
+                }
                 return Ok(evicted);
             }
             let pins = self.catalog.pins();
@@ -1689,7 +1782,8 @@ impl SwapScheduler {
                 .iter()
                 .filter(|line| line.source == "native")
                 .filter(|line| !pins.contains_key(&line.model))
-                .filter(|line| !evicted.contains(&line.model))
+                .filter(|line| options.override_active_consumers || !self.is_inflight(&line.model))
+                .filter(|line| !evicted.contains(&line.model) && !skipped.contains(&line.model))
                 .filter(|line| {
                     if options.override_active_consumers {
                         return true;
@@ -1736,18 +1830,64 @@ impl SwapScheduler {
                 ))
                 .into());
             };
-            self.stop_native(&model, "lru eviction")?;
-            evicted.push(model);
+            match self.stop_native(
+                &model,
+                "lru eviction",
+                false,
+                options.override_active_consumers,
+            ) {
+                Ok(()) => evicted.push(model),
+                // Locked by a concurrent ensure or protected between the
+                // candidate snapshot and now: skip it, never block the pass.
+                Err(e) if e.downcast_ref::<SwapError>().is_some_and(|e| {
+                    matches!(e, SwapError::Busy(_))
+                }) =>
+                {
+                    skipped.push(model)
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
-    fn stop_native(&self, id: &str, reason: &str) -> Result<()> {
-        let (handle, adapter_name) = {
+    /// Stop a model under its spawn lock, re-checking protection immediately
+    /// before signalling (the LRU candidate list may be stale: a stream can
+    /// start between selection and eviction).
+    /// `force` is the operator's one-action override: it bypasses the
+    /// in-flight guard (a sized pin is never bypassed implicitly).
+    fn stop_native(&self, id: &str, reason: &str, record_ledger: bool, force: bool) -> Result<()> {
+        let lock = self.spawn_lock(id);
+        let _guard = lock.try_lock().map_err(|_| {
+            SwapError::Busy(format!(
+                "`{id}` is currently being started or stopped by another request"
+            ))
+        })?;
+        if self.catalog.pins().contains_key(id) {
+            return Err(SwapError::Busy(format!(
+                "`{id}` carries a sized pin and is never evicted implicitly"
+            ))
+            .into());
+        }
+        if !force && self.is_inflight(id) {
+            return Err(SwapError::Busy(format!(
+                "`{id}` has an active stream and is never evicted"
+            ))
+            .into());
+        }
+        self.stop_native_inner(id, reason, record_ledger)
+    }
+
+    /// Unprotected stop body: only callers that already own the lifecycle
+    /// (the spawning ensure, an explicit protected stop) use this.
+    fn stop_native_inner(&self, id: &str, reason: &str, record_ledger: bool) -> Result<()> {
+        let (handle, adapter_name, prev_state, prev_source) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let Some(runtime) = inner.models.get_mut(id) else {
                 return Ok(());
             };
             let handle = runtime.handle.take();
+            let prev_state = runtime.state;
+            let prev_source = runtime.source;
             runtime.state = LifecycleState::Stopped;
             runtime.endpoint = None;
             runtime.source = None;
@@ -1756,24 +1896,87 @@ impl SwapScheduler {
                 .entry(id)
                 .map(|e| e.engine)
                 .unwrap_or_else(|| "llama_cpp".into());
-            (handle, adapter_name)
+            (handle, adapter_name, prev_state, prev_source)
         };
         if let Some(handle) = handle {
             if let Some(adapter) = self.adapter_for(&adapter_name) {
-                let _ = adapter.stop(&handle);
+                // A failed stop MUST keep the marker: the child may still own
+                // the GGUF flock, and a boot scan is the only recovery path.
+                if let Err(e) = adapter.stop(&handle) {
+                    // Keep BOTH the marker and the live registry row: the
+                    // child may still hold the flock, and the Engines tab
+                    // must still show it as serving.
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(runtime) = inner.models.get_mut(id) {
+                        runtime.state = prev_state;
+                        runtime.endpoint = Some(handle.endpoint.clone());
+                        runtime.handle = Some(handle.clone());
+                        runtime.source = prev_source;
+                    }
+                    return Err(SwapError::SpawnFailed(format!(
+                        "stop `{id}` failed: {e}"
+                    ))
+                    .into());
+                }
             } else {
                 terminate_pid(handle.pid, self.config.stop_grace);
+                if pid_alive(handle.pid) {
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(runtime) = inner.models.get_mut(id) {
+                        runtime.state = prev_state;
+                        runtime.endpoint = Some(handle.endpoint.clone());
+                        runtime.handle = Some(handle.clone());
+                        runtime.source = prev_source;
+                    }
+                    return Err(SwapError::SpawnFailed(format!(
+                        "stop `{id}` failed: process {} is still alive",
+                        handle.pid
+                    ))
+                    .into());
+                }
             }
+            self.release_endpoint_port(&handle.endpoint);
             self.evictions_today.fetch_add(1, Ordering::SeqCst);
             self.remove_marker(id);
-            let gib = self
-                .catalog
-                .entry(id)
-                .map(|e| self.need_gib(&e))
-                .unwrap_or(0.0);
-            let _ = self.ledger.record("evict", id, gib, reason);
+            if record_ledger {
+                let gib = self
+                    .catalog
+                    .entry(id)
+                    .map(|e| self.need_gib(&e))
+                    .unwrap_or(0.0);
+                let _ = self.ledger.record("evict", id, gib, reason);
+            }
         }
         Ok(())
+    }
+
+    /// Reserve a managed port for a spawn (unique across models).
+    fn reserve_port(&self) -> Option<u16> {
+        let mut reserved = self.reserved_ports.lock().unwrap_or_else(|e| e.into_inner());
+        for port in self.config.port_min..=self.config.port_max {
+            if reserved.contains(&port) {
+                continue;
+            }
+            if free_port(port, port).is_some() {
+                reserved.insert(port);
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    fn release_endpoint_port(&self, endpoint: &str) {
+        if let Some(port) = endpoint
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            self.reserved_ports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&port);
+        }
     }
 
     fn adapter_for(&self, engine: &str) -> Option<Arc<dyn EngineAdapter>> {
@@ -1847,12 +2050,15 @@ impl SwapScheduler {
             None => None,
         };
 
-        let lock = self.spawn_lock(&entry.id);
+        let spawn_lock = self.spawn_lock(&entry.id);
         let mut is_spawner = false;
         let mut handle = None;
         let queue_entry;
-        {
-            let _guard = lock.lock().await;
+        // `try_lock`: an ensure that arrives while another owns the decision
+        // joins the queue (cap/position/cancel apply to it) instead of
+        // blocking invisibly on the mutex.
+        match spawn_lock.try_lock() {
+            Ok(_guard) => {
             // Re-check under the spawn lock: a concurrent ensure may have won.
             if let Some(resident) = self.resident_ready(&entry) {
                 return Ok(EnsureOutcome::Attach {
@@ -1887,7 +2093,7 @@ impl SwapScheduler {
                 _ => {
                     // A stale adopted spec converges on an explicit ensure.
                     if self.runtime(&entry.id).map(|r| r.spec_stale).unwrap_or(false) {
-                        self.stop_native(&entry.id, "spec_stale convergence")?;
+                        self.stop_native_inner(&entry.id, "spec_stale convergence", true)?;
                     }
                     if options.override_active_consumers {
                         let _ = self.ledger.record_as(
@@ -1910,6 +2116,11 @@ impl SwapScheduler {
                     queue_entry = self.enqueue(&entry.id)?;
                 }
             }
+            }
+            Err(_) => {
+                // Another ensure owns the spawn lock: queue behind it.
+                queue_entry = self.enqueue(&entry.id)?;
+            }
         }
 
         let _queue_guard = QueueGuard {
@@ -1918,9 +2129,9 @@ impl SwapScheduler {
         };
         if is_spawner {
             let handle = handle.expect("spawner has a handle");
-            self.finish_spawn(&entry, handle, cancel).await
+            self.finish_spawn(&entry, handle, cancel, &queue_entry).await
         } else {
-            self.wait_ready(&entry.id, cancel).await
+            self.wait_ready(&entry.id, cancel, &queue_entry).await
         }
     }
 
@@ -2075,7 +2286,7 @@ impl SwapScheduler {
                     pid.map(|p| p.to_string()).unwrap_or_else(|| "adopted".into())
                 ),
             );
-            self.stop_native(&model, "exclusive cutover")?;
+            self.stop_native_inner(&model, "exclusive cutover", true)?;
             if let Some(pid) = pid {
                 match crate::engine_process::wait_pid_gone(pid, self.config.stop_grace) {
                     Some(ms) => self.log(&model, &format!("cutover: pid gone after {ms} ms")),
@@ -2304,11 +2515,12 @@ impl SwapScheduler {
         // L5: adapter-owned allocation (strixite conf scope, hipfire
         // single-owner port) avoids every Residency endpoint, imported
         // explicit ports and llama-swap's dynamic range; otherwise the L4
-        // generic free-port scan.
+        // generic scan, whose result is RESERVED in the port set so a
+        // concurrent spawn cannot collide with it.
         let avoid = self.avoided_ports();
         let port = adapter
             .allocate_port(&avoid)
-            .or_else(|| free_port(self.config.port_min, self.config.port_max))
+            .or_else(|| self.reserve_port())
             .ok_or_else(|| {
                 SwapError::SpawnFailed("no free port in the swap port range".into())
             })?;
@@ -2357,6 +2569,7 @@ impl SwapScheduler {
         let handle = match adapter.spawn(&request) {
             Ok(handle) => handle,
             Err(e) => {
+                self.release_endpoint_port(&endpoint);
                 self.remove_marker(&entry.id);
                 self.set_state(
                     &entry.id,
@@ -2429,6 +2642,7 @@ impl SwapScheduler {
         entry: &CatalogEntry,
         handle: EngineHandle,
         cancel: Option<&crate::inflight::InflightHandle>,
+        queue: &QueueEntry,
     ) -> Result<EnsureOutcome> {
         let adapter = self
             .adapter_for(&entry.engine)
@@ -2436,15 +2650,13 @@ impl SwapScheduler {
         let readiness_timeout = adapter.readiness_timeout().unwrap_or(self.config.wait_timeout);
         let started = std::time::Instant::now();
         loop {
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    self.stop_native(&entry.id, "request cancelled")?;
-                    return Err(SwapError::Cancelled(entry.id.clone()).into());
-                }
+            if cancel_requested(cancel, queue) {
+                self.stop_native_inner(&entry.id, "request cancelled", true)?;
+                return Err(SwapError::Cancelled(entry.id.clone()).into());
             }
             if !pid_alive(handle.pid) {
                 return self
-                    .handle_spawn_failure(entry, &handle, "engine process exited during load", cancel)
+                    .handle_spawn_failure(entry, &handle, "engine process exited during load", cancel, queue)
                     .await;
             }
             match adapter.health(&handle.endpoint, &handle) {
@@ -2463,6 +2675,7 @@ impl SwapScheduler {
                                     entry.served_alias()
                                 ),
                                 cancel,
+                                queue,
                             )
                             .await;
                     }
@@ -2477,6 +2690,8 @@ impl SwapScheduler {
                             runtime.source = Some(ResidentSource::Native);
                             runtime.last_error = None;
                             runtime.spec_stale = false;
+                            // A successful load closes the restart window.
+                            runtime.restarts = 0;
                         }
                     }
                     self.log(
@@ -2496,12 +2711,12 @@ impl SwapScheduler {
                     // listening process; `Err` means the child is gone (a
                     // reaped crash, not a transient connection).
                     return self
-                        .handle_spawn_failure(entry, &handle, &format!("{e}"), cancel)
+                        .handle_spawn_failure(entry, &handle, &format!("{e}"), cancel, queue)
                         .await;
                 }
             }
             if started.elapsed() > readiness_timeout {
-                self.stop_native(&entry.id, "load timeout")?;
+                self.stop_native_inner(&entry.id, "load timeout", true)?;
                 return Err(SwapError::Timeout {
                     model: entry.id.clone(),
                     waited_ms: started.elapsed().as_millis() as u64,
@@ -2518,14 +2733,25 @@ impl SwapScheduler {
         handle: &EngineHandle,
         reason: &str,
         cancel: Option<&crate::inflight::InflightHandle>,
+        queue: &QueueEntry,
     ) -> Result<EnsureOutcome> {
         // Stop (and reap) the failed child BEFORE the retry: a live holder of
         // the GGUF flock would make every restart fail with "locked".
         if let Some(adapter) = self.adapter_for(&entry.engine) {
-            let _ = adapter.stop(handle);
+            adapter
+                .stop(handle)
+                .map_err(|e| SwapError::SpawnFailed(format!("stop failed: {e}")))?;
         } else {
             terminate_pid(handle.pid, self.config.stop_grace);
+            if pid_alive(handle.pid) {
+                return Err(SwapError::SpawnFailed(format!(
+                    "stop failed: process {} is still alive",
+                    handle.pid
+                ))
+                .into());
+            }
         }
+        self.release_endpoint_port(&handle.endpoint);
         self.remove_marker(&entry.id);
         let restarts = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2543,7 +2769,7 @@ impl SwapScheduler {
             // re-run the `min_mem_gib` gate (spec: "re-run gate").
             self.wait_gate(entry, &EnsureOptions::default(), cancel).await?;
             let handle = self.start_spawn(entry)?;
-            return Box::pin(self.finish_spawn(entry, handle, cancel)).await;
+            return Box::pin(self.finish_spawn(entry, handle, cancel, queue)).await;
         }
         self.set_state(
             &entry.id,
@@ -2557,13 +2783,12 @@ impl SwapScheduler {
         &self,
         id: &str,
         cancel: Option<&crate::inflight::InflightHandle>,
+        queue: &QueueEntry,
     ) -> Result<EnsureOutcome> {
         let deadline = std::time::Instant::now() + self.config.wait_timeout;
         loop {
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    return Err(SwapError::Cancelled(id.to_string()).into());
-                }
+            if cancel_requested(cancel, queue) {
+                return Err(SwapError::Cancelled(id.to_string()).into());
             }
             {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2660,7 +2885,7 @@ impl SwapScheduler {
             .get(&resolved)
             .map(|r| r.handle.is_some())
             .unwrap_or(false);
-        self.stop_native(&resolved, reason)?;
+        self.stop_native(&resolved, reason, true, override_active_consumers)?;
         Ok(had)
     }
 
@@ -2718,23 +2943,38 @@ impl SwapScheduler {
                     .push(path.file_stem().unwrap_or_default().to_string_lossy().into_owned());
                 continue;
             };
-            let alive = pid_alive(marker.pid)
-                && process_start_time(marker.pid).is_none_or(|st| {
-                    marker.start_time == 0 || st == marker.start_time
-                });
-            let cmdline = if alive {
-                process_cmdline(marker.pid)
+            let live_pid = pid_alive(marker.pid);
+            // Identity = live pid + the recorded kernel start-time + the GGUF
+            // as a FULL argv element. An unknown start_time cannot prove the
+            // pid is the process we started (pid reuse), so adoption is
+            // refused and the marker left for the operator.
+            let start_time_matches = marker.start_time != 0
+                && process_start_time(marker.pid) == Some(marker.start_time);
+            let args = if live_pid && start_time_matches {
+                process_args(marker.pid)
             } else {
-                String::new()
+                Vec::new()
             };
-            let gguf_matches = marker.gguf.is_empty()
-                || cmdline.contains(&marker.gguf)
-                || marker
-                    .gguf
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|base| cmdline.contains(base));
-            if !alive || !gguf_matches {
+            let gguf_matches = if marker.gguf.is_empty() {
+                true
+            } else {
+                let want = std::fs::canonicalize(&marker.gguf)
+                    .unwrap_or_else(|_| PathBuf::from(&marker.gguf));
+                args.iter().any(|arg| {
+                    arg == &marker.gguf
+                        || std::fs::canonicalize(arg).is_ok_and(|arg| arg == want)
+                })
+            };
+            if live_pid && marker.start_time == 0 {
+                let warning = format!(
+                    "refusing to adopt `{}` (pid {}): the marker has no start_time,                      so pid identity cannot be proven",
+                    marker.model, marker.pid
+                );
+                self.log(&marker.model, &warning);
+                report.warnings.push(warning);
+                continue;
+            }
+            if !live_pid || !start_time_matches || !gguf_matches {
                 let _ = std::fs::remove_file(&path);
                 report.cleaned.push(marker.model.clone());
                 let _ = self.ledger.record("stop", &marker.model, 0.0, "stale adoption marker cleaned");
@@ -2757,6 +2997,16 @@ impl SwapScheduler {
                 && adopted_hash
                     .as_deref()
                     .is_some_and(|hash| hash != marker.spec_hash);
+            if expected_hash.is_none() {
+                let warning = format!(
+                    "adopted unnamed resident `{}` (pid {}): it is serving but has no \
+                     catalog entry, so its launch spec cannot be compared",
+                    marker.model, marker.pid
+                );
+                self.log(&marker.model, &warning);
+                report.catalog_missing.push(marker.model.clone());
+                report.warnings.push(warning);
+            }
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 inner.models.insert(
@@ -2786,6 +3036,18 @@ impl SwapScheduler {
                         gate: None,
                     },
                 );
+            }
+            if let Some(port) = marker
+                .endpoint
+                .trim_end_matches('/')
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+            {
+                self.reserved_ports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(port);
             }
             let _ = self
                 .ledger
@@ -2872,6 +3134,7 @@ impl SwapScheduler {
                         if r.state == LifecycleState::Loading {
                             r.state = LifecycleState::Ready;
                             r.last_error = None;
+                            r.restarts = 0;
                         }
                     }
                     self.log(&id, "recovered ready state after a dropped ensure future");
@@ -2913,7 +3176,7 @@ impl SwapScheduler {
             {
                 continue; // the probe raced a recovery
             }
-            let restarts = {
+            let (restarts, old_endpoint) = {
                 let mut inner =
                     self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(r) = inner.models.get_mut(&id) {
@@ -2921,11 +3184,14 @@ impl SwapScheduler {
                     r.state = LifecycleState::Stopped;
                     r.handle = None;
                     r.last_error = Some("crashed; restarting".into());
-                    r.restarts
+                    (r.restarts, r.endpoint.take())
                 } else {
-                    0
+                    (0, None)
                 }
             };
+            if let Some(endpoint) = old_endpoint {
+                self.release_endpoint_port(&endpoint);
+            }
             self.remove_marker(&id);
             self.log(&id, "crash detected; bounded restart");
             if restarts <= self.config.max_restarts {
@@ -2934,8 +3200,16 @@ impl SwapScheduler {
                         // Validate in the background; ensure callers that
                         // race this still see Loading → Ready.
                         let this = Arc::clone(self);
+                        let restart_queue = QueueEntry {
+                            id: 0,
+                            model: entry.id.clone(),
+                            requested_ms: now_ms(),
+                            cancelled: Arc::new(AtomicBool::new(false)),
+                        };
                         tokio::spawn(async move {
-                            let _ = this.finish_spawn(&entry, handle, None).await;
+                            let _ = this
+                                .finish_spawn(&entry, handle, None, &restart_queue)
+                                .await;
                         });
                     }
                 }
@@ -3549,6 +3823,29 @@ impl SwapScheduler {
     pub fn logs_dir(&self) -> &Path {
         &self.logs_dir
     }
+
+    #[cfg(test)]
+    fn adoption_dir_for_test(&self) -> &Path {
+        &self.adoption_dir
+    }
+}
+
+/// Abort signal for a wait. A routed request (in-flight handle attached)
+/// honors both its row cancellation and its queue-row cancellation. A direct
+/// `POST /api/engines/ensure` caller carries no handle: its own disconnect
+/// drops the future, and the queue row is informational for it (aborting the
+/// synchronous API call would surface an error to a caller that never asked
+/// to cancel).
+fn cancel_requested(
+    cancel: Option<&crate::inflight::InflightHandle>,
+    queue: &QueueEntry,
+) -> bool {
+    match cancel {
+        Some(handle) => {
+            handle.is_cancelled() || queue.cancelled.load(Ordering::SeqCst)
+        }
+        None => false,
+    }
 }
 
 fn sanitize(id: &str) -> String {
@@ -3849,6 +4146,16 @@ mod tests {
         assert_eq!(state("c"), "ready");
         assert_eq!(status.budget.evictions_today, 1);
         assert_eq!(fake.spawn_count(), 3);
+        // One aggregate ledger row per evict pass; a single victim keeps its
+        // model id (greppable sequence).
+        let evicts: Vec<String> = scheduler
+            .ledger()
+            .entries()
+            .into_iter()
+            .filter(|e| e.kind == "evict")
+            .map(|e| e.model)
+            .collect();
+        assert_eq!(evicts, vec!["a".to_string()]);
     }
 
     #[tokio::test]
@@ -4106,6 +4413,192 @@ mod tests {
         let model = status.models.iter().find(|m| m.id == "m").unwrap();
         assert_eq!(model.state, "ready");
         assert_eq!(model.endpoint.as_deref(), Some(first.endpoint()));
+    }
+
+    #[tokio::test]
+    async fn routed_queue_cancel_aborts_but_direct_ensure_still_completes() {
+        let (scheduler, _fake, _root) = scheduler("cancel-routed", &[("m", "")]);
+        let mut entry = scheduler.catalog().entry("m").unwrap();
+        entry
+            .launch_spec
+            .env
+            .insert("FAKE_LOAD_MS".into(), "600".into());
+        scheduler.catalog().upsert_entry(entry).unwrap();
+
+        // Routed request: in-flight row attached.
+        let registry = Arc::new(InflightRegistry::new());
+        let handle = Arc::new(registry.register(
+            "POST /v1/chat/completions".into(),
+            "m".into(),
+            "ua".into(),
+            "127.0.0.1:1".into(),
+            String::new(),
+            String::new(),
+            0,
+            None,
+        ));
+        handle.set_catalog_id("m");
+        let routed = {
+            let scheduler = Arc::clone(&scheduler);
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                scheduler.ensure_with_cancel("m", Some(&handle)).await
+            })
+        };
+        let queue_id = poll_queue_id(&scheduler, "m").await;
+        assert!(scheduler.cancel(queue_id), "queue row cancelled");
+        let error = routed.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        drop(handle);
+
+        // The queue-row cancellation was consumed; a DIRECT ensure (no
+        // in-flight row) owns its request and completes normally.
+        let outcome = scheduler.ensure("m").await.unwrap();
+        assert!(outcome.spawned());
+    }
+
+    async fn poll_queue_id(scheduler: &Arc<SwapScheduler>, model: &str) -> u64 {
+        for _ in 0..500 {
+            if let Some(row) = scheduler
+                .status()
+                .queue
+                .into_iter()
+                .find(|q| q.model == model)
+            {
+                return row.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no queue row for {model}");
+    }
+
+    #[tokio::test]
+    async fn stop_refuses_inflight_and_pinned_models_at_the_last_moment() {
+        let (scheduler, _fake, _root) = scheduler("protect", &[("m", "")]);
+        scheduler.ensure("m").await.unwrap();
+        let registry = Arc::new(InflightRegistry::new());
+        scheduler.attach_inflight(Arc::clone(&registry));
+        let handle = registry.register(
+            "POST /v1/chat/completions".into(),
+            "m".into(),
+            "ua".into(),
+            "127.0.0.1:1".into(),
+            String::new(),
+            String::new(),
+            0,
+            None,
+        );
+        handle.set_catalog_id("m");
+        let error = scheduler.evict("m", "test").unwrap_err();
+        assert!(error.to_string().contains("stream"), "{error}");
+        assert_eq!(scheduler.status().models[0].state, "ready");
+        drop(handle);
+        scheduler.catalog().pin("m", 5.0).unwrap();
+        let error = scheduler.evict("m", "test").unwrap_err();
+        assert!(error.to_string().contains("pin"), "{error}");
+        scheduler.catalog().unpin("m").unwrap();
+        assert!(scheduler.evict("m", "test").unwrap());
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_unknown_start_time_and_full_arg_mismatch() {
+        let (scheduler, _fake, root) = scheduler("adoption-identity", &[("m", "")]);
+        let entry = scheduler.catalog().entry("m").unwrap();
+        let gguf = entry.canonical_gguf().unwrap();
+        let dir = root.join(ADOPTION_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(&gguf)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if process_args(child.id()).iter().any(|a| a == &gguf.display().to_string()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // (a) live pid, unknown start_time → refuse, keep the marker.
+        let mut marker = AdoptionMarker {
+            model: "m".into(),
+            pid: child.id(),
+            gguf: gguf.display().to_string(),
+            start_time: 0,
+            spec_hash: crate::swap_catalog::launch_spec_hash(&entry),
+            scope_name: None,
+            endpoint: "http://127.0.0.1:5801".into(),
+        };
+        std::fs::write(dir.join("m.json"), serde_json::to_string(&marker).unwrap()).unwrap();
+        let report = scheduler.scan_adoption();
+        assert!(report.adopted.is_empty(), "{report:?}");
+        assert!(report.warnings.iter().any(|w| w.contains("no start_time")), "{report:?}");
+        assert!(dir.join("m.json").exists(), "unproven marker is kept");
+        // (b) known start_time, but the GGUF is not a FULL argv element
+        // (`m.gguf.bak` must not match `m.gguf`).
+        marker.start_time = process_start_time(child.id()).unwrap();
+        marker.gguf = format!("{}.bak", gguf.display());
+        std::fs::write(dir.join("m.json"), serde_json::to_string(&marker).unwrap()).unwrap();
+        let report = scheduler.scan_adoption();
+        assert!(report.adopted.is_empty(), "suffix must not match: {report:?}");
+        assert!(report.cleaned.contains(&"m".to_string()), "{report:?}");
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn failed_stop_keeps_marker_and_restores_the_live_row() {
+        let (scheduler, fake, _root) = scheduler("stop-failure", &[("m", "")]);
+        scheduler.ensure("m").await.unwrap();
+        assert!(scheduler
+            .adoption_dir_for_test()
+            .join("m.json")
+            .exists());
+        fake.set_fail_stop(true);
+        let error = scheduler.evict("m", "test").unwrap_err();
+        assert!(error.to_string().contains("stop `m` failed"), "{error}");
+        assert!(
+            scheduler.adoption_dir_for_test().join("m.json").exists(),
+            "a failed stop must never delete the ownership marker"
+        );
+        let model = scheduler.status().models.into_iter().next().unwrap();
+        assert_eq!(model.state, "ready", "the live row is restored: {model:?}");
+        assert!(model.resident, "still resident: {model:?}");
+        fake.set_fail_stop(false);
+        assert!(scheduler.evict("m", "test").unwrap());
+        assert!(!scheduler.adoption_dir_for_test().join("m.json").exists());
+    }
+
+    #[test]
+    fn ledger_rotation_keeps_the_newest_rows() {
+        let mut entries: Vec<BudgetEntry> = (0..3)
+            .map(|i| BudgetEntry {
+                ts: format!("{i}"),
+                kind: "admit".into(),
+                model: format!("m{i}"),
+                gib: 1.0,
+                reason: String::new(),
+                actor: None,
+            })
+            .collect();
+        for i in 3..6 {
+            entries.push(BudgetEntry {
+                ts: format!("{i}"),
+                kind: "admit".into(),
+                model: format!("m{i}"),
+                gib: 1.0,
+                reason: String::new(),
+                actor: None,
+            });
+            push_bounded(&mut entries, 3);
+        }
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries.iter().map(|e| e.ts.as_str()).collect::<Vec<_>>(),
+            vec!["3", "4", "5"]
+        );
     }
 
     #[test]

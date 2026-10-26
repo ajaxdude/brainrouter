@@ -1636,6 +1636,16 @@ pub fn run_migration_standalone(args: MigrationArgs) -> Result<()> {
                     candidates.push(probe);
                 }
             }
+            candidates.push(brainrouter::paths::brainrouter_state());
+            let derived = [
+                brainrouter::paths::env_dir("XDG_STATE_HOME", "", ".local/state"),
+            ];
+            for base in derived {
+                let cand = base.join("brainrouter");
+                if !candidates.contains(&cand) {
+                    candidates.push(cand);
+                }
+            }
             let has_snap = |root: &std::path::Path| -> bool {
                 let dir = root.join("migrations").join(phase.as_str());
                 dir.is_dir()

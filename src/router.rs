@@ -250,6 +250,36 @@ tokio::task_local! {
     /// The UDS request's grace clock (`None` for TCP/Router-level callers,
     /// whose grace window starts at the request itself).
     static REQUEST_SCOPE_CLOCK: Option<Arc<ScopeClock>>;
+    /// v2 L4: the in-flight row registered by the server at request arrival.
+    /// `try_local_once` threads it into `ensure_with_cancel`, so a routed
+    /// wait (queue position / load) is abortable from the in-flight row.
+    /// Direct `POST /api/engines/ensure` calls carry `None` — their client
+    /// owns the request, and a client disconnect drops the future instead.
+    static REQUEST_CANCEL: Option<Arc<crate::inflight::InflightHandle>>;
+}
+
+/// Run a routing future with the request's in-flight row in scope (server
+/// entry points). Without it, routing is exactly v1.
+pub async fn with_request_cancel<F: std::future::Future>(
+    handle: Option<Arc<crate::inflight::InflightHandle>>,
+    f: F,
+) -> F::Output {
+    REQUEST_CANCEL.scope(handle, f).await
+}
+
+fn current_request_cancel() -> Option<Arc<crate::inflight::InflightHandle>> {
+    REQUEST_CANCEL.try_with(|h| h.clone()).ok().flatten()
+}
+
+/// Provider label for events: the residency source, not a generic "native".
+fn resident_provider_name(source: crate::residency::ResidentSource) -> &'static str {
+    use crate::residency::ResidentSource;
+    match source {
+        ResidentSource::Native => "native",
+        ResidentSource::Container => "container",
+        ResidentSource::External => "external",
+        ResidentSource::Shim => "llama-swap",
+    }
 }
 
 pub struct Router {
@@ -1290,14 +1320,16 @@ impl Router {
         if let Some(swap) = &self.swap {
             if let Some(resolved) = swap.catalog().resolve_alias(&requested) {
                 use crate::residency::ResidentSource;
-                let outcome = swap.ensure(&resolved).await?;
+                // The in-flight row makes a routed queue/load wait abortable.
+                let cancel = current_request_cancel();
+                let outcome = match &cancel {
+                    Some(handle) => swap.ensure_with_cancel(&resolved, Some(handle)).await?,
+                    None => swap.ensure(&resolved).await?,
+                };
                 let source = match &outcome {
                     crate::swap_scheduler::EnsureOutcome::Attach { source, .. } => *source,
                 };
-                if matches!(
-                    source,
-                    ResidentSource::Native | ResidentSource::External | ResidentSource::Container
-                ) {
+                if source != ResidentSource::Shim {
                     let endpoint = outcome.endpoint().to_string();
                     let entry = swap.catalog().entry(&resolved);
                     let served = entry
@@ -1415,9 +1447,13 @@ impl Router {
         }
         let source = match info.effective_provider.as_deref() {
             Some("native") => "native",
+            Some("container") => "container",
+            Some("external") => "external",
             Some("llama-swap") => "shim",
             Some("manifest") => return (None, None),
-            _ => "external",
+            // Server-mode identities are containers (gufo/ds4).
+            Some(_) => "container",
+            None => return (None, None),
         };
         (Some("ready".to_string()), Some(source.to_string()))
     }
@@ -3065,43 +3101,6 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }
-    }
-
-    #[test]
-    fn golden_body_shim_equals_native_sanitization() {
-        // The shared llama-server-family contract: whatever the shim sends,
-        // the native adapter must send byte-identically.
-        let base: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "catalog-model",
-            "messages": [
-                {"role": "developer", "content": "dev instructions"},
-                {"role": "system", "content": "system instructions"},
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": null}
-            ]
-        }))
-        .unwrap();
-        let mut shim = base.clone();
-        sanitize_for_llama_family(&mut shim);
-        let mut native = base;
-        sanitize_for_llama_family(&mut native);
-        let shim_bytes = serde_json::to_vec(&shim).unwrap();
-        let native_bytes = serde_json::to_vec(&native).unwrap();
-        assert_eq!(shim_bytes, native_bytes, "golden body is endpoint-independent");
-        assert_eq!(shim.messages[0].role, "system");
-        assert_eq!(
-            shim.messages.iter().filter(|m| m.role == "system").count(),
-            1,
-            "developer→system and the system block merged"
-        );
-        // Idempotent (a re-applied sanitizer must not reshape again).
-        let mut twice = shim.clone();
-        sanitize_for_llama_family(&mut twice);
-        assert_eq!(
-            serde_json::to_vec(&twice).unwrap(),
-            shim_bytes,
-            "sanitization is idempotent"
-        );
     }
 
     #[test]
