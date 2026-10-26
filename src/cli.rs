@@ -769,7 +769,10 @@ pub async fn run(args: CliArgs) -> Result<()> {
             run_config_cmd(&client, action, "/api/config", "brainrouter.yaml").await?;
         }
         CliCommand::LlamaSwapConfig { action } => {
-            run_config_cmd(&client, action, "/api/llama-swap-config", "llama-swap config.yaml").await?;
+            // v2 L7: in native mode this surface is the swap-catalog view (the
+            // shim file is import provenance); shim mode reads/writes the shim
+            // config exactly as before.
+            run_config_cmd(&client, action, "/api/llama-swap-config", "local serving config").await?;
         }
         CliCommand::ReviewConfig { action } => match action {
             ReviewConfigAction::Status => {
@@ -1049,7 +1052,18 @@ pub fn export_env_lines_direct(path: &std::path::Path, force: bool) -> Result<()
     let text = store.env_line_export()?;
     brainrouter::plugins::store::atomic_write_0600(path, text.as_bytes())
         .with_context(|| format!("writing the env-line export to {}", path.display()))?;
-    // Audited event: the owner explicitly moved vault values to a file.
+    // Audited event: the owner explicitly moved vault values to a file. The
+    // audit record lives in the vault's audit trail (ids only, never values),
+    // not just the operator's stderr.
+    let ids: Vec<String> = store
+        .snapshot_records()?
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    store.append_audit_event(
+        "export_env_line",
+        json!({"path": path.display().to_string(), "credentials": ids}),
+    )?;
     tracing::info!(
         path = %path.display(),
         "credential vault exported to env-line form (owner command)"

@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// State-dir file name for the monthly provider ledger.
 pub const LEDGER_FILE: &str = "provider_budget.json";
@@ -70,6 +70,12 @@ pub struct ProviderBudget {
 }
 
 impl ProviderBudget {
+    fn lock(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Load the ledger. Missing = a fresh month; a stale month rolls over
     /// in memory (and on the next write).
     pub fn load(path: PathBuf) -> Result<Self> {
@@ -119,14 +125,14 @@ impl ProviderBudget {
     }
 
     pub fn month(&self) -> String {
-        let mut ledger = self.ledger.lock().unwrap();
+        let mut ledger = self.lock();
         ledger.roll_over();
         ledger.month.clone()
     }
 
     /// Month-to-date spend for one provider (rollover-aware).
     pub fn spent(&self, provider_id: &str) -> f64 {
-        let mut ledger = self.ledger.lock().unwrap();
+        let mut ledger = self.lock();
         ledger.roll_over();
         ledger
             .providers
@@ -175,28 +181,32 @@ impl ProviderBudget {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<()> {
-        let mut ledger = self.ledger.lock().unwrap();
-        ledger.roll_over();
-        let spend = ledger.providers.entry(provider_id.to_string()).or_default();
-        spend.spent_usd += cost_usd.max(0.0);
-        spend.input_tokens = spend.input_tokens.saturating_add(input_tokens);
-        spend.output_tokens = spend.output_tokens.saturating_add(output_tokens);
-        if estimated {
-            spend.estimated_requests = spend.estimated_requests.saturating_add(1);
-        } else {
-            spend.actual_requests = spend.actual_requests.saturating_add(1);
-        }
-        if self.path.as_os_str().is_empty() {
-            return Ok(());
-        }
-        let text = serde_json::to_string_pretty(&*ledger).context("serializing budget ledger")?;
+        let text = {
+            let mut ledger = self.lock();
+            ledger.roll_over();
+            let spend = ledger.providers.entry(provider_id.to_string()).or_default();
+            spend.spent_usd += cost_usd.max(0.0);
+            spend.input_tokens = spend.input_tokens.saturating_add(input_tokens);
+            spend.output_tokens = spend.output_tokens.saturating_add(output_tokens);
+            if estimated {
+                spend.estimated_requests = spend.estimated_requests.saturating_add(1);
+            } else {
+                spend.actual_requests = spend.actual_requests.saturating_add(1);
+            }
+            if self.path.as_os_str().is_empty() {
+                return Ok(());
+            }
+            // Serialize INSIDE the lock; write OUTSIDE it so the hot route
+            // path never holds the ledger mutex across a blocking file write.
+            serde_json::to_string_pretty(&*ledger).context("serializing budget ledger")?
+        };
         crate::plugins::store::atomic_write_0600(&self.path, text.as_bytes())
             .with_context(|| format!("writing budget ledger {}", self.path.display()))
     }
 
     /// Serialized ledger view for diagnostics/tests.
     pub fn snapshot(&self) -> serde_json::Value {
-        let mut ledger = self.ledger.lock().unwrap();
+        let mut ledger = self.lock();
         ledger.roll_over();
         serde_json::to_value(&*ledger).unwrap_or(serde_json::Value::Null)
     }

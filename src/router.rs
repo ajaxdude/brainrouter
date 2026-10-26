@@ -104,8 +104,23 @@ pub struct RouteInfo {
     pub provider: Option<String>,
     /// v2 L6: the LAN hop for a non-loopback provider.
     pub hop: Option<crate::routing_events::HopInfo>,
-    /// v2 L6: the budget guard's verdict for this request (warn badge).
+    /// v2 L6: the budget guard's verdict for this request (pre-dispatch
+    /// badge; the stream wrapper backfills it post-accrual).
     pub budget: Option<crate::routing_events::BudgetEvent>,
+    /// v2 L6: post-response provider metering (budget accrual + breaker on
+    /// mid-stream death). Wrapped after the route event is emitted so the
+    /// event id can be backfilled.
+    pub meter: Option<MeterPlan>,
+}
+
+/// Everything the response stream needs to meter one provider attempt.
+#[derive(Clone)]
+pub struct MeterPlan {
+    pub provider_id: String,
+    pub price: Option<crate::providers::Price>,
+    pub request_bytes: usize,
+    pub budget_mode: crate::providers::BudgetMode,
+    pub monthly_budget_usd: Option<f64>,
 }
 
 /// One failed hop in a fallback chain.
@@ -178,7 +193,11 @@ impl ProviderAdapter {
             Self::OpenAi(provider) => {
                 provider.chat_completion_with_role(request, forwarded_role).await
             }
-            Self::Anthropic(provider) => provider.chat_completion(request).await,
+            Self::Anthropic(provider) => {
+                provider
+                    .chat_completion_with_role(request, forwarded_role)
+                    .await
+            }
         }
     }
 }
@@ -200,7 +219,10 @@ fn fingerprint_of(record: &crate::providers::ProviderRecord, secret: Option<&str
 
 /// v2 L6: the additive hop descriptor for a provider route (absent for
 /// loopback base_urls — the spec's `hop {host, endpoint}`).
-fn hop_of(base_url: &str) -> Option<crate::routing_events::HopInfo> {
+fn hop_of(
+    base_url: &str,
+    kind: crate::providers::ProviderKind,
+) -> Option<crate::routing_events::HopInfo> {
     let parsed = reqwest::Url::parse(base_url).ok()?;
     let host = parsed.host_str()?.to_string();
     let loopback = host == "localhost"
@@ -212,9 +234,15 @@ fn hop_of(base_url: &str) -> Option<crate::routing_events::HopInfo> {
     if loopback {
         return None;
     }
+    // The concrete upstream endpoint (not just the base URL) so the Sankey
+    // hop names the wire path the request actually used.
+    let suffix = match kind {
+        crate::providers::ProviderKind::Anthropic => "/messages",
+        _ => "/chat/completions",
+    };
     Some(crate::routing_events::HopInfo {
         host,
-        endpoint: base_url.to_string(),
+        endpoint: format!("{}{suffix}", base_url.trim_end_matches('/')),
     })
 }
 
@@ -281,8 +309,12 @@ pub struct Router {
     /// v2 L4: the swap supervisor. `None` preserves the v1 llama-swap path
     /// byte-identically (integration tests and shim-only deployments).
     swap: Option<Arc<crate::swap_scheduler::SwapScheduler>>,
-    /// Direct providers for native/external residents (outside llama-swap).
+    /// Direct providers for native/external residents (outside the shim).
     native_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
+    /// v2 L7: which engine serves local traffic. `Shim` = the untouched v1
+    /// llama-swap path; `Native` = every local key resolves through the swap
+    /// supervisor (no `:8081` dialer).
+    swap_mode: crate::config::SwapMode,
     /// v2 L5: the Active-Consumer Set. In-process streams (the review loop)
     /// never create proxy in-flight rows, so the router enters/leaves the
     /// span around its own response stream.
@@ -344,6 +376,7 @@ impl Router {
             serving_providers: Mutex::new(HashMap::new()),
             swap: None,
             native_providers: Mutex::new(HashMap::new()),
+            swap_mode: crate::config::SwapMode::Shim,
             active_consumers: None,
         }
     }
@@ -356,6 +389,16 @@ impl Router {
 
     pub fn swap(&self) -> Option<&Arc<crate::swap_scheduler::SwapScheduler>> {
         self.swap.as_ref()
+    }
+
+    /// v2 L7: pin the serving mode. `Native` retires the shim dialer: the
+    /// supervisor owns every local key.
+    pub fn install_swap_mode(&mut self, mode: crate::config::SwapMode) {
+        self.swap_mode = mode;
+    }
+
+    pub fn swap_mode(&self) -> crate::config::SwapMode {
+        self.swap_mode
     }
 
     /// v2 L5: install the Active-Consumer Set (in-process stream protection).
@@ -383,7 +426,7 @@ impl Router {
 
     /// Catalog discovery is metadata-only; never invokes inference or starts a model.
     pub async fn model_catalog(&self) -> serde_json::Value {
-        let local = self.llama_swap.list_models().await;
+        let local = self.local_model_keys().await;
         let cloud_available = self.providers.cloud_available();
         let cloud = if cloud_available {
             let mut models: Vec<String> = Vec::new();
@@ -429,10 +472,24 @@ impl Router {
         })
     }
 
-    /// Model keys known to belong to llama-swap (from config). Exposed so the
-    /// flush-and-reload path can re-establish the local working set.
+    /// Model keys known to belong to the local serving layer (from config).
+    /// Exposed so the flush-and-reload path can re-establish the local working
+    /// set.
     pub fn local_models(&self) -> &Vec<String> {
         &self.local_models
+    }
+
+    /// Every local key the engine can serve. Shim mode asks the shim; native
+    /// mode reads the swap catalog (zero `:8081` traffic after the flip).
+    pub async fn local_model_keys(&self) -> Result<Vec<String>> {
+        if !self.swap_mode.is_native() {
+            return self.llama_swap.list_models().await;
+        }
+        Ok(self
+            .swap
+            .as_ref()
+            .map(|swap| swap.catalog().entries().into_iter().map(|e| e.id).collect())
+            .unwrap_or_default())
     }
 
     /// Rewrite the system prompt for local routing, unless the dashboard
@@ -810,12 +867,23 @@ impl Router {
         };
 
         let latency_ms = start.elapsed().as_millis() as u64;
+        // v2 L7: through the flip and the soak a supervisor-served local route
+        // keeps the v1 `llama-swap` provider spelling (one rename pass at
+        // deletion turns it into `local`). Event-only: the internal provider
+        // name stays `native` so `swap_source` derives correctly.
+        fn local_provider_literal(provider: Option<&str>) -> Option<String> {
+            match provider {
+                Some("native") => Some("llama-swap".to_string()),
+                other => other.map(str::to_string),
+            }
+        }
 
         let (response, info) = match result {
             Ok((resp, mut info)) => {
                 info.bonsai_decision = bonsai_decision;
                 // Transition tracker to streaming phase
-                let streaming_phase = if info.effective_provider.as_deref() == Some("manifest") {
+                let event_provider = local_provider_literal(info.effective_provider.as_deref());
+                let streaming_phase = if event_provider.as_deref() == Some("manifest") {
                     Phase::CloudStreaming
                 } else {
                     Phase::LocalStreaming
@@ -823,7 +891,7 @@ impl Router {
                 tracker.set(streaming_phase, Some(info.model_key.clone()), None, max_tokens);
                 // One event per failed hop so the dashboard shows the chain
                 // (e.g. manifest ✗ → local ✓) instead of a single card.
-                let winner_stage = provider_to_stage(&info.effective_provider, bonsai_decision);
+                let winner_stage = provider_to_stage(&event_provider, bonsai_decision);
                 for f in info.failed_attempts.iter().filter(|f| f.stage != winner_stage) {
                     let (toolbox_backend, compute_api) =
                         crate::routing_events::derive_serving_identity(Some(f.provider.as_str()));
@@ -862,17 +930,17 @@ impl Router {
                     });
                 }
                 let (toolbox_backend, compute_api) =
-                    crate::routing_events::derive_serving_identity(info.effective_provider.as_deref());
+                    crate::routing_events::derive_serving_identity(event_provider.as_deref());
                 let (swap_state, swap_source) = self.swap_event_fields(&info);
                 let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
                     prompt_excerpt,
                     requested_model,
-                    effective_provider: info.effective_provider.clone(),
+                    effective_provider: event_provider.clone(),
                     model_key: info.model_key.clone(),
                     latency_ms,
-                    stage: provider_to_stage(&info.effective_provider, bonsai_decision),
+                    stage: provider_to_stage(&event_provider, bonsai_decision),
                     success: true,
                     error: String::new(),
                     bonsai_decision,
@@ -897,6 +965,20 @@ impl Router {
                     hop: info.hop.clone(),
                     budget: info.budget.clone(),
                 });
+                // v2 L6: meter provider responses from the OUTSIDE in:
+                // breaker on mid-stream death + budget accrual with a
+                // post-accrual backfill of this event's budget badge.
+                let resp = match info.meter.clone() {
+                    Some(plan) => wrap_with_budget_capture(
+                        resp,
+                        Arc::clone(&self.budget),
+                        Arc::clone(&self.health),
+                        Arc::clone(&self.routing_events),
+                        event_id,
+                        plan,
+                    ),
+                    None => resp,
+                };
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
                 let events = Arc::clone(&self.routing_events);
@@ -1054,7 +1136,7 @@ impl Router {
                 pool.push(key.clone());
             }
         }
-        if let Ok(models) = self.llama_swap.list_models().await {
+        if let Ok(models) = self.local_model_keys().await {
             for key in models {
                 if key != seed && !pool.contains(&key) {
                     pool.push(key);
@@ -1079,15 +1161,29 @@ impl Router {
     /// llama-swap's own config (`parameters.ctx`); when the file is
     /// unreadable every ctx is unknown and the configured order stands.
     fn rank_by_ctx(&self, pool: &mut Vec<String>, seed: &str, approx_tokens: u64) {
-        let Some(path) = &self.llama_swap_config_path else {
-            debug!("llama-swap config path unknown; ctx ranking skipped");
-            return;
-        };
-        let ctx = match read_llama_swap_ctx(path) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                debug!(error = %e, "llama-swap config unreadable; ctx ranking skipped");
+        // Native mode: the catalog owns ctx (no shim config read).
+        let ctx: HashMap<String, u64> = if self.swap_mode.is_native() {
+            self.swap
+                .as_ref()
+                .map(|swap| {
+                    swap.catalog()
+                        .entries()
+                        .into_iter()
+                        .filter_map(|e| e.ctx.map(|ctx| (e.id, ctx)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            let Some(path) = &self.llama_swap_config_path else {
+                debug!("shim config path unknown; ctx ranking skipped");
                 return;
+            };
+            match read_llama_swap_ctx(path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    debug!(error = %e, "shim config unreadable; ctx ranking skipped");
+                    return;
+                }
             }
         };
         if ctx.is_empty() {
@@ -1155,6 +1251,7 @@ impl Router {
                             provider: None,
                             hop: None,
                             budget: None,
+                            meter: None,
                         },
                     ));
                 }
@@ -1266,9 +1363,26 @@ impl Router {
                     };
                     return Ok((wrap_with_timeout_stream(resp)?, "native".to_string()));
                 }
-                // Shim/other resident: the existing llama-swap/identity path
-                // below attaches to the same endpoint (single residency).
+                // Shim/other resident: the existing shim/identity path below
+                // attaches to the same endpoint (single residency). In native
+                // mode that fall-through is retired — the shim has been
+                // flushed and must never be dialed again.
+                if self.swap_mode.is_native() {
+                    return Err(anyhow!(
+                        "model `{requested}` is held by the llama-swap shim; flush it before \
+                         flipping swap.mode to native"
+                    ));
+                }
+            } else if self.swap_mode.is_native() {
+                return Err(anyhow!(
+                    "local model `{requested}` is not in the swap catalog (swap.mode: native) — \
+                     import it with `swap import` or add it through the swap catalog API"
+                ));
             }
+        } else if self.swap_mode.is_native() {
+            return Err(anyhow!(
+                "swap.mode is native but no swap supervisor is installed (internal boot error)"
+            ));
         }
         let (resp, model_key) = self.try_llama_swap(request, stage).await?;
         let _ = model_key;
@@ -1375,7 +1489,7 @@ impl Router {
             );
         };
         let requested_cloud_model = resolved.model.clone();
-        let hop = hop_of(&record.base_url);
+        let hop = hop_of(&record.base_url, record.kind);
         let price = record
             .models
             .iter()
@@ -1453,13 +1567,14 @@ impl Router {
 
         if let Some(stream) = accepted {
             let request_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
-            let response = wrap_with_budget_capture(
-                wrap_with_timeout(stream),
-                Arc::clone(&self.budget),
-                record.id.clone(),
+            let meter = MeterPlan {
+                provider_id: record.id.clone(),
                 price,
                 request_bytes,
-            );
+                budget_mode: record.budget_mode,
+                monthly_budget_usd: record.monthly_budget_usd,
+            };
+            let response = wrap_with_timeout(stream);
             return Ok((
                 response,
                 RouteInfo {
@@ -1470,6 +1585,7 @@ impl Router {
                     provider: Some(record.id.clone()),
                     hop,
                     budget: budget_event,
+                    meter: Some(meter),
                 },
             ));
         }
@@ -1531,6 +1647,7 @@ impl Router {
                     provider: None,
                     hop: None,
                     budget: budget_event,
+                    meter: None,
                 },
             ))
         }
@@ -1599,21 +1716,9 @@ impl Router {
                 .with_context(|| format!("reading provider credential file `{path}`"))?;
             return Ok(text.trim().to_string());
         }
-        // The vault file is authoritative: an owner/CLI write that lands
-        // after boot (or a rotation on another path) is observed immediately.
-        // Fall back to the daemon's in-memory copy when the file is absent
-        // (in-memory test stores).
-        let path = self.credentials.path();
-        if !path.as_os_str().is_empty() && path.exists() {
-            if let Ok(fresh) =
-                crate::credentials::CredentialStore::load(path.to_path_buf())
-            {
-                if let Ok(secret) = fresh.resolve(credential_id) {
-                    return Ok(secret.expose().to_string());
-                }
-            }
-        }
-        let secret = self.credentials.resolve(credential_id)?;
+        // The vault file is authoritative (rotations land immediately);
+        // `resolve_live` falls back to the in-memory copy for test stores.
+        let secret = self.credentials.resolve_live(credential_id)?;
         Ok(secret.expose().to_string())
     }
 
@@ -1692,15 +1797,18 @@ impl Router {
             .get(id)
             .with_context(|| format!("unknown provider `{id}`"))?;
         let adapter = self.adapter_for(&record).await?;
-        let model = record
-            .models
-            .first()
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| if record.kind == crate::providers::ProviderKind::Manifest {
+        // Probe the provider's FIRST declared model; the migrated manifest
+        // provider passes its v1 wire value. Never invent a fake model id.
+        let model = match record.models.first() {
+            Some(model) => model.id.clone(),
+            None if record.kind == crate::providers::ProviderKind::Manifest => {
                 "auto".to_string()
-            } else {
-                "probe".to_string()
-            });
+            }
+            None => anyhow::bail!(
+                "provider `{}` declares no models to probe; add a model or use the manifest kind",
+                record.id
+            ),
+        };
         let request = match record.kind {
             crate::providers::ProviderKind::Anthropic => {
                 crate::provider::anthropic::AnthropicProvider::probe_request(&model)
@@ -1729,6 +1837,145 @@ impl Router {
             "kind": record.kind.as_str(),
             "model": model,
         }))
+    }
+
+    /// v2 L6 LAN expose preview: every model string this request may
+    /// dispatch upstream, computed with the SAME helpers dispatch uses
+    /// (card resolution, decision slot, chain, cloud resolution) plus the
+    /// alias axes (`swap_catalog` alias, provider id/alias). The LAN listener
+    /// requires every candidate to be exposed, so a managed substitution
+    /// (local ⇒ `fallback_model`, subs ⇒ `subs_model`, auto ⇒ decision chain,
+    /// cloud ⇒ pool top/fallback) cannot escape the expose list.
+    pub async fn expose_candidates(
+        &self,
+        request: &ChatCompletionRequest,
+        role_header: &str,
+        cwd: &str,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let header_role = Role::parse(role_header).unwrap_or(Role::Main);
+        let selector = parse_selector(&request.model);
+        let role = if selector == Selector::Subs { Role::Subagent } else { header_role };
+        let explicit = selector.is_explicit();
+        let via_subs = selector == Selector::Subs;
+        let project = if explicit || !self.cards.has_scoped_cards() {
+            None
+        } else {
+            self.resolve_project(cwd).await
+        };
+        let target = if explicit {
+            selector
+        } else {
+            let assignment = self.cards.assignment(role, project.as_deref());
+            let compiled = parse_selector(&assignment);
+            if selector == Selector::Subs && compiled == Selector::Subs {
+                Selector::Auto
+            } else {
+                compiled
+            }
+        };
+        let review_strict = role == Role::Review;
+        // Capture before the match consumes the selector.
+        let cloud_model = match &target {
+            Selector::CloudId(model) => Some(model.clone()),
+            _ => None,
+        };
+        match target {
+            Selector::Local => self.push_expose_candidate(&mut out, &self.fallback_model),
+            Selector::Subs => {
+                let subs = self
+                    .subs_model
+                    .clone()
+                    .unwrap_or_else(|| self.fallback_model.clone());
+                self.push_expose_candidate(&mut out, &subs);
+            }
+            Selector::Bare(key) => self.push_expose_candidate(&mut out, &key),
+            Selector::Cloud | Selector::CloudId(_) => {
+                let query = self.pool_query(request, None);
+                if let Ok(resolved) = crate::providers::resolve_cloud_target(
+                    &self.providers.snapshot(),
+                    cloud_model.as_deref(),
+                    &query,
+                ) {
+                    self.push_expose_candidate(&mut out, &resolved.model);
+                }
+                if !review_strict {
+                    self.push_expose_candidate(&mut out, &self.fallback_model);
+                }
+            }
+            Selector::Auto => {
+                if via_subs && self.subs_model.is_some() {
+                    let subs = self.subs_model.clone().unwrap_or_default();
+                    self.push_expose_candidate(&mut out, &subs);
+                    return out;
+                }
+                let policy = self.cards.policy_for(project.as_deref());
+                let raw_bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
+                let features = RequestFeatures::extract(
+                    request,
+                    raw_bytes,
+                    role.as_str(),
+                    "auto",
+                    policy.privacy,
+                    policy.quality,
+                    project.as_deref().unwrap_or_default(),
+                );
+                let mut outcome = self.slot.decide(&features).await;
+                DecisionSlot::clamp(&mut outcome, policy.privacy, policy.quality);
+                match outcome.decision.route {
+                    SlotRoute::Cloud => {
+                        let tier = outcome.decision.tier.as_str().to_string();
+                        let query = self.pool_query(request, Some(tier.as_str()));
+                        if let Ok(resolved) = crate::providers::resolve_cloud_target(
+                            &self.providers.snapshot(),
+                            None,
+                            &query,
+                        ) {
+                            self.push_expose_candidate(&mut out, &resolved.model);
+                        }
+                        // route_slot always allows the managed fallback.
+                        self.push_expose_candidate(&mut out, &self.fallback_model);
+                    }
+                    SlotRoute::Local => {
+                        let candidates =
+                            self.chain_candidates(features.approx_prompt_tokens).await;
+                        for candidate in candidates {
+                            self.push_expose_candidate(&mut out, &candidate);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Add a dispatchable model plus its alias-resolved forms (swap catalog
+    /// alias, provider id/alias), so the LAN check covers the POST-alias wire
+    /// value, not just the selector spelling.
+    fn push_expose_candidate(&self, out: &mut Vec<String>, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let mut variants = vec![model.to_string()];
+        if let Some(swap) = &self.swap {
+            if let Some(resolved) = swap.catalog().resolve_alias(model) {
+                if resolved != model {
+                    variants.push(resolved);
+                }
+            }
+        }
+        if let Some((_, resolved)) =
+            crate::providers::resolve_bare_model(&self.providers.snapshot(), model)
+        {
+            if resolved != model {
+                variants.push(resolved);
+            }
+        }
+        for variant in variants {
+            if !out.contains(&variant) {
+                out.push(variant);
+            }
+        }
     }
 
     /// v2 L6: `cloud_available` replaces the v1 manifest-only flag at every
@@ -1770,6 +2017,7 @@ impl Router {
                     provider: None,
                     hop: None,
                     budget: None,
+                    meter: None,
                 },
             )),
             Err(e) => {
@@ -1802,6 +2050,7 @@ impl Router {
                         provider: None,
                         hop: None,
                         budget: None,
+                        meter: None,
                     },
                 ))
             }
@@ -2098,25 +2347,29 @@ fn wrap_with_timeout(
     ProviderResponse::Stream(Box::pin(timeout_stream))
 }
 
-/// v2 L6 budget guard: accrue the provider's monthly spend when the stream
-/// ends (or is dropped). Usage tokens from the SSE `usage` frame are exact;
-/// absent usage accrues the spec's `(bytes+3)/4` estimator, flagged
-/// `estimated`.
+/// v2 L6 provider meter: accrue the provider's monthly spend and report the
+/// breaker for a mid-stream death. Usage tokens from the SSE `usage` frame
+/// are exact; absent usage accrues the spec's `(bytes+3)/4` estimator,
+/// flagged `estimated`. On accrual the route event's `budget` badge is
+/// backfilled with POST-accrual spend (the emitted event carries the
+/// pre-dispatch view).
 fn wrap_with_budget_capture(
     resp: ProviderResponse,
     budget: Arc<crate::provider_budget::ProviderBudget>,
-    provider_id: String,
-    price: Option<crate::providers::Price>,
-    request_bytes: usize,
+    health: Arc<HealthTracker>,
+    events: Arc<RoutingEvents>,
+    event_id: u64,
+    plan: MeterPlan,
 ) -> ProviderResponse {
     match resp {
         ProviderResponse::Stream(stream) => {
             ProviderResponse::Stream(Box::pin(BudgetCaptureStream {
                 inner: stream,
                 budget,
-                provider_id,
-                price,
-                request_bytes,
+                health,
+                events,
+                event_id,
+                plan,
                 response_bytes: 0,
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -2130,9 +2383,10 @@ fn wrap_with_budget_capture(
 struct BudgetCaptureStream {
     inner: crate::provider::SseStream,
     budget: Arc<crate::provider_budget::ProviderBudget>,
-    provider_id: String,
-    price: Option<crate::providers::Price>,
-    request_bytes: usize,
+    health: Arc<HealthTracker>,
+    events: Arc<RoutingEvents>,
+    event_id: u64,
+    plan: MeterPlan,
     response_bytes: usize,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -2178,17 +2432,34 @@ impl BudgetCaptureStream {
         let (input, output, estimated) = match (self.prompt_tokens, self.completion_tokens) {
             (Some(input), Some(output)) => (input, output, false),
             _ => (
-                crate::provider_budget::estimate_tokens(self.request_bytes),
+                crate::provider_budget::estimate_tokens(self.plan.request_bytes),
                 crate::provider_budget::estimate_tokens(self.response_bytes),
                 true,
             ),
         };
-        let cost = crate::provider_budget::cost_of(self.price, input, output);
+        let cost = crate::provider_budget::cost_of(self.plan.price, input, output);
         if let Err(error) = self
             .budget
-            .record(&self.provider_id, cost, estimated, input, output)
+            .record(&self.plan.provider_id, cost, estimated, input, output)
         {
-            debug!(provider = %self.provider_id, %error, "budget accrual failed");
+            debug!(provider = %self.plan.provider_id, %error, "budget accrual failed");
+        }
+        // Post-accrual badge: the event emitted at headers carried the
+        // pre-dispatch spend; backfill it by event id (the TPS capture uses
+        // the same correlation).
+        if let Some(budget_usd) = self.plan.monthly_budget_usd {
+            let spent = self.budget.spent(&self.plan.provider_id);
+            self.events.update_budget(
+                self.event_id,
+                crate::routing_events::BudgetEvent {
+                    provider: self.plan.provider_id.clone(),
+                    mode: self.plan.budget_mode.as_str().to_string(),
+                    state: if spent >= budget_usd { "over" } else { "ok" }.to_string(),
+                    month: self.budget.month(),
+                    spent_usd: spent,
+                    monthly_budget_usd: budget_usd,
+                },
+            );
         }
     }
 }
@@ -2207,6 +2478,9 @@ impl futures_util::Stream for BudgetCaptureStream {
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(Some(Err(error))) => {
+                // L6-2: a stream that dies mid-flight is a backend fault —
+                // the header-time breaker never saw it.
+                this.health.report_failure(&this.plan.provider_id);
                 this.record();
                 std::task::Poll::Ready(Some(Err(error)))
             }

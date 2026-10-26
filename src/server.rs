@@ -26,18 +26,30 @@ fn home_path(rel: &str) -> String {
 }
 
 /// Return the list of editable config/agent files: (display_name, path, exists).
-fn config_file_list(home: &str, config_path: &std::path::Path, llama_swap_config_path: &std::path::Path) -> Vec<(&'static str, PathBuf, bool)> {
+fn config_file_list(
+    home: &str,
+    config_path: &std::path::Path,
+    llama_swap_config_path: &std::path::Path,
+    swap_mode: crate::config::SwapMode,
+) -> Vec<(&'static str, PathBuf, bool)> {
     let config_abs = std::fs::canonicalize(config_path)
         .unwrap_or_else(|_| config_path.to_path_buf());
-    let ls_abs = std::fs::canonicalize(llama_swap_config_path)
-        .unwrap_or_else(|_| llama_swap_config_path.to_path_buf());
+    // Native mode: the governing document is the swap catalog, not the
+    // imported shim file (never a silent admin trap on a non-governing file).
+    let (swap_name, swap_path) = if swap_mode.is_native() {
+        let path = crate::swap_catalog::default_path();
+        ("swap catalog", std::fs::canonicalize(&path).unwrap_or(path))
+    } else {
+        let path = llama_swap_config_path.to_path_buf();
+        ("llama-swap config", std::fs::canonicalize(&path).unwrap_or(path))
+    };
     let entries: Vec<(&str, PathBuf)> = vec![
         ("Agent System Prompt", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.md", home))),
         ("Review Prompt Template", PathBuf::from(format!("{}/.omp/agent/LLAMACPP.md", home))),
         ("Local System Prompt Override", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.local.md", home))),
         ("Model Aliases", PathBuf::from(format!("{}/.config/omp-bridge/config.yaml", home))),
         ("brainrouter.yaml", config_abs),
-        ("llama-swap config", ls_abs),
+        (swap_name, swap_path),
     ];
     entries.into_iter().map(|(name, path)| {
         let exists = path.exists();
@@ -145,8 +157,11 @@ pub struct AppState {
     pub review_service: Arc<ReviewService>,
     pub routing_events: Arc<RoutingEvents>,
 
-    /// llama-swap root URL (without /v1 suffix) for status polling.
+    /// Shim root URL (without /v1 suffix) for shim-mode status polling.
+    /// Native mode never dials it (v2 L7 flip).
     pub llama_swap_url: String,
+    /// v2 L7: which engine serves local traffic (`shim` floor | `native`).
+    pub swap_mode: crate::config::SwapMode,
     /// Manifest base URL for health checking (empty post-`v2.0-p6`; the
     /// provider registry owns cloud endpoints).
     pub manifest_url: String,
@@ -345,6 +360,15 @@ fn engines_json(state: &AppState) -> serde_json::Value {
         "groups": state.swap.catalog().groups(),
         "pins": state.swap.catalog().pins(),
         "logs_dir": state.swap.logs_dir().display().to_string(),
+        // v2 L7: which engine serves local traffic + the import source and
+        // catalog file an operator must know at the flip.
+        "swap": {
+            "mode": state.swap_mode.as_str(),
+            "import_source": state.llama_swap_config_path.display().to_string(),
+            "catalog_path": crate::swap_catalog::default_path().display().to_string(),
+            "catalog_keys": state.swap.catalog().entries().len(),
+            "groups_count": state.swap.catalog().groups().len(),
+        },
     })
 }
 
@@ -1039,7 +1063,13 @@ async fn handle_request_inner(
 
         // ── Inference status API (polls llama-swap + llama-server) ────────────
         ("GET", "/api/inference-status") => {
-            let resp = inference_status(&state.router.inference_tracker, &state.llama_swap_url).await;
+            let resp = inference_status(
+                &state.router.inference_tracker,
+                &state.llama_swap_url,
+                &state.swap,
+                state.swap_mode,
+            )
+            .await;
             into_unsync(resp)
         }
 
@@ -1050,6 +1080,8 @@ async fn handle_request_inner(
                 &state.manifest_url,
                 &state.routing_events,
                 state.providers.cloud_available(),
+                &state.swap,
+                state.swap_mode,
             )
             .await;
             into_unsync(resp)
@@ -1057,7 +1089,13 @@ async fn handle_request_inner(
 
         // ── Service restart API ────────────────────────────────────────────────
         ("POST", "/api/restart/llama-swap") => {
-            let resp = restart_service("llama-swap").await;
+            // v2 L7: native mode restarts the supervisor's engines (per-engine
+            // stop; the next ensure spawns fresh) instead of a systemd shim.
+            let resp = if state.swap_mode.is_native() {
+                restart_native_engines(&state.swap).await
+            } else {
+                restart_service("llama-swap").await
+            };
             into_unsync(resp)
         }
 
@@ -1098,7 +1136,19 @@ async fn handle_request_inner(
         }
 
         ("POST", "/api/upgrade/llama-swap") => {
-            let resp = upgrade_llama_swap().await;
+            let resp = if state.swap_mode.is_native() {
+                json_response(
+                    StatusCode::CONFLICT,
+                    &ErrorResponse {
+                        error: "swap.mode is native: there is no llama-swap shim to upgrade. \
+                                Native engines are upgraded with their catalog entries / \
+                                `swap catalog add`."
+                            .to_string(),
+                    },
+                )
+            } else {
+                upgrade_llama_swap().await
+            };
             into_unsync(resp)
         }
 
@@ -1157,6 +1207,27 @@ async fn handle_request_inner(
         }
 
         ("GET", "/api/models/llama-swap") => {
+            if state.swap_mode.is_native() {
+                let data: Vec<serde_json::Value> = state
+                    .swap
+                    .catalog()
+                    .entries()
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "id": entry.id,
+                            "object": "model",
+                            "owned_by": "swap",
+                            "name": entry.name,
+                        })
+                    })
+                    .collect();
+                let resp = json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "object": "list", "data": data }),
+                );
+                return Ok(into_unsync(resp));
+            }
             match handle_llama_swap_models(&state.llama_swap_url).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -2025,7 +2096,11 @@ async fn handle_request_inner(
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             let reload = val.get("reload").and_then(|v| v.as_bool()).unwrap_or(false);
             let local_models: Vec<String> = state.router.local_models().to_vec();
-            let resp = flush_models(&state.llama_swap_url, reload, &local_models).await;
+            let resp = if state.swap_mode.is_native() {
+                flush_models_native(&state.swap, reload, &local_models).await
+            } else {
+                flush_models(&state.llama_swap_url, reload, &local_models).await
+            };
             into_unsync(resp)
         }
 
@@ -2105,64 +2180,11 @@ async fn handle_request_inner(
         }
 
         ("GET", "/api/llama-swap-config") => {
-            match std::fs::read_to_string(&state.llama_swap_config_path) {
-                Ok(yaml) => {
-                    
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header("Content-Type", "text/yaml; charset=utf-8")
-                        .body(Full::new(Bytes::from(yaml)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
-                        .unwrap()
-                }
-                Err(e) => {
-                    let resp = json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse { error: format!("Failed to read llama-swap config: {}", e) },
-                    );
-                    into_unsync(resp)
-                }
-            }
+            into_unsync(swap_config_view(&state))
         }
 
         ("POST", "/api/llama-swap-config") => {
-            let body_bytes = req.collect().await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            if body_bytes.len() > 1_048_576 {
-                let resp = json_response(
-                    StatusCode::BAD_REQUEST,
-                    &ErrorResponse { error: "Request body too large (max 1MB)".to_string() },
-                );
-                into_unsync(resp)
-            } else {
-                let body = String::from_utf8_lossy(&body_bytes).to_string();
-                // Validate it's at least valid YAML.
-                match serde_yaml::from_str::<serde_yaml::Value>(&body) {
-                    Err(e) => {
-                        let resp = json_response(
-                            StatusCode::BAD_REQUEST,
-                            &ErrorResponse { error: format!("Invalid YAML: {}", e) },
-                        );
-                        into_unsync(resp)
-                    }
-                    Ok(_) => {
-                        let _guard = state.llama_swap_config_lock.lock().await;
-                        let tmp_path = unique_sibling_path(&state.llama_swap_config_path, "tmp");
-                        let write_result = atomic_write_path(&state.llama_swap_config_path, &tmp_path, body.as_bytes());
-                        if let Err(e) = write_result {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            let resp = json_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &ErrorResponse { error: format!("Failed to write llama-swap config: {}", e) },
-                            );
-                            into_unsync(resp)
-                        } else {
-                            let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
-                            into_unsync(resp)
-                        }
-                    }
-                }
-            }
+            into_unsync(swap_config_edit(req, &state).await)
         }
 
         ("POST", "/api/open-editor") => {
@@ -2189,7 +2211,7 @@ async fn handle_request_inner(
                     } else {
                         // Allowlist: only files from the config-files list can be opened.
                         let home = home_dir();
-                        let allowed = config_file_list(&home, &state.config_path, &state.llama_swap_config_path);
+                        let allowed = config_file_list(&home, &state.config_path, &state.llama_swap_config_path, state.swap_mode);
                         let canonical = std::fs::canonicalize(file_path).unwrap_or_default();
                         let is_allowed = allowed.iter().any(|(_, p, exists)| {
                             *exists && std::fs::canonicalize(p).ok().as_ref() == Some(&canonical)
@@ -2233,7 +2255,7 @@ async fn handle_request_inner(
 
         ("GET", "/api/config-files") => {
             let home = home_dir();
-            let files: Vec<serde_json::Value> = config_file_list(&home, &state.config_path, &state.llama_swap_config_path)
+            let files: Vec<serde_json::Value> = config_file_list(&home, &state.config_path, &state.llama_swap_config_path, state.swap_mode)
                 .into_iter()
                 .map(|(name, path, exists)| serde_json::json!({
                     "name": name,
@@ -2626,11 +2648,83 @@ pub(crate) async fn anthropic_messages_from_bytes(
     Ok(response)
 }
 
-/// Poll llama-swap and the active model's llama-server for inference status.
-/// Returns a combined view: which model is loaded, its state, and slot progress.
+/// One "running model" row for the inference-status panel.
+/// Shim mode: llama-swap `/running` (model, name, state, proxy). Native mode:
+/// the supervisor's per-model status (id, name, lifecycle state, endpoint) —
+/// zero `:8081` traffic after the flip.
+async fn running_entry(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    shim_url: &str,
+    mode: crate::config::SwapMode,
+    prefer: Option<&str>,
+) -> Option<(String, String, String, String)> {
+    if mode.is_native() {
+        let status = swap.status();
+        let pick = prefer
+            .and_then(|model| {
+                status
+                    .models
+                    .iter()
+                    .find(|m| m.id == model || m.name.as_deref() == Some(model))
+            })
+            .or_else(|| status.models.iter().find(|m| m.state == "ready" && m.endpoint.is_some()))
+            .or_else(|| status.models.iter().find(|m| m.state == "loading"))?;
+        let endpoint = pick.endpoint.clone()?;
+        return Some((
+            pick.id.clone(),
+            pick.name.clone().unwrap_or_else(|| pick.id.clone()),
+            pick.state.clone(),
+            endpoint,
+        ));
+    }
+    poll_llama_swap_running(shim_url).await
+}
+
+/// (is_active, n_decoded, n_tokens) for the active local slot. Native mode
+/// reads the supervisor resident's own `/slots` endpoint.
+async fn slot_entry(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    shim_url: &str,
+    mode: crate::config::SwapMode,
+    prefer: Option<&str>,
+) -> Option<(bool, u64, u64)> {
+    if mode.is_native() {
+        let (_, _, _, endpoint) = running_entry(swap, shim_url, mode, prefer).await?;
+        let resp = VERSION_CLIENT
+            .get(format!("{}/slots", endpoint.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        let body = resp.text().await.ok()?;
+        return parse_llama_slots(&body);
+    }
+    poll_llama_swap_slot(shim_url).await
+}
+
+/// Native-mode load progress for the active model (adapter-reported fraction;
+/// `None` = indeterminate, the native llama-server load window).
+fn native_load_progress(swap: &Arc<crate::swap_scheduler::SwapScheduler>, prefer: &str) -> Option<f32> {
+    let status = swap.status();
+    let pick = status
+        .models
+        .iter()
+        .find(|m| m.id == prefer || m.name.as_deref() == Some(prefer))?;
+    pick.progress
+        .as_ref()
+        .and_then(|progress| progress.fraction)
+        .map(|fraction| fraction as f32)
+}
+
+/// Poll the local serving layer and the active model's slot for inference
+/// status. Returns a combined view: which model is loaded, its state, and
+/// slot progress. Shim mode polls llama-swap; native mode reads the swap
+/// supervisor (the `:8081` dialer retires at the flip).
 async fn inference_status(
     tracker: &crate::inference_state::InferenceTracker,
     llama_swap_url: &str,
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    mode: crate::config::SwapMode,
 ) -> Response<Full<Bytes>> {
     use crate::inference_state::Phase;
 
@@ -2638,11 +2732,15 @@ async fn inference_status(
 
     match snap.phase {
         Phase::Idle => {
-            // No active request in brainrouter. Check if llama-swap has a model loaded.
-            let model_info = poll_llama_swap_running(llama_swap_url).await;
+            // No active request in brainrouter. Check if a model is loaded.
+            let model_info = running_entry(swap, llama_swap_url, mode, None).await;
             match model_info {
                 Some((name, display, swap_state, ref proxy)) if swap_state != "ready" => {
-                    let load_progress = poll_llama_server_health(proxy).await;
+                    let load_progress = if mode.is_native() {
+                        native_load_progress(swap, &name)
+                    } else {
+                        poll_llama_server_health(proxy).await
+                    };
                     json_response(StatusCode::OK, &serde_json::json!({
                         "state": "loading",
                         "model": name,
@@ -2652,9 +2750,10 @@ async fn inference_status(
                     }))
                 }
                 Some((name, display, _, _)) => {
-                    // Model is loaded and ready. Check /slots to detect activity
-                    // from clients hitting llama-swap directly (bypassing brainrouter).
-                    let slot_info = poll_llama_swap_slot(llama_swap_url).await;
+                    // Model is loaded and ready. Check the slot to detect
+                    // activity from clients hitting the engine directly
+                    // (bypassing brainrouter).
+                    let slot_info = slot_entry(swap, llama_swap_url, mode, Some(&name)).await;
                     let (state, n_decoded, n_tokens) = match &slot_info {
                         Some((true, 0, t)) => ("local_processing", 0u64, *t),
                         Some((true, n, t)) => ("local_generating", *n, *t),
@@ -2701,10 +2800,10 @@ async fn inference_status(
             }))
         }
         Phase::LocalWaiting | Phase::LocalStreaming => {
-            // For local, enrich with llama-swap /slots and /health data if available.
+            let prefer = snap.model.clone();
             let (slot_info, running_info) = tokio::join!(
-                poll_llama_swap_slot(llama_swap_url),
-                poll_llama_swap_running(llama_swap_url),
+                slot_entry(swap, llama_swap_url, mode, prefer.as_deref()),
+                running_entry(swap, llama_swap_url, mode, prefer.as_deref()),
             );
             let (sub_state, n_decoded, n_tokens) = match &slot_info {
                 Some((true, 0, t)) => ("local_processing", 0u64, *t),
@@ -2717,8 +2816,17 @@ async fn inference_status(
             };
             // If the slot shows no token generation yet, check if the model is still loading.
             let progress: Option<f32> = if n_decoded == 0 {
-                let proxy = running_info.as_ref().map(|(_, _, _, pr)| pr.as_str()).unwrap_or("");
-                poll_llama_server_health(proxy).await
+                if mode.is_native() {
+                    let name = snap
+                        .model
+                        .clone()
+                        .or_else(|| running_info.as_ref().map(|(name, _, _, _)| name.clone()))
+                        .unwrap_or_default();
+                    native_load_progress(swap, &name)
+                } else {
+                    let proxy = running_info.as_ref().map(|(_, _, _, pr)| pr.as_str()).unwrap_or("");
+                    poll_llama_server_health(proxy).await
+                }
             } else {
                 // Token generation in progress: slot n_tokens (total decoded so
                 // far) / max_tokens. Monotonic within the request.
@@ -2752,13 +2860,18 @@ async fn service_health(
     manifest_url: &str,
     routing_events: &RoutingEvents,
     cloud_available: bool,
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    mode: crate::config::SwapMode,
 ) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
     // Probe all services in parallel
     let (swap_ok, manifest_ok, llama_cpp_state) = tokio::join!(
-        // llama-swap: GET /running
+        // Local serving layer: shim /running, or the supervisor's registry.
         async {
+            if mode.is_native() {
+                return true;
+            }
             VERSION_CLIENT.get(format!("{}/running", llama_swap_url))
                 .timeout(timeout).send().await
                 .map(|r| r.status().is_success())
@@ -2776,8 +2889,24 @@ async fn service_health(
                 _ => false,
             }
         },
-        // llama.cpp (toolbox): tri-state check via llama-swap proxy
+        // llama.cpp tri-state: shim proxy health, or the supervisor's resident
+        // states (native mode never dials :8081).
         async {
+            if mode.is_native() {
+                let status = swap.status();
+                let ready = status.models.iter().filter(|m| m.state == "ready").count();
+                let loading = status.models.iter().filter(|m| m.state == "loading").count();
+                let failed = status.models.iter().filter(|m| m.state == "failed").count();
+                return if loading > 0 {
+                    "loading"
+                } else if ready > 0 {
+                    "healthy"
+                } else if failed > 0 {
+                    "unhealthy"
+                } else {
+                    "idle"
+                };
+            }
             let running_url = format!("{}/running", llama_swap_url);
             let resp = match VERSION_CLIENT.get(&running_url).timeout(timeout).send().await {
                 Ok(r) => r,
@@ -2832,6 +2961,7 @@ async fn service_health(
 
     json_response(StatusCode::OK, &serde_json::json!({
         "llama_swap": if swap_ok { "healthy" } else { "unhealthy" },
+        "swap_mode": mode.as_str(),
         "manifest": if !cloud_available {
             "disabled"
         } else if manifest_ok { "healthy" } else { "unhealthy" },
@@ -2933,6 +3063,90 @@ fn parse_llama_slots(body: &str) -> Option<(bool, u64, u64)> {
     }
     let (active, decoded, _prompt) = best?;
     Some((active, decoded, decoded))
+}
+
+/// Native-mode flush: evict every supervisor-owned resident (the flip's
+/// pre-condition — llama-swap is not dialed). `reload` warms the configured
+/// local working set through `ensure` afterwards.
+async fn flush_models_native(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    reload: bool,
+    local_models: &[String],
+) -> Response<Full<Bytes>> {
+    let mut unloaded = Vec::new();
+    let mut failed = Vec::new();
+    for model in swap.status().models {
+        if !matches!(
+            model.state.as_str(),
+            "ready" | "loading" | "draining" | "waiting"
+        ) {
+            continue;
+        }
+        match swap.evict_with_options(&model.id, "flush", true) {
+            Ok(true) => unloaded.push(model.id),
+            Ok(false) => {}
+            Err(error) => failed.push(format!("{}: {error}", model.id)),
+        }
+    }
+    let mut reloaded = Vec::new();
+    if reload {
+        for key in local_models {
+            match swap.ensure(key).await {
+                Ok(_) => {
+                    info!(model = %key, "swap supervisor reloaded local model after flush");
+                    reloaded.push(key.clone());
+                }
+                Err(error) => warn!(model = %key, %error, "flush reload failed"),
+            }
+        }
+    }
+    if !failed.is_empty() {
+        let error = format!("swap supervisor could not unload: {}", failed.join("; "));
+        return json_response(StatusCode::BAD_GATEWAY, &ErrorResponse { error });
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "status": "ok",
+            "message": if reload {
+                "flushed the swap supervisor, then reloaded the local working set"
+            } else {
+                "all swap-supervisor models unloaded from memory"
+            },
+            "unloaded": unloaded,
+            "reloaded": reloaded,
+        }),
+    )
+}
+
+/// Native-mode "Restart Local Stack": stop every supervisor-owned engine
+/// (per-engine, SIGTERM-grace); the next `ensure` spawns it fresh. Protected
+/// (active-consumer) engines are reported, not force-killed.
+async fn restart_native_engines(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+) -> Response<Full<Bytes>> {
+    let mut restarted = Vec::new();
+    let mut skipped = Vec::new();
+    for model in swap.status().models {
+        if !matches!(model.state.as_str(), "ready" | "loading" | "draining") {
+            continue;
+        }
+        match swap.evict(&model.id, "restart") {
+            Ok(true) => restarted.push(model.id),
+            Ok(false) => {}
+            Err(error) => skipped.push(format!("{}: {error}", model.id)),
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "status": "ok",
+            "service": "swap",
+            "message": "swap-supervisor engines stopped; they respawn on the next request",
+            "restarted": restarted,
+            "skipped": skipped,
+        }),
+    )
 }
 
 /// Unload every model llama-swap currently holds in memory (VRAM), without
@@ -3518,6 +3732,29 @@ async fn register_llama_swap_model(state: &AppState, request: RegisterLlamaSwapM
     let destination = models_dir.join(repo_basename);
     let model_path = resolve_primary_gguf(&destination, &request.quant_pattern)?;
     let warning = path_visibility_warning(&model_path);
+
+    // v2 L7 native mode: registration is a swap-catalog add. The shim file is
+    // never written (it is the retired import source).
+    if state.swap_mode.is_native() {
+        let entry = build_entry(&request.model_id, &model.name, &model_path);
+        let snippet = format!("models:\n{entry}");
+        let plan = crate::swap_catalog::import_llama_swap_config(&snippet)
+            .map_err(|error| RegisterError::Internal(format!("catalog entry build failed: {error}")))?;
+        state
+            .swap
+            .catalog()
+            .apply_import(&plan)
+            .map_err(|error| RegisterError::Internal(format!("swap catalog add failed: {error}")))?;
+        return Ok(RegisterLlamaSwapModelResponse {
+            status: "registered",
+            llama_swap_id: request.model_id,
+            model_path: model_path.display().to_string(),
+            message: "Registered in the swap catalog (swap.mode: native; no shim write)".to_string(),
+            reloaded: true,
+            warning,
+        });
+    }
+
     let entry = build_entry(&request.model_id, &model.name, &model_path);
 
     let _guard = state.llama_swap_config_lock.lock().await;
@@ -4171,12 +4408,19 @@ fn gpu_exclusive_lock_active() -> bool {
     modified.elapsed().map(|age| age < GPU_EXCLUSIVE_LOCK_MAX_AGE).unwrap_or(true)
 }
 
-pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
+pub async fn compute_versions_json(
+    bonsai_fork_path: &std::path::Path,
+    swap_mode: crate::config::SwapMode,
+    swap_keys: usize,
+) -> serde_json::Value {
     use tokio::process::Command;
 
-    // 1. llama-swap version (timeout so a hung binary can't freeze the task)
+    // 1. Local serving row. Native mode reports the swap supervisor (no shim
+    // binary exists to version); shim mode probes the llama-swap binary.
     const LOCAL_VERSION_TIMEOUT_SECS: u64 = 5;
-    let swap_ver = {
+    let swap_ver = if swap_mode.is_native() {
+        format!("native supervisor · {swap_keys} keys")
+    } else {
         let child = Command::new(home_bin("llama-swap"))
             .arg("--version")
             .output();
@@ -4329,13 +4573,20 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
 
     // 5. Remote "latest available" versions (GitHub / Docker Hub)
     let (llama_swap_latest, manifest_latest, toolbox_latest) = tokio::join!(
-        fetch_latest_llama_swap(),
+        async {
+            if swap_mode.is_native() {
+                None
+            } else {
+                fetch_latest_llama_swap().await
+            }
+        },
         fetch_latest_manifest(),
         fetch_latest_toolbox(),
     );
 
     serde_json::json!({
         "brainrouter": env!("CARGO_PKG_VERSION"),
+        "swap_mode": swap_mode.as_str(),
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
         "bonsai_fork": bonsai_fork_ver,
@@ -4835,6 +5086,114 @@ async fn read_routing_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// The read-only YAML view of the governing swap state.
+///
+/// Native mode: the swap catalog (the imported shim file is provenance, not
+/// the governing document). Shim mode: the shim's own config verbatim.
+fn swap_catalog_view_yaml(swap: &crate::swap_scheduler::SwapScheduler) -> String {
+    let data = swap.catalog().snapshot();
+    let mut models = serde_json::Map::new();
+    for (id, entry) in &data.entries {
+        models.insert(
+            id.clone(),
+            serde_json::json!({
+                "name": entry.name,
+                "engine": entry.engine,
+                "files": entry.files,
+                "ctx": entry.ctx,
+                "groups": entry.groups,
+                "aliases": entry.aliases,
+            }),
+        );
+    }
+    let doc = serde_json::json!({
+        "mode": "native",
+        "governing": crate::swap_catalog::default_path().to_string_lossy(),
+        "note": "Read-only view. Edit with `swap catalog add|rm` / `swap import` (API: /api/engines/catalog/*).",
+        "models": models,
+    });
+    serde_yaml::to_string(&doc).unwrap_or_else(|_| "# swap catalog view unavailable\n".to_string())
+}
+
+/// `GET /api/llama-swap-config`: shim config in shim mode, swap-catalog view
+/// in native mode (the flip retargets this surface — never a silent admin trap
+/// on a non-governing file).
+fn swap_config_view(state: &AppState) -> Response<Full<Bytes>> {
+    let yaml = if state.swap_mode.is_native() {
+        Ok(swap_catalog_view_yaml(&state.swap))
+    } else {
+        std::fs::read_to_string(&state.llama_swap_config_path)
+    };
+    match yaml {
+        Ok(yaml) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/yaml; charset=utf-8")
+            .header(
+                "X-Brainrouter-Swap-Mode",
+                state.swap_mode.as_str(),
+            )
+            .body(Full::new(Bytes::from(yaml)))
+            .unwrap(),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: format!("Failed to read the swap config: {error}"),
+            },
+        ),
+    }
+}
+
+/// `POST /api/llama-swap-config`: raw shim-config edits stay shim-mode only.
+/// In native mode the shim file is the IMPORT SOURCE — writing it would look
+/// like admin but govern nothing, so the edit is refused with a pointer to the
+/// catalog surface.
+async fn swap_config_edit(
+    req: Request<Incoming>,
+    state: &AppState,
+) -> Response<Full<Bytes>> {
+    if state.swap_mode.is_native() {
+        return json_response(
+            StatusCode::CONFLICT,
+            &ErrorResponse {
+                error: format!(
+                    "swap.mode is native: `{}` is the import source, not the governing catalog.                      Edit the swap catalog instead (`swap catalog add|rm`, `swap import`, or                      /api/engines/catalog/*).",
+                    state.llama_swap_config_path.display()
+                ),
+            },
+        );
+    }
+    let body_bytes = req
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    if body_bytes.len() > 1_048_576 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse { error: "Request body too large (max 1MB)".to_string() },
+        );
+    }
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
+    if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&body) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse { error: format!("Invalid YAML: {error}") },
+        );
+    }
+    let _guard = state.llama_swap_config_lock.lock().await;
+    let tmp_path = unique_sibling_path(&state.llama_swap_config_path, "tmp");
+    if let Err(error) =
+        atomic_write_path(&state.llama_swap_config_path, &tmp_path, body.as_bytes())
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse { error: format!("Failed to write the shim config: {error}") },
+        );
+    }
+    json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}))
+}
+
 async fn handle_llama_swap_models(
     llama_swap_url: &str,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
@@ -4856,6 +5215,18 @@ pub(crate) async fn build_model_list(state: &AppState) -> ModelListResponse {
         ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
     ];
     let mut seen: HashSet<String> = data.iter().map(|m| m.id.clone()).collect();
+    if state.swap_mode.is_native() {
+        for entry in state.swap.catalog().entries() {
+            if seen.insert(entry.id.clone()) {
+                data.push(ModelObject {
+                    id: entry.id,
+                    object: "model",
+                    created: 0,
+                    owned_by: "swap".to_string(),
+                });
+            }
+        }
+    } else {
     let ls_url = format!("{}/v1/models", state.llama_swap_url);
     if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
         .timeout(std::time::Duration::from_secs(2))
@@ -4878,6 +5249,7 @@ pub(crate) async fn build_model_list(state: &AppState) -> ModelListResponse {
                 }
             }
         }
+    }
     }
     for id in state.serving_identities.openai_compatible_served_models().await {
         if seen.insert(id.clone()) {

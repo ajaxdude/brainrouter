@@ -65,6 +65,31 @@ async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<SlotProgr
     parse_slot_progress(&slots, active_model)
 }
 
+/// Native-mode counterpart: the supervisor resident's own `/slots` endpoint
+/// (no `:8081` hop). Same parser, same progress semantics.
+async fn fetch_slots_native(
+    client: &reqwest::Client,
+    swap: &Arc<brainrouter::swap_scheduler::SwapScheduler>,
+) -> Option<SlotProgress> {
+    let status = swap.status();
+    let resident = status
+        .models
+        .iter()
+        .find(|m| m.state == "ready" && m.endpoint.is_some())?;
+    let model = resident.id.clone();
+    let endpoint = resident.endpoint.clone()?;
+    let slots = client
+        .get(format!("{}/slots", endpoint.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    parse_slot_progress(&slots, model)
+}
+
 fn parse_slot_progress(slots: &serde_json::Value, model: String) -> Option<SlotProgress> {
     let arr = slots
         .as_array()
@@ -165,6 +190,48 @@ pub struct ServeArgs {
 }
 
 /// Entry point for `brainrouter serve`.
+/// v2 L7 flip gate. `swap.mode: native` refuses to boot while the shim still
+/// reports loaded models — the operator flushes first, so no model is
+/// double-resident and retiring the shim Residency source is safe. An
+/// unreachable shim holds nothing; boot proceeds.
+async fn enforce_native_flip_gate(swap: &config::SwapConfig) -> Result<()> {
+    if !swap.mode.is_native() {
+        return Ok(());
+    }
+    // `base_url` may carry the OpenAI `/v1` suffix; `/running` is at the root.
+    let base = swap.shim_base_url().trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    let url = format!("{base}/running");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("building the flip-gate client")?;
+    let loaded: Vec<String> = match client.get(&url).send().await {
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(json) => json
+                .get("running")
+                .and_then(|running| running.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            row.get("model").and_then(|m| m.as_str()).map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    if !loaded.is_empty() {
+        anyhow::bail!(
+            "swap.mode: native refuses to boot — the llama-swap shim still reports loaded models: {}. Flush them first (dashboard \"Unload models\" or POST /api/models/flush), then restart. Native mode never double-resides a model.",
+            loaded.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(args: ServeArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(config::default_socket_path);
     let config_path = args.config.unwrap_or_else(config::default_config_path);
@@ -193,9 +260,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         )? {
             println!("{line}");
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let llama_swap_config = std::path::PathBuf::from(&home)
-            .join(".config/llama-swap/config.yaml");
+        let llama_swap_config =
+            brainrouter::migration::read_swap_config_path(&config_path)?;
         for line in brainrouter::migration::preview_v2_p4(
             &llama_swap_config,
             &brainrouter::paths::brainrouter_state(),
@@ -207,6 +273,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             &config_path,
             &brainrouter::paths::brainrouter_state(),
             &brainrouter::providers::default_path(),
+        )? {
+            println!("{line}");
+        }
+        for line in brainrouter::migration::preview_v2_p7(
+            &config_path,
+            &brainrouter::paths::brainrouter_state(),
         )? {
             println!("{line}");
         }
@@ -258,11 +330,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     }
 
     // v2 L4: import the live llama-swap config into the swap catalog (one-shot,
-    // snapshot + restore; CLI-owned entries are preserved).
+    // snapshot + restore; CLI-owned entries are preserved). `swap.config_path`
+    // is the import source (fedora hosts point it at their docker-mounted file;
+    // default `~/.config/llama-swap/config.yaml`).
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let llama_swap_config = std::path::PathBuf::from(&home)
-            .join(".config/llama-swap/config.yaml");
+        let llama_swap_config =
+            brainrouter::migration::read_swap_config_path(&config_path)?;
         for action in brainrouter::migration::run_v2_p4(
             &llama_swap_config,
             &brainrouter::paths::brainrouter_state(),
@@ -284,9 +357,31 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P6);
     }
 
+    // v2 L7: rename `llama_swap:` → `swap:` LAST, right before the config is
+    // read — after the p3 snapshot (which must hold the pristine v1 YAML
+    // byte-for-byte) and after p4/p6 (which inspect either spelling). Keys move
+    // verbatim; a default `base_url` is dropped with a note. Idempotent.
+    for action in brainrouter::migration::run_v2_p7(
+        &config_path,
+        &brainrouter::paths::brainrouter_state(),
+    )? {
+        warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P7);
+    }
     // Config
     let config = config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    // v2 L7 flip gate: native mode REFUSES to boot while the shim still holds
+    // loaded models (no silent double residency). The operator flushes the
+    // shim (dashboard "Unload models" / POST /api/models/flush), then restarts.
+    enforce_native_flip_gate(&config.swap).await?;
+    if config.swap.mode.is_native() {
+        info!(
+            mode = config.swap.mode.as_str(),
+            import_source = %config.swap.import_config_path().display(),
+            "swap.mode: native — the supervisor owns every local model; the :8081 shim is retired"
+        );
+    }
 
     let routing_mode = match brainrouter::roles::parse_selector(
         &cards.assignment(brainrouter::roles::Role::Main, None),
@@ -373,8 +468,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         tcp_addr = %tcp_addr,
         uds_path = %socket.display(),
         manifest_url = %config.manifest.base_url,
-        llama_swap_url = %config.llama_swap.base_url,
-        fallback_model = %config.llama_swap.fallback_model,
+        swap_mode = config.swap.mode.as_str(),
+        shim_url = %config.swap.shim_base_url(),
+        fallback_model = %config.swap.fallback_model,
         "Starting brainrouter daemon"
     );
     // The Bonsai llama-server launch backend (L3: config moved under
@@ -404,7 +500,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Nudge (per-request reasoning budget) runtime state — shared between the
     // classifier, the router, and the dashboard API.
     let nudge_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        config.llama_swap.nudge.enabled,
+        config.swap.nudge.enabled,
     ));
     let nudge_tier = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(2)); // deep — Bonsai is off by default, so there is no classifier to pick a tier
     let prompt_rewrite = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)); // off by default; enabling requires the Bonsai classifier to be running
@@ -452,10 +548,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         });
     let slot_classifier = Arc::new(Classifier::for_slot(
         slot_base_url,
-        config.llama_swap.fallback_model.clone(),
+        config.swap.fallback_model.clone(),
         slot_classifier_enabled,
         Arc::clone(&nudge_enabled),
-        config.llama_swap.nudge.model_key.clone(),
+        config.swap.nudge.model_key.clone(),
         std::time::Duration::from_millis(config.decision_model.timeout_ms.unwrap_or(15_000)),
     ));
     info!(kind = config.decision_model.kind.as_str(), enabled = config.decision_model.enabled, "Decision slot ready");
@@ -487,10 +583,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         }),
     );
 
-    // llama-swap provider (local)
+    // Shim provider (local shim mode only; native mode never dials it)
     let llama_swap = Arc::new(OpenAiProvider::new(
         "llama-swap".to_string(),
-        config.llama_swap.base_url.clone(),
+        config.swap.shim_base_url().to_string(),
         None,
     ));
 
@@ -502,7 +598,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     // Load optional custom local system prompt
     let local_system_prompt = config
-        .llama_swap
+        .swap
         .local_system_prompt
         .as_ref()
         .and_then(|path| match std::fs::read_to_string(path) {
@@ -575,6 +671,35 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         },
     );
+    // v2 L7: a native boot must resolve every ex-shim key through the registry.
+    // The p4 one-shot import may have run against the default path on a host
+    // whose live config lives elsewhere (`swap.config_path`), so an empty
+    // catalog imports from the configured source now instead of stranding keys.
+    if config.swap.mode.is_native() && swap_catalog.entries().is_empty() {
+        let source = config.swap.import_config_path();
+        if source.exists() {
+            match brainrouter::swap_catalog::import_llama_swap_file(&source)
+                .and_then(|plan| swap_catalog.apply_import(&plan))
+            {
+                Ok(outcome) => info!(
+                    path = %source.display(),
+                    added = outcome.added,
+                    updated = outcome.updated,
+                    "swap.mode: native — imported the catalog from the configured source"
+                ),
+                Err(error) => warn!(
+                    path = %source.display(),
+                    %error,
+                    "swap.mode: native — import source unreadable; the catalog is empty"
+                ),
+            }
+        } else {
+            warn!(
+                path = %source.display(),
+                "swap.mode: native — import source missing and the catalog is empty; add keys                  with `swap catalog add`"
+            );
+        }
+    }
     let budget_ledger = Arc::new(
         brainrouter::swap_scheduler::BudgetLedger::load(
             brainrouter::swap_scheduler::budget_path(),
@@ -639,12 +764,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     ));
     let mut scheduler_config = brainrouter::swap_scheduler::SwapSchedulerConfig {
         llama_swap_url: config
-            .llama_swap
-            .base_url
+            .swap
+            .shim_base_url()
             .trim_end_matches('/')
             .strip_suffix("/v1")
-            .unwrap_or(&config.llama_swap.base_url)
+            .unwrap_or(config.swap.shim_base_url())
             .to_string(),
+        shim_source_enabled: !config.swap.mode.is_native(),
         active_consumer_grace: active_consumers.grace(),
         gate_timeout: std::time::Duration::from_millis(fleet.gate_timeout_ms),
         gate_poll: std::time::Duration::from_millis(fleet.gate_poll_ms),
@@ -707,8 +833,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     // Router — shared between the proxy and the review service
     let llama_swap_config_path = {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
+        let p = config.swap.import_config_path();
         std::fs::canonicalize(&p).ok()
     };
     let mut router_builder = Router::new(brainrouter::router::RouterArgs {
@@ -718,22 +843,23 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         credentials: Arc::clone(&credentials_store),
         budget: Arc::clone(&provider_budget),
         llama_swap,
-        fallback_model: config.llama_swap.fallback_model.clone(),
-        local_models: config.llama_swap.local_models.clone(),
-        subs_model: config.llama_swap.subs_model.clone(),
+        fallback_model: config.swap.fallback_model.clone(),
+        local_models: config.swap.local_models.clone(),
+        subs_model: config.swap.subs_model.clone(),
         health,
         routing_events: Arc::clone(&routing_events),
         local_system_prompt,
         inference_tracker: Arc::clone(&inference_tracker),
-        nudge_budgets: config.llama_swap.nudge.budgets,
+        nudge_budgets: config.swap.nudge.budgets,
         nudge_enabled: Arc::clone(&nudge_enabled),
         nudge_tier: Arc::clone(&nudge_tier),
-        nudge_model_key: config.llama_swap.nudge.model_key.clone(),
+        nudge_model_key: config.swap.nudge.model_key.clone(),
         prompt_rewrite: Arc::clone(&prompt_rewrite),
         llama_swap_config_path,
         serving_identities: Some(Arc::clone(&serving_identities)),
     });
     router_builder.install_swap(Arc::clone(&swap_scheduler));
+    router_builder.install_swap_mode(config.swap.mode);
     router_builder.install_active_consumers(Arc::clone(&active_consumers));
     let router = Arc::new(router_builder);
 
@@ -749,7 +875,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         review_config,
         config.review_admission.clone(),
         Arc::clone(&providers),
-        config.llama_swap.fallback_model.clone(),
+        config.swap.fallback_model.clone(),
     ));
 
     #[cfg(feature = "benchmarks")]
@@ -773,11 +899,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     };
 
     let llama_swap_url = config
-        .llama_swap
-        .base_url
+        .swap
+        .shim_base_url()
         .trim_end_matches('/')
         .strip_suffix("/v1")
-        .unwrap_or(&config.llama_swap.base_url)
+        .unwrap_or(config.swap.shim_base_url())
         .to_string();
 
     // Prefer the migrated provider's URL; fall back to the live YAML value
@@ -832,10 +958,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         bonsai: Arc::new(bonsai_control),
         config_path: std::fs::canonicalize(&config_path).unwrap_or(config_path.clone()),
         llama_swap_config_path: {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            let p = std::path::PathBuf::from(format!("{}/.config/llama-swap/config.yaml", home));
+            let p = config.swap.import_config_path();
             std::fs::canonicalize(&p).unwrap_or(p)
         },
+        swap_mode: config.swap.mode,
         decision_config: config.decision_model.clone(),
         llama_swap_config_lock: Arc::new(tokio::sync::Mutex::new(())),
         tcp_addr: tcp_addr.to_string(),
@@ -845,8 +971,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         versions_cache: Arc::new(versions_rx),
         nudge_enabled,
         nudge_tier,
-        nudge_model_key: config.llama_swap.nudge.model_key.clone(),
-        nudge_budgets: config.llama_swap.nudge.budgets,
+        nudge_model_key: config.swap.nudge.model_key.clone(),
+        nudge_budgets: config.swap.nudge.budgets,
         prompt_rewrite,
         code_review_enabled,
         pr_guidelines_enabled,
@@ -895,18 +1021,27 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Background task: compute versions once, then refresh every 30 minutes.
     {
         let tx = Arc::clone(&versions_tx);
+        let fork_path = config
+            .decision_model
+            .launch
+            .as_ref()
+            .map(|l| l.fork_path.clone())
+            .unwrap_or_default();
+        let swap_mode = config.swap.mode;
+        let swap = Arc::clone(&state.swap);
         tokio::spawn(async move {
-            let fork_path = config
-                .decision_model
-                .launch
-                .as_ref()
-                .map(|l| l.fork_path.clone())
-                .unwrap_or_default();
-            let data = server::compute_versions_json(&fork_path).await;
+            let data =
+                server::compute_versions_json(&fork_path, swap_mode, swap.catalog().entries().len())
+                    .await;
             let _ = tx.send_replace(data);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
-                let data = server::compute_versions_json(&fork_path).await;
+                let data = server::compute_versions_json(
+                    &fork_path,
+                    swap_mode,
+                    swap.catalog().entries().len(),
+                )
+                .await;
                 let _ = tx.send_replace(data);
             }
         });
@@ -915,12 +1050,19 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // progress into the in-flight registry. Builds without /slots no-op.
     {
         let ls_url = state.llama_swap_url.clone();
+        let swap = Arc::clone(&state.swap);
+        let mode = state.swap_mode;
         let inflight = Arc::clone(&state.inflight);
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let Some(progress) = fetch_slots(&client, &ls_url).await else {
+                let progress = if mode.is_native() {
+                    fetch_slots_native(&client, &swap).await
+                } else {
+                    fetch_slots(&client, &ls_url).await
+                };
+                let Some(progress) = progress else {
                     continue;
                 };
                 inflight.set_slot_progress_for_model(
@@ -950,8 +1092,28 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     }
 
     // Server: the accept loops on the listeners bound at the very start.
-    server::run_with_listeners(bound.tcp, bound.uds_path, bound.uds, bound.uds_identity, bound.uds_lock, state).await?;
+    let serve_result = server::run_with_listeners(
+        bound.tcp,
+        bound.uds_path,
+        bound.uds,
+        bound.uds_identity,
+        bound.uds_lock,
+        Arc::clone(&state),
+    )
+    .await;
 
+    // v2 L7 rollback contract: shutdown stops every native child (SIGTERM →
+    // grace, flock released at child exit). Runs on the error path too, so a
+    // failed serve never leaves orphan engines loading into VRAM.
+    let stopped = state.swap.shutdown_all("daemon shutdown");
+    if !stopped.is_empty() {
+        info!(
+            models = ?stopped,
+            "swap supervisor stopped native children at shutdown"
+        );
+    }
+
+    serve_result?;
     Ok(())
 }
 

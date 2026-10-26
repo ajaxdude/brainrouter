@@ -232,7 +232,7 @@ impl ProviderStore {
     }
 
     pub fn snapshot(&self) -> Vec<ProviderRecord> {
-        self.data.lock().unwrap().providers.clone()
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).providers.clone()
     }
 
     pub fn get(&self, id: &str) -> Option<ProviderRecord> {
@@ -258,7 +258,7 @@ impl ProviderStore {
 
     /// The enabled manifest-kind auto provider (v1 `cloud` parity), when unique.
     pub fn auto_manifest(&self) -> Option<ProviderRecord> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut found = data
             .providers
             .iter()
@@ -270,7 +270,7 @@ impl ProviderStore {
     /// Add or replace one provider. Validation runs before the write.
     pub fn upsert(&self, mut record: ProviderRecord) -> Result<()> {
         validate_record(&mut record)?;
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if record.enabled && record.kind == ProviderKind::Manifest && record.auto {
             if let Some(other) = data.providers.iter().find(|p| {
                 p.id != record.id && p.enabled && p.kind == ProviderKind::Manifest && p.auto
@@ -292,7 +292,7 @@ impl ProviderStore {
     }
 
     pub fn remove(&self, id: &str) -> Result<bool> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = data.providers.len();
         data.providers.retain(|p| p.id != id);
         let removed = data.providers.len() != before;
@@ -304,7 +304,7 @@ impl ProviderStore {
 
     /// Replace the whole registry (v2.0-p6 migration).
     pub fn replace_all(&self, records: Vec<ProviderRecord>) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.providers = records;
         data.schema_version = 1;
         persist(&self.path, &data)
@@ -331,6 +331,17 @@ fn validate_record(record: &mut ProviderRecord) -> Result<()> {
             record.id,
             record.base_url
         );
+    }
+    // Credentials in the URL are refused at add/validate time: the record's
+    // credential_id is the only auth surface (URL userinfo would leak into
+    // logs/events and bypass store-managed rotation).
+    if let Ok(parsed) = reqwest::Url::parse(&record.base_url) {
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!(
+                "provider `{}`: base_url must not embed credentials (user:pass@); bind a credential_id instead",
+                record.id
+            );
+        }
     }
     record.base_url = record.base_url.trim_end_matches('/').to_string();
     if record.kind != ProviderKind::Manifest && record.auto {

@@ -4,6 +4,89 @@ Per-phase upgrade/rollback procedures. Phase tags + the per-leg restore
 contract live in `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback"); the change list is in `CHANGELOG.md`.
 
+## v2.0-p7 (L7): `swap:` section + the flip to the native supervisor
+
+L7 absorbs llama-swap. The section formerly spelled `llama_swap:` is now
+`swap:`; every kept key moves verbatim (`fallback_model`, `subs_model`,
+`local_models`, `local_system_prompt`, `nudge.model_key`) and `base_url` is
+REMOVED — no longer used: the shim URL is fixed (`http://localhost:8081/v1` in
+shim mode) and native mode uses the swap supervisor. Two new keys:
+
+```yaml
+swap:
+  mode: shim            # shim (today's behavior) | native (the flip)
+  config_path: "/opt/ai/llama-swap/config.yaml"   # optional import source
+  fallback_model: "your-local-model-key"
+```
+
+### First boot (automatic)
+
+`v2.0-p7` renames the section in place (snapshot: 
+`$XDG_STATE_HOME/brainrouter/migrations/v2.0-p7/config.yaml`; `.bak` sidecar),
+drops `base_url` with the note above, and leaves a file that boots. Preview
+and roll back without state writes:
+
+```sh
+brainrouter serve --dry-run           # includes the v2.0-p7 preview
+brainrouter migration restore v2.0-p7 # puts the llama_swap: section + base_url back
+```
+
+### fedora hosts: set `config_path` FIRST
+
+The native catalog imports from `swap.config_path` (default
+`~/.config/llama-swap/config.yaml`). On fedora the live llama-swap config is
+the docker-mounted file, so the pilot step is:
+
+1. `swap.config_path: "/opt/ai/llama-swap/config.yaml"` in `brainrouter.yaml`,
+2. restart (the import runs at boot; `v2.0-p4` uses this path when present),
+3. `brainrouter swap catalog list` — every model key from the llama-swap
+   config must be listed,
+4. parity check (one request per key through brainrouter) **before** flipping.
+
+Without step 1 the fedora native catalog is empty and the flip strands the
+host.
+
+### The flip (shim → native)
+
+1. Flush the shim so it holds no models: dashboard **Engines → Unload models**
+   (or `brainrouter flush-models`). This frees VRAM.
+2. Set `swap.mode: native` and restart brainrouter.
+
+Native boot REFUSES while llama-swap `/running` still reports loaded models:
+
+```
+swap.mode: native refuses to boot — the llama-swap shim still reports loaded
+models: model-a, model-b. Flush them first ... then restart.
+```
+
+That refusal is the safety interlock (no silent double residency). After a
+clean flip no component dials `:8081`; the supervisor owns every catalog key
+(`ensure` = attach-or-spawn, budget-admitted), flush/restart/model-listing/
+inference-status/registration all read the supervisor or the catalog, and the
+`/api/llama-swap-config` surface serves the swap-catalog view (POST is refused:
+the shim file is the import source, not the governing catalog).
+
+### Rollback (native → shim)
+
+1. Stop brainrouter. Native children are stopped by the scheduler on shutdown
+   (SIGTERM-grace, per-GGUF flock released at child exit) — verify `swap
+   status` shows no residents after the stop.
+2. Set `swap.mode: shim` and restart. llama-swap loads models on demand again;
+   the shim Residency source is live again and the config is unchanged.
+
+The flip is reversible until the deletion pass (soak exit: ≥7 days native, a
+full swap cycle of every catalog key, zero unexplained double-residency /
+no-fit / `blocked` events, budget view consistent, owner sign-off).
+
+### Groups (kickoff inventory)
+
+The owner's imported llama-swap config carries **2 groups**: `dirk-dual`
+(swap=false, exclusive=false) and `non-dual` (swap=true, exclusive=true). The
+native supervisor currently runs single-model entries; slot-sharing for group
+members is an OWNER-SCOPE decision before any group key routes natively —
+groups never silently degrade. See `docs/design/v2-streamlining.L7.log.md`
+("Groups kickoff artifact").
+
 ## v2.0-p6 (L6): providers, Manifest absorbed, LAN federation
 
 L6 replaces the hardcoded Manifest backend with a provider registry. New
@@ -89,14 +172,22 @@ brainrouter cli credential add lan-token --kind store --value "$(openssl rand -h
 ```
 
 Boot logs a plaintext-LAN risk marker (accepted risk: bearer over HTTP on a
-trusted LAN; `peer-info` enumerates exposed models to any token holder). The
-LAN route table is only `/v1/chat/completions`, `/v1/messages`, `/v1/models`
-(filtered), `/api/peer-info`; admin/dashboard/roles/credentials return 404 at
-listener level.
+trusted LAN; `peer-info` exposes `host_id`, brainrouter `version`, and the
+exposed model/tier/state menu to any token holder on that LAN). The LAN route
+table is only `/v1/chat/completions`, `/v1/messages`, `/v1/models` (filtered),
+`/api/peer-info`; admin/dashboard/roles/credentials return 404 at listener
+level.
+
+Expose is enforced on the RAW requested string AND on every model the route
+can actually dispatch (managed `local` ⇒ `fallback_model`, `subs` ⇒
+`subs_model`, `auto` ⇒ the decision chain/pool, `cloud` ⇒ pool top plus the
+managed fallback), including alias-resolved values. Expose the fallback and
+pool models too, or managed selectors will be refused.
 
 - **Rotation**: `brainrouter cli credential add lan-token --kind store --value
   '<new>'` — the old token stops working on the next request (constant-time
-  compare against the resolved vault value; no restart).
+  compare against the resolved vault value, file-first; no restart). Provider
+  credentials resolve the same way.
 - **Expose double-enforcement**: the RAW requested string AND the RESOLVED
   model must both be listed. An exposed alias resolving to a hidden model is
   refused (no cloud-spend escape).

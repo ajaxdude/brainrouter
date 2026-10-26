@@ -538,6 +538,42 @@ pub fn preview_v2_p6(
     Ok(lines)
 }
 
+/// Remove the top-level `manifest:` block, preserving every other line
+/// byte-for-byte (comments, key spellings, ordering). Handles both the block
+/// mapping form and an inline `manifest: {...}` value.
+pub fn remove_manifest_block(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    let mut skipping = false;
+    for line in yaml.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if !skipping {
+            if trimmed.trim_start().starts_with("manifest:")
+                && trimmed.len() == trimmed.trim_start().len()
+            {
+                skipping = true;
+                // Inline value? Consume just this line.
+                continue;
+            }
+            out.push_str(line);
+            continue;
+        }
+        // Inside the block: consume indented content, blank lines, and
+        // indented comments. A column-0 line starts the next top-level key
+        // (or its leading comment) and is kept.
+        if trimmed.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        let indented = trimmed.starts_with(' ') || trimmed.starts_with('\t');
+        if indented {
+            continue;
+        }
+        skipping = false;
+        out.push_str(line);
+    }
+    out
+}
+
 /// The `v2.0-p6` migration: `manifest.*` ⇒ provider `{id: "manifest", kind:
 /// manifest, base_url, credential: env:<api_key_env> if set, auto: true,
 /// models: []}`, `manifest.*` YAML removed, budget ledger created. Snapshot +
@@ -619,13 +655,12 @@ pub fn run_v2_p6(
     // Budget accumulator (0600; restart cannot reset it, calendar rollover).
     crate::provider_budget::ProviderBudget::ensure_file(budget_path)?;
 
-    // Strip `manifest.*` from the YAML.
-    let mut yaml: YamlValue =
-        serde_yaml::from_str(&String::from_utf8_lossy(&original)).context("re-parsing config YAML")?;
-    if let Some(map) = yaml.as_mapping_mut() {
-        map.remove(YamlValue::String("manifest".into()));
-    }
-    let out = serde_yaml::to_string(&yaml).context("serializing migrated config YAML")?;
+    // Strip `manifest.*` from the YAML. Textual, line-preserving removal:
+    // a serde round-trip would normalize EVERY other key's spelling
+    // (e.g. a pre-p7 `llama_swap:` section would be re-emitted as `swap:`),
+    // turning a manifest-only migration into an unrelated config rewrite.
+    let source = String::from_utf8_lossy(&original);
+    let out = remove_manifest_block(&source);
     crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
         .context("writing migrated config YAML")?;
 
@@ -695,6 +730,286 @@ pub fn restore_v2_p6(
         "restored {PHASE_V2_P6} from {} ({})",
         root.display(),
         restored.join(", ")
+    ))
+}
+
+/// The L7 phase tag: `brainrouter migration restore v2.0-p7`.
+///
+/// Renames the config section `llama_swap:` to `swap:` (every kept key moves
+/// verbatim) and removes `base_url` with a "no longer used" note. Idempotent:
+/// a file without the old section is a no-op (the same key-absence contract
+/// `v2.0-p6` uses — a restore followed by a boot re-migrates).
+pub const PHASE_V2_P7: &str = "v2.0-p7";
+
+/// The kept `swap:` keys (the enumeration the migration must preserve).
+pub const SWAP_KEPT_KEYS: &[&str] = &[
+    "fallback_model",
+    "subs_model",
+    "local_models",
+    "local_system_prompt",
+    "nudge",
+];
+
+/// The pre-migration `llama_swap:` section, read from raw YAML (runs before
+/// `config::load`, so a pre-migration file always inspects).
+#[derive(Debug, Clone)]
+pub struct V1SwapSection {
+    /// Section keys in file order (verbatim values are not decoded).
+    pub keys: Vec<String>,
+    /// `base_url` value when present (removed by the migration).
+    pub base_url: Option<String>,
+    /// `config_path`, the L7 import source, when the operator set it.
+    pub config_path: Option<PathBuf>,
+}
+
+fn read_yaml_root(config_path: &Path) -> Result<Option<YamlValue>> {
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading config for v2.0-p7"),
+    };
+    let root: YamlValue = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} for v2.0-p7", config_path.display()))?;
+    Ok(Some(root))
+}
+
+/// Read the pre-migration `llama_swap:` block (None = already migrated).
+pub fn read_v1_swap_section(config_path: &Path) -> Result<Option<V1SwapSection>> {
+    let Some(root) = read_yaml_root(config_path)? else {
+        return Ok(None);
+    };
+    let Some(value) = root.get("llama_swap") else {
+        return Ok(None);
+    };
+    // An empty/null section still needs the rename (the resulting `swap:`
+    // section then fails validation honestly on `fallback_model`).
+    let section = match value.as_mapping() {
+        Some(mapping) => mapping.clone(),
+        None => serde_yaml::Mapping::new(),
+    };
+    let section = &section;
+    let keys = section
+        .keys()
+        .filter_map(YamlValue::as_str)
+        .map(str::to_string)
+        .collect();
+    let base_url = section
+        .get(YamlValue::String("base_url".into()))
+        .and_then(YamlValue::as_str)
+        .map(str::to_string);
+    let config_path = section
+        .get(YamlValue::String("config_path".into()))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    Ok(Some(V1SwapSection {
+        keys,
+        base_url,
+        config_path,
+    }))
+}
+
+/// The L7 catalog import source: `swap.config_path` (or its pre-migration
+/// spelling), defaulting to the llama-swap default path.
+pub fn read_swap_config_path(config_path: &Path) -> Result<PathBuf> {
+    let Some(root) = read_yaml_root(config_path)? else {
+        return Ok(crate::config::default_import_config_path());
+    };
+    for section in ["swap", "llama_swap"] {
+        if let Some(value) = root
+            .get(section)
+            .and_then(|s| s.get("config_path"))
+            .and_then(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(PathBuf::from(value));
+        }
+    }
+    Ok(crate::config::default_import_config_path())
+}
+
+/// Read the configured `swap.mode` from raw YAML (pre-migration spelling
+/// accepted). `None` = the key is absent (default shim).
+pub fn read_swap_mode(config_path: &Path) -> Result<Option<crate::config::SwapMode>> {
+    let Some(root) = read_yaml_root(config_path)? else {
+        return Ok(None);
+    };
+    for section in ["swap", "llama_swap"] {
+        if let Some(mode) = root
+            .get(section)
+            .and_then(|s| s.get("mode"))
+            .and_then(YamlValue::as_str)
+        {
+            return Ok(Some(match mode {
+                "native" => crate::config::SwapMode::Native,
+                _ => crate::config::SwapMode::Shim,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// `--dry-run` preview for `v2.0-p7` — describes the rename, never writes.
+pub fn preview_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P7} (state untouched)"));
+    match read_v1_swap_section(config_path)? {
+        Some(section) => {
+            lines.push(format!(
+                "  would rename llama_swap: → swap: in {} (keys verbatim: {})",
+                config_path.display(),
+                section.keys.join(", ")
+            ));
+            match section.base_url.as_deref() {
+                Some(base_url)
+                    if base_url.trim().is_empty()
+                        || base_url.trim_end_matches('/')
+                            == crate::config::DEFAULT_SHIM_BASE_URL.trim_end_matches('/') =>
+                {
+                    lines.push(format!(
+                        "  would remove swap.base_url ({base_url}) — no longer used: the shim URL \
+                         has a fixed default and native mode uses the supervisor"
+                    ));
+                }
+                Some(base_url) => lines.push(format!(
+                    "  would keep swap.base_url ({base_url}) — a non-default shim endpoint is \
+                     honored (deprecated; drop it once the shim is deleted)"
+                )),
+                None => {}
+            }
+            lines.push(format!(
+                "  would snapshot the pre-migration config under {}",
+                snapshot_root(state_root, PHASE_V2_P7).display()
+            ));
+        }
+        None => lines.push(format!(
+            "  no llama_swap: section in {} — migration {PHASE_V2_P7} has nothing to do",
+            config_path.display()
+        )),
+    }
+    Ok(lines)
+}
+
+/// The `v2.0-p7` migration: `llama_swap:` ⇒ `swap:` (kept keys move verbatim,
+/// `base_url` dropped with a note). Snapshot + `.bak` first. Idempotent.
+pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let Some(section) = read_v1_swap_section(config_path)? else {
+        return Ok(Vec::new());
+    };
+    let original = std::fs::read(config_path)
+        .with_context(|| format!("reading {} for v2.0-p7", config_path.display()))?;
+    let mut root: YamlValue =
+        serde_yaml::from_slice(&original).context("re-parsing config YAML for v2.0-p7")?;
+
+    // Snapshot the exact pre-migration YAML (stable per-phase directory).
+    let snapshot_dir = snapshot_root(state_root, PHASE_V2_P7);
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+    let _ = std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700));
+    crate::plugins::store::atomic_write_0600(&snapshot_dir.join("config.yaml"), &original)?;
+
+    // `.bak` sidecar (oldest pre-migration copy; never clobbered).
+    if !bak_path(config_path).exists() {
+        std::fs::write(bak_path(config_path), &original).context("writing config .bak backup")?;
+    }
+
+    let old = root
+        .get("llama_swap")
+        .cloned()
+        .unwrap_or(YamlValue::Null);
+    let mut moved = match old {
+        YamlValue::Mapping(map) => map,
+        _ => serde_yaml::Mapping::new(),
+    };
+    // `base_url` dies for the default shim endpoint; a NON-default value is an
+    // operator's deliberate endpoint (and the frozen v1 fixtures' mock port),
+    // so it survives with the deprecation note — the shim floor stays
+    // byte-identical until the deletion pass.
+    let keeps_base_url = section
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| {
+            value.trim_end_matches('/') != crate::config::DEFAULT_SHIM_BASE_URL.trim_end_matches('/')
+        });
+    if !keeps_base_url {
+        moved.remove(YamlValue::String("base_url".into()));
+    }
+    let map = root
+        .as_mapping_mut()
+        .context("config YAML root is not a mapping")?;
+    map.remove(YamlValue::String("llama_swap".into()));
+    // If a `swap:` section already exists, its values win; missing keys move
+    // over from the old section.
+    let mut merged = match map
+        .get(YamlValue::String("swap".into()))
+        .and_then(YamlValue::as_mapping)
+        .cloned()
+    {
+        Some(existing) => {
+            let mut existing = existing;
+            for (key, value) in moved {
+                existing.entry(key).or_insert(value);
+            }
+            existing
+        }
+        None => moved,
+    };
+    if !keeps_base_url {
+        merged.remove(YamlValue::String("base_url".into()));
+    }
+    map.insert(YamlValue::String("swap".into()), YamlValue::Mapping(merged));
+
+    let mut out = String::from(
+        "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n# (every kept key moved verbatim; see docs/design/v2-streamlining.L7.log.md).\n",
+    );
+    out.push_str(&serde_yaml::to_string(&root).context("serializing migrated config YAML")?);
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+
+    let kept: Vec<&str> = section
+        .keys
+        .iter()
+        .filter(|key| SWAP_KEPT_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    Ok(vec![format!(
+        "renamed llama_swap: → swap: in {} (kept keys verbatim: {}); swap.base_url: {}; \
+         pre-migration snapshot: {}",
+        config_path.display(),
+        kept.join(", "),
+        match section.base_url.as_deref() {
+            Some(value) if keeps_base_url => {
+                format!("kept: non-default endpoint {value} — deprecated")
+            }
+            Some(_) => "dropped with a migration note".to_string(),
+            None => "absent".to_string(),
+        },
+        snapshot_dir.display()
+    )])
+}
+
+/// Restore `v2.0-p7`: put the pre-migration YAML back (the `llama_swap:`
+/// section returns with `base_url`).
+pub fn restore_v2_p7(state_root: &Path, config_path: &Path) -> Result<String> {
+    let root = snapshot_root(state_root, PHASE_V2_P7);
+    let snapshot_config = root.join("config.yaml");
+    if !snapshot_config.exists() {
+        anyhow::bail!(
+            "no {PHASE_V2_P7} migration snapshot found under {}",
+            root.display()
+        );
+    }
+    let bytes = std::fs::read(&snapshot_config)
+        .with_context(|| format!("reading {}", snapshot_config.display()))?;
+    std::fs::write(config_path, &bytes)
+        .with_context(|| format!("restoring config to {}", config_path.display()))?;
+    Ok(format!(
+        "restored {PHASE_V2_P7} from {} (config YAML: llama_swap: section + base_url)",
+        root.display()
     ))
 }
 
@@ -903,6 +1218,10 @@ pub fn restore(
             &crate::providers::default_path(),
             &crate::provider_budget::default_path(),
         );
+    }
+    // v2 L7: p7 owns the config YAML only (section rename).
+    if phase == PHASE_V2_P7 {
+        return restore_v2_p7(state_root, config_path);
     }
     // v2 L4: the p4 snapshot holds swap state only (no config/credentials/
     // cards); restoring it must not touch those unrelated files.
@@ -1133,6 +1452,18 @@ fn bak_path(config_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_block_removal_is_byte_preserving() {
+        let yaml = "manifest:\n  enabled: true\n  base_url: http://x/v1\nllama_swap:\n  port: 8081\n# tail\n";
+        let out = super::remove_manifest_block(yaml);
+        assert_eq!(out, "llama_swap:\n  port: 8081\n# tail\n");
+        let inline = "manifest: {enabled: false}\nmodels:\n  dir: /m\n";
+        assert_eq!(super::remove_manifest_block(inline), "models:\n  dir: /m\n");
+        let absent = "models:\n  dir: /m\n";
+        assert_eq!(super::remove_manifest_block(absent), absent);
+    }
+
+
     use super::*;
 
     fn v1_yaml(token: &str) -> String {
@@ -1427,6 +1758,201 @@ models:
         assert!(text.contains("dry-run"));
         assert!(!state.exists(), "dry-run writes no state");
         assert!(!catalog_path.exists(), "dry-run writes no catalog");
+    }
+
+    fn p7_config() -> &'static str {
+        "manifest:\n  enabled: false\n  base_url: \"http://localhost:3001/v1\"\nllama_swap:\n  base_url: \"http://localhost:8081/v1\"\n  fallback_model: dirk-main\n  subs_model: dirk-subs\n  local_models:\n    - dirk-main\n    - dirk-subs\n  local_system_prompt: /tmp/prompt.md\n  nudge:\n    enabled: true\n    model_key: dirk-nudge\n    budgets:\n      light: 10240\n      deep: 12288\n"
+    }
+
+    #[test]
+    fn p7_renames_the_section_verbatim_and_drops_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        let actions = run_v2_p7(&config, &state).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(actions[0].contains("renamed"), "{actions:?}");
+
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(
+            root.get("llama_swap").is_none(),
+            "old section must be absent post-migration"
+        );
+        let swap = root.get("swap").expect("swap: section");
+        assert_eq!(
+            swap.get("fallback_model").and_then(YamlValue::as_str),
+            Some("dirk-main")
+        );
+        assert_eq!(
+            swap.get("subs_model").and_then(YamlValue::as_str),
+            Some("dirk-subs")
+        );
+        assert_eq!(
+            swap.get("local_system_prompt").and_then(YamlValue::as_str),
+            Some("/tmp/prompt.md")
+        );
+        assert_eq!(
+            swap.get("nudge")
+                .and_then(|n| n.get("model_key"))
+                .and_then(YamlValue::as_str),
+            Some("dirk-nudge")
+        );
+        assert_eq!(
+            swap.get("nudge")
+                .and_then(|n| n.get("budgets"))
+                .and_then(|b| b.get("deep"))
+                .and_then(YamlValue::as_u64),
+            Some(12288)
+        );
+        assert!(
+            swap.get("base_url").is_none(),
+            "base_url is removed (no longer used)"
+        );
+        // Snapshot + `.bak` hold the pre-migration bytes.
+        let snapshot = snapshot_root(&state, PHASE_V2_P7).join("config.yaml");
+        assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), p7_config());
+        assert_eq!(
+            std::fs::read_to_string(config.with_extension("yaml.bak")).unwrap(),
+            p7_config()
+        );
+    }
+
+    #[test]
+    fn p7_keeps_a_non_default_shim_endpoint() {
+        // The frozen v1 fixtures point `base_url` at a mock port; dropping it
+        // would silently repoint the shim. A non-default endpoint survives
+        // (deprecated) so the shim floor stays byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "llama_swap:\n  base_url: \"http://127.0.0.1:19999/v1\"\n  fallback_model: m\n",
+        )
+        .unwrap();
+        let actions = run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        assert!(actions[0].contains("kept"), "{actions:?}");
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let swap = root.get("swap").expect("swap: section");
+        assert_eq!(
+            swap.get("base_url").and_then(YamlValue::as_str),
+            Some("http://127.0.0.1:19999/v1")
+        );
+        let loaded = crate::config::load(&config).unwrap();
+        assert_eq!(loaded.swap.shim_base_url(), "http://127.0.0.1:19999/v1");
+    }
+
+    #[test]
+    fn p7_is_idempotent_and_boots_as_the_new_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let after_first = std::fs::read_to_string(&config).unwrap();
+        assert!(run_v2_p7(&config, &dir.path().join("state"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), after_first);
+        // The migrated file parses through the live config loader.
+        let loaded = crate::config::load(&config).unwrap();
+        assert_eq!(loaded.swap.fallback_model, "dirk-main");
+        assert_eq!(loaded.swap.mode, crate::config::SwapMode::Shim);
+    }
+
+    #[test]
+    fn p7_dry_run_is_inert_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        let first = preview_v2_p7(&config, &state).unwrap();
+        let second = preview_v2_p7(&config, &state).unwrap();
+        assert_eq!(first, second);
+        let text = first.join("\n");
+        assert!(text.contains("llama_swap: → swap:"), "{text}");
+        assert!(text.contains("no longer used"), "{text}");
+        assert!(!state.exists(), "dry-run writes no state");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), p7_config());
+    }
+
+    #[test]
+    fn p7_restore_round_trips_the_old_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        run_v2_p7(&config, &state).unwrap();
+        std::fs::write(&config, "swap:\n  fallback_model: mutated\n").unwrap();
+        let msg = restore_v2_p7(&state, &config).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), p7_config());
+    }
+
+    #[test]
+    fn p7_merges_into_an_existing_swap_section_without_losing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "swap:\n  mode: native\n  fallback_model: new-main\nllama_swap:\n  fallback_model: old-main\n  subs_model: old-subs\n  base_url: http://localhost:8081/v1\n",
+        )
+        .unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(root.get("llama_swap").is_none());
+        let swap = root.get("swap").unwrap();
+        assert_eq!(
+            swap.get("mode").and_then(YamlValue::as_str),
+            Some("native"),
+            "existing values win"
+        );
+        assert_eq!(
+            swap.get("fallback_model").and_then(YamlValue::as_str),
+            Some("new-main")
+        );
+        assert_eq!(
+            swap.get("subs_model").and_then(YamlValue::as_str),
+            Some("old-subs"),
+            "missing keys move over"
+        );
+        assert!(swap.get("base_url").is_none());
+    }
+
+    #[test]
+    fn p7_import_path_reads_the_new_and_old_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "swap:\n  config_path: /opt/ai/llama-swap/config.yaml\n  fallback_model: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_swap_config_path(&config).unwrap(),
+            PathBuf::from("/opt/ai/llama-swap/config.yaml")
+        );
+        std::fs::write(
+            &config,
+            "llama_swap:\n  config_path: /srv/llama-swap.yaml\n  fallback_model: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_swap_config_path(&config).unwrap(),
+            PathBuf::from("/srv/llama-swap.yaml")
+        );
+        assert_eq!(read_swap_mode(&config).unwrap(), None);
+        std::fs::write(
+            &config,
+            "swap:\n  mode: native\n  fallback_model: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_swap_mode(&config).unwrap(),
+            Some(crate::config::SwapMode::Native)
+        );
     }
 
     #[test]

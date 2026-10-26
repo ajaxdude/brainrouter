@@ -127,6 +127,42 @@ fn unique_suffix() -> String {
     )
 }
 
+/// Where a test's isolated HOME/XDG tree lives.
+///
+/// `/tmp` is a tmpfs on this box, so anything written there is RAM. The daemon under
+/// test can materialize a rootless-podman store inside `$XDG_DATA_HOME` (one pulled
+/// toolbox image is ~1.9 GiB), and a leaked test root is therefore 1.9 GiB of RAM per
+/// run — enough to OOM-kill the model server next to the tests. Keep it on disk: Cargo
+/// hands integration tests the path `target/tmp/<binary>` via `CARGO_TARGET_TMPDIR`.
+fn test_root() -> PathBuf {
+    match option_env!("CARGO_TARGET_TMPDIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::temp_dir(),
+    }
+}
+
+/// Remove a test root, including anything a user namespace owns.
+///
+/// The podman store inside it is created through a user namespace, so its
+/// `overlay/*/diff` trees belong to the *subuid-mapped* root: an unprivileged
+/// `remove_dir_all` fails with EACCES and silently leaks the whole root. Retry inside
+/// that namespace (`podman unshare`), where those files are removable.
+fn remove_test_root(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    if fs::remove_dir_all(root).is_ok() {
+        return;
+    }
+    let _ = Command::new("podman")
+        .arg("unshare")
+        .args(["rm", "-rf"])
+        .arg(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 struct TestEnv {
     root: PathBuf,
     home: PathBuf,
@@ -140,7 +176,7 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("brainrouter-l4-{tag}-{}", unique_suffix()));
+        let root = test_root().join(format!("brainrouter-l4-{tag}-{}", unique_suffix()));
         let home = root.join("home");
         let config_home = root.join("config");
         let data_home = root.join("data");
@@ -220,7 +256,7 @@ impl TestEnv {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         if self.owned {
-            let _ = fs::remove_dir_all(&self.root);
+            remove_test_root(&self.root);
         }
     }
 }

@@ -304,6 +304,19 @@ impl RoutingEvents {
         false
     }
 
+    /// v2 L6: backfill the budget badge after the stream's accrual lands
+    /// (post-accrual spend, not the pre-dispatch estimate).
+    pub fn update_budget(&self, event_id: u64, budget: BudgetEvent) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        for event in inner.events.iter_mut().rev() {
+            if event.id == event_id {
+                event.budget = Some(budget);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Retain a confirmed stream sample and backfill only its own route event.
     /// The sample survives even if its route event was evicted while streaming.
     pub(crate) fn record_measurement(&self, measurement: CompletedStreamMeasurement) -> bool {

@@ -384,6 +384,47 @@ impl CredentialStore {
         Ok(data.credentials.values().cloned().collect())
     }
 
+    /// Resolve a credential with the VAULT FILE authoritative (rotations
+    /// written by a CLI/owner after boot are observed immediately; the
+    /// in-memory copy is the fallback for in-memory stores).
+    pub fn resolve_live(&self, credential_id: &str) -> Result<SecretString> {
+        let path = self.path();
+        if !path.as_os_str().is_empty() && path.exists() {
+            if let Ok(fresh) = CredentialStore::load(path.to_path_buf()) {
+                if let Ok(secret) = fresh.resolve(credential_id) {
+                    return Ok(secret);
+                }
+            }
+        }
+        self.resolve(credential_id)
+    }
+
+    /// Append one owner-audit record next to the store
+    /// (`credentials.audit.jsonl`, 0600, atomic rewrite). Values are NEVER
+    /// recorded — ids/actions/paths only.
+    pub fn append_audit_event(&self, action: &str, detail: serde_json::Value) -> Result<()> {
+        let path = self.path();
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let mut audit = path.with_extension("audit.jsonl");
+        if audit.as_os_str().is_empty() {
+            audit = path.with_file_name("credentials.audit.jsonl");
+        }
+        let mut text = std::fs::read_to_string(&audit).unwrap_or_default();
+        let record = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "actor": "owner-cli",
+            "action": action,
+            "detail": detail,
+        });
+        text.push_str(&record.to_string());
+        text.push('\n');
+        crate::plugins::store::atomic_write_0600(&audit, text.as_bytes())
+            .with_context(|| format!("appending to {}", audit.display()))?;
+        Ok(())
+    }
+
     /// v2 L6 credential env-line export (R7 reverse path): `NAME=VALUE` lines
     /// for `store`-kind credentials; `env`/`file` kinds pass their REFERENCES
     /// through as comments (never their values). Masked list rendering is

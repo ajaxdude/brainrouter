@@ -1034,6 +1034,9 @@ pub struct SwapSchedulerConfig {
     pub port_min: u16,
     pub port_max: u16,
     pub llama_swap_url: String,
+    /// v2 L7: the shim Residency source retires at the flip. `false` = native
+    /// mode: never dial the shim for `/running`, never list shim residents.
+    pub shim_source_enabled: bool,
     /// L5: idle grace after the last routed stream (Active-Consumer span).
     pub active_consumer_grace: Duration,
     /// L5: `MemAvailable` floor applied to spawning ensures (`0` = disabled).
@@ -1070,6 +1073,7 @@ impl Default for SwapSchedulerConfig {
             port_min: 5900,
             port_max: 5999,
             llama_swap_url: "http://127.0.0.1:8081".into(),
+            shim_source_enabled: true,
             active_consumer_grace: Duration::from_secs(
                 std::env::var("BRAINROUTER_ACTIVE_CONSUMER_GRACE_S")
                     .ok()
@@ -1421,7 +1425,14 @@ impl SwapScheduler {
     /// identities) into the cached sync view. The daemon poller calls this;
     /// tests drive the shim view directly.
     pub async fn refresh_residency(&self, client: &reqwest::Client) {
-        let view = residency::poll_shim(client, &self.config.llama_swap_url, &self.catalog).await;
+        // v2 L7: after the flip the shim source retires. Native mode keeps an
+        // empty shim view and never dials `:8081` (the boot gate made this
+        // safe by refusing while shim residents existed).
+        let view = if self.config.shim_source_enabled {
+            residency::poll_shim(client, &self.config.llama_swap_url, &self.catalog).await
+        } else {
+            residency::ResidencyView::new()
+        };
         self.set_shim_view(view);
         if let Some(registry) = &self.serving_identities {
             let snapshot = registry.snapshot().await;
@@ -1430,6 +1441,31 @@ impl SwapScheduler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = residency::observe_containers(&snapshot);
         }
+    }
+
+    /// v2 L7 rollback contract: stop every supervisor-owned child (adapters do
+    /// SIGTERM → grace → KILL; the per-GGUF flock is released when the child
+    /// exits). Called on daemon shutdown so a native→shim rollback leaves no
+    /// native resident behind.
+    pub fn shutdown_all(&self, reason: &str) -> Vec<String> {
+        let ids: Vec<String> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner
+                .models
+                .iter()
+                .filter(|(_, runtime)| runtime.handle.is_some())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut stopped = Vec::new();
+        for id in ids {
+            if let Err(error) = self.stop_native(&id, reason) {
+                tracing::warn!(model = %id, %error, "swap shutdown: could not stop native child");
+            } else {
+                stopped.push(id);
+            }
+        }
+        stopped
     }
 
     /// Combined Residency view: shim + own children + containers + external.

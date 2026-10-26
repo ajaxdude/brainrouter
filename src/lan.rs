@@ -174,7 +174,9 @@ fn authorized(app: &AppState, lane: &LanState, headers: &hyper::HeaderMap) -> bo
     let Some(presented) = bearer(headers) else {
         return false;
     };
-    let Ok(secret) = app.credentials.resolve(&lane.token_credential) else {
+    // File-first resolution: a CLI/owner rotation written after boot is
+    // observed on the next request (rotation is immediate).
+    let Ok(secret) = app.credentials.resolve_live(&lane.token_credential) else {
         return false;
     };
     constant_time_eq(presented.as_bytes(), secret.expose().as_bytes())
@@ -184,7 +186,7 @@ async fn handle(
     req: Request<Incoming>,
     app: Arc<AppState>,
     lane: Arc<LanState>,
-    _peer: SocketAddr,
+    peer: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -268,12 +270,6 @@ async fn handle(
                         )))
                     }
                 };
-            if let Err(error) = enforce_expose(&app, &lane, &request.model) {
-                return Ok(into_unsync(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                )));
-            }
             let session_id = crate::server::extract_session_id(&headers);
             let user_agent = headers
                 .get(hyper::header::USER_AGENT)
@@ -289,6 +285,12 @@ async fn handle(
                 .unwrap_or("main")
                 .trim()
                 .to_string();
+            if let Err(error) = enforce_expose(&app, &lane, &request, &role).await {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": error}),
+                )));
+            }
             match app
                 .router
                 .route_tagged_role(request, session_id, String::new(), user_agent, &role)
@@ -332,12 +334,9 @@ async fn handle(
                         )))
                     }
                 };
-            if let Err(error) = enforce_expose(&app, &lane, &parsed.model) {
-                return Ok(into_unsync(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                )));
-            }
+            // Expose is checked against the TRANSLATED canonical request so
+            // the preview sees the same features dispatch will see.
+            let preview_request = crate::anthropic::anthropic_to_openai(parsed);
             let session_id = crate::server::extract_session_id(&headers);
             let user_agent = headers
                 .get(hyper::header::USER_AGENT)
@@ -351,13 +350,19 @@ async fn handle(
                 .unwrap_or("main")
                 .trim()
                 .to_string();
+            if let Err(error) = enforce_expose(&app, &lane, &preview_request, &role).await {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": error}),
+                )));
+            }
             crate::server::anthropic_messages_from_bytes(
                 app,
                 bytes,
                 String::new(),
                 session_id,
                 user_agent,
-                "0.0.0.0:0".parse().unwrap(),
+                peer,
                 role,
             )
             .await
@@ -379,39 +384,39 @@ async fn handle(
     }
 }
 
-/// Expose double-enforcement: the RAW requested string AND the RESOLVED model
-/// must both be listed.
-fn enforce_expose(app: &AppState, lane: &LanState, raw: &str) -> std::result::Result<(), String> {
-    if !lane.expose.contains(raw) {
-        return Err(format!(
-            "model `{raw}` is not in the LAN expose list"
-        ));
+/// Expose double-enforcement (pure part, unit-tested): the RAW requested
+/// string AND every dispatchable RESOLVED candidate must be listed.
+pub fn expose_violation(
+    expose: &HashSet<String>,
+    raw: &str,
+    resolved: &[String],
+) -> Option<String> {
+    if !expose.contains(raw) {
+        return Some(format!("model `{raw}` is not in the LAN expose list"));
     }
-    let resolved = resolved_model(app, raw);
-    if let Some(resolved) = resolved {
-        if !lane.expose.contains(&resolved) {
-            return Err(format!(
-                "model `{raw}` resolves to `{resolved}`, which is not in the LAN expose list"
+    for model in resolved {
+        if !expose.contains(model) {
+            return Some(format!(
+                "model `{raw}` resolves to `{model}`, which is not in the LAN expose list"
             ));
         }
     }
-    Ok(())
+    None
 }
 
-fn resolved_model(app: &AppState, raw: &str) -> Option<String> {
-    let records = app.providers.snapshot();
-    match crate::roles::parse_selector(raw) {
-        crate::roles::Selector::Cloud => Some("auto".to_string()),
-        crate::roles::Selector::CloudId(rest) => {
-            let query = crate::providers::PoolQuery::default();
-            crate::providers::resolve_cloud_target(&records, Some(&rest), &query)
-                .ok()
-                .map(|target| target.model)
-        }
-        crate::roles::Selector::Bare(key) => {
-            Some(crate::providers::resolve_bare_model(&records, &key).map(|(_, m)| m).unwrap_or(key))
-        }
-        _ => None,
+/// Expose double-enforcement against the router's dispatch preview (managed
+/// substitution + alias rewrite included: `local` ⇒ `fallback_model`, `subs` ⇒
+/// `subs_model`, `auto` ⇒ the decision chain/pool, cloud ⇒ pool top/fallback).
+async fn enforce_expose(
+    app: &AppState,
+    lane: &LanState,
+    request: &crate::types::ChatCompletionRequest,
+    role: &str,
+) -> std::result::Result<(), String> {
+    let candidates = app.router.expose_candidates(request, role, "").await;
+    match expose_violation(&lane.expose, &request.model, &candidates) {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -462,4 +467,51 @@ fn peer_info(app: &AppState, lane: &LanState) -> Value {
         "models": models,
         "serving": serving,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expose(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn raw_model_must_be_exposed() {
+        assert!(expose_violation(&expose(&["a"]), "hidden", &[]).is_some());
+        assert!(expose_violation(&expose(&["a"]), "a", &[]).is_none());
+    }
+
+    #[test]
+    fn managed_substitutions_must_also_be_exposed() {
+        // L6-1: `local` (or an exposed managed token) dispatches the
+        // fallback model; exposing only the token must not grant it.
+        let violation = expose_violation(&expose(&["local"]), "local", &["fallback-model".into()]);
+        assert!(violation.is_some(), "unexposed managed substitution escaped");
+        let ok = expose_violation(
+            &expose(&["local", "fallback-model"]),
+            "local",
+            &["fallback-model".into()],
+        );
+        assert!(ok.is_none());
+    }
+
+    #[test]
+    fn alias_axis_is_enforced_on_the_post_alias_value() {
+        // The raw alias is exposed but its resolved target is not.
+        let violation = expose_violation(
+            &expose(&["allowed-alias"]),
+            "allowed-alias",
+            &["costly-model".into()],
+        );
+        assert!(violation.unwrap().contains("costly-model"));
+    }
+
+    #[test]
+    fn constant_time_compare_matches_equality() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"tokeN"));
+        assert!(!constant_time_eq(b"token", b"token "));
+    }
 }

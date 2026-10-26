@@ -1023,7 +1023,7 @@ function switchView(view) {
   const credView = document.getElementById('credentials-view');
   if (credView) credView.style.display = view === 'credentials' ? 'block' : 'none';
   if (view === 'credentials') { loadCredentials(); loadProviders(); }
-  if (view === 'models') loadProviderModelGroups();
+  if (view === 'models' && typeof loadProviderModelGroups === 'function') loadProviderModelGroups();
   if (view === 'engines') loadEngines();
 
   const modelsActive = isModelsView(view);
@@ -4490,6 +4490,10 @@ async function loadEngines() {
         '<span><span style="color:var(--textMute)">mem</span> ' + Number((platform.facts || {}).mem_total_gib || 0).toFixed(0) + ' GiB</span>' +
         '<span><span style="color:var(--textMute)">feed</span> ' + escHtml(platform.feed_origin || '') + '</span>' +
         '<span><span style="color:var(--textMute)">gpus</span> ' + gpus + '</span>' +
+        (engines.swap ? '<span><span style="color:var(--textMute)">mode</span> <strong>' + escHtml(engines.swap.mode) + '</strong>' +
+          (engines.swap.mode === 'native'
+            ? ' <span style="color:var(--textMute)">catalog ' + escHtml(String(engines.swap.catalog_keys)) + ' keys · ' + escHtml(String(engines.swap.groups_count)) + ' groups</span>'
+            : ' <span style="color:var(--textMute)">import ' + escHtml(engines.swap.import_source) + '</span>') + '</span>' : '') +
         '</div><div style="display:flex;flex-direction:column;gap:3px">' + offers + '</div>' +
         ((engines.adapter_detail || []).length
           ? '<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">' +

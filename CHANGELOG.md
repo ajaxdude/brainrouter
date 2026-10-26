@@ -4,6 +4,62 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L7: llama-swap absorbed — the flip (branch `v2-p3-roles`, pre-merge)
+
+The local serving layer gains a mode switch and the whole `:8081` surface is
+retargeted in native mode. `swap:` replaces `llama_swap:` (v2.0-p7, keys
+verbatim, `base_url` removed with a note; snapshot + dry-run + restore), and
+`swap.mode: native` makes the native supervisor the only local engine. Native
+boot REFUSES while llama-swap still reports loaded models (flush-first), the
+shim Residency source retires at the flip, and rollback (native → shim) leaves
+no children behind. Shim mode is the byte-identical default floor.
+
+### Added
+
+- **`swap:` config section** (`src/config.rs`: `SwapConfig`, `SwapMode`) with
+  `mode` (default `shim`), `config_path` (catalog import source; default
+  `~/.config/llama-swap/config.yaml`, fedora hosts point at
+  `/opt/ai/llama-swap/config.yaml`) and the kept v1 keys. The pre-migration
+  `llama_swap:` spelling still parses (serde alias) so frozen v1 fixtures and
+  un-migrated files boot.
+- **Flip gate** (`daemon::enforce_native_flip_gate`): native boot refuses with
+  the shim's loaded-model list; an unreachable shim proceeds. Native boot
+  imports the configured source when the catalog is empty.
+- **`v2.0-p7` migration** (`migration::run_v2_p7`): section rename, `base_url`
+  drop with a "no longer used" note, snapshot + `.bak`, dry-run preview,
+  `migration restore v2.0-p7`, idempotent; merges into an existing `swap:`
+  section (existing values win).
+- **Native-boot catalog import** from `swap.config_path` when the catalog is
+  empty (fedora reality; the p4 one-shot may have run against the default path).
+
+### Changed
+
+- **Consumer retargets in native mode** (shim mode untouched): router local
+  routing (catalog-only `ensure`; no shim fall-through), model listing
+  (`/v1/models`, `/api/models/llama-swap`), inference-status + in-flight PP feed
+  (supervisor per-model `/slots`), observability backend snapshot
+  (registry/catalog, same state vocabulary), flush (`evict` all + optional
+  warm-load), restart endpoint (per-engine stop; respawn on next request),
+  GGUF registration (catalog add; the shim file is never written),
+  `/api/llama-swap-config` (GET = swap-catalog view, POST refused with a
+  pointer), config-files panel row (swap catalog), versions/upgrades rows
+  (supervisor row; no shim binary probe or GitHub check), Engines tab
+  (mode/catalog-keys/groups badge).
+- **Provider literal** stays `"llama-swap"` on routed events through the flip
+  and the soak (supervisor routes translate `native` at event emission); the
+  deletion pass renames it to `"local"`.
+- **Residency**: `shim_source_enabled` in the scheduler config; native mode
+  never polls `/running` and lists no shim residents.
+- Repo YAMLs (`brainrouter.yaml`, `brainrouter-headless.yaml`,
+  `brainrouter.example.yaml`) use the `swap:` section with `mode: shim`.
+
+### Notes
+
+- `base_url` is still honored when present (parse compatibility for fixtures
+  and non-default shim ports) but the migration deletes it from operator files.
+- install.sh's llama-swap install/service step, the prompt-rewrite text and the
+  shim adapter itself remain until the nod-gated deletion pass.
+
 ## v2 L6: providers, Manifest absorbed, LAN federation (branch `v2-p3-roles`, pre-merge)
 
 Cloud is brainrouter's own decision. The hardcoded Manifest backend is
@@ -60,8 +116,11 @@ the distributed-role mechanism.
   (expose-filtered), `/api/peer-info`. Bearer compared constant-time against
   the resolved vault credential (rotation immediate), per-token bucket
   (defaults 20 burst / 4 per second) with 429 on excess, expose
-  double-enforcement (raw + resolved; alias/qualified escapes refused),
-  admin/dashboard 404 at listener level, plaintext-LAN risk logged at boot.
+  double-enforcement against the router's dispatch preview — RAW plus every
+  dispatchable value (managed `local`⇒fallback_model, `subs`⇒subs_model,
+  `auto`⇒chain/pool, `cloud`⇒target+fallback, and post-alias ids), so a
+  managed token cannot escape into unexposed spend; admin/dashboard 404 at
+  listener level, plaintext-LAN risk logged at boot.
   `peer-info` = `{host_id, version, models:[{key,ctx,tools,tier,state}],
   serving}` read-only.
 - **Role-header forwarding**: only `lan_peer` providers receive the request's
@@ -72,7 +131,9 @@ the distributed-role mechanism.
   restart), cost = price × usage tokens or the `(bytes+3)/4` estimator flagged
   `estimated`; `warn` records + badges, `stop` refuses as a PRIMARY failure
   (managed fallback fires; review escalates) and excludes the provider from
-  the auto pool.
+  the auto pool. Badges and the route event's `budget` field are backfilled
+  with POST-accrual spend, and a stream that dies mid-flight reports a breaker
+  failure (the header-time breaker cannot see it).
 - **Credential env-line export**: `brainrouter credential export --env-line
   <file> [--force]` (0600 atomic, refuse-if-exists) — `store` credentials as
   `NAME=VALUE`, `env`/`file` references as comments, masked lists unchanged.

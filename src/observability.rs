@@ -478,6 +478,54 @@ fn allowed_proxy(proxy: &str, backend: &str) -> bool {
         Some(url::Host::Ipv6(ip)) if ip.is_loopback())
 }
 
+/// Native-mode counterpart of [`poll_backend`]: the snapshot comes from the
+/// swap supervisor's registry + catalog, so no `:8081` traffic exists after
+/// the flip. State vocabulary matches the shim mapping (`loaded`/`loading`/
+/// `stopping`), keeping the observability UI byte-identical.
+fn poll_backend_native(
+    swap: &std::sync::Arc<crate::swap_scheduler::SwapScheduler>,
+) -> BackendSnapshot {
+    let status = swap.status();
+    let mut snapshot = BackendSnapshot {
+        sampled_at: Some(Utc::now()),
+        running_error: None,
+        catalog_error: None,
+        models: BTreeMap::new(),
+    };
+    let runtime: BTreeMap<String, (String, Option<String>)> = status
+        .models
+        .into_iter()
+        .map(|model| (model.id, (model.state, model.endpoint)))
+        .collect();
+    for entry in swap.catalog().entries() {
+        let (state, _endpoint) = runtime
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_else(|| ("stopped".to_string(), None));
+        let state = match state.as_str() {
+            "ready" => "loaded",
+            "loading" | "draining" => "loading",
+            "waiting" => "loading",
+            "failed" => "stopping",
+            _ => "stopped",
+        };
+        snapshot.models.insert(
+            entry.id.clone(),
+            BackendModel {
+                model_key: entry.id.clone(),
+                state: state.to_string(),
+                reported_state: Some(state.to_string()),
+                quantization: entry.quant.clone(),
+                artifact_path: entry.files.first().cloned(),
+                runtime_build: None,
+                context_tokens: entry.ctx,
+                metadata_error: None,
+            },
+        );
+    }
+    snapshot
+}
+
 async fn poll_backend(client: &reqwest::Client, url: &str) -> BackendSnapshot {
     let catalog_url = format!("{url}/v1/models");
     let running_url = format!("{url}/running");
@@ -917,7 +965,11 @@ pub fn start(state: &Arc<crate::server::AppState>) {
         let mut latches = BTreeMap::new();
         let mut revision = 0;
         loop {
-            let backend = poll_backend(&client, &state.llama_swap_url).await;
+            let backend = if state.swap_mode.is_native() {
+                poll_backend_native(&state.swap)
+            } else {
+                poll_backend(&client, &state.llama_swap_url).await
+            };
             let (settings, next_revision) = {
                 let current = state.observability.settings.lock().unwrap();
                 (current.settings.clone(), current.revision)

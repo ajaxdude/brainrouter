@@ -72,7 +72,17 @@ impl AnthropicProvider {
 
     pub async fn chat_completion(
         &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.chat_completion_with_role(request, None).await
+    }
+
+    /// L6 federation: forward the effective `x-brainrouter-role` header to a
+    /// `lan_peer` provider (distributed roles apply on the Anthropic wire too).
+    pub async fn chat_completion_with_role(
+        &self,
         mut request: ChatCompletionRequest,
+        role: Option<&str>,
     ) -> Result<ProviderResponse, ProviderError> {
         request.stream = Some(true);
         let body = to_anthropic_body(&request);
@@ -84,6 +94,9 @@ impl AnthropicProvider {
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", ANTHROPIC_VERSION);
+        if let Some(role) = role {
+            builder = builder.header("x-brainrouter-role", role);
+        }
         if let Some(key) = &self.api_key {
             builder = builder.header("x-api-key", key);
         }

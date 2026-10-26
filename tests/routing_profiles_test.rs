@@ -873,7 +873,9 @@ fn l3_configuration_is_validated() {
     fs::write(&config_path, serde_yaml::to_string(&good).unwrap()).unwrap();
     let loaded = config::load(&config_path).unwrap();
     assert!(!loaded.manifest.enabled);
-    assert_eq!(loaded.llama_swap.subs_model.as_deref(), Some("legacy-subs"));
+    // v2 L7 `v2.0-p7`: the section is `swap:` (the `llama_swap:` spelling
+    // still parses through the serde alias).
+    assert_eq!(loaded.swap.subs_model.as_deref(), Some("legacy-subs"));
     assert!(!loaded.decision_model.enabled);
 
     // A v1-era review block (forced_mode) is NOT an L3 config any more:

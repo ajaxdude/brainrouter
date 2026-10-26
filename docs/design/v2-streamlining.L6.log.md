@@ -165,16 +165,75 @@ a qualified `cloud/<lan-peer>/...` review card derives
     still yields no conv_id (old bucket grouping).
 11. **Anthropic non-stream mode** — not implemented: the router always speaks
     streaming (`stream: true`), matching the OpenAI adapter contract.
-12. **`peer-info.ctx` for local keys** — no ctx source is pinned for
+12. **P6 strips `manifest:` textually, not via a serde round-trip** — a
+    round-trip re-emits EVERY key with current spellings (and collides with
+    the L7 `llama_swap:`→`swap:` migration by rewriting the section before p7
+    runs). `remove_manifest_block` removes only the top-level block, leaving
+    all other bytes intact (unit-tested).
+13. **`peer-info.ctx` for local keys** — no ctx source is pinned for
     llama-swap keys; emitted as `0` unless the key is a provider model.
 
-## Verification run
+## Review round (Bruce L46): GO-with-gate disposition
 
-- `cargo test --test v2_l6_acceptance` — 25/25 green (the bar).
-- Prior suites: `cargo test --lib` + L1, L2, L2-fixpass, L3,
-  L3-plugin-decision, L4, L5, L5-smoke acceptance suites.
-- `cargo check` / `cargo clippy` both modes; `scripts/check-html-js.sh`.
-- Live smoke: LAN second listener against mock gateways (auth/rotation/rate/
-  admin-404/expose/peer-info), role-header forwarding to a mock peer,
-  qualified selector routing, and budget stop exclusion (fixture-tier rows in
-  Ray's suite exercise all three live).
+- **L6-1 (blocking) — managed expose bypass.** `lan.rs` now enforces expose
+  against `Router::expose_candidates`, a preview computed with the SAME
+  helpers dispatch uses (card resolution, decision slot + clamps, local chain,
+  cloud resolution), including the managed substitutions (`local` ⇒
+  `fallback_model`, `subs` ⇒ `subs_model`, `auto` ⇒ chain/pool, `cloud` ⇒
+  target + fallback) and the post-alias values (`swap_catalog` alias and
+  provider id/alias). EVERY candidate must be exposed or the LAN request is
+  400. Unit tests in `src/lan.rs` cover raw, managed-substitution, alias, and
+  constant-time compare. Wire note: a managed token (`local`/`auto`) therefore
+  requires its resolved fallback/chain models to be exposed too.
+- **L6-2 — breaker blind to mid-stream death + badge semantics.** The provider
+  meter (`BudgetCaptureStream`, now attached to every provider route from
+  `route_resolved` after the event id exists) reports `HealthTracker::
+  report_failure(provider)` on a stream error, accrues usage/estimator as
+  before, and backfills the already-emitted event's `budget` badge with
+  POST-accrual spend via `RoutingEvents::update_budget(event_id, ..)` (the
+  same correlation TPS capture uses). The badge emitted at headers remains the
+  pre-dispatch view for ~one stream duration.
+- **L6-3 — Anthropic role forwarding.** `AnthropicProvider::
+  chat_completion_with_role` sends `x-brainrouter-role`; the adapter enum
+  forwards the effective role for both wire families.
+- **L6-4 — p6 one-shot marker + atomic restore.** `migrations/v2.0-p6/.done`
+  is written after a successful migration; a later re-added `manifest:` block
+  is a no-op (restore-then-re-add cannot clobber the snapshot). Restore writes
+  the YAML through the 0600 atomic machinery.
+- **Nits.** `ProviderBudget` recovers poisoned locks and writes the ledger
+  file OUTSIDE the mutex; provider store locks recover poison too; LAN auth
+  and provider credentials both use `CredentialStore::resolve_live`
+  (file-first rotation); `peer-info` host/version risk is stated in UPGRADE;
+  credential export appends `credentials.audit.jsonl` (ids only); provider
+  Test probes the first declared model (manifest `auto`) and refuses to invent
+  `"probe"`; `hop.endpoint` is the concrete `/chat/completions` or `/messages`
+  URL; `validate_record` rejects `user:pass@` base URLs; LAN `/v1/messages`
+  carries the real peer address.
+
+## Verification run (final, after the Bruce L46 round)
+
+- `cargo test --test v2_l6_acceptance` — **25/25 green** (the bar; suite
+  untouched).
+- `cargo test --lib` — **487/487** on the combined L6+L7 tree (includes the
+  new LAN expose, budget rollover/estimator, provider resolution, migration
+  stripper, and peer-admission unit tests).
+- Prior suites: L1 6, L2 14, L2-fixpass 3, L3 21, L3-plugin-decision 7,
+  L4 17/17, L5 11/11, L5-smoke 9/9, `daemon_availability` 4 — all green on
+  the combined tree.
+  (An earlier run showed L5 9/11 with the `external-occupant` gate firing on
+  the owner's live `strix_server`; the host freed the device and the rows are
+  green.) An intermediate combined-tree run failed L4 on L7's p7
+  `llama_swap:`→`swap:` config rewrite (test precondition, not L6); Builder-L7
+  resolved it and L4 re-verified 17/17.
+- `cargo check` + `cargo clippy`, default and `--features benchmarks`: no
+  errors (only pre-existing warnings elsewhere).
+- `node scripts/test-benchmark-ui.cjs` (0 fail), `scripts/check-html-js.sh`
+  OK.
+- Live smoke: LAN second listener against mock gateways (auth + rotation,
+  rate burst, admin 404, expose raw/resolved/managed, peer-info), role-header
+  forwarding to a mock peer (both wire families), qualified selector routing,
+  and budget stop exclusion (Ray's fixture rows exercise all live).
+- Coordination note: v2 L7 landed its `llama_swap`→`swap` rename in the same
+  worktree mid-leg; the L6 files (providers/budget/lan/router provider arms/
+  migration p6/credentials/cli) were kept disjoint and the battery above was
+  re-run on the combined tree.
