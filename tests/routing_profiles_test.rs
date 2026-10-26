@@ -766,7 +766,7 @@ async fn cli_uses_the_same_typed_cards_and_reduced_review_api() {
         (
             &["review-config", "update", "--max-iterations", "7"],
             "/api/review-config",
-            json!({"max_iterations":7,"hankndory_integration":false,"design_doc_path":null}),
+            json!({"max_iterations":7,"hankndory_integration":false,"design_doc_path":null,"fallback_selector":null}),
         ),
     ];
     for (args, path, expected) in cases {

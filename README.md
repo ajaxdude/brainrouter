@@ -1649,6 +1649,16 @@ benchmarks:
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
+  # fallback_selector: cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash
+  # Second-chance reviewer backend. If the primary review-card model's cloud
+  # provider fails (credits exhausted, circuit open, unreachable), the review
+  # retries ONCE on this selector before escalating to a human. Must be a
+  # cloud selector; the qualified cloud/<provider>/<model> form names a
+  # distinct provider. Cloud reviews only — local reviews never migrate off
+  # their admitted model. Read from this file at boot (restart to apply); it
+  # is not part of the review card store and the POST /api/review-config body
+  # ignores it. Applies to explicitly-cloud review cards; an `auto` card
+  # resolving to cloud keeps the single-attempt escalation contract.
 # v2 L3: the reviewer MODEL lives on the review role card
 # (`brainrouter roles set review cloud/vendor/review-model`); the v1
 # `forced_mode`/`forced_model` keys and the `routing:` block (including

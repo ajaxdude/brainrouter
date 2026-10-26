@@ -698,6 +698,15 @@ pub struct ReviewConfig {
     /// while integration is on ⇒ the review fails closed (escalates).
     #[serde(default)]
     pub design_doc_path: Option<String>,
+
+    /// Second-chance reviewer selector (e.g. `cloud/deepseek-ai/DeepSeek-V4-Flash`).
+    /// When the primary reviewer backend fails — cloud credits exhausted, circuit
+    /// open, unreachable — the review retries ONCE against this selector before
+    /// escalating to a human. Cloud reviews only: a local review never migrates
+    /// to another model (its rubric and admission permit are model-specific).
+    /// Must be a `cloud/...` selector.
+    #[serde(default)]
+    pub fallback_selector: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -710,6 +719,7 @@ impl Default for ReviewConfig {
             max_iterations: default_max_iterations(),
             hankndory_integration: false,
             design_doc_path: None,
+            fallback_selector: None,
         }
     }
 }
@@ -717,6 +727,15 @@ impl Default for ReviewConfig {
 impl ReviewConfig {
     pub fn validate(&self) -> Result<()> {
         crate::roles::validate_iterations(self.max_iterations)?;
+        if let Some(sel) = self.fallback_selector.as_deref() {
+            let choice = crate::roles::ModelChoice::from_selector(sel)
+                .map_err(|e| anyhow::anyhow!("review.fallback_selector: {e}"))?;
+            if choice.backend() != "cloud" {
+                bail!(
+                    "review.fallback_selector must be a cloud selector (cloud/...), got {sel:?}"
+                );
+            }
+        }
         Ok(())
     }
 }

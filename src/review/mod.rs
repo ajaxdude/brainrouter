@@ -47,6 +47,10 @@ pub struct ReviewService {
     active_reviews: Arc<Mutex<HashSet<String>>>,
     /// Admission policy (memory-gated local reviewer, design H2).
     admission: Arc<admission::AdmissionCtx>,
+    /// YAML `review.fallback_selector` (infra reviewer failover, not card
+    /// policy): read from the YAML at boot — repointing it requires a daemon
+    /// restart — never from the review card store.
+    fallback_selector: Option<String>,
 }
 
 struct ActiveReviewGuard {
@@ -97,6 +101,7 @@ impl ReviewService {
                 fallback_model,
                 permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             }),
+            fallback_selector: config.fallback_selector.clone(),
         }
     }
 
@@ -252,6 +257,7 @@ impl ReviewService {
             max_iterations: extras.max_iterations,
             hankndory_integration: extras.hankndory_integration,
             design_doc_path: extras.design_doc_path,
+            fallback_selector: self.fallback_selector.clone(),
         }
     }
 

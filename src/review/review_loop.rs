@@ -4,7 +4,7 @@
 //! chat-completion requests go through, so review calls benefit from the same
 //! circuit breaker and stall detection.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -141,6 +141,18 @@ pub async fn run_loop(
     // the expansive guidance. The admitted backend is fixed for the whole run.
     let is_local = choice.backend() == "local";
 
+    // Infra failover (YAML `review.fallback_selector`): when the primary card
+    // selector's cloud backend fails (credits exhausted, circuit open,
+    // unreachable), retry once on this cloud selector before escalating.
+    // Cloud routes only — a local review never migrates off its admitted model.
+    let fallback_choice = match config.fallback_selector.as_deref() {
+        Some(sel) if choice.backend() == "cloud" => Some(
+            crate::roles::ModelChoice::from_selector(sel)
+                .map_err(|e| anyhow::anyhow!("review.fallback_selector `{sel}`: {e}"))?,
+        ),
+        _ => None,
+    };
+
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
     let mut feedback = String::new();
@@ -189,7 +201,16 @@ pub async fn run_loop(
 
         // Route through the same Router used by the HTTP proxy, tagging the event
         // with this session_id so the dashboard can correlate review calls.
-        let result = call_llm_for_review(router, built.text, session_id, &choice, project_dir, max_output_tokens).await;
+        let result = call_llm_for_review(
+            router,
+            built.text,
+            session_id,
+            &choice,
+            project_dir,
+            max_output_tokens,
+            fallback_choice.as_ref(),
+        )
+        .await;
 
         match result {
             Err(e) => {
@@ -216,8 +237,9 @@ pub async fn run_loop(
                 );
                 break;
             }
-            Ok((raw_text, route_info)) => {
-                let review_model = format!("requested {}; actual {}", choice.selector(), route_info.display());
+            Ok((raw_text, route_info, served_selector)) => {
+                let review_model =
+                    format!("requested {}; actual {}", served_selector, route_info.display());
 
                 // Parse the JSON response from the LLM
                 match parse_llm_response(&raw_text) {
@@ -348,7 +370,8 @@ async fn call_llm_for_review(
     choice: &crate::roles::ModelChoice,
     project_dir: &str,
     max_output_tokens: usize,
-) -> Result<(String, crate::router::RouteInfo)> {
+    fallback: Option<&crate::roles::ModelChoice>,
+) -> Result<(String, crate::router::RouteInfo, String)> {
     let request = ChatCompletionRequest {
         model: choice.selector(),
         messages: vec![
@@ -378,9 +401,61 @@ async fn call_llm_for_review(
     };
 
 
-    let (provider_response, route_info) = router
-        .route_with_choice(request, choice, Some(session_id.to_string()), project_dir.to_string(), String::new(), false)
-        .await?;
+    // One primary attempt; on failure, one retry on the infra fallback selector
+    // (when configured). A second failure is terminal — surfaced to the loop,
+    // which escalates. The selector string records the hop for the session.
+    // Clone for the primary leg only when a fallback leg could consume the
+    // original (review prompts are token-budgeted; avoid duplicating them on
+    // the feature-off path). The retry leg owns its request by construction.
+    let (primary_request, retry_request) = match fallback {
+        Some(_) => (request.clone(), Some(request)),
+        None => (request, None),
+    };
+    let (provider_response, route_info, served_selector) = match router
+        .route_with_choice(
+            primary_request,
+            choice,
+            Some(session_id.to_string()),
+            project_dir.to_string(),
+            String::new(),
+            false,
+        )
+        .await
+    {
+        Ok((provider_response, route_info)) => (provider_response, route_info, choice.selector()),
+        Err(e) => match fallback {
+            Some(fb) => {
+                warn!(
+                    error = %e,
+                    fallback = %fb.selector(),
+                    "review primary backend failed; retrying once on review.fallback_selector"
+                );
+                let retry_request = retry_request.expect("fallback configured ⇒ retry request kept");
+                match router
+                    .route_with_choice(
+                        retry_request,
+                        fb,
+                        Some(session_id.to_string()),
+                        project_dir.to_string(),
+                        String::new(),
+                        false,
+                    )
+                    .await
+                {
+                    Ok((provider_response, route_info)) => (
+                        provider_response,
+                        route_info,
+                        format!("{} (fell back to {})", choice.selector(), fb.selector()),
+                    ),
+                    Err(fe) => bail!(
+                        "review failed on primary backend ({e}); fallback `{}` failed too ({fe})",
+                        fb.selector()
+                    ),
+                }
+            }
+            None => return Err(e),
+        },
+    };
 
     // Collect the SSE stream into a full text response
     use crate::provider::ProviderResponse;
@@ -441,7 +516,7 @@ async fn call_llm_for_review(
                 }
             }
 
-            Ok((collected, route_info))
+            Ok((collected, route_info, served_selector))
         }
     }
 }
