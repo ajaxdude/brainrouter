@@ -67,19 +67,21 @@ deliberately, as the spec requires until the soak exit.
    markers removed. `kill_children_on_drop` is unchanged (L4 default false) —
    the explicit path is the contract.
 6. **`v2.0-p7` migration** (`src/migration.rs`) — `PHASE_V2_P7`,
-   `read_v1_swap_section`, `read_swap_config_path`, `read_swap_mode`,
+   `read_v1_swap_section`, `read_swap_config_path`,
    `preview_v2_p7`, `run_v2_p7`, `restore_v2_p7`; dispatcher + `migration
    restore v2.0-p7`. Rename keeps keys verbatim; `base_url` semantics below.
    Snapshot `migrations/v2.0-p7/config.yaml` + `.bak` sidecar. Idempotency is
    key-absence (same contract as p6: a restore followed by a boot re-migrates).
-   Merges into an existing `swap:` section (existing values win). Runs FIRST at
-   boot (before p3/p2/p4/p6 and before `config::load`); p4 now imports from
-   `swap.config_path`.
+   Merges into an existing `swap:` section (existing values win; the
+   merge never drops a `base_url` the newer section already spells). Runs
+   LAST at boot (after p3/p2/p4/p6, right before `config::load` — the p3
+   snapshot must hold the pristine v1 YAML and p4/p6 inspect either
+   spelling); p4 imports from `swap.config_path` via its own raw reader.
 7. **Tests** — `config::tests` (mode parse + default, alias boot, serialization
    shape, endpoint override, import path) and `migration::tests` p7 (verbatim
    key/value fidelity, old section absent, `base_url` drop, non-default
    endpoint preserved, dry-run inert + stable, restore round-trip, idempotency,
-   merge, import-path/mode raw reads).
+   merge, import-path raw read).
 8. **Docs** — `UPGRADE.md` (first boot, fedora `config_path` pilot steps, flip
    procedure, rollback, groups), `CHANGELOG.md`, this log; repo (gitignored)
    `brainrouter.yaml` / `brainrouter-headless.yaml` moved to `swap:` (the

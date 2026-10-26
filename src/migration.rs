@@ -851,27 +851,6 @@ pub fn read_swap_config_path(config_path: &Path) -> Result<PathBuf> {
     Ok(crate::config::default_import_config_path())
 }
 
-/// Read the configured `swap.mode` from raw YAML (pre-migration spelling
-/// accepted). `None` = the key is absent (default shim).
-pub fn read_swap_mode(config_path: &Path) -> Result<Option<crate::config::SwapMode>> {
-    let Some(root) = read_yaml_root(config_path)? else {
-        return Ok(None);
-    };
-    for section in ["swap", "llama_swap"] {
-        if let Some(mode) = root
-            .get(section)
-            .and_then(|s| s.get("mode"))
-            .and_then(YamlValue::as_str)
-        {
-            return Ok(Some(match mode {
-                "native" => crate::config::SwapMode::Native,
-                _ => crate::config::SwapMode::Shim,
-            }));
-        }
-    }
-    Ok(None)
-}
-
 /// `--dry-run` preview for `v2.0-p7` — describes the rename, never writes.
 pub fn preview_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
     let mut lines = Vec::new();
@@ -911,6 +890,67 @@ pub fn preview_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String
         )),
     }
     Ok(lines)
+}
+
+fn base_url_note(base_url: Option<&str>, keeps_base_url: bool) -> String {
+    match base_url {
+        Some(value) if keeps_base_url => {
+            format!("kept: non-default endpoint {value} — deprecated")
+        }
+        Some(_) => "dropped with a migration note".to_string(),
+        None => "absent".to_string(),
+    }
+}
+
+/// Rename the top-level `llama_swap:` section header to `swap:` in text,
+/// byte-preserving every other line. `None` when the file is not safe for
+/// the textual edit: a top-level `swap:` already exists (merge semantics
+/// belong to the structured path) or the section header carries an inline
+/// value / is not a plain column-0 `llama_swap:` mapping opener.
+fn text_rename_llama_swap(original: &str, drop_base_url: bool) -> Option<String> {
+    if original.lines().any(|line| line.starts_with("swap:"))
+        || !original.lines().any(|line| line == "llama_swap:")
+    {
+        return None;
+    }
+    let top_level_key = |line: &str| {
+        !line.is_empty()
+            && !line.starts_with([' ', '\t', '#', '-'])
+            && line.split_once(':').is_some()
+    };
+    let mut out = String::with_capacity(original.len());
+    let mut in_section = false;
+    let mut dropped_base_url = false;
+    for line in original.lines() {
+        if line == "llama_swap:" {
+            out.push_str(
+                "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n\
+                 # (every kept key moved verbatim; see docs/design/v2-streamlining.L7.log.md).\n",
+            );
+            out.push_str("swap:\n");
+            in_section = true;
+            continue;
+        }
+        if in_section && top_level_key(line) {
+            in_section = false;
+        }
+        if in_section && drop_base_url {
+            if line.starts_with("  base_url:") {
+                dropped_base_url = true;
+                continue;
+            }
+            // ONLY contiguous deeper-indented lines continue a removed block
+            // scalar — any other line ends the removal. (Without the reset,
+            // the first nested key under a later mapping was eaten.)
+            if dropped_base_url && line.starts_with("    ") && !line.trim().is_empty() {
+                continue;
+            }
+        }
+        dropped_base_url = false;
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// The `v2.0-p7` migration: `llama_swap:` ⇒ `swap:` (kept keys move verbatim,
@@ -956,6 +996,26 @@ pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
         .is_some_and(|value| {
             value.trim_end_matches('/') != crate::config::DEFAULT_SHIM_BASE_URL.trim_end_matches('/')
         });
+
+    // Textual rename first: the structured path below re-serializes the WHOLE
+    // file through serde_yaml, silently rewriting every comment, key order,
+    // quote style, and anchor in the operator's config. The rename only needs
+    // to touch the section header (and possibly one `base_url` line), so do
+    // it in text and leave everything else byte-identical (the p6 approach).
+    if let Some(text) = text_rename_llama_swap(
+        std::str::from_utf8(&original).context("config YAML is not UTF-8")?,
+        !keeps_base_url,
+    ) {
+        crate::plugins::store::atomic_write_0600(config_path, text.as_bytes())
+            .context("writing migrated config YAML")?;
+        return Ok(vec![format!(
+            "renamed llama_swap: → swap: in {} (textual rename; other lines, comments, and \
+             ordering untouched); swap.base_url: {}; pre-migration snapshot: {}",
+            config_path.display(),
+            base_url_note(section.base_url.as_deref(), keeps_base_url),
+            snapshot_dir.display()
+        )]);
+    }
     if !keeps_base_url {
         moved.remove(YamlValue::String("base_url".into()));
     }
@@ -965,6 +1025,10 @@ pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
     map.remove(YamlValue::String("llama_swap".into()));
     // If a `swap:` section already exists, its values win; missing keys move
     // over from the old section.
+    let existing_base_url = map
+        .get(YamlValue::String("swap".into()))
+        .and_then(|s| s.get("base_url"))
+        .is_some();
     let mut merged = match map
         .get(YamlValue::String("swap".into()))
         .and_then(YamlValue::as_mapping)
@@ -979,13 +1043,18 @@ pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
         }
         None => moved,
     };
-    if !keeps_base_url {
+    // The drop decision may only act on the OLD section's value: an
+    // `base_url` the operator already spells under `swap:` is their current
+    // config, not migration residue.
+    if !keeps_base_url && !existing_base_url {
         merged.remove(YamlValue::String("base_url".into()));
     }
     map.insert(YamlValue::String("swap".into()), YamlValue::Mapping(merged));
 
+    // Structured merge fallback (a top-level `swap:` section already exists,
+    // or the section is not a plain column-0 mapping header).
     let mut out = String::from(
-        "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n# (every kept key moved verbatim; see docs/design/v2-streamlining.L7.log.md).\n",
+        "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n# (keys merged; see docs/design/v2-streamlining.L7.log.md).\n",
     );
     out.push_str(&serde_yaml::to_string(&root).context("serializing migrated config YAML")?);
     crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
@@ -1002,13 +1071,7 @@ pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
          pre-migration snapshot: {}",
         config_path.display(),
         kept.join(", "),
-        match section.base_url.as_deref() {
-            Some(value) if keeps_base_url => {
-                format!("kept: non-default endpoint {value} — deprecated")
-            }
-            Some(_) => "dropped with a migration note".to_string(),
-            None => "absent".to_string(),
-        },
+        base_url_note(section.base_url.as_deref(), keeps_base_url),
         snapshot_dir.display()
     )])
 }
@@ -1841,6 +1904,31 @@ models:
     }
 
     #[test]
+    fn p7_rename_is_textual_and_preserves_comments_and_ordering() {
+        // serde_yaml re-serialization would have wiped every comment, quote
+        // style, and the operator's key ordering. The rename may only touch
+        // the section header line and the dropped base_url line.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        let source = "# top comment — operator kept\nmanifest:\n  enabled: false\nllama_swap:\n  # keep me\n  base_url: \"http://localhost:8081/v1\"\n  subs_model: 'dirk-subs' # trailing comment\n  fallback_model: dirk-main\nlogging:\n  level: debug\n";
+        std::fs::write(&config, source).unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(after.contains("# top comment — operator kept"), "{after}");
+        assert!(after.contains("  # keep me"), "{after}");
+        assert!(after.contains("'dirk-subs' # trailing comment"), "{after}");
+        assert!(!after.contains("base_url"), "{after}");
+        // Order: manifest, swap (with its keys in the original relative
+        // order: subs_model before fallback_model), logging.
+        let pos = |needle: &str| after.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(pos("manifest:") < pos("swap:"));
+        assert!(pos("subs_model") < pos("fallback_model"));
+        assert!(pos("swap:") < pos("logging:"));
+        // Everything outside the edit points is byte-identical.
+        assert!(after.contains("  subs_model: 'dirk-subs' # trailing comment\n  fallback_model: dirk-main\nlogging:\n  level: debug\n"), "{after}");
+    }
+
+    #[test]
     fn p7_keeps_a_non_default_shim_endpoint() {
         // The frozen v1 fixtures point `base_url` at a mock port; dropping it
         // would silently repoint the shim. A non-default endpoint survives
@@ -1964,16 +2052,8 @@ models:
             read_swap_config_path(&config).unwrap(),
             PathBuf::from("/srv/llama-swap.yaml")
         );
-        assert_eq!(read_swap_mode(&config).unwrap(), None);
-        std::fs::write(
-            &config,
-            "swap:\n  mode: native\n  fallback_model: x\n",
-        )
-        .unwrap();
-        assert_eq!(
-            read_swap_mode(&config).unwrap(),
-            Some(crate::config::SwapMode::Native)
-        );
+        // (`swap.mode` parsing itself is covered by config::tests — a raw
+        // second reader of the same key would only drift.)
     }
 
     /// L6-4: after p6 ran once, a RE-ADDED `manifest:` block must not

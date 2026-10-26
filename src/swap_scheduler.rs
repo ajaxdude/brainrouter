@@ -97,6 +97,15 @@ pub enum SwapError {
         pid: u32,
         endpoint: String,
     },
+    /// A model belongs to an imported llama-swap group whose slot-sharing
+    /// semantics the native supervisor does not implement yet. Spawning it
+    /// natively would silently degrade the group to independent single-model
+    /// engines, so it is refused until the operator decides.
+    /// Block reason: `blocked:groups-pending`.
+    GroupsPending {
+        model: String,
+        groups: Vec<String>,
+    },
 }
 
 impl SwapError {
@@ -109,7 +118,8 @@ impl SwapError {
             Self::Cancelled(_) => 499,
             Self::BlockedActiveConsumer { .. }
             | Self::GateBlocked { .. }
-            | Self::ExternalOccupant { .. } => 503,
+            | Self::ExternalOccupant { .. }
+            | Self::GroupsPending { .. } => 503,
             Self::UnitOwned { .. } => 409,
         }
     }
@@ -167,6 +177,13 @@ impl std::fmt::Display for SwapError {
                 "blocked:external-occupant: `{model}` needs the device occupied by an \
                  unregistered engine (pid {pid} at {endpoint}); run `swap adopt` or stop it, \
                  or pass --override"
+            ),
+            Self::GroupsPending { model, groups } => write!(
+                f,
+                "blocked:groups-pending: `{model}` belongs to group(s) {}; native group \
+                 routing awaits the operator slot-sharing decision (keep swap.mode: shim \
+                 for groups, or route a model outside the group)",
+                groups.join(", ")
             ),
         }
     }
@@ -1282,6 +1299,10 @@ pub struct SwapScheduler {
     takeover_units: Mutex<BTreeMap<String, String>>,
     /// L5 injectable `MemAvailable` probe (fixtures); env wins over it.
     mem_source: Mutex<Option<Arc<dyn Fn() -> f64 + Send + Sync>>>,
+    /// Set by `shutdown_all` (daemon exit / L7 rollback). The maintenance
+    /// tick and every spawn path honor it so a crash-restart or a late
+    /// ensure cannot resurrect a child the shutdown is killing.
+    shutting_down: AtomicBool,
     /// Serialized per-device swap locks (exclusive adapters).
     device_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Adapters already probed (once per adapter, at the first spawn).
@@ -1331,6 +1352,7 @@ impl SwapScheduler {
             device_locks: Mutex::new(BTreeMap::new()),
             probed_adapters: Mutex::new(BTreeSet::new()),
             unit_cache: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
             kill_children_on_drop: false,
         }
     }
@@ -1515,6 +1537,10 @@ impl SwapScheduler {
     /// exits). Called on daemon shutdown so a native→shim rollback leaves no
     /// native resident behind.
     pub fn shutdown_all(&self, reason: &str) -> Vec<String> {
+        // First: stop the world. Maintenance ticks and spawn paths check
+        // this flag so nothing resurrects a child mid-shutdown.
+        self.shutting_down.store(true, Ordering::Relaxed);
+
         let ids: Vec<String> = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner
@@ -2039,6 +2065,19 @@ impl SwapScheduler {
             ))
             .into());
         }
+        // L7 B3: a group member must not SPAWN natively while the group's
+        // slot-sharing semantics are undecided (two independent engines per
+        // group = double budget use or a per-GGUF flock collision — a silent
+        // degradation of the group). Attaching to a model that is already
+        // resident is allowed (it serves today; nothing new is spawned).
+        if !entry.groups.is_empty() {
+            return Err(SwapError::GroupsPending {
+                model: entry.id.clone(),
+                groups: entry.groups.clone(),
+            }
+            .into());
+        }
+
 
         // Serialized per-device swap lock: two exclusive ensures never race
         // their drain/spawn sequences on one device.
@@ -2490,6 +2529,14 @@ impl SwapScheduler {
     }
 
     fn start_spawn(&self, entry: &CatalogEntry) -> Result<EngineHandle> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Err(SwapError::SpawnFailed(format!(
+                "the swap supervisor is shutting down; `{}` cannot start",
+                entry.id
+            ))
+            .into());
+        }
+
         let adapter = self.adapter_for(&entry.engine).ok_or_else(|| {
             SwapError::SpawnFailed(format!(
                 "no adapter for engine `{}` (managed externally)",
@@ -3064,6 +3111,10 @@ impl SwapScheduler {
     /// Periodic maintenance: crash detection + bounded restart, and native
     /// residency/health refresh. Safe to call every second.
     pub async fn maintenance(self: &Arc<Self>) {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+
         let ids: Vec<String> = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner
@@ -3905,6 +3956,72 @@ mod tests {
             catalog.upsert_entry(entry).unwrap();
         }
         (catalog, root)
+    }
+
+    #[tokio::test]
+    async fn group_members_refuse_native_spawn_until_the_owner_decision() {
+        let root = test_root("groups");
+        let catalog = Arc::new(SwapCatalog::load(root.join("swap_catalog.json")).unwrap());
+        for id in ["g-a", "g-b", "solo"] {
+            std::fs::write(root.join(format!("{id}.gguf")), b"gguf").unwrap();
+        }
+        let cmd = |id: &str| {
+            format!(
+                "  {id}:\n    cmd: |\n      /usr/bin/llama-server --port ${{PORT}} --model {}\n",
+                root.join(format!("{id}.gguf")).display()
+            )
+        };
+        catalog
+            .apply_import(
+                &import_llama_swap_config(&format!(
+                    "groups:\n  pair:\n    swap: false\n    members: [g-a, g-b]\nmodels:\n{}{}{}",
+                    cmd("g-a"),
+                    cmd("g-b"),
+                    cmd("solo")
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let ledger = Arc::new(BudgetLedger::load(root.join(BUDGET_FILE)).unwrap());
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert("fake".into(), fake.clone());
+        let scheduler = Arc::new(
+            SwapScheduler::new(
+                catalog,
+                ledger,
+                SwapSchedulerConfig {
+                    wait_timeout: Duration::from_secs(5),
+                    ..SwapSchedulerConfig::default()
+                },
+                adapters,
+            )
+            .with_state_root(root.clone()),
+        );
+        let error = scheduler.ensure("g-a").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SwapError>(),
+                Some(SwapError::GroupsPending { groups, .. }) if groups.as_slice() == ["pair"]
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("blocked:groups-pending"), "{error}");
+        // The group NAME is not a routable key either.
+        let error = scheduler.ensure("pair").await.unwrap_err();
+        assert!(error.to_string().contains("not in the swap catalog"), "{error}");
+        // Non-group members still ensure normally (control), and nothing
+        // spawned for the group members.
+        let outcome = scheduler.ensure("solo").await.unwrap();
+        assert!(outcome.spawned());
+        // The group members appear in status but nothing was spawned for
+        // them: they never left `stopped` and hold no endpoint.
+        let models = scheduler.status().models;
+        for id in ["g-a", "g-b"] {
+            let m = models.iter().find(|m| m.id == id).expect("listed");
+            assert_eq!(m.state, "stopped", "{m:?}");
+            assert!(m.endpoint.is_none(), "{m:?}");
+        }
     }
 
     fn scheduler(name: &str, entries: &[(&str, &str)]) -> (Arc<SwapScheduler>, Arc<FakeAdapter>, PathBuf) {

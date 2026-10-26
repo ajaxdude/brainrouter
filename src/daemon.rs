@@ -65,29 +65,60 @@ async fn fetch_slots(client: &reqwest::Client, ls_url: &str) -> Option<SlotProgr
     parse_slot_progress(&slots, active_model)
 }
 
-/// Native-mode counterpart: the supervisor resident's own `/slots` endpoint
-/// (no `:8081` hop). Same parser, same progress semantics.
+/// Native-mode counterpart: every ready resident's own `/slots` endpoint
+/// (no `:8081` hop). Same parser, same progress semantics. One row per
+/// resident — with pinned multi-model sets, the first hit alone would leave
+/// every other resident's progress bars dead.
 async fn fetch_slots_native(
     client: &reqwest::Client,
     swap: &Arc<brainrouter::swap_scheduler::SwapScheduler>,
-) -> Option<SlotProgress> {
+) -> Vec<SlotProgress> {
     let status = swap.status();
-    let resident = status
+    let resident: Vec<(String, String)> = status
         .models
         .iter()
-        .find(|m| m.state == "ready" && m.endpoint.is_some())?;
-    let model = resident.id.clone();
-    let endpoint = resident.endpoint.clone()?;
-    let slots = client
-        .get(format!("{}/slots", endpoint.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
-    parse_slot_progress(&slots, model)
+        .filter(|m| m.state == "ready" && m.endpoint.is_some())
+        .map(|m| (m.id.clone(), m.endpoint.clone().unwrap()))
+        .collect();
+    let mut out = Vec::new();
+    for (model, endpoint) in resident {
+        let Ok(slots) = client
+            .get(format!("{}/slots", endpoint.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        else {
+            continue;
+        };
+        let Ok(slots) = slots.json::<serde_json::Value>().await else {
+            continue;
+        };
+        if let Some(progress) = parse_slot_progress(&slots, model) {
+            out.push(progress);
+        }
+    }
+    out
+}
+
+/// Every name a client may have requested that resolves to catalog id
+/// `id`: the id itself, imported aliases, and the served alias. In-flight
+/// rows carry the *requested* (pre-alias) key; the slot feed speaks catalog
+/// ids — attaching on the id alone leaves alias-requested rows' bars dead.
+fn served_names(swap: &brainrouter::swap_scheduler::SwapScheduler, id: &str) -> Vec<String> {
+    let mut names = vec![id.to_string()];
+    if let Some(entry) = swap.catalog().entry(id) {
+        for alias in &entry.aliases {
+            if !names.contains(alias) {
+                names.push(alias.clone());
+            }
+        }
+        let served = entry.served_alias();
+        if !names.contains(&served) {
+            names.push(served);
+        }
+    }
+    names
 }
 
 fn parse_slot_progress(slots: &serde_json::Value, model: String) -> Option<SlotProgress> {
@@ -206,23 +237,44 @@ async fn enforce_native_flip_gate(swap: &config::SwapConfig) -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("building the flip-gate client")?;
-    let loaded: Vec<String> = match client.get(&url).send().await {
-        Ok(response) => match response.json::<serde_json::Value>().await {
-            Ok(json) => json
-                .get("running")
-                .and_then(|running| running.as_array())
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| {
-                            row.get("model").and_then(|m| m.as_str()).map(str::to_string)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
+    // Tri-state probe: a connection-level failure means nothing is
+    // listening, hence nothing resident (boot proceeds). Anything else —
+    // timeout, non-2xx, unparseable body — is UNKNOWN state, not "empty":
+    // booting then would silently double-reside whatever the shim might
+    // hold, so boot refuses with the raw error for manual verification.
+    let outcome: Result<Vec<String>, String> = match client.get(&url).send().await {
+        Err(error) if error.is_connect() => Ok(Vec::new()),
+        Err(error) => Err(format!("GET {url}: {error}")),
+        Ok(response) => {
+            if !response.status().is_success() {
+                Err(format!("GET {url} -> HTTP {}", response.status()))
+            } else {
+                match response.json::<serde_json::Value>().await {
+                    Err(error) => Err(format!("decoding {url}: {error}")),
+                    Ok(json) => json
+                        .get("running")
+                        .and_then(|running| running.as_array())
+                        .map_or(
+                            Err(format!("{url} returned no `running` array: {json}")),
+                            |rows| {
+                                Ok(rows
+                                    .iter()
+                                    .filter_map(|row| {
+                                        row.get("model").and_then(|m| m.as_str()).map(str::to_string)
+                                    })
+                                    .collect())
+                            },
+                        )
+                }
+            }
+        }
     };
+    let loaded = outcome.map_err(|detail| {
+        anyhow::anyhow!(
+            "swap.mode: native refuses to boot — the shim's loaded-model state is unknown ({detail}). \
+             Verify {url} by hand (flush or stop llama-swap), then restart."
+        )
+    })?;
     if !loaded.is_empty() {
         anyhow::bail!(
             "swap.mode: native refuses to boot — the llama-swap shim still reports loaded models: {}. Flush them first (dashboard \"Unload models\" or POST /api/models/flush), then restart. Native mode never double-resides a model.",
@@ -1057,20 +1109,25 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             let client = reqwest::Client::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let progress = if mode.is_native() {
+                let progresses: Vec<SlotProgress> = if mode.is_native() {
                     fetch_slots_native(&client, &swap).await
                 } else {
-                    fetch_slots(&client, &ls_url).await
+                    fetch_slots(&client, &ls_url).await.into_iter().collect()
                 };
-                let Some(progress) = progress else {
-                    continue;
-                };
-                inflight.set_slot_progress_for_model(
-                    &progress.model,
-                    progress.prefill_progress,
-                    progress.generated_tokens,
-                    progress.max_tokens,
-                );
+                for progress in progresses {
+                    // Rows hold the requested (possibly aliased) key; the
+                    // feed speaks catalog ids — attach under every name the
+                    // catalog says resolves to this engine.
+                    let names = served_names(&swap, &progress.model);
+                    for name in &names {
+                        inflight.set_slot_progress_for_model(
+                            name,
+                            progress.prefill_progress,
+                            progress.generated_tokens,
+                            progress.max_tokens,
+                        );
+                    }
+                }
             }
         });
     }

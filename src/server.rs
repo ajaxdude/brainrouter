@@ -2880,7 +2880,10 @@ async fn service_health(
         // Local serving layer: shim /running, or the supervisor's registry.
         async {
             if mode.is_native() {
-                return true;
+                // Derived, not asserted: any failed engine is an unhealthy
+                // local stack (same criterion as the tri-state arm below).
+                let status = swap.status();
+                return !status.models.iter().any(|m| m.state == "failed");
             }
             VERSION_CLIENT.get(format!("{}/running", llama_swap_url))
                 .timeout(timeout).send().await
@@ -3085,6 +3088,8 @@ async fn flush_models_native(
 ) -> Response<Full<Bytes>> {
     let mut unloaded = Vec::new();
     let mut failed = Vec::new();
+    let mut already_gone = Vec::new();
+    let mut reload_failed = Vec::new();
     for model in swap.status().models {
         if !matches!(
             model.state.as_str(),
@@ -3094,7 +3099,9 @@ async fn flush_models_native(
         }
         match swap.evict_with_options(&model.id, "flush", true) {
             Ok(true) => unloaded.push(model.id),
-            Ok(false) => {}
+            // `false` = the state said live but no handle remained. Rare
+            // race, but a flush that "unloaded 3 of 4" must say so.
+            Ok(false) => already_gone.push(model.id),
             Err(error) => failed.push(format!("{}: {error}", model.id)),
         }
     }
@@ -3106,12 +3113,20 @@ async fn flush_models_native(
                     info!(model = %key, "swap supervisor reloaded local model after flush");
                     reloaded.push(key.clone());
                 }
-                Err(error) => warn!(model = %key, %error, "flush reload failed"),
+                Err(error) => {
+                    warn!(model = %key, %error, "flush reload failed");
+                    reload_failed.push(format!("{key}: {error}"));
+                }
             }
         }
     }
     if !failed.is_empty() {
-        let error = format!("swap supervisor could not unload: {}", failed.join("; "));
+        // Partial success stays visible: what DID unload rides in the body.
+        let error = format!(
+            "swap supervisor could not unload: {} (unloaded: {:?})",
+            failed.join("; "),
+            unloaded
+        );
         return json_response(StatusCode::BAD_GATEWAY, &ErrorResponse { error });
     }
     json_response(
@@ -3125,6 +3140,8 @@ async fn flush_models_native(
             },
             "unloaded": unloaded,
             "reloaded": reloaded,
+            "already_stopped": already_gone,
+            "reload_failed": reload_failed,
         }),
     )
 }
@@ -3143,16 +3160,21 @@ async fn restart_native_engines(
         }
         match swap.evict(&model.id, "restart") {
             Ok(true) => restarted.push(model.id),
-            Ok(false) => {}
+            // No handle left: already down; still part of the answer.
+            Ok(false) => skipped.push(format!("{}: already stopped", model.id)),
             Err(error) => skipped.push(format!("{}: {error}", model.id)),
         }
     }
     json_response(
         StatusCode::OK,
         &serde_json::json!({
-            "status": "ok",
+            "status": if skipped.is_empty() { "ok" } else { "partial" },
             "service": "swap",
-            "message": "swap-supervisor engines stopped; they respawn on the next request",
+            "message": if skipped.is_empty() {
+                "swap-supervisor engines stopped; they respawn on the next request"
+            } else {
+                "some engines could not be stopped; see skipped"
+            },
             "restarted": restarted,
             "skipped": skipped,
         }),

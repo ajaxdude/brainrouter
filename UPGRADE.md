@@ -9,8 +9,9 @@ rollback"); the change list is in `CHANGELOG.md`.
 L7 absorbs llama-swap. The section formerly spelled `llama_swap:` is now
 `swap:`; every kept key moves verbatim (`fallback_model`, `subs_model`,
 `local_models`, `local_system_prompt`, `nudge.model_key`) and `base_url` is
-REMOVED — no longer used: the shim URL is fixed (`http://localhost:8081/v1` in
-shim mode) and native mode uses the swap supervisor. Two new keys:
+dropped (no longer used: native mode talks to the swap supervisor; the shim
+URL is fixed in shim mode). A NON-default `base_url` — an endpoint the
+operator chose deliberately — is kept and marked deprecated instead. Two new keys:
 
 ```yaml
 swap:
@@ -49,7 +50,7 @@ host.
 ### The flip (shim → native)
 
 1. Flush the shim so it holds no models: dashboard **Engines → Unload models**
-   (or `brainrouter flush-models`). This frees VRAM.
+   (or `brainrouter cli flush-models`). This frees VRAM.
 2. Set `swap.mode: native` and restart brainrouter.
 
 Native boot REFUSES while llama-swap `/running` still reports loaded models:

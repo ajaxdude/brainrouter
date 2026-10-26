@@ -180,7 +180,16 @@ fn is_zero_f64(f: &f64) -> bool {
 /// against the registered serving identity for whichever provider actually
 /// served the request — it is not meant to be extended by more hardcoded
 /// provider-string matches as new backends are added.
-pub fn derive_serving_identity(effective_provider: Option<&str>) -> (Option<String>, Option<String>) {
+pub fn derive_serving_identity(
+    effective_provider: Option<&str>,
+    engine_hint: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(engine) = engine_hint {
+        // Supervisor-served: the catalog's real engine, and no compute-API
+        // invention — Vulkan is this box's llama.cpp fact, not a property
+        // of every engine (a native vllm/llg engine would be mislabeled).
+        return (Some(engine.to_string()), None);
+    }
     match effective_provider {
         Some("llama-swap") => (Some("llama_cpp".to_string()), Some("vulkan".to_string())),
         _ => (None, None),
@@ -490,15 +499,29 @@ mod tests {
     #[test]
     fn derive_serving_identity_maps_llama_swap_to_llama_cpp_vulkan() {
         assert_eq!(
-            derive_serving_identity(Some("llama-swap")),
+            derive_serving_identity(Some("llama-swap"), None),
             (Some("llama_cpp".to_string()), Some("vulkan".to_string()))
         );
     }
 
     #[test]
     fn derive_serving_identity_is_none_for_manifest_and_absent_provider() {
-        assert_eq!(derive_serving_identity(Some("manifest")), (None, None));
-        assert_eq!(derive_serving_identity(None), (None, None));
+        assert_eq!(derive_serving_identity(Some("manifest"), None), (None, None));
+        assert_eq!(derive_serving_identity(None, None), (None, None));
+    }
+
+    #[test]
+    fn derive_serving_identity_prefers_the_real_engine_over_the_provider_guess() {
+        // A supervisor-served engine reports its catalog engine, and never a
+        // fabricated compute API — Vulkan is this box's llama.cpp fact only.
+        assert_eq!(
+            derive_serving_identity(Some("llama-swap"), Some("llama_cpp")),
+            (Some("llama_cpp".to_string()), None)
+        );
+        assert_eq!(
+            derive_serving_identity(Some("native"), Some("vllm")),
+            (Some("vllm".to_string()), None)
+        );
     }
 
     #[test]

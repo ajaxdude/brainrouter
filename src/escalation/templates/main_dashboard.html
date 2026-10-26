@@ -1023,7 +1023,7 @@ function switchView(view) {
   const credView = document.getElementById('credentials-view');
   if (credView) credView.style.display = view === 'credentials' ? 'block' : 'none';
   if (view === 'credentials') { loadCredentials(); loadProviders(); }
-  if (view === 'models' && typeof loadProviderModelGroups === 'function') loadProviderModelGroups();
+  if (view === 'models') loadProviderModelGroups();
   if (view === 'engines') loadEngines();
 
   const modelsActive = isModelsView(view);

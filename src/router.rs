@@ -923,8 +923,10 @@ impl Router {
                 // (e.g. manifest ✗ → local ✓) instead of a single card.
                 let winner_stage = provider_to_stage(&event_provider, bonsai_decision);
                 for f in info.failed_attempts.iter().filter(|f| f.stage != winner_stage) {
-                    let (toolbox_backend, compute_api) =
-                        crate::routing_events::derive_serving_identity(Some(f.provider.as_str()));
+                    let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(
+                        Some(f.provider.as_str()),
+                        self.served_engine(&f.model_key).as_deref(),
+                    );
                     self.routing_events.emit(RouteEvent {
                         id: 0,
                         timestamp: String::new(),
@@ -959,8 +961,10 @@ impl Router {
                         budget: None,
                     });
                 }
-                let (toolbox_backend, compute_api) =
-                    crate::routing_events::derive_serving_identity(event_provider.as_deref());
+                let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(
+                    event_provider.as_deref(),
+                    self.served_engine(&info.model_key).as_deref(),
+                );
                 let (swap_state, swap_source) = self.swap_event_fields(&info);
                 let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
@@ -1021,7 +1025,8 @@ impl Router {
             }
             Err(e) => {
                 tracker.clear();
-                let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(None);
+                let (toolbox_backend, compute_api) =
+                    crate::routing_events::derive_serving_identity(None, None);
                 self.routing_events.emit(RouteEvent {
                     id: 0,
                     timestamp: String::new(),
@@ -1434,6 +1439,15 @@ impl Router {
         ));
         providers.insert(endpoint.to_string(), Arc::clone(&provider));
         provider
+    }
+
+    /// The catalog's real engine when `model_key` is supervisor-served;
+    /// `None` for shim/cloud or unknown keys, leaving provider-based
+    /// derivation untouched.
+    fn served_engine(&self, model_key: &str) -> Option<String> {
+        let swap = self.swap.as_ref()?;
+        let id = swap.catalog().resolve_alias(model_key)?;
+        swap.catalog().entry(&id).map(|e| e.engine)
     }
 
     /// v2 L4 event fields: the swap lifecycle/source for a routed model, when
