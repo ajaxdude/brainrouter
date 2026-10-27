@@ -2046,6 +2046,12 @@ impl Router {
     pub fn health_state(&self, provider_id: &str) -> &'static str {
         self.health.state(provider_id)
     }
+    /// Typed selection predicate: would the router dial this provider right
+    /// now? Same `is_healthy` rule used by cloud routing (`degraded` still
+    /// selectable; `broken` selectable only after the cooldown).
+    pub fn provider_is_healthy(&self, provider_id: &str) -> bool {
+        self.health.is_healthy(provider_id)
+    }
 
     /// Managed local path (the `local` selector): v1 semantics — route to
     /// `fallback_model` with the one-`fallback_model`-retry hop

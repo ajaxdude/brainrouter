@@ -1749,7 +1749,7 @@ Protected mutations require a loopback peer or the Unix socket. Browser `Origin`
 | `POST` | `/api/inflight/cancel` | Cancel one in-flight request — body `{id}`; 404 for an unknown id |
 | `GET` | `/api/omp-sessions` | OMP session titles for the Sankey SESSION column |
 | `GET` | `/api/routing-stats` | Routing statistics |
-| `GET` | `/api/service-health` | Service health status per provider |
+| `GET` | `/api/service-health` | Service health status per provider (`manifest` breaker-derived once registry-managed; active probe otherwise) |
 | `GET` | `/api/plugins` | Plugin registry, live status lines, notification toasts (v2 L2) |
 | `GET` | `/api/inference-status` | Current inference state (for progress bar) |
 | `GET` | `/api/review-config` | Current review mode and forced model |

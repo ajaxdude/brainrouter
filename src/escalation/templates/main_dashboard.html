@@ -2196,6 +2196,8 @@ function renderHealthPill() {
   return { ...state, text };
 }
 
+let nudgeData = null;
+
 function postureState() {
   const reasoning = nudgeData ? ((nudgeData.enabled ? (nudgeData.tier || 'auto') : 'off')) : 'loading';
   const review = typeof codeReviewEnabled === 'boolean' ? (codeReviewEnabled ? 'on' : 'off') : 'loading';

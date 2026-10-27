@@ -1082,6 +1082,16 @@ async fn handle_request_inner(
                 state.providers.cloud_available(),
                 &state.swap,
                 state.swap_mode,
+                // v2.0-p6+: once manifest is registry-managed, the provider
+                // breaker is the honest health signal — the SAME predicate
+                // cloud routing uses to pick the provider. Rate-limit pseudo-
+                // errors (429/credits/auth) deliberately do not trip it (see
+                // router ManifestPeek / is_backend_fault), and a provider with
+                // no traffic yet reads up. The legacy /api/v1/health probe only
+                // fits the self-hosted manifest app; OpenAI-compatible
+                // gateways (Synthetic) 404 that path while being up.
+                state.providers.get("manifest")
+                    .map(|_| state.router.provider_is_healthy("manifest")),
             )
             .await;
             into_unsync(resp)
@@ -2865,6 +2875,11 @@ async fn inference_status(
 /// States: "healthy", "unhealthy", "idle" (service up but no model loaded),
 /// "loading" (model is loading), "disabled" (Bonsai/Manifest off in config).
 /// Also reports whether the last cloud request fell back to local.
+/// The `manifest` field is breaker-derived once the provider registry holds a
+/// `manifest` record (v2.0-p6+): a provider with zero traffic reads `healthy`
+/// (optimistic until first use, like selection itself), and rate-limit/credits
+/// pseudo-errors do not trip it. Pre-registry configs keep the active
+/// `GET /api/v1/health` probe.
 async fn service_health(
     llama_swap_url: &str,
     manifest_url: &str,
@@ -2872,6 +2887,7 @@ async fn service_health(
     cloud_available: bool,
     swap: &Arc<crate::swap_scheduler::SwapScheduler>,
     mode: crate::config::SwapMode,
+    manifest_registry_up: Option<bool>,
 ) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
@@ -2890,8 +2906,13 @@ async fn service_health(
                 .map(|r| r.status().is_success())
                 .unwrap_or(false)
         },
-        // Manifest: GET /api/v1/health
+        // Manifest: when p6-absorbed into the provider registry, the caller
+        // resolves the breaker (same predicate cloud routing uses) — Some(_)
+        // short-circuits the dial. None => legacy self-hosted probe.
         async {
+            if let Some(up) = manifest_registry_up {
+                return up;
+            }
             let url = format!("{}/api/v1/health", manifest_url);
             match VERSION_CLIENT.get(&url).timeout(timeout).send().await {
                 Ok(r) if r.status().is_success() => {
@@ -6277,6 +6298,71 @@ mod tests {
             "/api/engines/logs"
         );
         assert_eq!(normalize_engines_path("GET", "/health"), "/health");
+    }
+
+    // ── /api/service-health manifest arms ──────────────────────────────────
+
+    async fn manifest_field(tag: &str, registry_up: Option<bool>, cloud_available: bool) -> String {
+        use crate::swap_scheduler::{BudgetLedger, SwapScheduler, SwapSchedulerConfig};
+        // Unique per test (not just per arm): the two Some(true) tests must not
+        // share a temp dir under parallel harness execution.
+        let root = std::env::temp_dir().join(format!(
+            "br-service-health-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_micros(),
+            tag
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let swap = std::sync::Arc::new(SwapScheduler::new(
+            std::sync::Arc::new(
+                crate::swap_catalog::SwapCatalog::load(root.join("swap_catalog.json")).unwrap(),
+            ),
+            std::sync::Arc::new(BudgetLedger::load(root.join("provider_budget.json")).unwrap()),
+            SwapSchedulerConfig::default(),
+            Default::default(),
+        ));
+        let events = RoutingEvents::new();
+        // Both dial URLs dead: if the legacy probe is ever reached, the arm
+        // reports unhealthy — a Some(true) pass therefore PROVES the registry
+        // short-circuit. cloud_available=false checks the "disabled" gate.
+        let resp = service_health(
+            "http://127.0.0.1:1/v1",
+            "http://127.0.0.1:1",
+            &events,
+            cloud_available,
+            &swap,
+            crate::config::SwapMode::Shim,
+            registry_up,
+        )
+        .await;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        let field = value["manifest"].as_str().unwrap().to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        field
+    }
+
+    #[tokio::test]
+    async fn service_health_manifest_registry_beats_dead_legacy_probe() {
+        assert_eq!(manifest_field("up", Some(true), true).await, "healthy");
+    }
+
+    #[tokio::test]
+    async fn service_health_manifest_open_breaker_reports_unhealthy() {
+        assert_eq!(manifest_field("down", Some(false), true).await, "unhealthy");
+    }
+
+    #[tokio::test]
+    async fn service_health_manifest_without_registry_record_probes_legacy() {
+        assert_eq!(manifest_field("legacy", None, true).await, "unhealthy");
+    }
+
+    #[tokio::test]
+    async fn service_health_manifest_disabled_wins_over_registry_up() {
+        assert_eq!(manifest_field("disabled", Some(true), false).await, "disabled");
     }
 
 }
