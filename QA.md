@@ -8,6 +8,12 @@ Names/ports are the prod box's; on a fresh install adjust (defaults in
 README/PRD). `HANDOFF-*.md` files, if present, are machine-local notes — not
 documentation.
 
+**Preflight:** before the local-model scenarios (S2, S7, S8, S10 click tests),
+read any machine-local `HANDOFF-*.md` notes — llama-swap is sometimes masked *on
+purpose* by operator sessions (then `:8081` refuses and `/api/service-health`
+shows `llama_swap: unhealthy` by design; cloud scenarios still run). Treat a
+documented mask as the expected state, not a regression.
+
 Shortcuts:
 
 ```bash
