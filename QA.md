@@ -1,241 +1,201 @@
-# brainrouter QA — guided tour + test checklist
+# brainrouter QA — scenario suite + UI walkthrough
 
-**Last verified:** 2026-10-26 against prod binary **1.1.13** (master `16bc573`),
-README PRD at the same commit. Every command below was executed successfully on
-the prod box. Paths, ports, model names, and provider names are **machine-specific**
-to that box; on a fresh install adjust them (defaults noted where they differ).
+Each scenario is one end-to-end question: **"pick X as model/reviewer, point
+harness Y at it — does it work?"** Run top to bottom; each is self-contained.
+Last verified 2026-10-26 on binary **1.1.13** (master `16bc573`) — including the
+UI walkthrough (S10), which was executed with a real browser, not asserted.
+Names/ports are the prod box's; on a fresh install adjust (defaults in
+README/PRD). `HANDOFF-*.md` files, if present, are machine-local notes — not
+documentation.
 
-Some of this reflects **post-PRD behavior** shipped across the v2 program:
-provider registry (v2 L6 — `docs/design/v2-streamlining.L6.md`), the `v2.0-p6`
-manifest-into-registry migration (`src/migration.rs`), `review.fallback_selector`
-(`src/review/review_loop.rs`, `tests/review_fallback_test.rs`), the
-`cloud/<provider>/<id>` selector grammar, and `provider_budget.json`. Where these
-contradict README/PRD, the code + these verified outputs are current truth until
-the PRD is updated.
+Shortcuts:
 
-Mental model in one paragraph: brainrouter is an OpenAI-compatible front door on
-`:9099`. Harnesses (OMP, Claude, scripts) point at it and pick a *selector* —
-`auto`, a bare local model key, or `cloud/...`. brainrouter owns the decision:
-local llama-swap models, cloud providers, role cards, fallback. It also runs a
-code-review loop (LLM reviewer → verdict → human escalation) and a live dashboard.
+```bash
+B=http://127.0.0.1:9099
+BR=~/brainrouter-v2/target/release/brainrouter
+```
 
 ---
 
-## 0. Prereqs (read this first)
+## S1 — Does brainrouter itself answer? (2 min)
 
-- Config default for a fresh install: `$XDG_CONFIG_HOME/brainrouter/brainrouter.yaml`
-  (falls back to `~/.config/brainrouter/brainrouter.yaml`). The systemd unit on the
-  prod box instead passes `~/brainrouter-v2/brainrouter.yaml` (GUI-mode boot; the
-  `brainrouter-headless.yaml` twin only matters on headless boots).
-- **No hot reload.** Any yaml edit needs `systemctl --user restart brainrouter`
-  (~10 s blip; in-flight sessions hiccup, runtime dashboard toggles revert).
-- Secrets: this box uses `~/.brainrouter-synthetic.env` + `~/.brainrouter-deepinfra.env`,
-  both `chmod 600`, untracked/gitignored, exported by `~/.local/bin/brainrouter-start.sh`.
-  Upstream convention is `/etc/brainrouter/env` (root:aistack 640) or
-  `~/.config/brainrouter/.env`. Never put key values in git-tracked files.
-- All HTTP checks assume `B=http://127.0.0.1:9099`, `BR=~/brainrouter-v2/target/release/brainrouter`.
+1. `systemctl --user is-active brainrouter` → **`active`**
+2. `curl -s $B/health` → **200 JSON**
+3. `curl -s $B/api/versions` → **brainrouter >= 1.1.13**
+4. Open `http://127.0.0.1:9099/dashboard` → **renders; browser console (F12) shows zero errors; version badge non-empty; health pill resolves within ~5 s** (a permanently-"loading" pill = JS boot crash — check console, this was a real bug, fixed 867dac7)
 
-```bash
-systemctl --user is-active brainrouter        # want: active
-curl -s $B/health                             # want: 200 JSON
-curl -s $B/api/versions | python3 -m json.tool # want: brainrouter >= 1.1.13
-```
+If not: `journalctl --user -u brainrouter -n 50`. Adapter WARNs about
+`llama-server`/`strix_server` missing on PATH are normal (containerized engines, shim mode).
 
-## 1. System status
+## S2 — Pick **dirk-qwen3.8-27b-q4-subs** as the model, curl as the harness (2 min)
 
-```bash
-$BR cli status     # llama-swap, providers, classifier, cloud fallback at a glance
-$BR cli versions   # vs /api/versions above
-$BR cli inference  # which model is resident right now, state, slot progress
-```
+1. ```bash
+   curl -s $B/v1/chat/completions -H 'content-type: application/json' \
+     -d '{"model":"dirk-qwen3.8-27b-q4-subs","messages":[{"role":"user","content":"reply with the single word ok"}],"max_tokens":16}'
+   ```
 
-Pass: no component shown as down except engines you intentionally do not run
-(adapter probe WARNs for `llama-server`/`strix_server` not on PATH are expected —
-those engines live in containers; the daemon runs in shim mode against llama-swap).
+   → **streamed `data:` chunks, no error.**
+2. `curl -s $B/api/routing-events | python3 -m json.tool | head -30`
+   → **`stage=local_primary`, `requested_model == model`** — a substitution/fallback here would be a bug (explicit picks are authoritative).
+3. `$BR cli inference` → **subs model resident.**
 
-## 2. Model catalog (what can I ask for?) — input for section 3, no separate pass gate
+## S3 — Pick **DeepSeek-V4.1 (Synthetic)** as the chat model (1 min)
 
-```bash
-curl -s $B/v1/models | python3 -c 'import json,sys; [print(m["id"]) for m in json.load(sys.stdin)["data"]]'
-```
+1. ```bash
+   curl -s $B/v1/chat/completions \
+     -d '{"model":"cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017","messages":[{"role":"user","content":"reply with the single word ok"}],"max_tokens":16}'
+   ```
 
-Selector cheat sheet (all verified on prod):
+   → **streamed chunks.**
+2. routing-events → **cloud stage, provider `manifest`.**
+3. `curl -s $B/api/service-health` → **`"manifest": "healthy"`** — once p6-absorbed this is the circuit breaker (same predicate routing uses), so a 429 rate-limit does NOT flip it; an open breaker (3 backend faults) does.
+4. If you get 429: Synthetic is subscription-throttled — that's S5's trigger, keep going.
 
-| Selector | Meaning |
-|---|---|
-| `auto` | classifier decides local vs cloud |
-| `dirk-qwen3.8-27b-q4-subs` (bare key) | **that** local model, no substitution, no fallback |
-| `local` | local routing, model chosen for you |
-| `cloud` | cloud, provider auto |
-| `cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017` | exact model on provider `manifest` (Synthetic gateway) |
-| `cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash` | exact model on provider `deepinfra` (post-PRD L6 registry) |
+## S4 — Pick **DeepSeek-V4.1 as the reviewer**. Does the review loop work? (3 min)
 
-## 3. Core routing — make a request and watch the decision
+1. Planted-bug repo:
 
-```bash
-# 3a. explicit local pick (should NOT swap models, NO fallback on error)
-curl -s $B/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"dirk-qwen3.8-27b-q4-subs","messages":[{"role":"user","content":"say ok"}],"max_tokens":8}'
+   ```bash
+   D=$(mktemp -d /tmp/qa-XXXX) && cd $D && git init -q
+   printf 'def add(a,b):\n    return a + b\n' > calc.py
+   git add -A && git -c user.email=t@t -c user.name=t commit -qm base
+   printf 'def add(a,b):\n    return a - b  # bug\n' > calc.py && git add calc.py
+   ```
 
-# 3b. cloud exact (Synthetic; streams SSE — `data:` lines)
-curl -s $B/v1/chat/completions \
-  -d '{"model":"cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017","messages":[{"role":"user","content":"say ok"}],"max_tokens":8}'
+2. `$BR cli roles get` → **review = cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017** (if not, `cli roles set review` it; **re-check after every daemon restart** — issue #2).
+3. `$BR cli review request qa-$(date +%m%d)-001 'planted bug: add subtracts' --cwd $D`
+   → **(1–3 min) `STATUS: needs_revision` naming the subtraction.**
+4. `$BR cli review lgtm <session-id>`; `cd / && rm -rf $D` → **closed.**
 
-# 3c. the receipt for both: per-request decisions, conv_id, stage, requested vs actual model
-curl -s $B/api/routing-events | python3 -m json.tool | head -40
-```
+## S5 — Does credit-outage failover route the reviewer to DeepInfra? (2 min)
 
-Pass: both stream a completion; routing-events shows `stage=local_primary` for 3a
-with `requested_model == model_key` (explicit picks are authoritative — a fallback
-here would be a bug) and a cloud stage for 3b.
+- **Proven banked check:** `$BR cli review get a8f10372-0b86-4f2e-ab0d-4e860f310158`
+  → **`review_model` contains "fell back to ... deepinfra"** — happened on a real
+  Synthetic 429. Reading this line = pass.
+- **Config gate:** `curl -s $B/api/review-config` → **`fallback_selector` = cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash.**
+- **Force it:** set the card directly and rerun S4 step 3:
+  `$BR cli roles set review cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash`
+  → verdict from deepinfra; then **restore the card.**
 
-## 4. Role cards (the single model config)
+## S6 — Does a human clear reviews from the browser? (3 min — UI, see S10 for the click path)
 
-```bash
-$BR cli roles get                       # {assignments, policy}
-curl -s $B/api/roles | python3 -m json.tool
-# move one (goes through the running daemon, persists to role_cards.json):
-$BR cli roles set review cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017
-$BR cli roles get | grep -A1 review
-```
+CLI-equivalent: `$BR cli review lgtm <id>`. The real UI button (S10 step 5) is the
+thing to verify: escalated card → **LGTM** → `$BR cli review get <id>` →
+**`status: approved`, `reviewer_type: human`, `human_feedback: "lgtm"`.**
 
-Pass: assignment appears immediately (daemon write). **After any restart, re-check
-it**: the review card may have reset to `auto` — that is known defect
-https://github.com/ajaxdude/brainrouter/issues/2 firing, not a new regression.
+## S7 — Put **brainrouter inside a real harness**. Does the conversation look right? (5 min)
 
-## 5. Providers + credentials (vault)
+1. Wire any OpenAI-compatible harness to `http://127.0.0.1:9099/v1` (any API key string):
 
-Already registered on prod; a fresh box needs the add steps first (they are
-idempotent — re-running updates in place):
+   ```bash
+   python3 - <<'PY'
+   import openai
+   c = openai.OpenAI(base_url="http://127.0.0.1:9099/v1", api_key="x")
+   for turn in ("remember the word pineapple", "what word did I ask you to remember?"):
+       print(c.chat.completions.create(model="dirk-qwen3.8-27b-q4-subs",
+             messages=[{"role":"user","content":turn}]).choices[0].message.content)
+   PY
+   ```
 
-```bash
-# fresh-box setup (post-PRD L6 registry):
-#   $BR cli credential add deepinfra-jwt --kind env --env DEEPINFRA_JWT --grants cloud
-#   $BR cli provider add deepinfra --kind openai-compatible \
-#       --base-url https://api.deepinfra.com/v1/openai \
-#       --credential env:DEEPINFRA_JWT --model deepseek-ai/DeepSeek-V4-Flash
-# note: `provider test` health-probes DECLARED models, so the --model flag above
-# is what makes the next line pass.
-$BR cli provider list                   # prod: 'manifest' (env:SYNTHETIC_API_KEY) + 'deepinfra' (env:DEEPINFRA_JWT)
-$BR cli provider test deepinfra
-$BR cli credential list                 # values NEVER printed — that's the point
-```
+   (OMP users: add an OpenAI-compatible provider, `base_url` `http://127.0.0.1:9099/v1`, `auth: none`, pick any key from `curl -s $B/v1/models`.)
+2. → **ONE card for both turns** (cards group by conversation; turns nest).
+3. `curl -s $B/api/routing-events` → **both turns share one `conv_id`.**
 
-Pass: provider test succeeds, or fails **only** with DeepInfra's known quirk (their
-`/models` probe 401s; actual chat completions work — proved with a
-`cloud/deepinfra/...` selector as in section 3). Cloud spend ledger:
-`~/.local/state/brainrouter/provider_budget.json` (monthly totals, written by the
-v2.0-p6 migration).
+## S8 — Can you watch a generation live? (1 min)
 
-## 6. The review loop (the flagship feature)
+Terminal A: `"write 400 words about routing daemons"`, `max_tokens: 400`.
+Terminal B immediately: `curl -s $B/api/inflight` → **one row (model, elapsed, bytes).**
+DS4-class models finish in ~2 s — long requests only.
 
-How it works: agent stages a diff → `request_review` → reviewer LLM reads the PRD,
-`AGENTS.md`, and `git diff HEAD` (uncommitted only) → `approved` / `needs_revision`
-→ after 5 bad iterations or LLM errors it **parks for a human** (infra escalation,
-not a code verdict). Credit-outage failover (post-PRD, v2):
-`review.fallback_selector` in the yaml retries the review **once on the DeepInfra
-provider** before escalating — this fired for real on 2026-10-26 when Synthetic
-returned 429.
+## S9 — Does it survive a restart? (3 min; do when no review is in flight)
 
-Full end-to-end proof you can run in 3 minutes, no OMP session needed:
+1. `systemctl --user restart brainrouter`
+2. `curl -s $B/api/versions` → **active, same version.**
+3. `$BR cli roles get` → **review card unchanged.** Reset to `auto` = issue
+   https://github.com/ajaxdude/brainrouter/issues/2 — set it back, comment if new.
+4. S3 curl → **cloud answers** (start.sh re-exports `~/.brainrouter-*.env`, both 600).
+5. `curl -s $B/api/review-config` → **fallback_selector still set** (yaml, untouched by migrations).
 
-```bash
-D=$(mktemp -d /tmp/qa-proof-XXXX) && cd $D && git init -q
-printf 'def add(a,b):\n    return a + b\n' > calc.py
-git add -A && git -c user.email=t@t -c user.name=t commit -qm base
-printf 'def add(a,b):\n    return a - b  # bug\n' > calc.py && git add calc.py
-$BR cli review request qa-proof-$(date +%Y%m%d)-001 'planted bug: add() subtracts' --cwd $D
-#   (add --async to not block; then: $BR cli review list / $BR cli review get <id>)
-# expect: STATUS: needs_revision flagging the subtraction
-$BR cli review lgtm <session-id>     # close it (same action as the dashboard button)
-cd / && rm -rf $D
-```
+## S10 — UI walkthrough (browser; the part CLI can't test) (10 min)
 
-Also check: `curl -s $B/api/review-config | python3 -m json.tool` shows
-`fallback_selector` set. Human escalation surface: the **dashboard** (`/dashboard`)
-shows sessions; JSON list at `/review/api/sessions`, detail at `/review/session/:id`.
-(`GET /review/` itself redirects to `/dashboard`.)
-Pass: verdict correct; session closed; no parked sessions left (`$BR cli review list`).
+Verified end-to-end on 2026-10-26 at 1440×900 — zero console errors page-wide.
 
-## 7. Dashboard (live observability)
+1. **Overview** `/dashboard` → pill green, version badge shown, posture line
+   (`reasoning/review/HankNDory/PR`) populated, not "loading".
+2. **Sankey + click linkage:** fire an S2 request first. Six columns render
+   (HARNESS/SESSION/ROUTING/BACKEND/ENGINE + MODEL). **Click a card** → its whole
+   path stays lit, everything else dims. **Click a sankey node** (e.g. `curl`) →
+   same path highlight from the other direction.
+3. **Card filters:** `reviews` tab lists review sessions with per-session
+   Route→…→Done phase bars and full LLM feedback ("Full LLM review" block);
+   search box (top) filters cards by text.
+4. **Escalated review = action buttons:** to see them, force one —
+   `$BR cli roles set review cloud/deepinfra/no-such-model-xyz`, submit an S4-style
+   review `--async`, wait ~30 s → card turns red **Escalated · Human action required**
+   with **Send Feedback / Continue iterating / LGTM**. Click **LGTM** → card clears;
+   `$BR cli review get <id>` → approved by human. **Restore the card.**
+5. **Nav sweep:** Models / Engines / Config / Credentials / Plugins each render
+   with distinct content; no page throws a console error. Credential VALUES are
+   never displayed.
+6. **Guard rail (don't test destructively):** "Flush Models" opens a confirm
+   dialog — that dialog is the guard; cancelling leaves models resident.
+7. Narrow window (<~900 px) collapses the card grid — responsive design, not a bug.
 
-Open `http://127.0.0.1:9099/dashboard`. Fire a couple of section-3 requests first.
+## Appendix A — what you can pick
 
-- **Sankey** (`SK_COLS`, `main_dashboard.html`): six columns — HARNESS (from
-  User-Agent), SESSION (OMP session titles), ROUTING (decision class), BACKEND,
-  ENGINE, MODEL. Click a node → whole path highlights.
-- **Cards**: one card per *conversation*; server-side `conv_id` = stable hash of
-  the conversation prefix (system prompt + first user message), or the client
-  session header when present; turns nest inside. Click a card → its sankey path lights up.
-- **In-flight panel**: `curl -s $B/api/inflight` — live rows (model, elapsed, bytes).
-  A ds4 generation takes ~2 s, so race it with a long request or trust the JSON.
-- **Known data gap**: the DeepSeek DS4 llama-server exposes no `/slots` and no
-  usage chunk, so PP-progress stays 0 and tps chips stay empty for that model.
-  Inherent to that build, not a bug (proven by tests + llama-swap `/running`).
+| Role | Pick | Selector / command |
+|---|---|---|
+| Local models | any key from `curl -s $B/v1/models` | bare key |
+| Cloud chat / reviewer | DeepSeek-V4.1 (Synthetic) | `cloud/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017` |
+| Cloud reviewer backup | DeepSeek-V4-Flash (DeepInfra) | `cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash` |
+| Reviewer role | set it | `$BR cli roles set review <selector>` |
+| Undecided | classifier/registry decides | `auto` / `cloud` / `local` |
 
-## 8. Swap / engines / runtime toggles — informational; toggle checks live here
+## Appendix B — full test battery (any code change)
+
+Cargo target names are `tests/` file stems (e.g. `routing_profiles_test`).
 
 ```bash
-$BR cli context status          # llama-swap context size (also: context set <tokens|auto>)
-$BR cli nudge status            # thinking-budget nudge (tiers light/deep)
-$BR cli prompt-rewrite status   # local pass-through toggle
-$BR cli restart llama-swap      # last resort; kills resident models
-```
-
-Note: there is no live `/api/context` HTTP route on 1.1.13 (404) — use the CLI.
-Toggles flip immediately but are runtime state: a daemon restart reverts them to yaml values.
-
-## 9. Full test battery (run after any code change)
-
-Cargo target names are the file stems in `tests/` (e.g. `routing_profiles_test`,
-not `routing_profiles`).
-
-```bash
-cd ~/brainrouter-v2   # or the repo clone you're testing
-cargo test --locked --lib                                  # ~500 unit tests at 1.1.13 (PRD baseline said 391)
+cargo test --locked --lib                    # 501 unit tests at 1.1.13
 cargo test --locked --test v2_l1_acceptance --test v2_l2_acceptance --test v2_l3_acceptance \
   --test v2_l4_acceptance --test v2_l5_acceptance 2>&1 | grep -E 'test result|FAILED'
 cargo test --locked --test v2_l5_smoke --test v2_l6_acceptance --test v2_l7_acceptance \
   --test review_fallback_test --test routing_profiles_test 2>&1 | grep -E 'test result|FAILED'
-```
-
-Plus the repo's standing validation gates (fast, run them all before shipping):
-
-```bash
 cargo clippy --locked --all-targets
 cargo build --locked --bin brainrouter
-bash scripts/check-html-js.sh          # dashboard JS syntax gate
+bash scripts/check-html-js.sh
 node --test scripts/test-benchmark-ui.cjs
 ```
 
-Expected reds on the prod box: exactly two L5 tests that need a live strixite
-engine (the strixite `strix_server` binary/container serving `:5300`; it is not
-installed here) — `l5_external_observer_ready_at_endpoint_attach_adopt_and_ownership`
-and `l5_acs_in_process_review_stream_pin_without_inflight_row`. Anything else =
-investigate before shipping.
+Expected reds on the prod box: exactly the two L5 tests needing a live strixite
+engine (`strix_server` on `:5300`) —
+`l5_external_observer_ready_at_endpoint_attach_adopt_and_ownership`,
+`l5_acs_in_process_review_stream_pin_without_inflight_row`. Anything else: investigate.
 
-## 10. Sign-off table
+## Appendix C — sign-off
 
 | # | Check | Pass |
 |---|---|---|
-| 0 | daemon active, versions >= 1.1.13 | ☐ |
-| 1 | cli status green (probe WARNs OK) | ☐ |
-| 2+3 | model catalog + local/cloud curl, routing-events correct stage | ☐ |
-| 4 | roles set persists; re-check after restart (issue #2) | ☐ |
-| 5 | provider deepinfra reachable, vault silent | ☐ |
-| 6 | planted-bug review → needs_revision → closed | ☐ |
-| 7 | dashboard sankey (6 cols) / cards / inflight live | ☐ |
-| 8 | context/nudge/prompt-rewrite status commands answer | ☐ |
-| 9 | battery: only the 2 known strixite-dependent reds | ☐ |
+| S1 | daemon up, dashboard boots error-free | ☐ |
+| S2 | explicit local pick, no substitution | ☐ |
+| S3 | cloud pick + honest breaker health | ☐ |
+| S4 | reviewer catches planted bug | ☐ |
+| S5 | DeepInfra failover (banked or forced) | ☐ |
+| S6+S10.4 | human LGTM button resolves escalated session | ☐ |
+| S7 | harness conv groups to one card | ☐ |
+| S8 | in-flight row visible | ☐ |
+| S9 | restart keeps card/config (else issue #2) | ☐ |
+| B | battery green except the 2 known reds | ☐ |
 
-## Known gotchas (short list)
+## Gotchas
 
-1. Restart can reset the review role card — tracked:
-   https://github.com/ajaxdude/brainrouter/issues/2. Check section 4 after restarts.
-2. `request_review` only sees **uncommitted** diff (`git diff HEAD`) — committed
-   batches need human re-review via the dashboard (`/review/api/sessions` for data).
-3. Parked/escalated sessions hang until a human resolves (`$BR cli review lgtm` or
-   dashboard button). `request_review` blocking ~30 min then timing out is NOT a failure.
-4. Synthetic can 429 (rate/credit); `fallback_selector` covers it — watch
-   `~/.local/state/brainrouter/provider_budget.json`.
-5. Config edits without restart = silently ignored. No hot reload, by design.
+1. Review card can reset on restart — issue #2; re-check `cli roles get`.
+2. Reviews read **uncommitted** diff only (`git diff HEAD`); committed batches
+   need human re-review via the dashboard reviews tab.
+3. Escalated reviews park until a human acts (S10.4 buttons or `cli review lgtm`);
+   a 30-min `request_review` timeout is not a failure — poll `cli review get`.
+4. Synthetic 429s (subscription limits) are normal and handled by
+   `fallback_selector`; spend ledger: `~/.local/state/brainrouter/provider_budget.json`.
+5. No hot reload: yaml edits need `systemctl --user restart brainrouter`.
+6. Runtime toggles (nudge, prompt-rewrite, privacy chips) revert on restart —
+   that's expected; yaml is truth.
