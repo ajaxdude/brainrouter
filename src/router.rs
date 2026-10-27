@@ -40,7 +40,7 @@ use crate::{
     stream::TimeoutStream,
     types::{ChatCompletionRequest, ChatMessage},
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{stream as fstream, StreamExt};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -59,8 +59,7 @@ const TTFT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Maximum silence between consecutive SSE chunks once generation has started.
 /// 180 s is generous but still catches genuinely hung connections.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(180);
-/// Provider health-tracker keys. Used for circuit breaking.
-const MANIFEST_KEY: &str = "manifest";
+/// Local llama-swap health-tracker key (v1 breaker semantics preserved).
 const LLAMA_SWAP_KEY: &str = "llama-swap";
 /// Requests above this approximate token count get the known-ctx pool ranking
 /// (L3 "pool-by-ctx applies … for large requests"). Below it every candidate
@@ -100,6 +99,28 @@ pub struct RouteInfo {
     /// The dashboard emits one RouteEvent per entry so multi-hop routes
     /// render as a hop chain instead of a single collapsed card.
     pub failed_attempts: Vec<FailedAttempt>,
+    /// v2 L6: the provider registry id that served the route (additive event
+    /// field; `effective_provider` keeps v1 spellings).
+    pub provider: Option<String>,
+    /// v2 L6: the LAN hop for a non-loopback provider.
+    pub hop: Option<crate::routing_events::HopInfo>,
+    /// v2 L6: the budget guard's verdict for this request (pre-dispatch
+    /// badge; the stream wrapper backfills it post-accrual).
+    pub budget: Option<crate::routing_events::BudgetEvent>,
+    /// v2 L6: post-response provider metering (budget accrual + breaker on
+    /// mid-stream death). Wrapped after the route event is emitted so the
+    /// event id can be backfilled.
+    pub meter: Option<MeterPlan>,
+}
+
+/// Everything the response stream needs to meter one provider attempt.
+#[derive(Clone)]
+pub struct MeterPlan {
+    pub provider_id: String,
+    pub price: Option<crate::providers::Price>,
+    pub request_bytes: usize,
+    pub budget_mode: crate::providers::BudgetMode,
+    pub monthly_budget_usd: Option<f64>,
 }
 
 /// One failed hop in a fallback chain.
@@ -109,6 +130,8 @@ pub struct FailedAttempt {
     pub provider: String,
     pub model_key: String,
     pub error: String,
+    /// v2 L6: the LAN hop of the failed provider attempt, when any.
+    pub hop: Option<crate::routing_events::HopInfo>,
 }
 
 impl RouteInfo {
@@ -120,7 +143,13 @@ impl RouteInfo {
                 format!("{} → manifest ({})", self.bonsai_decision, model)
             }
             Some("llama-swap") => format!("{} → llama-swap ({})", self.bonsai_decision, self.model_key),
-            Some(other) => format!("{} → {}", self.bonsai_decision, other),
+            Some(other) => {
+                if self.model_key.is_empty() {
+                    format!("{} → {}", self.bonsai_decision, other)
+                } else {
+                    format!("{} → {} ({})", self.bonsai_decision, other, self.model_key)
+                }
+            }
             None => format!("{} → error", self.bonsai_decision),
         }
     }
@@ -147,17 +176,125 @@ struct Resolution {
     proxy_review_strict: bool,
 }
 
+/// v2 L6: one outbound adapter (wire family + resolved credential).
+#[derive(Clone)]
+enum ProviderAdapter {
+    OpenAi(Arc<OpenAiProvider>),
+    Anthropic(Arc<crate::provider::anthropic::AnthropicProvider>),
+}
+
+impl ProviderAdapter {
+    async fn chat(
+        &self,
+        request: ChatCompletionRequest,
+        forwarded_role: Option<&str>,
+    ) -> Result<ProviderResponse, crate::provider::ProviderError> {
+        match self {
+            Self::OpenAi(provider) => {
+                provider.chat_completion_with_role(request, forwarded_role).await
+            }
+            Self::Anthropic(provider) => {
+                provider
+                    .chat_completion_with_role(request, forwarded_role)
+                    .await
+            }
+        }
+    }
+}
+
+struct CachedAdapter {
+    /// Hash of (kind, base_url, credential) — rebuild on rotation/rebind.
+    fingerprint: String,
+    adapter: ProviderAdapter,
+}
+
+fn fingerprint_of(record: &crate::providers::ProviderRecord, secret: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    record.kind.as_str().hash(&mut hasher);
+    record.base_url.hash(&mut hasher);
+    secret.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// v2 L6: the additive hop descriptor for a provider route (absent for
+/// loopback base_urls — the spec's `hop {host, endpoint}`).
+fn hop_of(
+    base_url: &str,
+    kind: crate::providers::ProviderKind,
+) -> Option<crate::routing_events::HopInfo> {
+    let parsed = reqwest::Url::parse(base_url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let loopback = host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if loopback {
+        return None;
+    }
+    // The concrete upstream endpoint (not just the base URL) so the Sankey
+    // hop names the wire path the request actually used.
+    let suffix = match kind {
+        crate::providers::ProviderKind::Anthropic => "/messages",
+        _ => "/chat/completions",
+    };
+    Some(crate::routing_events::HopInfo {
+        host,
+        endpoint: format!("{}{suffix}", base_url.trim_end_matches('/')),
+    })
+}
+
 tokio::task_local! {
     /// The UDS request's grace clock (`None` for TCP/Router-level callers,
     /// whose grace window starts at the request itself).
     static REQUEST_SCOPE_CLOCK: Option<Arc<ScopeClock>>;
+    /// v2 L4: the in-flight row registered by the server at request arrival.
+    /// `try_local_once` threads it into `ensure_with_cancel`, so a routed
+    /// wait (queue position / load) is abortable from the in-flight row.
+    /// Direct `POST /api/engines/ensure` calls carry `None` — their client
+    /// owns the request, and a client disconnect drops the future instead.
+    static REQUEST_CANCEL: Option<Arc<crate::inflight::InflightHandle>>;
+}
+
+/// Run a routing future with the request's in-flight row in scope (server
+/// entry points). Without it, routing is exactly v1.
+pub async fn with_request_cancel<F: std::future::Future>(
+    handle: Option<Arc<crate::inflight::InflightHandle>>,
+    f: F,
+) -> F::Output {
+    REQUEST_CANCEL.scope(handle, f).await
+}
+
+fn current_request_cancel() -> Option<Arc<crate::inflight::InflightHandle>> {
+    REQUEST_CANCEL.try_with(|h| h.clone()).ok().flatten()
+}
+
+/// Provider label for events: the residency source, not a generic "native".
+fn resident_provider_name(source: crate::residency::ResidentSource) -> &'static str {
+    use crate::residency::ResidentSource;
+    match source {
+        ResidentSource::Native => "native",
+        ResidentSource::Container => "container",
+        ResidentSource::External => "external",
+        ResidentSource::Shim => "llama-swap",
+    }
 }
 
 pub struct Router {
     slot: Arc<DecisionSlot>,
     cards: Arc<RoleCardStore>,
-    manifest: Arc<OpenAiProvider>,
-    manifest_enabled: bool,
+    /// v2 L6: the provider registry replaces the hardcoded Manifest backend.
+    providers: Arc<crate::providers::ProviderStore>,
+    /// Credential vault (provider keys resolve per dispatch — rotation is
+    /// immediate).
+    credentials: Arc<crate::credentials::CredentialStore>,
+    /// Monthly per-provider budget guard.
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    /// Cached outbound adapters keyed by provider id (rebuilt when the
+    /// resolved credential changes).
+    provider_adapters: Mutex<HashMap<String, CachedAdapter>>,
     llama_swap: Arc<OpenAiProvider>,
     fallback_model: String,
     /// Model keys known to belong to llama-swap. Requests for these bypass the slot.
@@ -199,15 +336,29 @@ pub struct Router {
     /// backends. `None` preserves the pre-Feature-B llama-swap-only path.
     serving_identities: Option<Arc<ServingIdentityRegistry>>,
     serving_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
+    /// v2 L4: the swap supervisor. `None` preserves the v1 llama-swap path
+    /// byte-identically (integration tests and shim-only deployments).
+    swap: Option<Arc<crate::swap_scheduler::SwapScheduler>>,
+    /// Direct providers for native/external residents (outside the shim).
+    native_providers: Mutex<HashMap<String, Arc<OpenAiProvider>>>,
+    /// v2 L7: which engine serves local traffic. `Shim` = the untouched v1
+    /// llama-swap path; `Native` = every local key resolves through the swap
+    /// supervisor (no `:8081` dialer).
+    swap_mode: crate::config::SwapMode,
+    /// v2 L5: the Active-Consumer Set. In-process streams (the review loop)
+    /// never create proxy in-flight rows, so the router enters/leaves the
+    /// span around its own response stream.
+    active_consumers: Option<Arc<crate::active_consumers::ActiveConsumers>>,
 }
 
 pub struct RouterArgs {
     pub slot: Arc<DecisionSlot>,
     pub cards: Arc<RoleCardStore>,
-    pub manifest: Arc<OpenAiProvider>,
-    /// Whether the cloud backend (Manifest) is enabled. Off → cloud requests
-    /// skip Manifest and fall straight back to llama-swap.
-    pub manifest_enabled: bool,
+    /// v2 L6 provider registry (cloud/LAN endpoints; `cloud_available` is
+    /// derived from it — the v1 manifest-only availability flag is gone).
+    pub providers: Arc<crate::providers::ProviderStore>,
+    pub credentials: Arc<crate::credentials::CredentialStore>,
+    pub budget: Arc<crate::provider_budget::ProviderBudget>,
     pub llama_swap: Arc<OpenAiProvider>,
     pub fallback_model: String,
     /// Model keys known to belong to llama-swap. See `LlamaSwapConfig::local_models`.
@@ -232,8 +383,10 @@ impl Router {
         Self {
             slot: args.slot,
             cards: args.cards,
-            manifest: args.manifest,
-            manifest_enabled: args.manifest_enabled,
+            providers: args.providers,
+            credentials: args.credentials,
+            budget: args.budget,
+            provider_adapters: Mutex::new(HashMap::new()),
             llama_swap: args.llama_swap,
             fallback_model: args.fallback_model,
             local_models: args.local_models,
@@ -251,7 +404,39 @@ impl Router {
             llama_swap_config_path: args.llama_swap_config_path,
             serving_identities: args.serving_identities,
             serving_providers: Mutex::new(HashMap::new()),
+            swap: None,
+            native_providers: Mutex::new(HashMap::new()),
+            swap_mode: crate::config::SwapMode::Shim,
+            active_consumers: None,
         }
+    }
+
+    /// v2 L4: install the swap supervisor. Without it every local route is
+    /// the untouched v1 path.
+    pub fn install_swap(&mut self, swap: Arc<crate::swap_scheduler::SwapScheduler>) {
+        self.swap = Some(swap);
+    }
+
+    pub fn swap(&self) -> Option<&Arc<crate::swap_scheduler::SwapScheduler>> {
+        self.swap.as_ref()
+    }
+
+    /// v2 L7: pin the serving mode. `Native` retires the shim dialer: the
+    /// supervisor owns every local key.
+    pub fn install_swap_mode(&mut self, mode: crate::config::SwapMode) {
+        self.swap_mode = mode;
+    }
+
+    pub fn swap_mode(&self) -> crate::config::SwapMode {
+        self.swap_mode
+    }
+
+    /// v2 L5: install the Active-Consumer Set (in-process stream protection).
+    pub fn install_active_consumers(
+        &mut self,
+        consumers: Arc<crate::active_consumers::ActiveConsumers>,
+    ) {
+        self.active_consumers = Some(consumers);
     }
 
     pub fn cards(&self) -> &Arc<RoleCardStore> {
@@ -271,9 +456,35 @@ impl Router {
 
     /// Catalog discovery is metadata-only; never invokes inference or starts a model.
     pub async fn model_catalog(&self) -> serde_json::Value {
-        let local = self.llama_swap.list_models().await;
-        let cloud = if self.manifest_enabled {
-            self.manifest.list_models().await
+        let local = self.local_model_keys().await;
+        let cloud_available = self.providers.cloud_available();
+        let cloud = if cloud_available {
+            let mut models: Vec<String> = Vec::new();
+            for provider in self
+                .providers
+                .snapshot()
+                .into_iter()
+                .filter(|p| p.enabled && !p.lan_peer)
+            {
+                // Registry entries are the curated menu; OpenAI-compatible
+                // providers additionally answer `/models` (authenticated
+                // metadata only — never inference).
+                for model in &provider.models {
+                    if !models.contains(&model.id) {
+                        models.push(model.id.clone());
+                    }
+                }
+                if let Ok(ProviderAdapter::OpenAi(adapter)) = self.adapter_for(&provider).await {
+                    if let Ok(list) = adapter.list_models().await {
+                        for model in list {
+                            if !models.contains(&model) {
+                                models.push(model);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(models)
         } else {
             Err(anyhow!("Cloud is disabled; discovery was not attempted"))
         };
@@ -285,16 +496,30 @@ impl Router {
         }
         serde_json::json!({
             "local": entry(local), "cloud": entry(cloud),
-            "cloud_enabled": self.manifest_enabled,
+            "cloud_enabled": cloud_available,
             "local_default": self.fallback_model,
             "unknown_model_policy": "Explicit IDs are accepted without discovery; the provider validates availability. Explicit local failures are errors. Cloud failure or disabled cloud uses the existing local fallback.",
         })
     }
 
-    /// Model keys known to belong to llama-swap (from config). Exposed so the
-    /// flush-and-reload path can re-establish the local working set.
+    /// Model keys known to belong to the local serving layer (from config).
+    /// Exposed so the flush-and-reload path can re-establish the local working
+    /// set.
     pub fn local_models(&self) -> &Vec<String> {
         &self.local_models
+    }
+
+    /// Every local key the engine can serve. Shim mode asks the shim; native
+    /// mode reads the swap catalog (zero `:8081` traffic after the flip).
+    pub async fn local_model_keys(&self) -> Result<Vec<String>> {
+        if !self.swap_mode.is_native() {
+            return self.llama_swap.list_models().await;
+        }
+        Ok(self
+            .swap
+            .as_ref()
+            .map(|swap| swap.catalog().entries().into_iter().map(|e| e.id).collect())
+            .unwrap_or_default())
     }
 
     /// Rewrite the system prompt for local routing, unless the dashboard
@@ -590,9 +815,8 @@ impl Router {
             }
             // Direct cloud: skip the slot, go straight to Manifest.
             Selector::Cloud => {
-                info!("Direct cloud mode — routing to Manifest");
-                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                request.model = "auto".into();
+                info!("Direct cloud mode — resolving the provider registry");
+                tracker.set(Phase::CloudWaiting, None, Some("Cloud".into()), max_tokens);
                 // v1's role-specific strict rule: a `review` cloud selector
                 // never hops to the local fallback (the failure surfaces and
                 // the review loop maps it to escalated).
@@ -600,18 +824,31 @@ impl Router {
                     "cloud-direct",
                     "cloud",
                     None,
-                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                    self.route_cloud(
+                        request,
+                        allow_local_fallback && !resolution.proxy_review_strict,
+                        role_str,
+                        None,
+                        None,
+                    )
+                    .await,
                 )
             }
             Selector::CloudId(model) => {
                 crate::roles::validate_model_id(&model)?;
-                request.model = model.clone();
-                tracker.set(Phase::CloudWaiting, Some(model), Some("Manifest".into()), max_tokens);
+                tracker.set(Phase::CloudWaiting, Some(model.clone()), Some("Cloud".into()), max_tokens);
                 (
                     "cloud-direct",
                     "cloud",
                     None,
-                    self.route_cloud(request, allow_local_fallback && !resolution.proxy_review_strict).await,
+                    self.route_cloud(
+                        request,
+                        allow_local_fallback && !resolution.proxy_review_strict,
+                        role_str,
+                        Some(model),
+                        None,
+                    )
+                    .await,
                 )
             }
             Selector::Subs => {
@@ -660,12 +897,23 @@ impl Router {
         };
 
         let latency_ms = start.elapsed().as_millis() as u64;
+        // v2 L7: through the flip and the soak a supervisor-served local route
+        // keeps the v1 `llama-swap` provider spelling (one rename pass at
+        // deletion turns it into `local`). Event-only: the internal provider
+        // name stays `native` so `swap_source` derives correctly.
+        fn local_provider_literal(provider: Option<&str>) -> Option<String> {
+            match provider {
+                Some("native") => Some("llama-swap".to_string()),
+                other => other.map(str::to_string),
+            }
+        }
 
         let (response, info) = match result {
             Ok((resp, mut info)) => {
                 info.bonsai_decision = bonsai_decision;
                 // Transition tracker to streaming phase
-                let streaming_phase = if info.effective_provider.as_deref() == Some("manifest") {
+                let event_provider = local_provider_literal(info.effective_provider.as_deref());
+                let streaming_phase = if event_provider.as_deref() == Some("manifest") {
                     Phase::CloudStreaming
                 } else {
                     Phase::LocalStreaming
@@ -673,10 +921,12 @@ impl Router {
                 tracker.set(streaming_phase, Some(info.model_key.clone()), None, max_tokens);
                 // One event per failed hop so the dashboard shows the chain
                 // (e.g. manifest ✗ → local ✓) instead of a single card.
-                let winner_stage = provider_to_stage(&info.effective_provider, bonsai_decision);
+                let winner_stage = provider_to_stage(&event_provider, bonsai_decision);
                 for f in info.failed_attempts.iter().filter(|f| f.stage != winner_stage) {
-                    let (toolbox_backend, compute_api) =
-                        crate::routing_events::derive_serving_identity(Some(f.provider.as_str()));
+                    let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(
+                        Some(f.provider.as_str()),
+                        self.served_engine(&f.model_key).as_deref(),
+                    );
                     self.routing_events.emit(RouteEvent {
                         id: 0,
                         timestamp: String::new(),
@@ -704,19 +954,27 @@ impl Router {
                         rationale: slot.as_ref().map(|s| s.rationale.clone()),
                         decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                         chosen_model: Some(f.model_key.clone()),
+                        swap_state: None,
+                        swap_source: None,
+                        provider: Some(f.provider.clone()),
+                        hop: f.hop.clone(),
+                        budget: None,
                     });
                 }
-                let (toolbox_backend, compute_api) =
-                    crate::routing_events::derive_serving_identity(info.effective_provider.as_deref());
+                let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(
+                    event_provider.as_deref(),
+                    self.served_engine(&info.model_key).as_deref(),
+                );
+                let (swap_state, swap_source) = self.swap_event_fields(&info);
                 let event_id = self.routing_events.emit(RouteEvent {
                     id: 0, // overwritten by emit()
                     timestamp: String::new(), // overwritten by emit()
                     prompt_excerpt,
                     requested_model,
-                    effective_provider: info.effective_provider.clone(),
+                    effective_provider: event_provider.clone(),
                     model_key: info.model_key.clone(),
                     latency_ms,
-                    stage: provider_to_stage(&info.effective_provider, bonsai_decision),
+                    stage: provider_to_stage(&event_provider, bonsai_decision),
                     success: true,
                     error: String::new(),
                     bonsai_decision,
@@ -735,7 +993,26 @@ impl Router {
                     rationale: slot.as_ref().map(|s| s.rationale.clone()),
                     decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                     chosen_model: Some(info.model_key.clone()),
+                    swap_state,
+                    swap_source,
+                    provider: info.provider.clone(),
+                    hop: info.hop.clone(),
+                    budget: info.budget.clone(),
                 });
+                // v2 L6: meter provider responses from the OUTSIDE in:
+                // breaker on mid-stream death + budget accrual with a
+                // post-accrual backfill of this event's budget badge.
+                let resp = match info.meter.clone() {
+                    Some(plan) => wrap_with_budget_capture(
+                        resp,
+                        Arc::clone(&self.budget),
+                        Arc::clone(&self.health),
+                        Arc::clone(&self.routing_events),
+                        event_id,
+                        plan,
+                    ),
+                    None => resp,
+                };
                 // Wrap the stream to clear the tracker when it completes
                 let tracker_for_stream = Arc::clone(&self.inference_tracker);
                 let events = Arc::clone(&self.routing_events);
@@ -748,7 +1025,8 @@ impl Router {
             }
             Err(e) => {
                 tracker.clear();
-                let (toolbox_backend, compute_api) = crate::routing_events::derive_serving_identity(None);
+                let (toolbox_backend, compute_api) =
+                    crate::routing_events::derive_serving_identity(None, None);
                 self.routing_events.emit(RouteEvent {
                     id: 0,
                     timestamp: String::new(),
@@ -776,6 +1054,11 @@ impl Router {
                     rationale: slot.as_ref().map(|s| s.rationale.clone()),
                     decision_fallback: slot.as_ref().and_then(|s| s.decision_fallback),
                     chosen_model: None,
+                    swap_state: None,
+                    swap_source: None,
+                    provider: None,
+                    hop: None,
+                    budget: None,
                 });
                 return Err(e);
             }
@@ -828,17 +1111,25 @@ impl Router {
         let routing_cloud = if used_model_kind { "slot → cloud" } else { "auto → cloud" };
         match decision.route {
             SlotRoute::Cloud => {
-                tracker.set(Phase::CloudWaiting, None, Some("Manifest".into()), max_tokens);
-                request.model = "auto".into();
+                tracker.set(Phase::CloudWaiting, None, Some("Cloud".into()), max_tokens);
                 // Managed auto path keeps the PRD cloud→local fallback
                 // guarantee (the review-role strictness is card-scoped, not
-                // slot-scoped).
+                // slot-scoped). Chain widening is NOT applied: the managed
+                // shape stays the v1 two-step (primary → fallback_model).
                 let _ = allow_local_fallback;
+                let tier = decision.tier.as_str().to_string();
                 (
                     "cloud",
                     routing_cloud,
                     Some(slot_event),
-                    self.route_cloud(request, true).await,
+                    self.route_cloud(
+                        request,
+                        true,
+                        resolution.role.as_str(),
+                        None,
+                        Some(tier.as_str()),
+                    )
+                    .await,
                 )
             }
             SlotRoute::Local => {
@@ -880,7 +1171,7 @@ impl Router {
                 pool.push(key.clone());
             }
         }
-        if let Ok(models) = self.llama_swap.list_models().await {
+        if let Ok(models) = self.local_model_keys().await {
             for key in models {
                 if key != seed && !pool.contains(&key) {
                     pool.push(key);
@@ -905,15 +1196,29 @@ impl Router {
     /// llama-swap's own config (`parameters.ctx`); when the file is
     /// unreadable every ctx is unknown and the configured order stands.
     fn rank_by_ctx(&self, pool: &mut Vec<String>, seed: &str, approx_tokens: u64) {
-        let Some(path) = &self.llama_swap_config_path else {
-            debug!("llama-swap config path unknown; ctx ranking skipped");
-            return;
-        };
-        let ctx = match read_llama_swap_ctx(path) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                debug!(error = %e, "llama-swap config unreadable; ctx ranking skipped");
+        // Native mode: the catalog owns ctx (no shim config read).
+        let ctx: HashMap<String, u64> = if self.swap_mode.is_native() {
+            self.swap
+                .as_ref()
+                .map(|swap| {
+                    swap.catalog()
+                        .entries()
+                        .into_iter()
+                        .filter_map(|e| e.ctx.map(|ctx| (e.id, ctx)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            let Some(path) = &self.llama_swap_config_path else {
+                debug!("shim config path unknown; ctx ranking skipped");
                 return;
+            };
+            match read_llama_swap_ctx(path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    debug!(error = %e, "shim config unreadable; ctx ranking skipped");
+                    return;
+                }
             }
         };
         if ctx.is_empty() {
@@ -978,6 +1283,10 @@ impl Router {
                             effective_provider: Some(provider),
                             model_key: key.clone(),
                             failed_attempts: failed,
+                            provider: None,
+                            hop: None,
+                            budget: None,
+                            meter: None,
                         },
                     ));
                 }
@@ -988,6 +1297,7 @@ impl Router {
                         provider: "llama-swap".to_string(),
                         model_key: key.clone(),
                         error: e.to_string(),
+                        hop: None,
                     });
                     last_error = Some(e);
                 }
@@ -999,7 +1309,7 @@ impl Router {
     /// One local attempt: server-mode identity wins, then llama-swap.
     async fn try_local_once(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         stage: Stage,
     ) -> Result<(ProviderResponse, String)> {
         let requested = request.model.clone();
@@ -1009,95 +1319,732 @@ impl Router {
             let resp = provider.chat_completion(request).await?;
             return Ok((wrap_with_timeout_stream(resp)?, provider_name));
         }
+        // v2 L4: catalogued models resolve through the swap supervisor's
+        // `ensure` (Residency-first attach / budget-admitted spawn / queue).
+        // Catalogued models only — every v1 selector/key keeps the old path.
+        if let Some(swap) = &self.swap {
+            if let Some(resolved) = swap.catalog().resolve_alias(&requested) {
+                use crate::residency::ResidentSource;
+                // The in-flight row makes a routed queue/load wait abortable.
+                let cancel = current_request_cancel();
+                let outcome = match &cancel {
+                    Some(handle) => swap.ensure_with_cancel(&resolved, Some(handle)).await?,
+                    None => swap.ensure(&resolved).await?,
+                };
+                let source = match &outcome {
+                    crate::swap_scheduler::EnsureOutcome::Attach { source, .. } => *source,
+                };
+                if source != ResidentSource::Shim {
+                    let endpoint = outcome.endpoint().to_string();
+                    let entry = swap.catalog().entry(&resolved);
+                    let served = entry
+                        .as_ref()
+                        .map(|e| e.served_alias())
+                        .unwrap_or_else(|| resolved.clone());
+                    let provider = self.native_provider(&endpoint).await;
+                    sanitize_for_llama_family(&mut request);
+                    request.model = served;
+                    // v2 L5 hipfire context math (pre-forward): `max_tokens`
+                    // defaults to the engine's remaining context; a prompt
+                    // that cannot fit is a typed 400 shortfall.
+                    if entry.as_ref().map(|e| e.engine.as_str()) == Some("hipfire") {
+                        let bytes =
+                            serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+                        let measured =
+                            crate::decision::RequestFeatures::approx_tokens_of_body(bytes);
+                        let ctx = entry
+                            .as_ref()
+                            .and_then(|e| e.ctx)
+                            .unwrap_or(crate::engine_hipfire::DEFAULT_MAX_SEQ);
+                        match crate::engine_hipfire::shape_max_tokens(
+                            request.max_tokens,
+                            ctx,
+                            measured,
+                        ) {
+                            Ok(tokens) => request.max_tokens = Some(tokens),
+                            Err(shortfall) => return Err(anyhow::Error::new(shortfall)),
+                        }
+                    }
+                    // v2 L5: an in-process route creates no proxy in-flight
+                    // row: enter the Active-Consumer Set before the upstream
+                    // call so a concurrent ensure cannot drain this engine
+                    // mid-stream, and release on drop/error.
+                    let keys = crate::active_consumers::protection_keys(
+                        &resolved,
+                        Some(&endpoint),
+                    );
+                    let consumers = self.active_consumers.clone();
+                    if let Some(consumers) = &consumers {
+                        for key in &keys {
+                            consumers.enter(key);
+                        }
+                    }
+                    let resp = match provider.chat_completion(request).await {
+                        Ok(resp) => resp,
+                        Err(error) => {
+                            if let Some(consumers) = &consumers {
+                                for key in &keys {
+                                    consumers.leave(key);
+                                }
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    let resp = match consumers {
+                        Some(consumers) => {
+                            crate::active_consumers::wrap_held_with_active_consumer(
+                                resp, consumers, keys,
+                            )
+                        }
+                        None => resp,
+                    };
+                    return Ok((wrap_with_timeout_stream(resp)?, "native".to_string()));
+                }
+                // Shim/other resident: the existing shim/identity path below
+                // attaches to the same endpoint (single residency). In native
+                // mode that fall-through is retired — the shim has been
+                // flushed and must never be dialed again.
+                if self.swap_mode.is_native() {
+                    return Err(anyhow!(
+                        "model `{requested}` is held by the llama-swap shim; flush it before \
+                         flipping swap.mode to native"
+                    ));
+                }
+            } else if self.swap_mode.is_native() {
+                return Err(anyhow!(
+                    "local model `{requested}` is not in the swap catalog (swap.mode: native) — \
+                     import it with `swap import` or add it through the swap catalog API"
+                ));
+            }
+        } else if self.swap_mode.is_native() {
+            return Err(anyhow!(
+                "swap.mode is native but no swap supervisor is installed (internal boot error)"
+            ));
+        }
         let (resp, model_key) = self.try_llama_swap(request, stage).await?;
         let _ = model_key;
         Ok((resp, "llama-swap".to_string()))
     }
 
-    /// Cloud path: try Manifest first. On error/circuit-open, fall back to
-    /// llama-swap with the configured fallback model.
+    /// Direct provider for a native/external resident endpoint.
+    async fn native_provider(&self, endpoint: &str) -> Arc<OpenAiProvider> {
+        let mut providers = self.native_providers.lock().await;
+        if let Some(provider) = providers.get(endpoint) {
+            return Arc::clone(provider);
+        }
+        let provider = Arc::new(OpenAiProvider::new(
+            "native".to_string(),
+            format!("{}/v1", endpoint.trim_end_matches('/')),
+            None,
+        ));
+        providers.insert(endpoint.to_string(), Arc::clone(&provider));
+        provider
+    }
+
+    /// The catalog's real engine when `model_key` is supervisor-served;
+    /// `None` for shim/cloud or unknown keys, leaving provider-based
+    /// derivation untouched.
+    fn served_engine(&self, model_key: &str) -> Option<String> {
+        let swap = self.swap.as_ref()?;
+        let id = swap.catalog().resolve_alias(model_key)?;
+        swap.catalog().entry(&id).map(|e| e.engine)
+    }
+
+    /// v2 L4 event fields: the swap lifecycle/source for a routed model, when
+    /// the catalog owns it. Additive; `None` for every non-swap route.
+    fn swap_event_fields(&self, info: &RouteInfo) -> (Option<String>, Option<String>) {
+        let Some(swap) = &self.swap else {
+            return (None, None);
+        };
+        if swap.catalog().resolve_alias(&info.model_key).is_none() {
+            return (None, None);
+        }
+        let source = match info.effective_provider.as_deref() {
+            Some("native") => "native",
+            Some("container") => "container",
+            Some("external") => "external",
+            Some("llama-swap") => "shim",
+            Some("manifest") => return (None, None),
+            // Server-mode identities are containers (gufo/ds4).
+            Some(_) => "container",
+            None => return (None, None),
+        };
+        (Some("ready".to_string()), Some(source.to_string()))
+    }
+
+    /// v2 L6 cloud path: resolve the provider registry, try the cloud target
+    /// ONCE, then the single `fallback_model` hop (v1 managed shape — chain
+    /// widening applies only to the auto pool, never here).
     async fn route_cloud(
+        &self,
+        request: ChatCompletionRequest,
+        allow_local_fallback: bool,
+        role: &str,
+        cloud_model: Option<String>,
+        tier: Option<&str>,
+    ) -> Result<(ProviderResponse, RouteInfo)> {
+        let query = self.pool_query(&request, tier);
+        let records = self.providers.snapshot();
+        let resolved = match crate::providers::resolve_cloud_target(
+            &records,
+            cloud_model.as_deref(),
+            &query,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // v1 parity: no usable cloud target is a MANAGED PRIMARY
+                // failure (the `fallback_model` hop fires; a reviewer
+                // escalates) — EXCEPT an explicit selector ambiguity, which
+                // is a 4xx naming the providers (rule (c)).
+                let explicit = cloud_model.is_some();
+                if explicit && self.providers.cloud_available() {
+                    return Err(anyhow::Error::new(error));
+                }
+                let requested = cloud_model
+                    .clone()
+                    .unwrap_or_else(|| "auto".to_string());
+                let disabled = crate::providers::ProviderRecord {
+                    id: "cloud".to_string(),
+                    kind: crate::providers::ProviderKind::Manifest,
+                    base_url: String::new(),
+                    credential_id: None,
+                    auto: false,
+                    models: Vec::new(),
+                    lan_peer: false,
+                    enabled: false,
+                    monthly_budget_usd: None,
+                    budget_mode: crate::providers::BudgetMode::Warn,
+                };
+                return self
+                    .cloud_fallback(
+                        request,
+                        allow_local_fallback,
+                        &disabled,
+                        requested,
+                        format!("cloud unavailable: {error}"),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        };
+        let Some(record) = records
+            .iter()
+            .find(|p| p.id == resolved.provider_id && p.enabled)
+            .cloned()
+        else {
+            anyhow::bail!(
+                "provider `{}` is no longer enabled",
+                resolved.provider_id
+            );
+        };
+        let requested_cloud_model = resolved.model.clone();
+        let hop = hop_of(&record.base_url, record.kind);
+        let price = record
+            .models
+            .iter()
+            .find(|m| m.id == resolved.model)
+            .and_then(|m| m.price);
+        let budget_event = self.budget_event(&record);
+
+        let mut primary_error: Option<String> = None;
+        if self
+            .budget
+            .stop_exhausted(&record.id, record.monthly_budget_usd, record.budget_mode)
+        {
+            warn!(
+                provider = %record.id,
+                "Provider over its monthly budget (stop mode) — managed primary failure"
+            );
+            primary_error = Some(format!(
+                "provider `{}` is over its monthly budget ({} mode); refused before dispatch",
+                record.id,
+                record.budget_mode.as_str()
+            ));
+        } else if !self.health.is_healthy(&record.id) {
+            warn!(provider = %record.id, "Provider circuit open, skipping");
+            primary_error = Some(format!("provider `{}` circuit open", record.id));
+        }
+
+        let mut model_key = requested_cloud_model.clone();
+        let mut accepted: Option<crate::provider::SseStream> = None;
+        if primary_error.is_none() {
+            match self
+                .dispatch_provider(&record, &request, role, &resolved.model)
+                .await
+            {
+                Ok(ProviderResponse::Stream(stream)) => match record.kind {
+                    crate::providers::ProviderKind::Manifest => {
+                        match peek_manifest_model(stream).await {
+                            ManifestPeek::Accepted { stream, model } => {
+                                if let Some(model) = model {
+                                    model_key = model;
+                                }
+                                self.health.report_success(&record.id);
+                                accepted = Some(stream);
+                            }
+                            ManifestPeek::PseudoError => {
+                                // Reachable but cannot fulfill (credits/auth):
+                                // fall back WITHOUT a breaker failure report.
+                                warn!(
+                                    provider = %record.id,
+                                    "Manifest returned pseudo-success (model=manifest) — falling back without a breaker failure"
+                                );
+                                primary_error =
+                                    Some("manifest pseudo-success sentinel".to_string());
+                            }
+                            ManifestPeek::Failed(error) => {
+                                warn!(provider = %record.id, error = %error, "Manifest stream failed before metadata, falling back");
+                                self.health.report_failure(&record.id);
+                                primary_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        self.health.report_success(&record.id);
+                        accepted = Some(stream);
+                    }
+                },
+                Err(e) => {
+                    warn!(provider = %record.id, error = %e, "Provider failed, falling back");
+                    if e.is_backend_fault {
+                        self.health.report_failure(&record.id);
+                    }
+                    primary_error = Some(e.message);
+                }
+            }
+        }
+
+        if let Some(stream) = accepted {
+            let request_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+            let meter = MeterPlan {
+                provider_id: record.id.clone(),
+                price,
+                request_bytes,
+                budget_mode: record.budget_mode,
+                monthly_budget_usd: record.monthly_budget_usd,
+            };
+            let response = wrap_with_timeout(stream);
+            return Ok((
+                response,
+                RouteInfo {
+                    bonsai_decision: "cloud",
+                    effective_provider: Some(record.id.clone()),
+                    model_key,
+                    failed_attempts: Vec::new(),
+                    provider: Some(record.id.clone()),
+                    hop,
+                    budget: budget_event,
+                    meter: Some(meter),
+                },
+            ));
+        }
+
+        self.cloud_fallback(
+            request,
+            allow_local_fallback,
+            &record,
+            requested_cloud_model,
+            primary_error.unwrap_or_else(|| "provider unavailable".to_string()),
+            hop,
+            budget_event,
+        )
+        .await
+    }
+
+    /// The v1 managed second step: one `fallback_model` hop, one
+    /// FailedAttempt event, then stop on a second failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn cloud_fallback(
         &self,
         mut request: ChatCompletionRequest,
         allow_local_fallback: bool,
+        record: &crate::providers::ProviderRecord,
+        requested_cloud_model: String,
+        error: String,
+        hop: Option<crate::routing_events::HopInfo>,
+        budget_event: Option<crate::routing_events::BudgetEvent>,
     ) -> Result<(ProviderResponse, RouteInfo)> {
-        // Callers normalize managed aliases to auto; exact cloud IDs pass through.
-        let requested_cloud_model = request.model.clone();
+        // Reviewer calls pass allow_local_fallback=false so a cloud reviewer
+        // never silently executes on a local model (wrong rubric; review loop
+        // maps the surfaced failure to `escalated`).
+        {
+            if !allow_local_fallback {
+                anyhow::bail!(
+                    "cloud reviewer route: provider `{}` unavailable ({}); local fallback is disabled",
+                    record.id,
+                    error
+                );
+            }
+            request.model = self.fallback_model.clone();
+            let model_key = self.fallback_model.clone();
+            let (resp, _) = self
+                .try_local_once(request, Stage::CloudFallback)
+                .await?;
+            Ok((
+                resp,
+                RouteInfo {
+                    bonsai_decision: "cloud",
+                    effective_provider: Some("llama-swap".to_string()),
+                    model_key,
+                    failed_attempts: vec![FailedAttempt {
+                        stage: Stage::CloudPrimary,
+                        provider: record.id.clone(),
+                        model_key: requested_cloud_model,
+                        error,
+                        hop,
+                    }],
+                    provider: None,
+                    hop: None,
+                    budget: budget_event,
+                    meter: None,
+                },
+            ))
+        }
+    }
 
-        if !self.manifest_enabled {
-            warn!(
-                provider = MANIFEST_KEY,
-                "Manifest is disabled (manifest.enabled: false) — cloud request falls back to llama-swap"
-            );
-        } else if self.health.is_healthy(MANIFEST_KEY) {
-            info!(provider = MANIFEST_KEY, "Attempting Manifest");
-            match self.manifest.chat_completion(request.clone()).await {
-                Ok(ProviderResponse::Stream(stream)) => {
-                    match peek_manifest_model(stream).await {
-                        ManifestPeek::Accepted { stream, model } => {
-                            let model_key = model.unwrap_or_else(|| requested_cloud_model.clone());
-                            self.health.report_success(MANIFEST_KEY);
-                            info!(provider = MANIFEST_KEY, model = %model_key, "Manifest accepted request");
-                            return Ok((
-                                wrap_with_timeout(stream),
-                                RouteInfo {
-                                    bonsai_decision: "cloud",
-                                    effective_provider: Some("manifest".to_string()),
-                                    model_key,
-                                    failed_attempts: Vec::new(),
-                                },
-                            ));
-                        }
-                        ManifestPeek::PseudoError => {
-                        warn!(provider = MANIFEST_KEY, "Manifest returned pseudo-success (model=manifest) — likely credits exhausted or auth error, falling back");
-                        // Don't report health failure — Manifest is reachable, just can't fulfill.
-                        }
-                        ManifestPeek::Failed(error) => {
-                            warn!(provider = MANIFEST_KEY, error = %error, "Manifest stream failed before metadata, falling back");
-                            self.health.report_failure(MANIFEST_KEY);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = MANIFEST_KEY, error = %e, "Manifest failed, falling back to llama-swap");
-                    if e.is_backend_fault {
-                        self.health.report_failure(MANIFEST_KEY);
-                    }
-                    // Always fall through to llama-swap — PRD guarantees automatic fallback.
+    /// Pool-relevant features of one request (ctx/tools/tier + stop-mode
+    /// budget exclusions).
+    fn pool_query(
+        &self,
+        request: &ChatCompletionRequest,
+        tier: Option<&str>,
+    ) -> crate::providers::PoolQuery {
+        let approx_tokens = request
+            .messages
+            .iter()
+            .chain(std::iter::empty())
+            .map(|m| {
+                serde_json::to_vec(&m.content)
+                    .map(|v| (v.len() as u64).div_ceil(4))
+                    .unwrap_or(0)
+            })
+            .sum::<u64>()
+            .max(serde_json::to_vec(request).map(|v| v.len() as u64).unwrap_or(0).div_ceil(4));
+        let needs_tools = request
+            .extra
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        let records = self.providers.snapshot();
+        crate::providers::PoolQuery {
+            approx_tokens,
+            needs_tools,
+            tier: tier.and_then(crate::providers::ModelTier::parse),
+            over_budget: self.budget.stop_excluded(&records),
+        }
+    }
+
+    /// The budget badge/event for a provider route (None when the provider has
+    /// no configured budget).
+    fn budget_event(
+        &self,
+        record: &crate::providers::ProviderRecord,
+    ) -> Option<crate::routing_events::BudgetEvent> {
+        let budget = record.monthly_budget_usd?;
+        let spent = self.budget.spent(&record.id);
+        Some(crate::routing_events::BudgetEvent {
+            provider: record.id.clone(),
+            mode: record.budget_mode.as_str().to_string(),
+            state: if spent >= budget { "over" } else { "ok" }.to_string(),
+            month: self.budget.month(),
+            spent_usd: spent,
+            monthly_budget_usd: budget,
+        })
+    }
+
+    /// Resolve a provider credential id (`env:NAME` / `file:PATH` references
+    /// from the v1 migration, or a credentials-store record id).
+    fn resolve_provider_credential(&self, credential_id: &str) -> Result<String> {
+        if let Some(var) = credential_id.strip_prefix("env:") {
+            return std::env::var(var).with_context(|| {
+                format!("provider credential env var `{var}` is unset")
+            });
+        }
+        if let Some(path) = credential_id.strip_prefix("file:") {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading provider credential file `{path}`"))?;
+            return Ok(text.trim().to_string());
+        }
+        // The vault file is authoritative (rotations land immediately);
+        // `resolve_live` falls back to the in-memory copy for test stores.
+        let secret = self.credentials.resolve_live(credential_id)?;
+        Ok(secret.expose().to_string())
+    }
+
+    /// Build (or reuse) the outbound adapter for one provider. The cache key
+    /// includes a credential fingerprint so rotation takes over immediately.
+    async fn adapter_for(
+        &self,
+        record: &crate::providers::ProviderRecord,
+    ) -> Result<ProviderAdapter> {
+        let secret = match record.credential_id.as_deref() {
+            Some(id) => Some(self.resolve_provider_credential(id)?),
+            None => None,
+        };
+        let fingerprint = fingerprint_of(record, secret.as_deref());
+        {
+            let cache = self.provider_adapters.lock().await;
+            if let Some(cached) = cache.get(&record.id) {
+                if cached.fingerprint == fingerprint {
+                    return Ok(cached.adapter.clone());
                 }
             }
-        } else {
-            warn!(provider = MANIFEST_KEY, "Manifest circuit open, skipping");
         }
-
-        // Cloud fallback → llama-swap with fallback_model.
-        // Reviewer calls (design H3) pass allow_local_fallback=false so a cloud
-        // reviewer never silently executes on a local model (which would use
-        // the wrong rubric and could load an unadmitted model / OOM). The
-        // failure surfaces and the review loop maps it to `escalated`.
-        if !allow_local_fallback {
-            anyhow::bail!(
-                "cloud reviewer route: Manifest unavailable (disabled, circuit open, or error) and local fallback is disabled"
-            );
-        }
-        // Cloud fallback → llama-swap with fallback_model
-        request.model = self.fallback_model.clone();
-        let model_key = self.fallback_model.clone();
-        let (resp, _) = self.try_local_once(request, Stage::CloudFallback).await?;
-        Ok((
-            resp,
-            RouteInfo {
-                bonsai_decision: "cloud",
-                effective_provider: Some("llama-swap".to_string()),
-                model_key,
-                failed_attempts: vec![FailedAttempt {
-                    stage: Stage::CloudPrimary,
-                    provider: "manifest".to_string(),
-                    model_key: requested_cloud_model,
-                    error: "manifest unavailable (disabled, circuit open, or error)".to_string(),
-                }],
+        let adapter = match record.kind {
+            crate::providers::ProviderKind::Anthropic => {
+                ProviderAdapter::Anthropic(Arc::new(
+                    crate::provider::anthropic::AnthropicProvider::new(
+                        record.id.clone(),
+                        record.base_url.clone(),
+                        secret,
+                    ),
+                ))
+            }
+            _ => ProviderAdapter::OpenAi(Arc::new(OpenAiProvider::new(
+                record.id.clone(),
+                record.base_url.clone(),
+                secret,
+            ))),
+        };
+        let mut cache = self.provider_adapters.lock().await;
+        cache.insert(
+            record.id.clone(),
+            CachedAdapter {
+                fingerprint,
+                adapter: adapter.clone(),
             },
-        ))
+        );
+        Ok(adapter)
+    }
+
+    /// One provider dispatch. Only `lan_peer` providers receive the forwarded
+    /// effective `x-brainrouter-role` header (distributed roles).
+    async fn dispatch_provider(
+        &self,
+        record: &crate::providers::ProviderRecord,
+        request: &ChatCompletionRequest,
+        role: &str,
+        model: &str,
+    ) -> Result<ProviderResponse, crate::provider::ProviderError> {
+        let adapter = self.adapter_for(record).await.map_err(|error| {
+            crate::provider::ProviderError {
+                message: format!("provider `{}`: {error}", record.id),
+                is_backend_fault: false,
+            }
+        })?;
+        let mut request = request.clone();
+        request.model = model.to_string();
+        let forwarded = record.lan_peer.then_some(role);
+        adapter.chat(request, forwarded).await
+    }
+
+    /// v2 L6 provider Test: one cheap completion probe with the provider's
+    /// kind-specific auth headers.
+    pub async fn probe_provider(&self, id: &str) -> Result<serde_json::Value> {
+        let record = self
+            .providers
+            .get(id)
+            .with_context(|| format!("unknown provider `{id}`"))?;
+        let adapter = self.adapter_for(&record).await?;
+        // Probe the provider's FIRST declared model; the migrated manifest
+        // provider passes its v1 wire value. Never invent a fake model id.
+        let model = match record.models.first() {
+            Some(model) => model.id.clone(),
+            None if record.kind == crate::providers::ProviderKind::Manifest => {
+                "auto".to_string()
+            }
+            None => anyhow::bail!(
+                "provider `{}` declares no models to probe; add a model or use the manifest kind",
+                record.id
+            ),
+        };
+        let request = match record.kind {
+            crate::providers::ProviderKind::Anthropic => {
+                crate::provider::anthropic::AnthropicProvider::probe_request(&model)
+            }
+            _ => ChatCompletionRequest {
+                model: model.clone(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(serde_json::Value::String("ping".to_string())),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: Some(true),
+                temperature: None,
+                max_tokens: Some(16),
+                top_p: None,
+                stop: None,
+                extra: serde_json::Value::Null,
+            },
+        };
+        adapter.chat(request, None).await.map_err(|e| anyhow!(e.message))?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "provider": record.id,
+            "kind": record.kind.as_str(),
+            "model": model,
+        }))
+    }
+
+    /// v2 L6 LAN expose preview: every model string this request may
+    /// dispatch upstream, computed with the SAME helpers dispatch uses
+    /// (card resolution, decision slot, chain, cloud resolution) plus the
+    /// alias axes (`swap_catalog` alias, provider id/alias). The LAN listener
+    /// requires every candidate to be exposed, so a managed substitution
+    /// (local ⇒ `fallback_model`, subs ⇒ `subs_model`, auto ⇒ decision chain,
+    /// cloud ⇒ pool top/fallback) cannot escape the expose list.
+    pub async fn expose_candidates(
+        &self,
+        request: &ChatCompletionRequest,
+        role_header: &str,
+        cwd: &str,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let header_role = Role::parse(role_header).unwrap_or(Role::Main);
+        let selector = parse_selector(&request.model);
+        let role = if selector == Selector::Subs { Role::Subagent } else { header_role };
+        let explicit = selector.is_explicit();
+        let via_subs = selector == Selector::Subs;
+        let project = if explicit || !self.cards.has_scoped_cards() {
+            None
+        } else {
+            self.resolve_project(cwd).await
+        };
+        let target = if explicit {
+            selector
+        } else {
+            let assignment = self.cards.assignment(role, project.as_deref());
+            let compiled = parse_selector(&assignment);
+            if selector == Selector::Subs && compiled == Selector::Subs {
+                Selector::Auto
+            } else {
+                compiled
+            }
+        };
+        let review_strict = role == Role::Review;
+        // Capture before the match consumes the selector.
+        let cloud_model = match &target {
+            Selector::CloudId(model) => Some(model.clone()),
+            _ => None,
+        };
+        match target {
+            Selector::Local => self.push_expose_candidate(&mut out, &self.fallback_model),
+            Selector::Subs => {
+                let subs = self
+                    .subs_model
+                    .clone()
+                    .unwrap_or_else(|| self.fallback_model.clone());
+                self.push_expose_candidate(&mut out, &subs);
+            }
+            Selector::Bare(key) => self.push_expose_candidate(&mut out, &key),
+            Selector::Cloud | Selector::CloudId(_) => {
+                let query = self.pool_query(request, None);
+                if let Ok(resolved) = crate::providers::resolve_cloud_target(
+                    &self.providers.snapshot(),
+                    cloud_model.as_deref(),
+                    &query,
+                ) {
+                    self.push_expose_candidate(&mut out, &resolved.model);
+                }
+                if !review_strict {
+                    self.push_expose_candidate(&mut out, &self.fallback_model);
+                }
+            }
+            Selector::Auto => {
+                if via_subs && self.subs_model.is_some() {
+                    let subs = self.subs_model.clone().unwrap_or_default();
+                    self.push_expose_candidate(&mut out, &subs);
+                    return out;
+                }
+                let policy = self.cards.policy_for(project.as_deref());
+                let raw_bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
+                let features = RequestFeatures::extract(
+                    request,
+                    raw_bytes,
+                    role.as_str(),
+                    "auto",
+                    policy.privacy,
+                    policy.quality,
+                    project.as_deref().unwrap_or_default(),
+                );
+                let mut outcome = self.slot.decide(&features).await;
+                DecisionSlot::clamp(&mut outcome, policy.privacy, policy.quality);
+                match outcome.decision.route {
+                    SlotRoute::Cloud => {
+                        let tier = outcome.decision.tier.as_str().to_string();
+                        let query = self.pool_query(request, Some(tier.as_str()));
+                        if let Ok(resolved) = crate::providers::resolve_cloud_target(
+                            &self.providers.snapshot(),
+                            None,
+                            &query,
+                        ) {
+                            self.push_expose_candidate(&mut out, &resolved.model);
+                        }
+                        // route_slot always allows the managed fallback.
+                        self.push_expose_candidate(&mut out, &self.fallback_model);
+                    }
+                    SlotRoute::Local => {
+                        let candidates =
+                            self.chain_candidates(features.approx_prompt_tokens).await;
+                        for candidate in candidates {
+                            self.push_expose_candidate(&mut out, &candidate);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Add a dispatchable model plus its alias-resolved forms (swap catalog
+    /// alias, provider id/alias), so the LAN check covers the POST-alias wire
+    /// value, not just the selector spelling.
+    fn push_expose_candidate(&self, out: &mut Vec<String>, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let mut variants = vec![model.to_string()];
+        if let Some(swap) = &self.swap {
+            if let Some(resolved) = swap.catalog().resolve_alias(model) {
+                if resolved != model {
+                    variants.push(resolved);
+                }
+            }
+        }
+        if let Some((_, resolved)) =
+            crate::providers::resolve_bare_model(&self.providers.snapshot(), model)
+        {
+            if resolved != model {
+                variants.push(resolved);
+            }
+        }
+        for variant in variants {
+            if !out.contains(&variant) {
+                out.push(variant);
+            }
+        }
+    }
+
+    /// v2 L6: `cloud_available` replaces the v1 manifest-only flag at every
+    /// admission consumer.
+    pub fn cloud_available(&self) -> bool {
+        self.providers.cloud_available()
+    }
+
+    pub fn providers(&self) -> &Arc<crate::providers::ProviderStore> {
+        &self.providers
+    }
+
+    pub fn budget(&self) -> &Arc<crate::provider_budget::ProviderBudget> {
+        &self.budget
+    }
+
+    /// Live per-provider breaker state (`healthy|degraded|open`).
+    pub fn health_state(&self, provider_id: &str) -> &'static str {
+        self.health.state(provider_id)
     }
 
     /// Managed local path (the `local` selector): v1 semantics — route to
@@ -1117,6 +2064,10 @@ impl Router {
                     effective_provider: Some(provider),
                     model_key: requested,
                     failed_attempts: Vec::new(),
+                    provider: None,
+                    hop: None,
+                    budget: None,
+                    meter: None,
                 },
             )),
             Err(e) => {
@@ -1144,7 +2095,12 @@ impl Router {
                             provider: "llama-swap".to_string(),
                             model_key: requested,
                             error: e.to_string(),
+                            hop: None,
                         }],
+                        provider: None,
+                        hop: None,
+                        budget: None,
+                        meter: None,
                     },
                 ))
             }
@@ -1181,26 +2137,9 @@ impl Router {
                 stage
             ));
         }
-        // Sanitize messages for local llama-server compatibility:
-        //  1. Normalize 'developer' role → 'system' (OpenAI-style role that Qwen3
-        //     templates don't recognize).
-        //  2. Merge system messages into one (Qwen3 requires single system msg at pos 0).
-        //  3. Ensure assistant messages have content (llama-server rejects assistant
-        //     messages with neither content nor tool_calls).
-        for msg in &mut request.messages {
-            if msg.role == "developer" {
-                msg.role = "system".to_string();
-            }
-        }
-        let (sys, rest): (Vec<_>, Vec<_>) = request
-            .messages
-            .into_iter()
-            .partition(|m| m.role == "system");
-        request.messages = merge_system_messages(sys)
-            .into_iter()
-            .chain(rest)
-            .collect();
-        sanitize_assistant_messages(&mut request.messages);
+        // Shared llama-server-family shaping (shim + native): the exact same
+        // sanitized body must reach both endpoint kinds.
+        sanitize_for_llama_family(&mut request);
         let model_key = request.model.clone();
         debug!(
             provider = LLAMA_SWAP_KEY,
@@ -1273,6 +2212,33 @@ fn server_mode_provider_name(identity: &ServingIdentity) -> String {
 
 fn server_mode_provider_base_url(identity: &ServingIdentity) -> String {
     format!("{}/v1", identity.endpoint.trim_end_matches('/'))
+}
+
+/// The shared llama-server-family request shape (v2 L4): applied to BOTH the
+/// llama-swap shim and native llama-server endpoints so one request produces a
+/// byte-identical sanitized body on either path (golden-body contract).
+///
+/// 1. Normalize 'developer' role → 'system' (OpenAI-style role that Qwen3
+///    templates don't recognize).
+/// 2. Merge system messages into one (Qwen3 requires a single system msg at
+///    position 0).
+/// 3. Ensure assistant messages have content (llama-server rejects assistant
+///    messages with neither content nor tool_calls).
+pub fn sanitize_for_llama_family(request: &mut ChatCompletionRequest) {
+    for msg in &mut request.messages {
+        if msg.role == "developer" {
+            msg.role = "system".to_string();
+        }
+    }
+    let (sys, rest): (Vec<_>, Vec<_>) = request
+        .messages
+        .drain(..)
+        .partition(|m| m.role == "system");
+    request.messages = merge_system_messages(sys)
+        .into_iter()
+        .chain(rest)
+        .collect();
+    sanitize_assistant_messages(&mut request.messages);
 }
 
 /// Collapse multiple system messages into a single one by concatenating their
@@ -1429,6 +2395,158 @@ fn wrap_with_timeout(
 ) -> ProviderResponse {
     let timeout_stream = TimeoutStream::new(stream, TTFT_TIMEOUT, STREAM_STALL_TIMEOUT);
     ProviderResponse::Stream(Box::pin(timeout_stream))
+}
+
+/// v2 L6 provider meter: accrue the provider's monthly spend and report the
+/// breaker for a mid-stream death. Usage tokens from the SSE `usage` frame
+/// are exact; absent usage accrues the spec's `(bytes+3)/4` estimator,
+/// flagged `estimated`. On accrual the route event's `budget` badge is
+/// backfilled with POST-accrual spend (the emitted event carries the
+/// pre-dispatch view).
+fn wrap_with_budget_capture(
+    resp: ProviderResponse,
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    health: Arc<HealthTracker>,
+    events: Arc<RoutingEvents>,
+    event_id: u64,
+    plan: MeterPlan,
+) -> ProviderResponse {
+    match resp {
+        ProviderResponse::Stream(stream) => {
+            ProviderResponse::Stream(Box::pin(BudgetCaptureStream {
+                inner: stream,
+                budget,
+                health,
+                events,
+                event_id,
+                plan,
+                response_bytes: 0,
+                prompt_tokens: None,
+                completion_tokens: None,
+                buffer: Vec::new(),
+                recorded: false,
+            }))
+        }
+    }
+}
+
+struct BudgetCaptureStream {
+    inner: crate::provider::SseStream,
+    budget: Arc<crate::provider_budget::ProviderBudget>,
+    health: Arc<HealthTracker>,
+    events: Arc<RoutingEvents>,
+    event_id: u64,
+    plan: MeterPlan,
+    response_bytes: usize,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    buffer: Vec<u8>,
+    recorded: bool,
+}
+
+impl BudgetCaptureStream {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.response_bytes += bytes.len();
+        const MAX_BUFFER: usize = 1024 * 1024;
+        self.buffer.extend_from_slice(bytes);
+        while let Some(index) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=index).collect();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Some(payload) = text.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+                continue;
+            };
+            if let Some(usage) = value.get("usage") {
+                if let Some(tokens) = usage.get("prompt_tokens").and_then(serde_json::Value::as_u64) {
+                    self.prompt_tokens = Some(tokens);
+                }
+                if let Some(tokens) = usage.get("completion_tokens").and_then(serde_json::Value::as_u64) {
+                    self.completion_tokens = Some(tokens);
+                }
+            }
+        }
+        if self.buffer.len() > MAX_BUFFER {
+            self.buffer.clear();
+        }
+    }
+
+    fn record(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let (input, output, estimated) = match (self.prompt_tokens, self.completion_tokens) {
+            (Some(input), Some(output)) => (input, output, false),
+            _ => (
+                crate::provider_budget::estimate_tokens(self.plan.request_bytes),
+                crate::provider_budget::estimate_tokens(self.response_bytes),
+                true,
+            ),
+        };
+        let cost = crate::provider_budget::cost_of(self.plan.price, input, output);
+        if let Err(error) = self
+            .budget
+            .record(&self.plan.provider_id, cost, estimated, input, output)
+        {
+            debug!(provider = %self.plan.provider_id, %error, "budget accrual failed");
+        }
+        // Post-accrual badge: the event emitted at headers carried the
+        // pre-dispatch spend; backfill it by event id (the TPS capture uses
+        // the same correlation).
+        if let Some(budget_usd) = self.plan.monthly_budget_usd {
+            let spent = self.budget.spent(&self.plan.provider_id);
+            self.events.update_budget(
+                self.event_id,
+                crate::routing_events::BudgetEvent {
+                    provider: self.plan.provider_id.clone(),
+                    mode: self.plan.budget_mode.as_str().to_string(),
+                    state: if spent >= budget_usd { "over" } else { "ok" }.to_string(),
+                    month: self.budget.month(),
+                    spent_usd: spent,
+                    monthly_budget_usd: budget_usd,
+                },
+            );
+        }
+    }
+}
+
+impl futures_util::Stream for BudgetCaptureStream {
+    type Item = anyhow::Result<bytes::Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                this.observe(&chunk);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                // L6-2: a stream that dies mid-flight is a backend fault —
+                // the header-time breaker never saw it.
+                this.health.report_failure(&this.plan.provider_id);
+                this.record();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.record();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for BudgetCaptureStream {
+    fn drop(&mut self) {
+        self.record();
+    }
 }
 
 /// Wrap a ProviderResponse stream so the inference tracker is cleared when
@@ -1754,9 +2872,12 @@ fn delta_has_generated_output(delta: &serde_json::Value) -> bool {
 /// stage precisely, but here we reconstruct for the error path.
 fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str) -> Stage {
     match (bonsai_decision, effective_provider.as_deref()) {
-        ("cloud", Some("manifest")) | ("cloud-direct", Some("manifest")) => Stage::CloudPrimary,
-        ("cloud", Some("llama-swap")) | ("cloud-direct", Some("llama-swap")) => Stage::CloudFallback,
-        ("local-direct", Some("llama-swap")) | ("local", Some("llama-swap")) => Stage::LocalPrimary,
+        // v2 L6: any provider id on a cloud decision is the cloud PRIMARY
+        // (the migrated `manifest` key included); llama-swap is the v1
+        // managed second step.
+        (decision, Some("llama-swap")) if decision.starts_with("cloud") => Stage::CloudFallback,
+        (decision, Some(_)) if decision.starts_with("cloud") => Stage::CloudPrimary,
+        ("local-direct", Some(_)) | ("local", Some(_)) => Stage::LocalPrimary,
         _ => Stage::LocalPrimary,
     }
 }
@@ -1771,9 +2892,20 @@ fn provider_to_stage(effective_provider: &Option<String>, bonsai_decision: &str)
 /// and fallbacks. FNV-1a 64-bit: identity only, no security relevance.
 /// "" when the request carries no user message.
 pub(crate) fn conversation_fingerprint(request: &ChatCompletionRequest) -> String {
-    let sys = request.messages.iter().find(|m| m.role == "system").map(|m| message_text(&m.content));
-    let first_user = request.messages.iter().find(|m| m.role == "user").map(|m| message_text(&m.content));
-    let (Some(sys), Some(first_user)) = (sys, first_user) else {
+    // A system message is NOT required (bare harness requests still group);
+    // the first user message is the conversation anchor.
+    let sys = request
+        .messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| message_text(&m.content))
+        .unwrap_or_default();
+    let Some(first_user) = request
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| message_text(&m.content))
+    else {
         return String::new();
     };
     if first_user.is_empty() {
@@ -2114,6 +3246,11 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         });
         // Matching conversation backfills.
         assert!(events.update_tps("abc123", 41.5, 77.0));
@@ -2152,6 +3289,11 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 

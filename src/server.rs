@@ -26,18 +26,30 @@ fn home_path(rel: &str) -> String {
 }
 
 /// Return the list of editable config/agent files: (display_name, path, exists).
-fn config_file_list(home: &str, config_path: &std::path::Path, llama_swap_config_path: &std::path::Path) -> Vec<(&'static str, PathBuf, bool)> {
+fn config_file_list(
+    home: &str,
+    config_path: &std::path::Path,
+    llama_swap_config_path: &std::path::Path,
+    swap_mode: crate::config::SwapMode,
+) -> Vec<(&'static str, PathBuf, bool)> {
     let config_abs = std::fs::canonicalize(config_path)
         .unwrap_or_else(|_| config_path.to_path_buf());
-    let ls_abs = std::fs::canonicalize(llama_swap_config_path)
-        .unwrap_or_else(|_| llama_swap_config_path.to_path_buf());
+    // Native mode: the governing document is the swap catalog, not the
+    // imported shim file (never a silent admin trap on a non-governing file).
+    let (swap_name, swap_path) = if swap_mode.is_native() {
+        let path = crate::swap_catalog::default_path();
+        ("swap catalog", std::fs::canonicalize(&path).unwrap_or(path))
+    } else {
+        let path = llama_swap_config_path.to_path_buf();
+        ("llama-swap config", std::fs::canonicalize(&path).unwrap_or(path))
+    };
     let entries: Vec<(&str, PathBuf)> = vec![
         ("Agent System Prompt", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.md", home))),
         ("Review Prompt Template", PathBuf::from(format!("{}/.omp/agent/LLAMACPP.md", home))),
         ("Local System Prompt Override", PathBuf::from(format!("{}/.omp/agent/APPEND_SYSTEM.local.md", home))),
         ("Model Aliases", PathBuf::from(format!("{}/.config/omp-bridge/config.yaml", home))),
         ("brainrouter.yaml", config_abs),
-        ("llama-swap config", ls_abs),
+        (swap_name, swap_path),
     ];
     entries.into_iter().map(|(name, path)| {
         let exists = path.exists();
@@ -101,12 +113,16 @@ const MAIN_DASHBOARD_HTML: &str = include_str!("escalation/templates/main_dashbo
 /// v2 R2: token the dashboard's nav script reads to hide the Benchmarks
 /// explorer link in builds without the `benchmarks` feature.
 const BENCHMARKS_FEATURE_TOKEN: &str = "__BENCHMARKS_FEATURE_ENABLED__";
+/// v2 L4: the probe's catalog platform id replaces the hardcoded literal.
+const CURRENT_PLATFORM_TOKEN: &str = "__CURRENT_PLATFORM_ID__";
 
-fn main_dashboard_html() -> String {
-    MAIN_DASHBOARD_HTML.replace(
-        BENCHMARKS_FEATURE_TOKEN,
-        if cfg!(feature = "benchmarks") { "true" } else { "false" },
-    )
+fn main_dashboard_html(platform_id: &str) -> String {
+    MAIN_DASHBOARD_HTML
+        .replace(
+            BENCHMARKS_FEATURE_TOKEN,
+            if cfg!(feature = "benchmarks") { "true" } else { "false" },
+        )
+        .replace(CURRENT_PLATFORM_TOKEN, platform_id)
 }
 const FAVICON_SVG: &[u8] = include_bytes!("escalation/templates/favicon.svg");
 const LOGO_SVG: &[u8] = include_bytes!("escalation/templates/logo.svg");
@@ -141,12 +157,19 @@ pub struct AppState {
     pub review_service: Arc<ReviewService>,
     pub routing_events: Arc<RoutingEvents>,
 
-    /// llama-swap root URL (without /v1 suffix) for status polling.
+    /// Shim root URL (without /v1 suffix) for shim-mode status polling.
+    /// Native mode never dials it (v2 L7 flip).
     pub llama_swap_url: String,
-    /// Manifest base URL for health checking.
+    /// v2 L7: which engine serves local traffic (`shim` floor | `native`).
+    pub swap_mode: crate::config::SwapMode,
+    /// Manifest base URL for health checking (empty post-`v2.0-p6`; the
+    /// provider registry owns cloud endpoints).
     pub manifest_url: String,
-    /// Whether the cloud backend (Manifest) is enabled from config.
-    pub manifest_enabled: bool,
+    /// v2 L6: the provider registry (cloud + LAN peers). `cloud_available`
+    /// replaces the v1 manifest-only flag at every admission consumer.
+    pub providers: Arc<crate::providers::ProviderStore>,
+    /// v2 L6: the monthly per-provider budget ledger.
+    pub budget: Arc<crate::provider_budget::ProviderBudget>,
     /// v2 L2 plugin subsystem: registry, supervisor, RPC UDS servers.
     pub plugins: Arc<crate::plugins::PluginManager>,
     /// Path to brainrouter's own config file (used by the config UI and
@@ -214,6 +237,10 @@ pub struct AppState {
     pub decision_config: crate::config::DecisionModelConfig,
     /// v2 L2 credentials store — exposed to the L3 credentials UI endpoints.
     pub credentials: Arc<crate::credentials::CredentialStore>,
+    /// v2 L4: the boot platform probe (id, GPUs, budgets, engine offers).
+    pub platform: Arc<crate::platform::PlatformProbe>,
+    /// v2 L4: swap supervisor (catalog, residency, budget, queue, adapters).
+    pub swap: Arc<crate::swap_scheduler::SwapScheduler>,
     /// Serving-identity registry (PR11a, §5b/§16): bookkeeping-only record
     /// of currently-running toolbox Server Mode containers'
     /// `{toolbox_backend, compute_api, runtime_profile_id, endpoint}`.
@@ -244,6 +271,125 @@ pub(crate) struct ModelObject {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// v2 L4: one canonical path per engine operation so the documented route
+/// names (list/queue/pin/unpin/import/logs) and their obvious aliases hit the
+/// same handlers (`/api/engines/list` → `/api/engines`,
+/// `/api/engines/import` GET/POST → preview/apply, trailing slashes ignored).
+fn normalize_engines_path<'a>(method: &str, path: &'a str) -> &'a str {
+    if !(path.starts_with("/api/engines") || path.starts_with("/api/platform")) {
+        return path;
+    }
+    let trimmed = path.trim_end_matches('/');
+    match (method, trimmed) {
+        ("GET", "/api/engines/list") => "/api/engines",
+        ("GET", "/api/engines/import") => "/api/engines/import/preview",
+        ("POST", "/api/engines/import") => "/api/engines/import/apply",
+        _ => {
+            if trimmed.is_empty() {
+                path
+            } else {
+                trimmed
+            }
+        }
+    }
+}
+
+/// v2 L4: a swap admission failure is an explicit 503 with the shared
+/// `-32005` busy code (never a generic 502). Returns `None` for other errors.
+fn swap_busy_response(error: &anyhow::Error) -> Option<Response<Full<Bytes>>> {
+    let text = error.to_string();
+    if !text.contains(&format!("{}", crate::swap_scheduler::BUSY_CODE))
+        && !text.contains("no-fit")
+        && !text.contains("swap queue")
+    {
+        return None;
+    }
+    Some(json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({
+            "error": {
+                "message": text,
+                "type": "insufficient_capacity",
+                "code": crate::swap_scheduler::BUSY_CODE,
+            }
+        }),
+    ))
+}
+
+/// v2 L4 import source path: the daemon's configured llama-swap config, or an
+/// explicit `path` confined to the caller's HOME (never an arbitrary read).
+fn engines_import_path(
+    state: &AppState,
+    requested: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let Some(requested) = requested.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(state.llama_swap_config_path.clone());
+    };
+    let path = std::fs::canonicalize(requested)
+        .map_err(|e| anyhow::anyhow!("resolving import path {requested}: {e}"))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let home = std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home));
+    let state_root = crate::paths::brainrouter_state();
+    if !path.starts_with(&home) && !path.starts_with(&state_root) {
+        anyhow::bail!(
+            "import path must live under $HOME or the brainrouter state directory"
+        );
+    }
+    Ok(path)
+}
+
+/// v2 L4: the Engines tab / `swap status` payload.
+fn engines_json(state: &AppState) -> serde_json::Value {
+    let status = state.swap.status();
+    serde_json::json!({
+        "platform": &*state.platform,
+        "models": status.models,
+        "queue": status.queue,
+        "budget": status.budget,
+        "adoption": status.adoption,
+        "shim_error": status.shim_error,
+        // L4 consumers read `adapters` as the adapter-name list; the L5
+        // detail badges are additive under `adapter_detail`.
+        "adapters": status.adapter_names,
+        "adapter_detail": status.adapters,
+        "external": status.external,
+        "units": status.units,
+        "active_consumers": status.active_consumers,
+        "groups": state.swap.catalog().groups(),
+        "pins": state.swap.catalog().pins(),
+        "logs_dir": state.swap.logs_dir().display().to_string(),
+        // v2 L7: which engine serves local traffic + the import source and
+        // catalog file an operator must know at the flip.
+        "swap": {
+            "mode": state.swap_mode.as_str(),
+            "import_source": state.llama_swap_config_path.display().to_string(),
+            "catalog_path": crate::swap_catalog::default_path().display().to_string(),
+            "catalog_keys": state.swap.catalog().entries().len(),
+            "groups_count": state.swap.catalog().groups().len(),
+        },
+    })
+}
+
+/// Map a swap failure onto its HTTP status (`404` unknown model, `503`
+/// no-fit/queue-full/spawn-failure with `-32005`, `504` timeout).
+fn swap_api_error(error: anyhow::Error) -> Response<Full<Bytes>> {
+    use crate::swap_scheduler::SwapError;
+    if let Some(swap_error) = error.downcast_ref::<SwapError>() {
+        return json_response(
+            StatusCode::from_u16(swap_error.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &serde_json::json!({
+                "error": swap_error.to_string(),
+                "code": swap_error.code(),
+            }),
+        );
+    }
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &serde_json::json!({ "error": error.to_string() }),
+    )
 }
 
 /// Create a JSON response with the given status code
@@ -311,12 +457,15 @@ fn request_is_destructive(method: &str, path: &str, _has_query: bool) -> bool {
         || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/policy"))
         || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/credentials"))
         || (method == "POST" && path.starts_with("/api/decision/"))
+        // v2 L4 swap supervisor mutations (spawn/stop/pin/import/add/rm).
+        || (matches!(method, "POST" | "DELETE") && path.starts_with("/api/engines"))
         || (method == "POST" && path.starts_with("/api/llama-swap/"))
         || (method == "POST" && (
             path == "/api/config" || path == "/api/llama-swap-config"
             || path == "/api/open-editor"
             || path == "/api/routing-mode" || path == "/api/review-config"
             || path.starts_with("/api/plugins")
+            || path.starts_with("/api/providers")
             || path == "/api/bonsai/toggle" || path == "/api/models/flush"
             || path == "/api/nudge" || path == "/api/prompt-rewrite"
             // Review API is destructive too: it spawns reviews (arbitrary
@@ -350,7 +499,7 @@ async fn handle_request_inner(
     peer_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible> {
     let method = req.method().as_str();
-    let path = req.uri().path();
+    let path = normalize_engines_path(method, req.uri().path());
 
     debug!("Request: {} {}", method, path);
 
@@ -431,6 +580,16 @@ async fn handle_request_inner(
         return crate::observability::handle_request(req, &state).await;
     }
 
+    // ── v2 L6: provider registry API (Credentials-page Providers section) ──
+    // Route spellings are unpinned by the design; the assignment's probe list
+    // (`/api/providers[/add|/upsert|/list]`, `PUT|DELETE /api/providers/{id}`,
+    // `POST /api/providers/{id}/test`) is supported verbatim and kept stable.
+    if path.starts_with("/api/providers") {
+        let method = method.to_string();
+        let path = path.to_string();
+        return Ok(handle_providers_api(&method, &path, req, state).await);
+    }
+
     let response = match (method, path) {
         ("GET", "/health") => {
             let resp = json_response(StatusCode::OK, &HealthResponse { status: "ok" });
@@ -494,7 +653,9 @@ async fn handle_request_inner(
                 .status(StatusCode::OK)
                 .header("content-type", "text/html; charset=utf-8")
                 .header("cache-control", "no-store")
-                .body(Full::new(Bytes::from(main_dashboard_html().into_bytes())))
+                .body(Full::new(Bytes::from(
+                    main_dashboard_html(&state.platform.id).into_bytes(),
+                )))
                 .expect("Failed to build HTML response");
             into_unsync(resp)
         }
@@ -515,6 +676,348 @@ async fn handle_request_inner(
                 .body(Full::new(Bytes::from_static(LOGO_SVG)))
                 .expect("Failed to build logo response");
             into_unsync(resp)
+        }
+
+        // ── v2 L4: platform probe + swap supervisor API ──────────────────────
+        ("GET", "/api/platform") => {
+            into_unsync(json_response(StatusCode::OK, &*state.platform))
+        }
+
+        ("GET", "/api/engines") | ("GET", "/api/engines/status") => {
+            into_unsync(json_response(StatusCode::OK, &engines_json(&state)))
+        }
+
+        ("GET", "/api/engines/queue") => {
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "queue": state.swap.status().queue }),
+            ))
+        }
+
+        ("POST", "/api/engines/queue") | ("POST", "/api/engines/ensure") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            // L5 one-action overrides (audit-logged by the scheduler).
+            let options = crate::swap_scheduler::EnsureOptions {
+                override_active_consumers: truthy(&val, &["override", "swap_anyway"]),
+                force_gate: truthy(&val, &["force_gate", "force-gate"]),
+                attach_only: truthy(&val, &["attach_only", "attach-only"]),
+                actor: request_actor(&val, peer_addr),
+            };
+            match state.swap.ensure_with_options(model, None, options).await {
+                Ok(outcome) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "model": match &outcome {
+                            crate::swap_scheduler::EnsureOutcome::Attach { model, .. } => model,
+                        },
+                        "endpoint": outcome.endpoint(),
+                        "spawned": outcome.spawned(),
+                        "attached": !outcome.spawned(),
+                    }),
+                )),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("POST", "/api/engines/evict") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            let override_active = truthy(&val, &["override", "swap_anyway"]);
+            let actor = request_actor(&val, peer_addr);
+            match state.swap.evict_with_actor(
+                model,
+                "explicit evict",
+                override_active,
+                actor.as_deref(),
+            ) {
+                Ok(stopped) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "model": model, "stopped": stopped }),
+                )),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        // ── v2 L5: external residents, takeover, ACS events ─────────────────
+        ("GET", "/api/engines/external") => {
+            let status = state.swap.status();
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "external": status.external,
+                    "units": status.units,
+                }),
+            ))
+        }
+
+        ("GET", "/api/engines/consumers") => {
+            let status = state.swap.status();
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "active_consumers": status.active_consumers,
+                }),
+            ))
+        }
+
+        ("GET", "/api/engines/events") => {
+            let limit = query_param(req.uri().query().unwrap_or(""), "limit")
+                .parse::<usize>()
+                .unwrap_or(200)
+                .min(2000);
+            let entries = state.swap.ledger().entries();
+            let start = entries.len().saturating_sub(limit);
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "events": &entries[start..] }),
+            ))
+        }
+
+        ("POST", "/api/engines/adopt") => {
+            let val = read_json_body(req).await;
+            let model = val
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let endpoint = val
+                .get("endpoint")
+                .or_else(|| val.get("url"))
+                .and_then(|e| e.as_str())
+                .map(str::trim)
+                .filter(|e| !e.is_empty());
+            let pid = val.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+            let actor = request_actor(&val, peer_addr);
+            // L5 adopt contract: `{model}` OR `{endpoint}` (the dashboard
+            // prefers the endpoint when the observer could not name the
+            // model).
+            let result = match (model, endpoint) {
+                (Some(model), _) => state
+                    .swap
+                    .adopt_external_as(model, pid, actor.as_deref()),
+                (None, Some(endpoint)) => {
+                    state.swap.adopt_endpoint(endpoint, pid, actor.as_deref())
+                }
+                (None, None) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": "model or endpoint is required" }),
+                    )))
+                }
+            };
+            match result {
+                Ok(report) => into_unsync(json_response(StatusCode::OK, &report)),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("POST", "/api/engines/takeover") => {
+            let val = read_json_body(req).await;
+            let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "model is required" }),
+                )));
+            };
+            let options = crate::swap_scheduler::TakeoverOptions {
+                unit: val.get("unit").and_then(|u| u.as_str()).map(String::from),
+                override_unit: truthy(&val, &["override", "override_unit"]),
+                force_gate: truthy(&val, &["force_gate", "force-gate"]),
+                override_active_consumers: truthy(&val, &["swap_anyway"]),
+                actor: request_actor(&val, peer_addr),
+            };
+            match state.swap.takeover(model, options).await {
+                Ok(report) => into_unsync(json_response(StatusCode::OK, &report)),
+                Err(error) => into_unsync(swap_api_error(error)),
+            }
+        }
+
+        ("DELETE", p) if p.starts_with("/api/engines/queue/") => {
+            match p["/api/engines/queue/".len()..].parse::<u64>() {
+                Ok(id) if state.swap.cancel(id) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "cancelled": true, "id": id }),
+                )),
+                _ => into_unsync(json_response(
+                    StatusCode::NOT_FOUND,
+                    &serde_json::json!({ "error": "Unknown queue id" }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/pin") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            let gib = val
+                .get("reserved_gib")
+                .or_else(|| val.get("gib"))
+                .and_then(|g| g.as_f64())
+                .unwrap_or(0.0);
+            match state.swap.catalog().pin(model, gib) {
+                Ok(()) => {
+                    let _ = state
+                        .swap
+                        .ledger()
+                        .record("pin", model, gib, "sized pin reservation");
+                    into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "pins": state.swap.catalog().pins() }),
+                    ))
+                }
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/unpin") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            match state.swap.catalog().unpin(model) {
+                Ok(removed) => {
+                    if removed {
+                        let _ = state
+                            .swap
+                            .ledger()
+                            .record("unpin", model, 0.0, "pin removed");
+                    }
+                    into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "removed": removed, "pins": state.swap.catalog().pins() }),
+                    ))
+                }
+                Err(error) => into_unsync(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("GET", "/api/engines/import/preview") => {
+            let requested = query_param(req.uri().query().unwrap_or(""), "path");
+            let config = match engines_import_path(&state, Some(&requested)) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )))
+                }
+            };
+            match crate::swap_catalog::import_llama_swap_file(&config) {
+                Ok(plan) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "config": config.display().to_string(),
+                        "would_import": plan.entries.len(),
+                        "entries": plan.entries.keys().collect::<Vec<_>>(),
+                        "groups": plan.groups,
+                        "warnings": plan.warnings,
+                        "lines": plan.summary_lines(),
+                    }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/import/apply") => {
+            let val = read_json_body(req).await;
+            let requested = val.get("path").and_then(|p| p.as_str());
+            let config = match engines_import_path(&state, requested) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )))
+                }
+            };
+            match crate::swap_catalog::import_llama_swap_file(&config)
+                .and_then(|plan| state.swap.catalog().apply_import(&plan))
+            {
+                Ok(outcome) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "config": config.display().to_string(),
+                        "added": outcome.added,
+                        "updated": outcome.updated,
+                        "unchanged": outcome.unchanged,
+                        "skipped": outcome.skipped,
+                    }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/catalog/add") => {
+            let val = read_json_body(req).await;
+            match serde_json::from_value::<crate::swap_catalog::CatalogEntry>(val) {
+                Ok(entry) => match crate::swap_catalog::validate_entry(&entry)
+                    .and_then(|()| state.swap.catalog().upsert_entry(entry))
+                {
+                    Ok(()) => into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "ok": true }),
+                    )),
+                    Err(error) => into_unsync(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    )),
+                },
+                Err(error) => into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("POST", "/api/engines/catalog/rm") => {
+            let val = read_json_body(req).await;
+            let model = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            match state.swap.catalog().remove_entry(model) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "removed": removed }),
+                )),
+                Err(error) => into_unsync(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": error.to_string() }),
+                )),
+            }
+        }
+
+        ("GET", p) if p == "/api/engines/logs" => {
+            let query = req.uri().query().unwrap_or("");
+            let model = query_param(query, "model");
+            let lines = query_param(query, "lines")
+                .parse::<usize>()
+                .unwrap_or(200)
+                .min(2000);
+            into_unsync(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "model": model,
+                    "lines": state.swap.logs(&model, lines),
+                }),
+            ))
         }
 
         // ── In-flight request tracking API ────────────────────────────────────────
@@ -560,7 +1063,13 @@ async fn handle_request_inner(
 
         // ── Inference status API (polls llama-swap + llama-server) ────────────
         ("GET", "/api/inference-status") => {
-            let resp = inference_status(&state.router.inference_tracker, &state.llama_swap_url).await;
+            let resp = inference_status(
+                &state.router.inference_tracker,
+                &state.llama_swap_url,
+                &state.swap,
+                state.swap_mode,
+            )
+            .await;
             into_unsync(resp)
         }
 
@@ -570,7 +1079,9 @@ async fn handle_request_inner(
                 &state.llama_swap_url,
                 &state.manifest_url,
                 &state.routing_events,
-                state.manifest_enabled,
+                state.providers.cloud_available(),
+                &state.swap,
+                state.swap_mode,
             )
             .await;
             into_unsync(resp)
@@ -578,7 +1089,13 @@ async fn handle_request_inner(
 
         // ── Service restart API ────────────────────────────────────────────────
         ("POST", "/api/restart/llama-swap") => {
-            let resp = restart_service("llama-swap").await;
+            // v2 L7: native mode restarts the supervisor's engines (per-engine
+            // stop; the next ensure spawns fresh) instead of a systemd shim.
+            let resp = if state.swap_mode.is_native() {
+                restart_native_engines(&state.swap).await
+            } else {
+                restart_service("llama-swap").await
+            };
             into_unsync(resp)
         }
 
@@ -619,7 +1136,19 @@ async fn handle_request_inner(
         }
 
         ("POST", "/api/upgrade/llama-swap") => {
-            let resp = upgrade_llama_swap().await;
+            let resp = if state.swap_mode.is_native() {
+                json_response(
+                    StatusCode::CONFLICT,
+                    &ErrorResponse {
+                        error: "swap.mode is native: there is no llama-swap shim to upgrade. \
+                                Native engines are upgraded with their catalog entries / \
+                                `swap catalog add`."
+                            .to_string(),
+                    },
+                )
+            } else {
+                upgrade_llama_swap().await
+            };
             into_unsync(resp)
         }
 
@@ -678,6 +1207,27 @@ async fn handle_request_inner(
         }
 
         ("GET", "/api/models/llama-swap") => {
+            if state.swap_mode.is_native() {
+                let data: Vec<serde_json::Value> = state
+                    .swap
+                    .catalog()
+                    .entries()
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "id": entry.id,
+                            "object": "model",
+                            "owned_by": "swap",
+                            "name": entry.name,
+                        })
+                    })
+                    .collect();
+                let resp = json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "object": "list", "data": data }),
+                );
+                return Ok(into_unsync(resp));
+            }
             match handle_llama_swap_models(&state.llama_swap_url).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -1546,7 +2096,11 @@ async fn handle_request_inner(
             let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             let reload = val.get("reload").and_then(|v| v.as_bool()).unwrap_or(false);
             let local_models: Vec<String> = state.router.local_models().to_vec();
-            let resp = flush_models(&state.llama_swap_url, reload, &local_models).await;
+            let resp = if state.swap_mode.is_native() {
+                flush_models_native(&state.swap, reload, &local_models).await
+            } else {
+                flush_models(&state.llama_swap_url, reload, &local_models).await
+            };
             into_unsync(resp)
         }
 
@@ -1626,64 +2180,11 @@ async fn handle_request_inner(
         }
 
         ("GET", "/api/llama-swap-config") => {
-            match std::fs::read_to_string(&state.llama_swap_config_path) {
-                Ok(yaml) => {
-                    
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header("Content-Type", "text/yaml; charset=utf-8")
-                        .body(Full::new(Bytes::from(yaml)).map_err(|e| anyhow::anyhow!(e)).boxed_unsync())
-                        .unwrap()
-                }
-                Err(e) => {
-                    let resp = json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse { error: format!("Failed to read llama-swap config: {}", e) },
-                    );
-                    into_unsync(resp)
-                }
-            }
+            into_unsync(swap_config_view(&state))
         }
 
         ("POST", "/api/llama-swap-config") => {
-            let body_bytes = req.collect().await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            if body_bytes.len() > 1_048_576 {
-                let resp = json_response(
-                    StatusCode::BAD_REQUEST,
-                    &ErrorResponse { error: "Request body too large (max 1MB)".to_string() },
-                );
-                into_unsync(resp)
-            } else {
-                let body = String::from_utf8_lossy(&body_bytes).to_string();
-                // Validate it's at least valid YAML.
-                match serde_yaml::from_str::<serde_yaml::Value>(&body) {
-                    Err(e) => {
-                        let resp = json_response(
-                            StatusCode::BAD_REQUEST,
-                            &ErrorResponse { error: format!("Invalid YAML: {}", e) },
-                        );
-                        into_unsync(resp)
-                    }
-                    Ok(_) => {
-                        let _guard = state.llama_swap_config_lock.lock().await;
-                        let tmp_path = unique_sibling_path(&state.llama_swap_config_path, "tmp");
-                        let write_result = atomic_write_path(&state.llama_swap_config_path, &tmp_path, body.as_bytes());
-                        if let Err(e) = write_result {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            let resp = json_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &ErrorResponse { error: format!("Failed to write llama-swap config: {}", e) },
-                            );
-                            into_unsync(resp)
-                        } else {
-                            let resp = json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}));
-                            into_unsync(resp)
-                        }
-                    }
-                }
-            }
+            into_unsync(swap_config_edit(req, &state).await)
         }
 
         ("POST", "/api/open-editor") => {
@@ -1710,7 +2211,7 @@ async fn handle_request_inner(
                     } else {
                         // Allowlist: only files from the config-files list can be opened.
                         let home = home_dir();
-                        let allowed = config_file_list(&home, &state.config_path, &state.llama_swap_config_path);
+                        let allowed = config_file_list(&home, &state.config_path, &state.llama_swap_config_path, state.swap_mode);
                         let canonical = std::fs::canonicalize(file_path).unwrap_or_default();
                         let is_allowed = allowed.iter().any(|(_, p, exists)| {
                             *exists && std::fs::canonicalize(p).ok().as_ref() == Some(&canonical)
@@ -1754,7 +2255,7 @@ async fn handle_request_inner(
 
         ("GET", "/api/config-files") => {
             let home = home_dir();
-            let files: Vec<serde_json::Value> = config_file_list(&home, &state.config_path, &state.llama_swap_config_path)
+            let files: Vec<serde_json::Value> = config_file_list(&home, &state.config_path, &state.llama_swap_config_path, state.swap_mode)
                 .into_iter()
                 .map(|(name, path, exists)| serde_json::json!({
                     "name": name,
@@ -1783,7 +2284,7 @@ async fn handle_request_inner(
 /// The dashboard uses this (plus a stable hash of the conversation prefix)
 /// to group events per conversation so each one renders as a single card.
 /// If a client ever adds a session header, this picks it up with no code change.
-fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
+pub(crate) fn extract_session_id(headers: &hyper::http::HeaderMap) -> Option<String> {
     const CANDIDATES: [&str; 6] = [
         "x-omp-session",
         "x-session-id",
@@ -1950,10 +2451,21 @@ async fn handle_chat_completion(
         0,
         request.max_tokens,
     );
+    // v2 L4 additive: stamp the swap-catalog id at route time so the LRU
+    // never evicts a model with an active (or loading) stream.
+    if let Some(catalog_id) = state.swap.catalog().resolve_alias(&request.model) {
+        handle.set_catalog_id(catalog_id);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
+        let cancel_row = Arc::clone(&handle);
         let result = tokio::select! {
-            result = state.router.route_tagged_role(request, session_id, cwd, user_agent, &role) => result,
+            // v2 L4: the in-flight row travels into `ensure_with_cancel`, so
+            // a routed queue/load wait aborts when the row is cancelled.
+            result = crate::router::with_request_cancel(
+                Some(cancel_row),
+                state.router.route_tagged_role(request, session_id, cwd, user_agent, &role),
+            ) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {
@@ -1991,6 +2503,33 @@ async fn handle_chat_completion(
         }
         Ok(Ok(Err(error))) => {
             routing_task.abort();
+            // L5 hipfire context math: a prompt that cannot fit is a real
+            // 400 with the shortfall, not a 502.
+            if let Some(shortfall) = error
+                .downcast_ref::<crate::engine_hipfire::ContextShortfall>()
+            {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: shortfall.to_string(),
+                    },
+                )));
+            }
+            if let Some(response) = swap_busy_response(&error) {
+                return Ok(into_unsync(response));
+            }
+            // v2 L6 rule (c): a multi-match/no-provider selector resolution is
+            // an explicit client error (naming the providers), not a backend
+            // failure.
+            if error
+                .downcast_ref::<crate::providers::CloudSelectorError>()
+                .is_some()
+            {
+                return Ok(into_unsync(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse { error: error.to_string() },
+                )));
+            }
             return Ok(into_unsync(json_response(
                 StatusCode::BAD_GATEWAY,
                 &ErrorResponse { error: format!("routing failed: {error}") },
@@ -2042,6 +2581,20 @@ async fn handle_anthropic_messages(
     role: String,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let body_bytes = req.collect().await?.to_bytes();
+    anthropic_messages_from_bytes(state, body_bytes, cwd, session_id, user_agent, peer_addr, role).await
+}
+
+/// The body-bytes entry point shared by the primary `/v1/messages` route and
+/// the v2 L6 LAN listener (which must enforce `lan.expose` before routing).
+pub(crate) async fn anthropic_messages_from_bytes(
+    state: Arc<AppState>,
+    body_bytes: Bytes,
+    cwd: String,
+    session_id: Option<String>,
+    user_agent: String,
+    peer_addr: SocketAddr,
+    role: String,
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
     let anthropic_req: AnthropicMessagesRequest = serde_json::from_slice(&body_bytes)?;
     let model = anthropic_req.model.clone();
     let mut oai_request = anthropic_to_openai(anthropic_req);
@@ -2061,10 +2614,17 @@ async fn handle_anthropic_messages(
         0,
         oai_request.max_tokens,
     );
+    if let Some(catalog_id) = state.swap.catalog().resolve_alias(&oai_request.model) {
+        handle.set_catalog_id(catalog_id);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let routing_task = tokio::spawn(async move {
+        let cancel_row = Arc::clone(&handle);
         let result = tokio::select! {
-            result = state.router.route_tagged_role(oai_request, session_id, cwd, user_agent, &role) => result,
+            result = crate::router::with_request_cancel(
+                Some(cancel_row),
+                state.router.route_tagged_role(oai_request, session_id, cwd, user_agent, &role),
+            ) => result,
             _ = handle.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
         };
         let stream_result = result.map(|(resp, info)| {
@@ -2098,11 +2658,83 @@ async fn handle_anthropic_messages(
     Ok(response)
 }
 
-/// Poll llama-swap and the active model's llama-server for inference status.
-/// Returns a combined view: which model is loaded, its state, and slot progress.
+/// One "running model" row for the inference-status panel.
+/// Shim mode: llama-swap `/running` (model, name, state, proxy). Native mode:
+/// the supervisor's per-model status (id, name, lifecycle state, endpoint) —
+/// zero `:8081` traffic after the flip.
+async fn running_entry(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    shim_url: &str,
+    mode: crate::config::SwapMode,
+    prefer: Option<&str>,
+) -> Option<(String, String, String, String)> {
+    if mode.is_native() {
+        let status = swap.status();
+        let pick = prefer
+            .and_then(|model| {
+                status
+                    .models
+                    .iter()
+                    .find(|m| m.id == model || m.name.as_deref() == Some(model))
+            })
+            .or_else(|| status.models.iter().find(|m| m.state == "ready" && m.endpoint.is_some()))
+            .or_else(|| status.models.iter().find(|m| m.state == "loading"))?;
+        let endpoint = pick.endpoint.clone()?;
+        return Some((
+            pick.id.clone(),
+            pick.name.clone().unwrap_or_else(|| pick.id.clone()),
+            pick.state.clone(),
+            endpoint,
+        ));
+    }
+    poll_llama_swap_running(shim_url).await
+}
+
+/// (is_active, n_decoded, n_tokens) for the active local slot. Native mode
+/// reads the supervisor resident's own `/slots` endpoint.
+async fn slot_entry(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    shim_url: &str,
+    mode: crate::config::SwapMode,
+    prefer: Option<&str>,
+) -> Option<(bool, u64, u64)> {
+    if mode.is_native() {
+        let (_, _, _, endpoint) = running_entry(swap, shim_url, mode, prefer).await?;
+        let resp = VERSION_CLIENT
+            .get(format!("{}/slots", endpoint.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        let body = resp.text().await.ok()?;
+        return parse_llama_slots(&body);
+    }
+    poll_llama_swap_slot(shim_url).await
+}
+
+/// Native-mode load progress for the active model (adapter-reported fraction;
+/// `None` = indeterminate, the native llama-server load window).
+fn native_load_progress(swap: &Arc<crate::swap_scheduler::SwapScheduler>, prefer: &str) -> Option<f32> {
+    let status = swap.status();
+    let pick = status
+        .models
+        .iter()
+        .find(|m| m.id == prefer || m.name.as_deref() == Some(prefer))?;
+    pick.progress
+        .as_ref()
+        .and_then(|progress| progress.fraction)
+        .map(|fraction| fraction as f32)
+}
+
+/// Poll the local serving layer and the active model's slot for inference
+/// status. Returns a combined view: which model is loaded, its state, and
+/// slot progress. Shim mode polls llama-swap; native mode reads the swap
+/// supervisor (the `:8081` dialer retires at the flip).
 async fn inference_status(
     tracker: &crate::inference_state::InferenceTracker,
     llama_swap_url: &str,
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    mode: crate::config::SwapMode,
 ) -> Response<Full<Bytes>> {
     use crate::inference_state::Phase;
 
@@ -2110,11 +2742,15 @@ async fn inference_status(
 
     match snap.phase {
         Phase::Idle => {
-            // No active request in brainrouter. Check if llama-swap has a model loaded.
-            let model_info = poll_llama_swap_running(llama_swap_url).await;
+            // No active request in brainrouter. Check if a model is loaded.
+            let model_info = running_entry(swap, llama_swap_url, mode, None).await;
             match model_info {
                 Some((name, display, swap_state, ref proxy)) if swap_state != "ready" => {
-                    let load_progress = poll_llama_server_health(proxy).await;
+                    let load_progress = if mode.is_native() {
+                        native_load_progress(swap, &name)
+                    } else {
+                        poll_llama_server_health(proxy).await
+                    };
                     json_response(StatusCode::OK, &serde_json::json!({
                         "state": "loading",
                         "model": name,
@@ -2124,9 +2760,10 @@ async fn inference_status(
                     }))
                 }
                 Some((name, display, _, _)) => {
-                    // Model is loaded and ready. Check /slots to detect activity
-                    // from clients hitting llama-swap directly (bypassing brainrouter).
-                    let slot_info = poll_llama_swap_slot(llama_swap_url).await;
+                    // Model is loaded and ready. Check the slot to detect
+                    // activity from clients hitting the engine directly
+                    // (bypassing brainrouter).
+                    let slot_info = slot_entry(swap, llama_swap_url, mode, Some(&name)).await;
                     let (state, n_decoded, n_tokens) = match &slot_info {
                         Some((true, 0, t)) => ("local_processing", 0u64, *t),
                         Some((true, n, t)) => ("local_generating", *n, *t),
@@ -2173,10 +2810,10 @@ async fn inference_status(
             }))
         }
         Phase::LocalWaiting | Phase::LocalStreaming => {
-            // For local, enrich with llama-swap /slots and /health data if available.
+            let prefer = snap.model.clone();
             let (slot_info, running_info) = tokio::join!(
-                poll_llama_swap_slot(llama_swap_url),
-                poll_llama_swap_running(llama_swap_url),
+                slot_entry(swap, llama_swap_url, mode, prefer.as_deref()),
+                running_entry(swap, llama_swap_url, mode, prefer.as_deref()),
             );
             let (sub_state, n_decoded, n_tokens) = match &slot_info {
                 Some((true, 0, t)) => ("local_processing", 0u64, *t),
@@ -2189,8 +2826,17 @@ async fn inference_status(
             };
             // If the slot shows no token generation yet, check if the model is still loading.
             let progress: Option<f32> = if n_decoded == 0 {
-                let proxy = running_info.as_ref().map(|(_, _, _, pr)| pr.as_str()).unwrap_or("");
-                poll_llama_server_health(proxy).await
+                if mode.is_native() {
+                    let name = snap
+                        .model
+                        .clone()
+                        .or_else(|| running_info.as_ref().map(|(name, _, _, _)| name.clone()))
+                        .unwrap_or_default();
+                    native_load_progress(swap, &name)
+                } else {
+                    let proxy = running_info.as_ref().map(|(_, _, _, pr)| pr.as_str()).unwrap_or("");
+                    poll_llama_server_health(proxy).await
+                }
             } else {
                 // Token generation in progress: slot n_tokens (total decoded so
                 // far) / max_tokens. Monotonic within the request.
@@ -2223,14 +2869,22 @@ async fn service_health(
     llama_swap_url: &str,
     manifest_url: &str,
     routing_events: &RoutingEvents,
-    manifest_enabled: bool,
+    cloud_available: bool,
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    mode: crate::config::SwapMode,
 ) -> Response<Full<Bytes>> {
     let timeout = std::time::Duration::from_secs(3);
 
     // Probe all services in parallel
     let (swap_ok, manifest_ok, llama_cpp_state) = tokio::join!(
-        // llama-swap: GET /running
+        // Local serving layer: shim /running, or the supervisor's registry.
         async {
+            if mode.is_native() {
+                // Derived, not asserted: any failed engine is an unhealthy
+                // local stack (same criterion as the tri-state arm below).
+                let status = swap.status();
+                return !status.models.iter().any(|m| m.state == "failed");
+            }
             VERSION_CLIENT.get(format!("{}/running", llama_swap_url))
                 .timeout(timeout).send().await
                 .map(|r| r.status().is_success())
@@ -2248,8 +2902,24 @@ async fn service_health(
                 _ => false,
             }
         },
-        // llama.cpp (toolbox): tri-state check via llama-swap proxy
+        // llama.cpp tri-state: shim proxy health, or the supervisor's resident
+        // states (native mode never dials :8081).
         async {
+            if mode.is_native() {
+                let status = swap.status();
+                let ready = status.models.iter().filter(|m| m.state == "ready").count();
+                let loading = status.models.iter().filter(|m| m.state == "loading").count();
+                let failed = status.models.iter().filter(|m| m.state == "failed").count();
+                return if loading > 0 {
+                    "loading"
+                } else if ready > 0 {
+                    "healthy"
+                } else if failed > 0 {
+                    "unhealthy"
+                } else {
+                    "idle"
+                };
+            }
             let running_url = format!("{}/running", llama_swap_url);
             let resp = match VERSION_CLIENT.get(&running_url).timeout(timeout).send().await {
                 Ok(r) => r,
@@ -2304,7 +2974,8 @@ async fn service_health(
 
     json_response(StatusCode::OK, &serde_json::json!({
         "llama_swap": if swap_ok { "healthy" } else { "unhealthy" },
-        "manifest": if !manifest_enabled {
+        "swap_mode": mode.as_str(),
+        "manifest": if !cloud_available {
             "disabled"
         } else if manifest_ok { "healthy" } else { "unhealthy" },
         "llama_cpp": llama_cpp_state,
@@ -2405,6 +3076,109 @@ fn parse_llama_slots(body: &str) -> Option<(bool, u64, u64)> {
     }
     let (active, decoded, _prompt) = best?;
     Some((active, decoded, decoded))
+}
+
+/// Native-mode flush: evict every supervisor-owned resident (the flip's
+/// pre-condition — llama-swap is not dialed). `reload` warms the configured
+/// local working set through `ensure` afterwards.
+async fn flush_models_native(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+    reload: bool,
+    local_models: &[String],
+) -> Response<Full<Bytes>> {
+    let mut unloaded = Vec::new();
+    let mut failed = Vec::new();
+    let mut already_gone = Vec::new();
+    let mut reload_failed = Vec::new();
+    for model in swap.status().models {
+        if !matches!(
+            model.state.as_str(),
+            "ready" | "loading" | "draining" | "waiting"
+        ) {
+            continue;
+        }
+        match swap.evict_with_options(&model.id, "flush", true) {
+            Ok(true) => unloaded.push(model.id),
+            // `false` = the state said live but no handle remained. Rare
+            // race, but a flush that "unloaded 3 of 4" must say so.
+            Ok(false) => already_gone.push(model.id),
+            Err(error) => failed.push(format!("{}: {error}", model.id)),
+        }
+    }
+    let mut reloaded = Vec::new();
+    if reload {
+        for key in local_models {
+            match swap.ensure(key).await {
+                Ok(_) => {
+                    info!(model = %key, "swap supervisor reloaded local model after flush");
+                    reloaded.push(key.clone());
+                }
+                Err(error) => {
+                    warn!(model = %key, %error, "flush reload failed");
+                    reload_failed.push(format!("{key}: {error}"));
+                }
+            }
+        }
+    }
+    if !failed.is_empty() {
+        // Partial success stays visible: what DID unload rides in the body.
+        let error = format!(
+            "swap supervisor could not unload: {} (unloaded: {:?})",
+            failed.join("; "),
+            unloaded
+        );
+        return json_response(StatusCode::BAD_GATEWAY, &ErrorResponse { error });
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "status": "ok",
+            "message": if reload {
+                "flushed the swap supervisor, then reloaded the local working set"
+            } else {
+                "all swap-supervisor models unloaded from memory"
+            },
+            "unloaded": unloaded,
+            "reloaded": reloaded,
+            "already_stopped": already_gone,
+            "reload_failed": reload_failed,
+        }),
+    )
+}
+
+/// Native-mode "Restart Local Stack": stop every supervisor-owned engine
+/// (per-engine, SIGTERM-grace); the next `ensure` spawns it fresh. Protected
+/// (active-consumer) engines are reported, not force-killed.
+async fn restart_native_engines(
+    swap: &Arc<crate::swap_scheduler::SwapScheduler>,
+) -> Response<Full<Bytes>> {
+    let mut restarted = Vec::new();
+    let mut skipped = Vec::new();
+    for model in swap.status().models {
+        if !matches!(model.state.as_str(), "ready" | "loading" | "draining") {
+            continue;
+        }
+        match swap.evict(&model.id, "restart") {
+            Ok(true) => restarted.push(model.id),
+            // No handle left: already down; still part of the answer.
+            Ok(false) => skipped.push(format!("{}: already stopped", model.id)),
+            Err(error) => skipped.push(format!("{}: {error}", model.id)),
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "status": if skipped.is_empty() { "ok" } else { "partial" },
+            "service": "swap",
+            "message": if skipped.is_empty() {
+                "swap-supervisor engines stopped; they respawn on the next request"
+            } else {
+                "some engines could not be stopped; see skipped"
+            },
+            "restarted": restarted,
+            "skipped": skipped,
+        }),
+    )
 }
 
 /// Unload every model llama-swap currently holds in memory (VRAM), without
@@ -2990,6 +3764,29 @@ async fn register_llama_swap_model(state: &AppState, request: RegisterLlamaSwapM
     let destination = models_dir.join(repo_basename);
     let model_path = resolve_primary_gguf(&destination, &request.quant_pattern)?;
     let warning = path_visibility_warning(&model_path);
+
+    // v2 L7 native mode: registration is a swap-catalog add. The shim file is
+    // never written (it is the retired import source).
+    if state.swap_mode.is_native() {
+        let entry = build_entry(&request.model_id, &model.name, &model_path);
+        let snippet = format!("models:\n{entry}");
+        let plan = crate::swap_catalog::import_llama_swap_config(&snippet)
+            .map_err(|error| RegisterError::Internal(format!("catalog entry build failed: {error}")))?;
+        state
+            .swap
+            .catalog()
+            .apply_import(&plan)
+            .map_err(|error| RegisterError::Internal(format!("swap catalog add failed: {error}")))?;
+        return Ok(RegisterLlamaSwapModelResponse {
+            status: "registered",
+            llama_swap_id: request.model_id,
+            model_path: model_path.display().to_string(),
+            message: "Registered in the swap catalog (swap.mode: native; no shim write)".to_string(),
+            reloaded: true,
+            warning,
+        });
+    }
+
     let entry = build_entry(&request.model_id, &model.name, &model_path);
 
     let _guard = state.llama_swap_config_lock.lock().await;
@@ -3643,12 +4440,19 @@ fn gpu_exclusive_lock_active() -> bool {
     modified.elapsed().map(|age| age < GPU_EXCLUSIVE_LOCK_MAX_AGE).unwrap_or(true)
 }
 
-pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_json::Value {
+pub async fn compute_versions_json(
+    bonsai_fork_path: &std::path::Path,
+    swap_mode: crate::config::SwapMode,
+    swap_keys: usize,
+) -> serde_json::Value {
     use tokio::process::Command;
 
-    // 1. llama-swap version (timeout so a hung binary can't freeze the task)
+    // 1. Local serving row. Native mode reports the swap supervisor (no shim
+    // binary exists to version); shim mode probes the llama-swap binary.
     const LOCAL_VERSION_TIMEOUT_SECS: u64 = 5;
-    let swap_ver = {
+    let swap_ver = if swap_mode.is_native() {
+        format!("native supervisor · {swap_keys} keys")
+    } else {
         let child = Command::new(home_bin("llama-swap"))
             .arg("--version")
             .output();
@@ -3801,13 +4605,20 @@ pub async fn compute_versions_json(bonsai_fork_path: &std::path::Path) -> serde_
 
     // 5. Remote "latest available" versions (GitHub / Docker Hub)
     let (llama_swap_latest, manifest_latest, toolbox_latest) = tokio::join!(
-        fetch_latest_llama_swap(),
+        async {
+            if swap_mode.is_native() {
+                None
+            } else {
+                fetch_latest_llama_swap().await
+            }
+        },
         fetch_latest_manifest(),
         fetch_latest_toolbox(),
     );
 
     serde_json::json!({
         "brainrouter": env!("CARGO_PKG_VERSION"),
+        "swap_mode": swap_mode.as_str(),
         "llama_swap": swap_ver,
         "llama_cpp": toolbox_ver,
         "bonsai_fork": bonsai_fork_ver,
@@ -4307,6 +5118,114 @@ async fn read_routing_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// The read-only YAML view of the governing swap state.
+///
+/// Native mode: the swap catalog (the imported shim file is provenance, not
+/// the governing document). Shim mode: the shim's own config verbatim.
+fn swap_catalog_view_yaml(swap: &crate::swap_scheduler::SwapScheduler) -> String {
+    let data = swap.catalog().snapshot();
+    let mut models = serde_json::Map::new();
+    for (id, entry) in &data.entries {
+        models.insert(
+            id.clone(),
+            serde_json::json!({
+                "name": entry.name,
+                "engine": entry.engine,
+                "files": entry.files,
+                "ctx": entry.ctx,
+                "groups": entry.groups,
+                "aliases": entry.aliases,
+            }),
+        );
+    }
+    let doc = serde_json::json!({
+        "mode": "native",
+        "governing": crate::swap_catalog::default_path().to_string_lossy(),
+        "note": "Read-only view. Edit with `swap catalog add|rm` / `swap import` (API: /api/engines/catalog/*).",
+        "models": models,
+    });
+    serde_yaml::to_string(&doc).unwrap_or_else(|_| "# swap catalog view unavailable\n".to_string())
+}
+
+/// `GET /api/llama-swap-config`: shim config in shim mode, swap-catalog view
+/// in native mode (the flip retargets this surface — never a silent admin trap
+/// on a non-governing file).
+fn swap_config_view(state: &AppState) -> Response<Full<Bytes>> {
+    let yaml = if state.swap_mode.is_native() {
+        Ok(swap_catalog_view_yaml(&state.swap))
+    } else {
+        std::fs::read_to_string(&state.llama_swap_config_path)
+    };
+    match yaml {
+        Ok(yaml) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/yaml; charset=utf-8")
+            .header(
+                "X-Brainrouter-Swap-Mode",
+                state.swap_mode.as_str(),
+            )
+            .body(Full::new(Bytes::from(yaml)))
+            .unwrap(),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: format!("Failed to read the swap config: {error}"),
+            },
+        ),
+    }
+}
+
+/// `POST /api/llama-swap-config`: raw shim-config edits stay shim-mode only.
+/// In native mode the shim file is the IMPORT SOURCE — writing it would look
+/// like admin but govern nothing, so the edit is refused with a pointer to the
+/// catalog surface.
+async fn swap_config_edit(
+    req: Request<Incoming>,
+    state: &AppState,
+) -> Response<Full<Bytes>> {
+    if state.swap_mode.is_native() {
+        return json_response(
+            StatusCode::CONFLICT,
+            &ErrorResponse {
+                error: format!(
+                    "swap.mode is native: `{}` is the import source, not the governing catalog.                      Edit the swap catalog instead (`swap catalog add|rm`, `swap import`, or                      /api/engines/catalog/*).",
+                    state.llama_swap_config_path.display()
+                ),
+            },
+        );
+    }
+    let body_bytes = req
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    if body_bytes.len() > 1_048_576 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse { error: "Request body too large (max 1MB)".to_string() },
+        );
+    }
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
+    if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&body) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse { error: format!("Invalid YAML: {error}") },
+        );
+    }
+    let _guard = state.llama_swap_config_lock.lock().await;
+    let tmp_path = unique_sibling_path(&state.llama_swap_config_path, "tmp");
+    if let Err(error) =
+        atomic_write_path(&state.llama_swap_config_path, &tmp_path, body.as_bytes())
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse { error: format!("Failed to write the shim config: {error}") },
+        );
+    }
+    json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}))
+}
+
 async fn handle_llama_swap_models(
     llama_swap_url: &str,
 ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, anyhow::Error> {
@@ -4328,6 +5247,18 @@ pub(crate) async fn build_model_list(state: &AppState) -> ModelListResponse {
         ModelObject { id: "cloud".to_string(), object: "model", created: 0, owned_by: "brainrouter".to_string() },
     ];
     let mut seen: HashSet<String> = data.iter().map(|m| m.id.clone()).collect();
+    if state.swap_mode.is_native() {
+        for entry in state.swap.catalog().entries() {
+            if seen.insert(entry.id.clone()) {
+                data.push(ModelObject {
+                    id: entry.id,
+                    object: "model",
+                    created: 0,
+                    owned_by: "swap".to_string(),
+                });
+            }
+        }
+    } else {
     let ls_url = format!("{}/v1/models", state.llama_swap_url);
     if let Ok(resp) = VERSION_CLIENT.get(&ls_url)
         .timeout(std::time::Duration::from_secs(2))
@@ -4350,6 +5281,7 @@ pub(crate) async fn build_model_list(state: &AppState) -> ModelListResponse {
                 }
             }
         }
+    }
     }
     for id in state.serving_identities.openai_compatible_served_models().await {
         if seen.insert(id.clone()) {
@@ -4389,6 +5321,48 @@ fn plugins_reply(result: anyhow::Result<serde_json::Value>) -> Response<UnsyncBo
 
 /// Query-string parameter lookup (no percent-decoding needed for the plugin
 /// endpoints' numeric/id params).
+/// Audit identity for L5 mutations: the CLI sends `cli:uid=<uid>`; an
+/// API-driven loopback admin is `admin@<origin>`. Control characters are
+/// stripped so a hostile header cannot forge ledger lines.
+fn sanitize_actor(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn request_actor(value: &serde_json::Value, peer_addr: std::net::SocketAddr) -> Option<String> {
+    if let Some(explicit) = value
+        .get("actor")
+        .and_then(|actor| actor.as_str())
+        .and_then(sanitize_actor)
+    {
+        return Some(explicit);
+    }
+    Some(if peer_addr.port() == 0 {
+        "admin@unix-socket".to_string()
+    } else {
+        format!("admin@{peer_addr}")
+    })
+}
+
+/// Accept either a JSON boolean or a `"true"`/`"1"`/`"yes"` string for the
+/// L5 single-action flags (CLI/API ergonomics; no accidental truthiness).
+fn truthy(value: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| match value.get(*key) {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(text)) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => false,
+    })
+}
+
 fn query_param(query: &str, key: &str) -> String {
     query
         .split('&')
@@ -4650,21 +5624,19 @@ pub(crate) fn remove_owned_uds(path: &std::path::Path, expected: (u64, u64)) {
 }
 
 pub(crate) async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
-    let metadata = loop {
-        match std::fs::symlink_metadata(uds_path) {
-            Ok(metadata) => break metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            // ENOTDIR: an ancestor of the path is not a directory — the
-            // caller's state dir (e.g. a test tmpdir) was deleted out from
-            // under the boot. Clean startup failure, not a bind success.
-            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-                anyhow::bail!(
-                    "the parent directory of {} no longer exists; not binding (the daemon's                      state directory was deleted during startup)",
-                    uds_path.display()
-                )
-            }
-            Err(error) => return Err(error.into()),
+    let metadata = match std::fs::symlink_metadata(uds_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // ENOTDIR: an ancestor of the path is not a directory — the
+        // caller's state dir (e.g. a test tmpdir) was deleted out from
+        // under the boot. Clean startup failure, not a bind success.
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            anyhow::bail!(
+                "the parent directory of {} no longer exists; not binding (the daemon's                      state directory was deleted during startup)",
+                uds_path.display()
+            )
         }
+        Err(error) => return Err(error.into()),
     };
     if !metadata.file_type().is_socket() {
         anyhow::bail!(
@@ -4701,6 +5673,223 @@ pub(crate) async fn prepare_uds_path(uds_path: &std::path::Path) -> Result<()> {
     }
 }
 
+
+// ── v2 L6: provider registry API ─────────────────────────────────────────────
+
+/// Provider records with the live breaker state and the budget badge (the
+/// Credentials-page Providers section renders both). Credential ids only —
+/// values never appear here.
+fn providers_json(state: &AppState) -> serde_json::Value {
+    let records = state.providers.snapshot();
+    let month = state.budget.month();
+    let providers: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| {
+            let mut value = serde_json::to_value(record).unwrap_or_else(|_| serde_json::json!({}));
+            value["breaker"] = serde_json::json!(state.router.health_state(&record.id));
+            let spent = state.budget.spent(&record.id);
+            let budget = record.monthly_budget_usd;
+            value["budget"] = serde_json::json!({
+                "month": month,
+                "mode": record.budget_mode.as_str(),
+                "monthly_budget_usd": budget,
+                "spent_usd": spent,
+                "state": budget
+                    .map(|budget| if spent >= budget { "over" } else { "ok" })
+                    .unwrap_or("none"),
+            });
+            value
+        })
+        .collect();
+    serde_json::json!({ "providers": providers })
+}
+
+fn provider_api_error(status: StatusCode, message: impl std::fmt::Display) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    into_unsync(json_response(status, &serde_json::json!({ "error": message.to_string() })))
+}
+
+async fn handle_providers_api(
+    method: &str,
+    path: &str,
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
+    let record_body = |value: serde_json::Value, id: Option<String>| {
+        let value = value.get("provider").cloned().unwrap_or(value);
+        let mut record: crate::providers::ProviderRecord = serde_json::from_value(value)?;
+        if let Some(id) = id {
+            record.id = id;
+        }
+        anyhow::Ok(record)
+    };
+
+    match (method, path) {
+        ("GET", "/api/providers") | ("GET", "/api/providers/list") => {
+            into_unsync(json_response(StatusCode::OK, &providers_json(&state)))
+        }
+        ("POST", "/api/providers") | ("POST", "/api/providers/add") | ("POST", "/api/providers/upsert") => {
+            let body = read_json_body(req).await;
+            let record = match record_body(body, None) {
+                Ok(record) => record,
+                Err(error) => return provider_api_error(StatusCode::BAD_REQUEST, error),
+            };
+            if let Some(credential) = record.credential_id.as_deref() {
+                let is_ref = credential.starts_with("env:") || credential.starts_with("file:");
+                if !is_ref && !state.credentials.exists(credential).unwrap_or(false) {
+                    return provider_api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("credential `{credential}` does not exist in the credentials store"),
+                    );
+                }
+            }
+            match state.providers.upsert(record) {
+                Ok(()) => into_unsync(json_response(StatusCode::OK, &providers_json(&state))),
+                Err(error) => provider_api_error(StatusCode::BAD_REQUEST, error),
+            }
+        }
+        ("POST", "/api/providers/remove") => {
+            let body = read_json_body(req).await;
+            let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing id");
+            };
+            match state.providers.remove(id) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"removed": removed, "providers": providers_json(&state)["providers"]}),
+                )),
+                Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+        // v2 L6 provider-editor discovery feed: ask a LAN peer brainrouter for
+        // `/api/peer-info` and hand the exposed menu to the Providers form.
+        ("POST", "/api/providers/peer-info") => {
+            let body = read_json_body(req).await;
+            let Some(base_url) = body
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+            else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing base_url");
+            };
+            let credential = body
+                .get("credential_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let token = match credential {
+                Some(credential) => {
+                    let resolved = if let Some(var) = credential.strip_prefix("env:") {
+                        std::env::var(var).map_err(|_| format!("env var {var} is unset"))
+                    } else if let Some(path) = credential.strip_prefix("file:") {
+                        std::fs::read_to_string(path)
+                            .map(|v| v.trim().to_string())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        state
+                            .credentials
+                            .resolve(credential)
+                            .map(|secret| secret.expose().to_string())
+                            .map_err(|e| e.to_string())
+                    };
+                    match resolved {
+                        Ok(token) => Some(token),
+                        Err(error) => {
+                            return provider_api_error(
+                                StatusCode::BAD_REQUEST,
+                                format!("credential `{credential}`: {error}"),
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            let root = base_url
+                .trim_end_matches('/')
+                .strip_suffix("/v1")
+                .unwrap_or(base_url.trim_end_matches('/'))
+                .to_string();
+            let mut request = reqwest::Client::new()
+                .get(format!("{root}/api/peer-info"))
+                .timeout(std::time::Duration::from_secs(5));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(info) => into_unsync(json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({"peer_info": info}),
+                        )),
+                        Err(error) => {
+                            provider_api_error(StatusCode::BAD_GATEWAY, error)
+                        }
+                    }
+                }
+                Ok(response) => provider_api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("peer-info -> HTTP {}", response.status()),
+                ),
+                Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+            }
+        }
+        ("POST", "/api/providers/test") => {
+            let body = read_json_body(req).await;
+            let Some(id) = body.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+                return provider_api_error(StatusCode::BAD_REQUEST, "missing id");
+            };
+            match state.router.probe_provider(&id).await {
+                Ok(result) => into_unsync(json_response(StatusCode::OK, &result)),
+                Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+            }
+        }
+        ("POST", p) | ("PUT", p) if p.starts_with("/api/providers/") => {
+            let rest = &p["/api/providers/".len()..];
+            if let Some(id) = rest.strip_suffix("/test") {
+                let id = id.to_string();
+                return match state.router.probe_provider(&id).await {
+                    Ok(result) => into_unsync(json_response(StatusCode::OK, &result)),
+                    Err(error) => provider_api_error(StatusCode::BAD_GATEWAY, error),
+                };
+            }
+            if let Some(id) = rest.strip_suffix("/remove") {
+                let id = id.to_string();
+                return match state.providers.remove(&id) {
+                    Ok(removed) => into_unsync(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({"removed": removed}),
+                    )),
+                    Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+                };
+            }
+            if method == "PUT" {
+                let body = read_json_body(req).await;
+                let record = match record_body(body, Some(rest.to_string())) {
+                    Ok(record) => record,
+                    Err(error) => return provider_api_error(StatusCode::BAD_REQUEST, error),
+                };
+                return match state.providers.upsert(record) {
+                    Ok(()) => into_unsync(json_response(StatusCode::OK, &providers_json(&state))),
+                    Err(error) => provider_api_error(StatusCode::BAD_REQUEST, error),
+                };
+            }
+            provider_api_error(StatusCode::NOT_FOUND, "unknown providers route")
+        }
+        ("DELETE", p) if p.starts_with("/api/providers/") => {
+            let id = &p["/api/providers/".len()..];
+            match state.providers.remove(id) {
+                Ok(removed) => into_unsync(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"removed": removed}),
+                )),
+                Err(error) => provider_api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            }
+        }
+        _ => provider_api_error(StatusCode::NOT_FOUND, "unknown providers route"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -5010,6 +6199,16 @@ mod tests {
         let socket_path = dir.join("brainrouter.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         drop(listener);
+        // Under the full parallel suite another test may fork a child while
+        // this listener exists; until that child execs (CLOEXEC closes the
+        // inherited fd) a connect can briefly succeed. Wait for the kernel to
+        // report the socket dead — the condition the test is about.
+        for _ in 0..400 {
+            if UnixStream::connect(&socket_path).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         prepare_uds_path(&socket_path).await.unwrap();
         assert!(!socket_path.exists());
@@ -5049,4 +6248,35 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn engines_mutations_are_gated_and_reads_are_not() {
+        assert!(request_is_destructive("POST", "/api/engines/ensure", false));
+        assert!(request_is_destructive("POST", "/api/engines/import/apply", false));
+        assert!(request_is_destructive("DELETE", "/api/engines/queue/3", false));
+        assert!(!request_is_destructive("GET", "/api/engines", false));
+        assert!(!request_is_destructive("GET", "/api/engines/import/preview", false));
+        assert!(!request_is_destructive("GET", "/api/platform", false));
+    }
+
+    #[test]
+    fn engine_route_aliases_normalize_to_one_handler() {
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/list"),
+            "/api/engines"
+        );
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/import"),
+            "/api/engines/import/preview"
+        );
+        assert_eq!(
+            normalize_engines_path("POST", "/api/engines/import"),
+            "/api/engines/import/apply"
+        );
+        assert_eq!(
+            normalize_engines_path("GET", "/api/engines/logs/"),
+            "/api/engines/logs"
+        );
+        assert_eq!(normalize_engines_path("GET", "/health"), "/health");
+    }
+
 }

@@ -4,6 +4,278 @@ Per-phase upgrade/rollback procedures. Phase tags + the per-leg restore
 contract live in `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback"); the change list is in `CHANGELOG.md`.
 
+## v2.0-p7 (L7): `swap:` section + the flip to the native supervisor
+
+L7 absorbs llama-swap. The section formerly spelled `llama_swap:` is now
+`swap:`; every kept key moves verbatim (`fallback_model`, `subs_model`,
+`local_models`, `local_system_prompt`, `nudge.model_key`) and `base_url` is
+dropped (no longer used: native mode talks to the swap supervisor; the shim
+URL is fixed in shim mode). A NON-default `base_url` — an endpoint the
+operator chose deliberately — is kept and marked deprecated instead. Two new keys:
+
+```yaml
+swap:
+  mode: shim            # shim (today's behavior) | native (the flip)
+  config_path: "/opt/ai/llama-swap/config.yaml"   # optional import source
+  fallback_model: "your-local-model-key"
+```
+
+### First boot (automatic)
+
+`v2.0-p7` renames the section in place (snapshot: 
+`$XDG_STATE_HOME/brainrouter/migrations/v2.0-p7/config.yaml`; `.bak` sidecar),
+drops `base_url` with the note above, and leaves a file that boots. Preview
+and roll back without state writes:
+
+```sh
+brainrouter serve --dry-run           # includes the v2.0-p7 preview
+brainrouter migration restore v2.0-p7 # puts the llama_swap: section + base_url back
+```
+
+### fedora hosts: set `config_path` FIRST
+
+The native catalog imports from `swap.config_path` (default
+`~/.config/llama-swap/config.yaml`). On fedora the live llama-swap config is
+the docker-mounted file, so the pilot step is:
+
+1. `swap.config_path: "/opt/ai/llama-swap/config.yaml"` in `brainrouter.yaml`,
+2. restart (the import runs at boot; `v2.0-p4` uses this path when present),
+3. `brainrouter swap catalog list` — every model key from the llama-swap
+   config must be listed,
+4. parity check (one request per key through brainrouter) **before** flipping.
+
+Without step 1 the fedora native catalog is empty and the flip strands the
+host.
+
+### The flip (shim → native)
+
+1. Flush the shim so it holds no models: dashboard **Engines → Unload models**
+   (or `brainrouter cli flush-models`). This frees VRAM.
+2. Set `swap.mode: native` and restart brainrouter.
+
+Native boot REFUSES while llama-swap `/running` still reports loaded models:
+
+```
+swap.mode: native refuses to boot — the llama-swap shim still reports loaded
+models: model-a, model-b. Flush them first ... then restart.
+```
+
+That refusal is the safety interlock (no silent double residency). After a
+clean flip no component dials `:8081`; the supervisor owns every catalog key
+(`ensure` = attach-or-spawn, budget-admitted), flush/restart/model-listing/
+inference-status/registration all read the supervisor or the catalog, and the
+`/api/llama-swap-config` surface serves the swap-catalog view (POST is refused:
+the shim file is the import source, not the governing catalog).
+
+### Rollback (native → shim)
+
+1. Stop brainrouter. Native children are stopped by the scheduler on shutdown
+   (SIGTERM-grace, per-GGUF flock released at child exit) — verify `swap
+   status` shows no residents after the stop.
+2. Set `swap.mode: shim` and restart. llama-swap loads models on demand again;
+   the shim Residency source is live again and the config is unchanged.
+
+The flip is reversible until the deletion pass (soak exit: ≥7 days native, a
+full swap cycle of every catalog key, zero unexplained double-residency /
+no-fit / `blocked` events, budget view consistent, owner sign-off).
+
+### Groups (kickoff inventory)
+
+The owner's imported llama-swap config carries **2 groups**: `dirk-dual`
+(swap=false, exclusive=false) and `non-dual` (swap=true, exclusive=true). The
+native supervisor currently runs single-model entries; slot-sharing for group
+members is an OWNER-SCOPE decision before any group key routes natively —
+groups never silently degrade. See `docs/design/v2-streamlining.L7.log.md`
+("Groups kickoff artifact").
+
+## v2.0-p6 (L6): providers, Manifest absorbed, LAN federation
+
+L6 replaces the hardcoded Manifest backend with a provider registry. New
+state under `$XDG_STATE_HOME/brainrouter/`:
+
+- `providers.json` (0600) — `{providers: [record]}`; `credential_id` names a
+  credential in the L2 vault (or `env:VAR` for the migrated v1 indirection).
+  Key VALUES never live here.
+- `provider_budget.json` (0600) — the monthly provider accumulator, keyed
+  `YYYY-MM`. The L4 swap `budget.json` is a separate ledger (unrelated).
+
+### First boot (automatic)
+
+The `v2.0-p6` migration consumes exactly
+`manifest.enabled` + `manifest.base_url` + `manifest.api_key_env` and creates:
+
+```json
+{"id": "manifest", "kind": "manifest", "base_url": "<v1 url>",
+ "credential_id": "env:<api_key_env>", "auto": true, "models": [],
+ "lan_peer": false, "enabled": true, "budget_mode": "warn"}
+```
+
+`models: []` is intentional: the v1 gateway accepts ids it did not advertise,
+so `cloud/<id>` passes through verbatim (v1 parity). The `manifest:` block is
+then removed from the YAML; `config.yaml.bak` and
+`migrations/v2.0-p6/config.yaml` hold the pre-migration bytes. Preview with:
+
+```sh
+brainrouter serve --dry-run          # includes the v2.0-p6 preview
+brainrouter migration restore v2.0-p6 # round-trips YAML, removes providers+ledger
+```
+
+Use the CLI (mutations go through the daemon) or the dashboard Credentials →
+Providers section:
+
+```sh
+# Bare `cloud` = the enabled manifest-auto provider (v1 behavior).
+brainrouter cli provider list
+
+# Reference deployment: DeepInfra (OpenAI-compatible) as the reviewer cloud.
+brainrouter cli credential add deepinfra-key --kind store --value '<paste>'
+brainrouter cli provider add deepinfra --kind openai-compatible \
+  --base-url https://api.deepinfra.com/v1/openai --credential deepinfra-key \
+  --model deepseek-ai/DeepSeek-V4-Flash
+brainrouter cli provider test deepinfra
+brainrouter cli roles set review cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash
+
+# Anthropic wire provider (x-api-key + anthropic-version, never Bearer):
+brainrouter cli provider add anthropic-cloud --kind anthropic \
+  --base-url https://api.anthropic.com/v1 --credential anthropic-key \
+  --model claude-sonnet-4-5
+```
+
+Manual provider fields: `kind` (`openai-compatible|anthropic|manifest`),
+`base_url`, `credential_id` (omit = auth-less local gateway), `auto`
+(manifest kind only), `models[{id, alias?, ctx, tools, tier,
+price:{in,out}}]`, `lan_peer`, `enabled`, `monthly_budget_usd`,
+`budget_mode` (`warn|stop`). Tier is `fast|balanced|deep` and drives pool
+ranking; price is `$/1K` in/out and feeds the budget guard.
+
+Selector forms: `cloud` (manifest-auto or pool top), `cloud/<id>` (unique
+id/alias match → else manifest passthrough; multi-match is a 4xx naming the
+providers), `cloud/<provider>/<model>` (qualified; only when the first segment
+names an enabled provider — otherwise the remainder cascades). A `cloud/`
+prefix never reaches llama-swap.
+
+### LAN federation (opt-in; second listener)
+
+Default off: no listener exists and the loopback surface is byte-identical to
+v1. To enable, add to `brainrouter.yaml` and restart:
+
+```yaml
+lan:
+  enabled: true
+  bind: "0.0.0.0:9099"         # second listener, dedicated to inference
+  token_credential: lan-token  # credential id in the vault
+  expose: [qwen3-8b, cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash]
+  rate: {burst: 20, per_sec: 4}
+```
+
+```sh
+brainrouter cli credential add lan-token --kind store --value "$(openssl rand -hex 32)"
+```
+
+Boot logs a plaintext-LAN risk marker (accepted risk: bearer over HTTP on a
+trusted LAN; `peer-info` exposes `host_id`, brainrouter `version`, and the
+exposed model/tier/state menu to any token holder on that LAN). The LAN route
+table is only `/v1/chat/completions`, `/v1/messages`, `/v1/models` (filtered),
+`/api/peer-info`; admin/dashboard/roles/credentials return 404 at listener
+level.
+
+Expose is enforced on the RAW requested string AND on every model the route
+can actually dispatch (managed `local` ⇒ `fallback_model`, `subs` ⇒
+`subs_model`, `auto` ⇒ the decision chain/pool, `cloud` ⇒ pool top plus the
+managed fallback), including alias-resolved values. Expose the fallback and
+pool models too, or managed selectors will be refused.
+
+- **Rotation**: `brainrouter cli credential add lan-token --kind store --value
+  '<new>'` — the old token stops working on the next request (constant-time
+  compare against the resolved vault value, file-first; no restart). Provider
+  credentials resolve the same way.
+- **Expose double-enforcement**: the RAW requested string AND the RESOLVED
+  model must both be listed. An exposed alias resolving to a hidden model is
+  refused (no cloud-spend escape).
+- **Peer provider** (federation): register the peer's `http://host:9099/v1`
+  with `lan_peer: true` and the peer's LAN token as its credential. Only peers
+  receive the forwarded `x-brainrouter-role` header, so the peer applies its
+  own Review/Main/Subagent cards to the named role.
+- **Budget**: set `monthly_budget_usd` + `budget_mode` per provider.
+  `warn` badges + events; `stop` refuses as a primary failure (the managed
+  `fallback_model` hop fires; a review escalates) and excludes the provider
+  from the auto pool. The ledger rolls over on the calendar month and survives
+  restarts.
+- **Revert path**: `brainrouter credential export --env-line
+  /etc/brainrouter/env --force` writes `NAME=VALUE` lines for `store`
+  credentials (0600, atomic; `env`/`file` references become comments) so a
+  reverted v1 can consume them via `EnvironmentFile=`.
+
+### fedora hosts
+
+The Manifest binary is untouched; brainrouter simply no longer requires it.
+On fedora1/fedora2 keep `manifest.base_url` pointing at the local gateway
+during migration, or register the cloud provider directly and drop Manifest.
+
+## v2.0-p4 (L4): swap catalog + platform probe
+
+L4 introduces two owner-visible state files under
+`$XDG_STATE_HOME/brainrouter/`:
+
+- `swap_catalog.json` — the model registry (entries with resolved launch
+  specs, sized pins, llama-swap groups metadata);
+- `budget.json` — the append-only budget ledger (admit/deny/evict/pin/spawn/
+  stop/adopt entries);
+- plus `adoption/<model>.json` markers (one per native child) and
+  `swap_logs/<model>.log` engine logs.
+
+On the first boot of a v2 L4 daemon the `v2.0-p4` migration imports the live
+llama-swap `~/.config/llama-swap/config.yaml` into `swap_catalog.json`:
+
+1. A stable snapshot directory
+   `$XDG_STATE_HOME/brainrouter/migrations/v2.0-p4/` captures the
+   pre-migration catalog and budget ledger (0600, atomic).
+2. The macro chain is expanded (`${ls}`, `${common}`, per-model macro
+   overrides) but runtime placeholders (`${PORT}`) are preserved; groups are
+   recorded as metadata; existing CLI-added entries are never overwritten.
+3. The catalog is marked with the phase; later boots are no-ops. Re-running
+   the import is idempotent (`brainrouter swap import-llamaswap`), and
+   `--dry-run` prints the plan without touching state.
+
+Preview before booting:
+
+```sh
+brainrouter serve --dry-run            # includes the v2.0-p4 preview
+brainrouter swap import-llamaswap --dry-run
+```
+
+Rollback: `brainrouter migration restore v2.0-p4` restores the pre-import
+catalog/budget (or removes them if they did not exist), then revert the
+phase merge. Pins and budget reservations are state, not config — the
+snapshot is what returns them.
+
+Operational notes:
+
+- Native spawns go through a transient systemd user scope
+  (`systemd-run --user --scope`) so engines survive daemon restarts and can
+  be adopted. The daemon tracks the ENGINE pid (resolved from the scope's
+  `cgroup.procs`), never the `systemd-run` wrapper, and daemon shutdown never
+  kills engines. Without systemd the daemon falls back to `setsid`; adoption
+  is best-effort and the Engines tab says so. Do not run the daemon with
+  `KillMode=control-group` expecting native children to die with it — that
+  is the point of the scope.
+- Cancelling a queue row aborts a ROUTED request's wait (the harness request
+  carrying an in-flight row). A direct `POST /api/engines/ensure` caller owns
+  its request: dropping the client connection is its cancel, and the queue
+  row is informational.
+- A running engine is never killed by an upgrade. If the resolved launch spec
+  changed, it is adopted and badged `spec_stale`; `swap ensure <model>`
+  converges it explicitly.
+- The swap queue is in-memory and resets on daemon restart (clients retry;
+  adopted loads keep serving).
+- `budget.json` is append-only but bounded: it rotates at write, keeping the
+  newest 5000 rows. An LRU pass records one aggregate row (a single victim
+  keeps its model id).
+- `BRAINROUTER_BUDGET_GIB` overrides the probe-reported budget (GiB);
+  `BRAINROUTER_SWAP_QUEUE_CAP`, `BRAINROUTER_SWAP_WAIT_MS`,
+  `BRAINROUTER_SWAP_STOP_GRACE_MS`, and `BRAINROUTER_SWAP_NO_SYSTEMD=1` are
+  operational knobs.
+
 ## v2.0-p3 (L3): role cards + decision slot
 
 v1 configured models in four places: the `routing:` profile block

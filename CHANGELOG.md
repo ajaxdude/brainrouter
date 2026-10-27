@@ -4,6 +4,369 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## v2 L7: llama-swap absorbed — the flip (branch `v2-p3-roles`, pre-merge)
+
+The local serving layer gains a mode switch and the whole `:8081` surface is
+retargeted in native mode. `swap:` replaces `llama_swap:` (v2.0-p7, keys
+verbatim, `base_url` removed with a note; snapshot + dry-run + restore), and
+`swap.mode: native` makes the native supervisor the only local engine. Native
+boot REFUSES while llama-swap still reports loaded models (flush-first), the
+shim Residency source retires at the flip, and rollback (native → shim) leaves
+no children behind. Shim mode is the byte-identical default floor.
+
+### Added
+
+- **`swap:` config section** (`src/config.rs`: `SwapConfig`, `SwapMode`) with
+  `mode` (default `shim`), `config_path` (catalog import source; default
+  `~/.config/llama-swap/config.yaml`, fedora hosts point at
+  `/opt/ai/llama-swap/config.yaml`) and the kept v1 keys. The pre-migration
+  `llama_swap:` spelling still parses (serde alias) so frozen v1 fixtures and
+  un-migrated files boot.
+- **Flip gate** (`daemon::enforce_native_flip_gate`): native boot refuses with
+  the shim's loaded-model list; an unreachable shim proceeds. Native boot
+  imports the configured source when the catalog is empty.
+- **`v2.0-p7` migration** (`migration::run_v2_p7`): section rename, `base_url`
+  drop with a "no longer used" note, snapshot + `.bak`, dry-run preview,
+  `migration restore v2.0-p7`, idempotent; merges into an existing `swap:`
+  section (existing values win).
+- **Native-boot catalog import** from `swap.config_path` when the catalog is
+  empty (fedora reality; the p4 one-shot may have run against the default path).
+
+### Changed
+
+- **Consumer retargets in native mode** (shim mode untouched): router local
+  routing (catalog-only `ensure`; no shim fall-through), model listing
+  (`/v1/models`, `/api/models/llama-swap`), inference-status + in-flight PP feed
+  (supervisor per-model `/slots`), observability backend snapshot
+  (registry/catalog, same state vocabulary), flush (`evict` all + optional
+  warm-load), restart endpoint (per-engine stop; respawn on next request),
+  GGUF registration (catalog add; the shim file is never written),
+  `/api/llama-swap-config` (GET = swap-catalog view, POST refused with a
+  pointer), config-files panel row (swap catalog), versions/upgrades rows
+  (supervisor row; no shim binary probe or GitHub check), Engines tab
+  (mode/catalog-keys/groups badge).
+- **Provider literal** stays `"llama-swap"` on routed events through the flip
+  and the soak (supervisor routes translate `native` at event emission); the
+  deletion pass renames it to `"local"`.
+- **Residency**: `shim_source_enabled` in the scheduler config; native mode
+  never polls `/running` and lists no shim residents.
+- Repo YAMLs (`brainrouter.yaml`, `brainrouter-headless.yaml`,
+  `brainrouter.example.yaml`) use the `swap:` section with `mode: shim`.
+
+### Notes
+
+- `base_url` is still honored when present (parse compatibility for fixtures
+  and non-default shim ports) but the migration deletes it from operator files.
+- install.sh's llama-swap install/service step, the prompt-rewrite text and the
+  shim adapter itself remain until the nod-gated deletion pass.
+
+## v2 L6: providers, Manifest absorbed, LAN federation (branch `v2-p3-roles`, pre-merge)
+
+Cloud is brainrouter's own decision. The hardcoded Manifest backend is
+replaced by a provider registry (`providers.json`, 0600 atomic) that binds
+credentials from the vault, pools enabled non-peer providers for the `cloud`
+route, and speaks both OpenAI-compatible and Anthropic wires. v1 configs boot
+unchanged: `manifest.*` migrates one-shot into a `manifest`-kind provider
+(snapshot + `.bak` + `migration restore v2.0-p6`) and the v1 `cloud` /
+`cloud/<id>` behavior is byte-identical (parity corpus replayed against mock
+gateways). LAN federation adds a SECOND, opt-in listener with a bearer token,
+per-token rate limit, expose double-enforcement, and role-header forwarding —
+the distributed-role mechanism.
+
+### Added
+
+- **Provider registry** (`src/providers.rs`): record `{id, kind:
+  openai-compatible|anthropic|manifest, base_url, credential_id?, auto,
+  models: [{id, alias?, ctx, tools, tier, price?}], lan_peer, enabled,
+  monthly_budget_usd?, budget_mode}`. CRUD API (`GET/POST /api/providers*`,
+  `PUT|DELETE /api/providers/{id}`, `POST /api/providers/{id}/test`) and CLI
+  `provider add|list|remove|test`. Two enabled `auto: true` manifest providers
+  is refused at add time (rule (b) uniqueness).
+- **Selector resolution matrix** (L6 spec (a)-(d)):
+  `cloud` → enabled manifest-auto provider, else the auto pool's top candidate;
+  `cloud/<id>` → unique id/alias match, else the single manifest-auto
+  passthrough (verbatim v1 parity), multi-match = explicit 4xx naming the
+  providers; `cloud/<provider>/<model>` is taken only when the first segment
+  names an ENABLED provider (otherwise the whole remainder cascades to rule
+  (a)/(b)). A `cloud/` prefix can never resolve to a local llama-swap key.
+- **Anthropic outbound adapter** (`src/provider/anthropic.rs`):
+  canonical OpenAI request → Messages body (`system` extraction, tools,
+  stop_sequences), auth via `x-api-key` + `anthropic-version` (never Bearer),
+  SSE translation back to OpenAI chunks (text/thinking/tool deltas,
+  `message_stop` → `[DONE]`).
+- **Cloud auto pool** (`route=cloud`): enabled non-peer providers' models,
+  ctx/tools filtered, tier-fit ranked, deterministic tie-break = provider
+  record order then model list order. `lan_peer` models never join the cloud
+  pool; `privacy: local-only` treats peers as local-trusted.
+- **Per-provider breakers**: `HealthTracker::state()` (`healthy`/`degraded`/
+  `open`), keyed by provider id (the migrated Manifest provider keeps the v1
+  literal `manifest`). 429 is a backend fault; 3 faults open, 60 s cooldown
+  heals.
+- **v2.0-p6 migration** (`src/migration.rs`): exact v1 keys
+  `manifest.{enabled,base_url,api_key_env}` → provider `{id: "manifest",
+  kind: manifest, base_url, credential: env:<api_key_env>, auto: true,
+  models: []}`; env-var indirection kept (values never enter the record);
+  `manifest.*` YAML removed after `.bak` + snapshot; monthly budget ledger
+  created; `serve --dry-run` previews; `brainrouter migration restore v2.0-p6`
+  restores config + removes providers/ledger. Idempotent (no manifest block =
+  no writes).
+- **LAN federation** (`src/lan.rs`, config `lan: {enabled, bind,
+  token_credential, expose, rate:{burst,per_sec}}`): a second listener whose
+  route table is ONLY `/v1/chat/completions`, `/v1/messages`, `/v1/models`
+  (expose-filtered), `/api/peer-info`. Bearer compared constant-time against
+  the resolved vault credential (rotation immediate), per-token bucket
+  (defaults 20 burst / 4 per second) with 429 on excess, expose
+  double-enforcement against the router's dispatch preview — RAW plus every
+  dispatchable value (managed `local`⇒fallback_model, `subs`⇒subs_model,
+  `auto`⇒chain/pool, `cloud`⇒target+fallback, and post-alias ids), so a
+  managed token cannot escape into unexposed spend; admin/dashboard 404 at
+  listener level, plaintext-LAN risk logged at boot.
+  `peer-info` = `{host_id, version, models:[{key,ctx,tools,tier,state}],
+  serving}` read-only.
+- **Role-header forwarding**: only `lan_peer` providers receive the request's
+  effective `x-brainrouter-role` verbatim (distributed roles: the peer applies
+  its OWN role cards). Non-peer providers never see it.
+- **Budget guard** (`src/provider_budget.rs`, `provider_budget.json`, 0600):
+  per-provider monthly ledger keyed `YYYY-MM` (calendar rollover, survives
+  restart), cost = price × usage tokens or the `(bytes+3)/4` estimator flagged
+  `estimated`; `warn` records + badges, `stop` refuses as a PRIMARY failure
+  (managed fallback fires; review escalates) and excludes the provider from
+  the auto pool. Badges and the route event's `budget` field are backfilled
+  with POST-accrual spend, and a stream that dies mid-flight reports a breaker
+  failure (the header-time breaker cannot see it).
+- **Credential env-line export**: `brainrouter credential export --env-line
+  <file> [--force]` (0600 atomic, refuse-if-exists) — `store` credentials as
+  `NAME=VALUE`, `env`/`file` references as comments, masked lists unchanged.
+- **Events (additive)**: `provider` (`{host, endpoint}` hop on non-loopback
+  provider routes), and `budget` (`{provider, mode, state, month, spent_usd,
+  monthly_budget_usd}`). Sankey ROUTING renders the LAN hop.
+- **Dashboard**: Providers section on the Credentials page (add/update, Test,
+  Remove, live breaker state, budget badge, declared models) and per-provider
+  model lists (grouped, with qualified selector hints) on the Models page.
+- **Admission**: `cloud_available` (≥1 enabled non-peer provider) replaces
+  `manifest_enabled` everywhere; `AdmittedBackend::Peer` / `BackendDecision::
+  Peer` — a qualified `cloud/<lan-peer>/...` review card is peer-admitted with
+  cloud-parity strictness and no local memory gate.
+
+### Removed
+
+- `config.manifest` as a required block (the migrated provider owns the URL;
+  the struct stays parse-compatible and optional); `AdmissionInputs.
+  manifest_enabled`; the Manifest-only router special case
+  (`Router.manifest`/`manifest_enabled`); manifest-only breaker naming.
+
+## v2 L5: strixite + hipfire adapters (branch `v2-p3-roles`, pre-merge)
+
+The icon fleets become supervisor-managed engines. strixite (gfx1151) and
+hipfire (gfx1100) are L4 `EngineAdapter` implementations: generated confs own
+the port, readiness is a `/v1/models` stem assertion, and the cutover is
+pid-scoped (`SIGTERM` → pid-gone → settle → `MemAvailable` gate → spawn →
+stem poll). Icon-launched servers are now **visible** through a read-only
+`/proc` observer and are attach-only until `swap adopt`. Routed streams
+(proxy in-flight rows *and* router in-process streams the proxy never sees)
+protect their endpoint through an Active-Consumer Set with an idle grace, so a
+live session is never mid-swap.
+
+### Added
+
+- **Active-Consumer Set** (`src/active_consumers.rs`): per-endpoint/catalog-id
+  spans entered by the router around in-process streams and by proxy rows,
+  left on completion with a configurable idle grace
+  (`active_consumer_grace_s`, default 120 s, per-host fleet profile). The
+  scheduler consults it before every eviction; a protected model is skipped,
+  the block is recorded (`budget.json` kind `blocked`, reason
+  `blocked:active-consumer`), and `/api/engines/consumers` +
+  `/api/engines/events` expose the span. One-action bypass:
+  `swap ensure <model> --override` / dashboard **Swap anyway**, audit-logged.
+- **strixite adapter** (`src/engine_strixite.rs`): per-model generated confs
+  (profile template + supervisor-allocated port, `${PORT}` required,
+  `--print-config` validation opt-in), engine-validated launch args (conf-owned
+  flags rejected at spec build), port allocation that avoids every Residency
+  endpoint, imported explicit `--port` values and llama-swap's dynamic
+  `${PORT}` range, `/slots`-equivalent progress when exposed (indeterminate +
+  EWMA otherwise), exclusive device class, and `strix_server.service` as the
+  takeover unit.
+- **hipfire adapter** (`src/engine_hipfire.rs`): card registry (`*.mq4` + `.mtp`
+  sidecar, missing sidecar = warning), **version-keyed flag schema** re-derived
+  when the probed engine version changes (schema-drift badge; `--mtp` rejected
+  by construction), single-owner `:8080` with squat detection (foreign stems ⇒
+  Failed + banner, nothing signalled), stop = SIGTERM + port-free gate, context
+  math (`max_tokens` defaults to the engine's remaining context; a prompt that
+  does not fit is a typed shortfall the proxy surfaces as 400), and
+  `hipfire-serve.service` as the takeover unit.
+- **External-engine Residency observer** (`src/engine_observer.rs`): read-only
+  `/proc` scan for `strix_server`/`hipfire`, endpoint from argv `--port`
+  (hipfire default 8080), `/v1/models` stems resolved against the catalog.
+  Classification precedence: pids in the native registry/markers are never
+  double-listed as external. External residents are Ready-at-external
+  (attach-not-spawn), budget-counted, and a cutover never signals them.
+- **pid-scoped unit takeover** (`src/engine_systemd.rs`): unit state from
+  `systemctl --user show` (`ActiveState`, `MainPID`, `ControlGroup`), pids =
+  `MainPID` + control-group members only; `swap takeover <model>` attaches when
+  the unit already serves the model, adopts its pid, and otherwise requires the
+  single-action `--override` (`blocked:unit-owned` without it). `systemctl` is
+  replaceable (`BRAINROUTER_SYSTEMCTL`) and the runtime is injectable.
+- **`swap adopt <model> [--pid N]` / `swap adopt --endpoint <url>`**: registers
+  an observed icon-launched pid as a supervisor-owned resident with a
+  **port-less** adopted spec hash (no permanent `spec_stale` badge); only then
+  may a cutover signal it. The endpoint form resolves the model from the
+  observer (gguf or served stems) and names the missing catalog entry instead
+  of guessing.
+- **Unregistered external occupant refusal**: a spawning ensure on an
+  exclusive device whose matching external process resolves to no catalog
+  entry refuses with `blocked:external-occupant` (503, busy code, ledger
+  event) until the operator adopts or stops it; `--override` is the single
+  audited bypass. The pid is never signalled.
+- **Audit actor**: `budget.json` entries gain an `actor` field (ts = when,
+  model = target). API mutations carry `admin@<origin>` (or a sanitized
+  CLI-supplied `cli:uid=<uid>`); takeover reports surface the actor.
+- **Engine probe wiring**: adapters are probed at daemon registration and once
+  at the first ensure; the hipfire schema is derived from
+  `<program> --version` at construction, re-derived on every spawn/probe, and
+  refreshed (30 s TTL) for the Engines tab, so the version-keyed flag set is
+  live rather than aspirational.
+- **`min_mem_gib` gate**: after drain + settle the scheduler re-reads
+  `MemAvailable` (injectable) against the adapter floor; below the floor the
+  model is visible as `Waiting(gate)` with threshold + current value, fails
+  after the timeout with a named reason, and `--force-gate` bypasses it
+  (audit-logged).
+- **APIs**: `GET /api/engines` gains additive `external`, `units`,
+  `active_consumers`, `adapter_detail`; model rows gain `gate`, `port`,
+  `conf_path`, `active_consumer`. New `GET /api/engines/external`,
+  `GET /api/engines/consumers`, `GET /api/engines/events`,
+  `POST /api/engines/adopt`, `POST /api/engines/takeover` (loopback + CSRF
+  gated like the other engine mutations). Ensure/evict accept `override`,
+  `force_gate`, `attach_only`.
+- **Engines tab**: external residents with Adopt/Attach, takeover units,
+  Active-Consumer spans, `Waiting(gate)` and **Swap anyway** / **Takeover**
+  controls (escHtml, additive blocks).
+- **CLI**: `swap ensure --override --force-gate --attach-only`,
+  `swap evict --override`, `swap takeover --unit --override --force-gate`,
+  `swap adopt --pid`.
+- **Docs**: `docs/UPGRADE.md` host procedures (strix-halo live strixite pilot,
+  fedora1 hipfire unit migration incl. Q4 default user-service takeover and
+  rollback), plus `docs/design/v2-streamlining.L5.log.md`.
+
+### Changed
+
+- `EngineAdapter` gains defaulted L5 hooks (`min_mem_gib`, `exclusive_key`,
+  `allocate_port`, `takeover_unit`, `conf_path_for`, `describe`); existing
+  adapters (`fake`, `llama_cpp`, shim, external) are unchanged.
+- `Resident` gains an additive `engine` field (external residents).
+- The scheduler's admission order is now exclusive cutover → ACS-aware
+  budget eviction → memory gate → spawn, serialized by a per-device lock.
+- `swap_catalog::validate_entry` accepts the `strixite`/`hipfire` engines.
+
+### Host tier (owner-nod-gated, not executed by this build)
+
+Live strixite A→B swap on strix-halo and the fedora1 hipfire unit migration
+are pilots: procedures in `docs/UPGRADE.md`, no host action taken here.
+
+## v2 L4 — Swap supervisor + platform probe (branch `v2-p4-l4`, pre-merge)
+
+brainrouter now owns engine processes and model lifecycle behind one
+abstraction, with the owner's icon-script invariants inherited: single-instance
+per-GGUF lock, start-ownership, health, and a served-model stem assertion. The
+Residency view is the input side of every decision — **Residency before
+budget**: a model already serving anywhere (llama-swap, a native child, a
+server-mode container, or the L5 external slot) is attached with no spawn and
+no budget gate. Shim-mode routing stays byte-identical.
+
+### Added
+
+- **Platform probe** (`src/platform.rs`): machine-id identity, GPU arch from
+  KFD topology (sysfs PCI fallback), `MemTotal`/`MemAvailable`, GTT from
+  `ttm.pages_limit`/`amdgpu.gttsize`, install markers, a vendored feed
+  (`strix-halo`, `r9700`, `gb10`, `intel-b70`) plus an optional remote feed
+  URL cached under `$XDG_STATE_HOME/brainrouter/platform_feed.json` with a
+  24 h staleness bound. `id = feed platform id` when the detected arch
+  matches, else `generic-<gpu-arch>` with an explicit unknown-platform banner
+  (fedora1 = `generic-gfx1100`, fail-open: every engine/toolbox offered). The
+  engine compatibility matrix is data (`ENGINE_MATRIX`: strixite = gfx1151 +
+  GTT ≥ 100 GiB, gufo = gfx1151, hipfire = discrete gfx9/10/11/12,
+  llama.cpp = universal) and drives offers + reasons-not. The dashboard's
+  hardcoded `CURRENT_PLATFORM_ID` is replaced by the probe's id at render
+  time; `GET /api/platform` exposes the probe.
+- **Swap catalog** (`src/swap_catalog.rs`): `swap_catalog.json` (0600,
+  atomic) with entries `{id, engine, files, ctx, quant, family, tools,
+  vram_estimate_gib, launch_spec, aliases, groups, provenance,
+  last_stream_completed, ewma_load_ms, fingerprints}`, sized **pins**, and
+  llama-swap **groups** as metadata. Entry fingerprints (mtime+size) make a
+  changed GGUF a `spec_stale` signal.
+- **llama-swap import** (inverse of `llama_swap_register.rs`): parses
+  `config.yaml`, resolves the macro chain recursively (top-level `macros:`
+  shadowed by per-model `macros:`, so `${common}` → `${ctx}` → concrete
+  flags) while preserving runtime placeholders (`${PORT}`), maps `--model`/
+  `-c`/`--alias`/`--jinja`, records `env`, `aliases`, groups, and llama-swap
+  settings. Idempotent merge (CLI-owned entries are never overwritten);
+  `--dry-run` is stable and inert.
+- **Residency view** (`src/residency.rs`): shim (`/running`, every entry, not
+  just `running[0]`), native children, server-mode container identities, and
+  the external-engine registry slot (L5 feeds it). `ready_for` matches
+  catalog id / canonical GGUF / served alias.
+- **Swap supervisor** (`src/swap_scheduler.rs`): lifecycle
+  `Stopped|Loading|Ready|Draining|Failed`; `ensure` = Residency → queue →
+  budget admission → LRU evict-to-fit → spawn; in-memory queue with cap +
+  cancel; pins counted once as `max(vram_estimate, reserved_gib)`; append-only
+  `budget.json` ledger (rotated at write, newest 5000 rows; one aggregate
+  evict row per LRU pass); in-flight-aware LRU keyed on last **stream
+  completion**, with pins/active streams re-checked under the model's spawn
+  lock immediately before signalling; child-held per-GGUF `flock` (inherited fd, CLOEXEC cleared);
+  adoption markers (`adoption/<model>.json` with pid/start_time/spec_hash)
+  written before spawn and scanned at boot — live pid + recorded start_time +
+  the GGUF as a FULL argv element ⇒ adopt, spec mismatch ⇒ adopt +
+  `spec_stale` (never killed), dead ⇒ clean, unprovable identity ⇒ refuse
+  (marker kept), missing catalog entry ⇒ adopt as an unnamed resident
+  (`catalog_missing` warning, never killed). A failed stop keeps the marker
+  and restores the live row. Managed ports are reserved per spawn; bounded
+  restart resets its budget on Ready.
+  `FakeAdapter` is the scripted acceptance substrate (load ms, stem set,
+  crash, progress) with a real child process.
+- **Native llama.cpp adapter** (`src/engine_native.rs`): spawns through
+  `systemd-run --user --scope --quiet --collect -p KillMode=control-group`
+  (cgroup escape — adoption needs the child outside the daemon's cgroup),
+  plain `setsid` fallback where systemd is absent (documented best-effort
+  adoption). The tracked pid is the ENGINE: the resolver walks the transient
+  scope's `cgroup.procs`, an exec'd `systemd-run` wrapper, or
+  `/proc/<pid>/task/*/children`, and refuses the spawn if it cannot prove
+  which process is the engine. Daemon shutdown never kills engines (adapter
+  `Drop` is inert); `stop` is group TERM (`systemctl --user stop --no-block
+  <scope>.scope`) then SIGTERM → grace → SIGKILL on the engine pid, erroring
+  if it survives. `/health` + `/v1/models` status; load progress
+  indeterminate + elapsed (EWMA ETA from the registry).
+- **Shared llama-server shaping**: `sanitize_for_llama_family` (developer→
+  system, single system block, assistant content fix) is applied to the shim
+  and native paths identically (both call the same function; its merge tests
+  remain).
+- **Engines tab + API**: `GET /api/engines` (models/queue/budget/adoption),
+  `/api/engines/{ensure,evict,pin,unpin,import/preview,import/apply,logs,
+  catalog/add,catalog/rm}`, `GET /api/platform`; loopback+CSRF gated
+  mutations; Engines tab (platform card, offers+reasons, lifecycle,
+  queue+cancel, budget gauge by source + pins, import panel) and a Models-tab
+  "serve via" column.
+- **CLI**: `brainrouter swap status|ensure|evict|catalog list|
+  import-llamaswap [--dry-run]|pin|unpin|add|rm` and
+  `brainrouter platform show [--json]`. Reads are direct; mutations go
+  through the daemon and refuse cleanly when it is down.
+- **Migration `v2.0-p4`**: first boot imports the live llama-swap config into
+  `swap_catalog.json` (one stable snapshot directory per phase, atomic
+  writes, CLI-owned entries preserved, one-shot marker);
+  `--dry-run` previews and `migration restore v2.0-p4` round-trips the
+  pre-migration catalog + budget ledger.
+- **Events + in-flight (additive)**: `RouteEvent.swap_state` /
+  `swap_source` (true residency source: `shim`/`native`/`container`/
+  `external`); in-flight rows gain `catalog_id` (stamped at route time) and a
+  clean-stream-completion hook that writes the LRU clock. Routing runs under
+  the request's in-flight row, so a routed queue/load wait is cancellable
+  from `DELETE /api/engines/queue/<id>`; a direct `ensure` owns its request
+  and completes.
+
+### Revert
+
+`git revert -m 1 <merge>` for the phase; `brainrouter migration restore
+v2.0-p4` restores the pre-import catalog/budget, then `v2.0-p3`/`v2.0-p2`
+restore the pre-L3/L2 state. `v1-classic` remains the global rollback.
+
 ## v2 L3 — Role cards + decision slot (branch `v2-p3-roles`, pre-merge)
 
 One model config for everything: role cards replace the routing profile, the

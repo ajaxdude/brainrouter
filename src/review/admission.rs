@@ -15,6 +15,9 @@ use std::collections::HashMap;
 pub enum AdmittedBackend {
     Cloud,
     Local,
+    /// v2 L6: a `lan_peer` provider (strictness = cloud parity, no local
+    /// memory gate; failure escalates exactly like a cloud reviewer).
+    Peer,
 }
 
 impl AdmittedBackend {
@@ -22,6 +25,7 @@ impl AdmittedBackend {
         match self {
             AdmittedBackend::Cloud => "cloud",
             AdmittedBackend::Local => "local",
+            AdmittedBackend::Peer => "peer",
         }
     }
 }
@@ -34,17 +38,21 @@ pub enum BackendDecision {
     Cloud { reason: Option<String> },
     /// Run on the local reviewer model.
     Local,
+    /// v2 L6: run on a `lan_peer` provider named by a qualified cloud card.
+    Peer,
     /// Cannot run at all; `reason` becomes the `blocked:<reason>` wire status.
     Blocked { reason: String },
 }
 
 /// Inputs to the pure admission decision.
 pub struct AdmissionInputs<'a> {
-    /// `"cloud" | "local" | "auto"` (unknown treated as `auto`).
+    /// `"cloud" | "local" | "auto" | "peer"` (unknown treated as `auto`).
     pub configured_backend: &'a str,
     pub configured_model: Option<&'a str>,
     pub fallback_model: &'a str,
-    pub manifest_enabled: bool,
+    /// v2 L6: ≥1 enabled non-`lan_peer` provider (replaces the v1
+    /// manifest-only availability flag).
+    pub cloud_available: bool,
     pub budgets: &'a HashMap<String, u64>,
     pub system_reserve_mb: u64,
     /// `None` when `/proc/meminfo` is unreadable (non-Linux, or macOS).
@@ -55,14 +63,17 @@ pub struct AdmissionInputs<'a> {
 
 /// Decide the reviewer backend per the v6 admission table. Pure.
 pub fn decide_backend(i: &AdmissionInputs) -> BackendDecision {
-    let cloud_available = i.manifest_enabled;
+    let cloud_available = i.cloud_available;
 
     // Resolve the intended backend from the configured choice.
     let want_local = match i.configured_backend {
+        // v2 L6: a peer provider is neither cloud spend nor local memory —
+        // no memory gate, cloud-parity strictness.
+        "peer" => return BackendDecision::Peer,
         "cloud" => return BackendDecision::Cloud { reason: None },
         "local" => true,
-        // `auto` (and any unknown value): cloud iff Manifest is enabled, else local.
-        _ => !i.manifest_enabled,
+        // `auto` (and any unknown value): cloud iff a cloud provider exists.
+        _ => !i.cloud_available,
     };
     if !want_local {
         return BackendDecision::Cloud { reason: None };
@@ -126,8 +137,10 @@ pub enum AdmissionResult {
     Admitted {
         choice: crate::roles::ModelChoice,
         /// Held for the entire review run when admitted local (bounds
-        /// concurrent local reviews); `None` for cloud.
+        /// concurrent local reviews); `None` for cloud/peer.
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        /// The backend the run was admitted to (v2 L6 adds `Peer`).
+        backend: AdmittedBackend,
     },
     Blocked {
         /// Becomes the `blocked:<reason>` surfaced to the caller.
@@ -142,19 +155,39 @@ pub enum AdmissionResult {
 /// local one. `mem_available_mb` is injected for testability.
 pub fn admit(
     configured: &crate::roles::ModelChoice,
-    manifest_enabled: bool,
+    cloud_available: bool,
+    fallback_model: &str,
+    cfg: &crate::config::ReviewAdmissionConfig,
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    mem_available_mb: Option<u64>,
+) -> AdmissionResult {
+    admit_with_backend(
+        configured,
+        configured.backend(),
+        cloud_available,
+        fallback_model,
+        cfg,
+        permits,
+        mem_available_mb,
+    )
+}
+
+/// [`admit`] with an explicit effective backend (`peer` derivation).
+pub fn admit_with_backend(
+    configured: &crate::roles::ModelChoice,
+    backend: &'static str,
+    cloud_available: bool,
     fallback_model: &str,
     cfg: &crate::config::ReviewAdmissionConfig,
     permits: &std::sync::Arc<tokio::sync::Semaphore>,
     mem_available_mb: Option<u64>,
 ) -> AdmissionResult {
     use crate::roles::ModelChoice;
-    let backend = configured.backend();
     let inputs = |permit_available: bool| AdmissionInputs {
         configured_backend: backend,
         configured_model: configured.model(),
         fallback_model,
-        manifest_enabled,
+        cloud_available,
         budgets: &cfg.local_model_budget_mb,
         system_reserve_mb: cfg.system_reserve_mb,
         mem_available_mb,
@@ -180,9 +213,15 @@ pub fn admit(
 
     // First decide assuming a permit is available (it only matters for local).
     match decide_backend(&inputs(true)) {
+        BackendDecision::Peer => AdmissionResult::Admitted {
+            choice: configured.clone(),
+            permit: None,
+            backend: AdmittedBackend::Peer,
+        },
         BackendDecision::Cloud { .. } => AdmissionResult::Admitted {
             choice: cloud_choice(),
             permit: None,
+            backend: AdmittedBackend::Cloud,
         },
         BackendDecision::Blocked { reason } => AdmissionResult::Blocked { reason },
         BackendDecision::Local => {
@@ -196,12 +235,14 @@ pub fn admit(
                 return AdmissionResult::Admitted {
                     choice: local_choice(),
                     permit: None,
+                    backend: AdmittedBackend::Local,
                 };
             }
             match std::sync::Arc::clone(permits).try_acquire_owned() {
                 Ok(permit) => AdmissionResult::Admitted {
                     choice: local_choice(),
                     permit: Some(permit),
+                    backend: AdmittedBackend::Local,
                 },
                 // Budgeted local, but the permit is busy: fall back to cloud if
                 // available, else block (reason reflects the real cause).
@@ -209,6 +250,7 @@ pub fn admit(
                     BackendDecision::Cloud { .. } => AdmissionResult::Admitted {
                         choice: cloud_choice(),
                         permit: None,
+                        backend: AdmittedBackend::Cloud,
                     },
                     _ => AdmissionResult::Blocked { reason: "permit_busy".to_string() },
                 },
@@ -221,7 +263,10 @@ pub fn admit(
 /// review loop so it can resolve the backend per run.
 pub struct AdmissionCtx {
     pub config: crate::config::ReviewAdmissionConfig,
-    pub manifest_enabled: bool,
+    pub cloud_available: bool,
+    /// v2 L6: the provider registry, used to derive `peer` from a qualified
+    /// `cloud/<peer>/...` review card.
+    pub providers: std::sync::Arc<crate::providers::ProviderStore>,
     pub fallback_model: String,
     pub permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -229,14 +274,39 @@ pub struct AdmissionCtx {
 impl AdmissionCtx {
     /// Resolve the backend for a run, reading live `/proc/meminfo`.
     pub fn resolve(&self, configured: &crate::roles::ModelChoice) -> AdmissionResult {
-        admit(
+        // v2 L6: a qualified `cloud/<provider>/<model>` review card whose
+        // first segment names an enabled `lan_peer` provider derives
+        // `configured_backend = peer`.
+        let backend = self.effective_backend(configured);
+        admit_with_backend(
             configured,
-            self.manifest_enabled,
+            backend,
+            self.cloud_available,
             &self.fallback_model,
             &self.config,
             &self.permits,
             read_meminfo_available_mb(),
         )
+    }
+
+    fn effective_backend(&self, configured: &crate::roles::ModelChoice) -> &'static str {
+        if let crate::roles::Selector::CloudId(rest) = crate::roles::parse_selector(&configured.selector()) {
+            if let Some((first, remainder)) = rest.split_once('/') {
+                if !remainder.is_empty() {
+                    if let Some(provider) = self
+                        .providers
+                        .snapshot()
+                        .into_iter()
+                        .find(|p| p.id == first && p.enabled)
+                    {
+                        if provider.lan_peer {
+                            return "peer";
+                        }
+                    }
+                }
+            }
+        }
+        configured.backend()
     }
 }
 
@@ -259,11 +329,46 @@ mod tests {
             configured_backend: configured,
             configured_model: None,
             fallback_model: "local-model",
-            manifest_enabled: manifest,
+            cloud_available: manifest,
             budgets: b,
             system_reserve_mb: 4096,
             mem_available_mb: mem,
             permit_available: permit,
+        }
+    }
+
+    #[test]
+    fn qualified_peer_review_card_admits_as_peer() {
+        let providers = std::sync::Arc::new(
+            crate::providers::ProviderStore::in_memory_with(vec![
+                crate::providers::ProviderRecord {
+                    id: "fedora1".into(),
+                    kind: crate::providers::ProviderKind::OpenaiCompatible,
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    credential_id: None,
+                    auto: false,
+                    models: vec![],
+                    lan_peer: true,
+                    enabled: true,
+                    monthly_budget_usd: None,
+                    budget_mode: crate::providers::BudgetMode::Warn,
+                },
+            ]),
+        );
+        let ctx = AdmissionCtx {
+            config: Default::default(),
+            cloud_available: false,
+            providers,
+            fallback_model: "local-model".into(),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let choice = crate::roles::ModelChoice::from_selector("cloud/fedora1/deepseek").unwrap();
+        match ctx.resolve(&choice) {
+            AdmissionResult::Admitted { backend, permit, .. } => {
+                assert_eq!(backend, AdmittedBackend::Peer);
+                assert!(permit.is_none(), "peer runs never hold the local permit");
+            }
+            AdmissionResult::Blocked { reason } => panic!("blocked: {reason}"),
         }
     }
 
@@ -277,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_prefers_cloud_when_manifest_enabled() {
+    fn auto_prefers_cloud_when_a_cloud_provider_exists() {
         let b = budgets(&[]);
         assert_eq!(
             decide_backend(&inputs("auto", true, &b, None, true)),
@@ -371,7 +476,7 @@ mod tests {
         let cfg = admission_cfg(&[], 4096);
         let sem = Arc::new(Semaphore::new(1));
         match admit(&ModelChoice::Auto, true, "fb", &cfg, &sem, Some(99_999)) {
-            AdmissionResult::Admitted { choice, permit } => {
+            AdmissionResult::Admitted { choice, permit, .. } => {
                 assert_eq!(choice.backend(), "cloud");
                 assert!(permit.is_none());
             }
@@ -386,7 +491,7 @@ mod tests {
         let sem = Arc::new(Semaphore::new(1));
         let choice = ModelChoice::Local { model: Some("m".to_string()) };
         match admit(&choice, false, "fb", &cfg, &sem, Some(20_000)) {
-            AdmissionResult::Admitted { choice, permit } => {
+            AdmissionResult::Admitted { choice, permit, .. } => {
                 assert_eq!(choice.backend(), "local");
                 assert!(permit.is_some());
                 assert_eq!(sem.available_permits(), 0, "local admission holds the permit");
@@ -413,7 +518,7 @@ mod tests {
         let _held = Arc::clone(&sem).try_acquire_owned().unwrap(); // exhaust the single permit
         let choice = ModelChoice::Local { model: Some("m".to_string()) };
         match admit(&choice, true, "fb", &cfg, &sem, Some(20_000)) {
-            AdmissionResult::Admitted { choice, permit } => {
+            AdmissionResult::Admitted { choice, permit, .. } => {
                 assert_eq!(choice.backend(), "cloud");
                 assert!(permit.is_none());
             }
@@ -446,7 +551,7 @@ mod tests {
         let _held = Arc::clone(&sem).try_acquire_owned().unwrap(); // exhaust the permit
         let choice = ModelChoice::Local { model: Some("no-budget-model".to_string()) };
         match admit(&choice, false, "fb", &cfg, &sem, Some(100)) {
-            AdmissionResult::Admitted { choice, permit } => {
+            AdmissionResult::Admitted { choice, permit, .. } => {
                 assert_eq!(choice.backend(), "local");
                 assert!(permit.is_none(), "ungated local must not hold a permit");
             }

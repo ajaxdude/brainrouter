@@ -17,6 +17,14 @@ if git diff --cached --name-only | grep -qE '^src/escalation/templates/.*\.html$
     }
 fi
 
+# ── L7 hygiene: the retired `llama_swap:` YAML key must not return ─────────
+if git diff --cached --name-only | grep -qE '^src/.*\.rs$'; then
+    bash scripts/check-v2-p7-clean.sh || {
+        echo "pre-commit: v2.0-p7 config-spelling hygiene check FAILED — commit aborted" >&2
+        exit 1
+    }
+fi
+
 CARGO_TOML="Cargo.toml"
 SENTINEL=".git/BRAINROUTER_VERSION_BUMPED"
 

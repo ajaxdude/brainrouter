@@ -435,6 +435,813 @@ fn strip_v1_keys_and_add_decision_model(config_path: &Path, state: &V1State) -> 
     Ok(())
 }
 
+// ── v2.0-p4: swap catalog import (L4) ───────────────────────────────────────
+
+/// The L6 phase tag: `brainrouter migration restore v2.0-p6`. Migrates the
+/// v1 `manifest.*` YAML block into a `manifest`-kind provider record and
+/// creates the monthly provider budget accumulator.
+pub const PHASE_V2_P6: &str = "v2.0-p6";
+
+/// The exact v1 manifest keys (there is NO `manifest.model` key).
+#[derive(Debug, Clone)]
+pub struct V1Manifest {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key_env: Option<String>,
+}
+
+/// Read the v1 manifest block from raw YAML (no validation — runs BEFORE
+/// `config::load` so a v1 file always inspects).
+pub fn read_v1_manifest(config_path: &Path) -> Result<Option<V1Manifest>> {
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading config for v2.0-p6"),
+    };
+    let root: YamlValue = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} for v2.0-p6", config_path.display()))?;
+    let Some(manifest) = root.get("manifest") else {
+        return Ok(None);
+    };
+    let enabled = manifest
+        .get("enabled")
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(false);
+    let base_url = manifest
+        .get("base_url")
+        .and_then(YamlValue::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let api_key_env = manifest
+        .get("api_key_env")
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(Some(V1Manifest {
+        enabled,
+        base_url,
+        api_key_env,
+    }))
+}
+
+/// `--dry-run` preview for `v2.0-p6` — describes the migration, never writes.
+pub fn preview_v2_p6(
+    config_path: &Path,
+    state_root: &Path,
+    providers_path: &Path,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P6} (state untouched)"));
+    match read_v1_manifest(config_path)? {
+        Some(manifest) => {
+            lines.push(format!(
+                "  would migrate manifest.enabled={} base_url={} api_key_env={} into provider \
+                 'manifest' (kind manifest, auto: true, models: [], enabled: {})",
+                manifest.enabled,
+                if manifest.base_url.is_empty() { "<unset>" } else { &manifest.base_url },
+                manifest
+                    .api_key_env
+                    .as_deref()
+                    .map(|var| format!("env:{var}"))
+                    .unwrap_or_else(|| "<none>".to_string()),
+                manifest.enabled,
+            ));
+            lines.push(format!(
+                "  would snapshot the pre-migration config under {}",
+                snapshot_root(state_root, PHASE_V2_P6).display()
+            ));
+            lines.push(format!(
+                "  would remove the manifest.* block from {} (backup: {}.bak)",
+                config_path.display(),
+                config_path.display()
+            ));
+        }
+        None => lines.push(format!(
+            "  no manifest.* block in {} — migration {PHASE_V2_P6} has nothing to do",
+            config_path.display()
+        )),
+    }
+    lines.push(format!(
+        "  providers store: {}",
+        if providers_path.exists() {
+            format!("{} (existing records preserved)", providers_path.display())
+        } else {
+            format!("would create {}", providers_path.display())
+        }
+    ));
+    lines.push(format!(
+        "  would create the monthly provider budget accumulator {}",
+        crate::provider_budget::default_path().display()
+    ));
+    Ok(lines)
+}
+
+/// Remove the top-level `manifest:` block, preserving every other line
+/// byte-for-byte (comments, key spellings, ordering). Handles both the block
+/// mapping form and an inline `manifest: {...}` value.
+pub fn remove_manifest_block(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    let mut skipping = false;
+    for line in yaml.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if !skipping {
+            if trimmed.trim_start().starts_with("manifest:")
+                && trimmed.len() == trimmed.trim_start().len()
+            {
+                skipping = true;
+                // Inline value? Consume just this line.
+                continue;
+            }
+            out.push_str(line);
+            continue;
+        }
+        // Inside the block: consume indented content, blank lines, and
+        // indented comments. A column-0 line starts the next top-level key
+        // (or its leading comment) and is kept.
+        if trimmed.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        let indented = trimmed.starts_with(' ') || trimmed.starts_with('\t');
+        if indented {
+            continue;
+        }
+        skipping = false;
+        out.push_str(line);
+    }
+    out
+}
+
+/// The `v2.0-p6` migration: `manifest.*` ⇒ provider `{id: "manifest", kind:
+/// manifest, base_url, credential: env:<api_key_env> if set, auto: true,
+/// models: []}`, `manifest.*` YAML removed, budget ledger created. Snapshot +
+/// `.bak` first (the `v2.0-p3` machinery). Idempotent: no manifest block = no
+/// writes.
+pub fn run_v2_p6(
+    config_path: &Path,
+    state_root: &Path,
+    providers_path: &Path,
+    budget_path: &Path,
+) -> Result<Vec<String>> {
+    let Some(manifest) = read_v1_manifest(config_path)? else {
+        return Ok(Vec::new());
+    };
+    if manifest.base_url.is_empty() && manifest.enabled {
+        anyhow::bail!(
+            "v2.0-p6: manifest.enabled is true but manifest.base_url is empty in {}",
+            config_path.display()
+        );
+    }
+    let original = std::fs::read(config_path)
+        .with_context(|| format!("reading {} for v2.0-p6", config_path.display()))?;
+
+    // Snapshot the pre-migration state (stable per-phase directory): the
+    // config verbatim plus whichever state files exist.
+    let root = snapshot_root(state_root, PHASE_V2_P6);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating {}", root.display()))?;
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    crate::plugins::store::atomic_write_0600(&root.join("config.yaml"), &original)?;
+    for (source, name) in [
+        (providers_path, crate::providers::PROVIDERS_FILE),
+        (budget_path, crate::provider_budget::LEDGER_FILE),
+    ] {
+        if source.exists() {
+            let bytes = std::fs::read(source)
+                .with_context(|| format!("reading {} for snapshot", source.display()))?;
+            crate::plugins::store::atomic_write_0600(&root.join(name), &bytes)?;
+        }
+    }
+
+    // `.bak` sidecar (byte-for-byte pre-migration YAML). Never clobber an
+    // earlier phase's backup: `.bak` is the ROLLBACK copy of the oldest
+    // pre-migration state (an L1 keeper asserts the v1 legacy shape survives
+    // there), while this phase's exact pre-state lives in the snapshot dir.
+    if !bak_path(config_path).exists() {
+        std::fs::write(bak_path(config_path), &original).context("writing config .bak backup")?;
+    }
+
+    // Provider record (env-var indirection kept: the value never enters the
+    // record or the providers file).
+    let record = crate::providers::ProviderRecord {
+        id: "manifest".to_string(),
+        kind: crate::providers::ProviderKind::Manifest,
+        base_url: manifest.base_url.clone(),
+        credential_id: manifest
+            .api_key_env
+            .as_deref()
+            .map(|var| format!("env:{var}")),
+        auto: true,
+        models: Vec::new(),
+        lan_peer: false,
+        enabled: manifest.enabled,
+        monthly_budget_usd: None,
+        budget_mode: crate::providers::BudgetMode::Warn,
+    };
+    // A missing file is an empty registry; the upsert creates it (0600
+    // atomic) with the migrated record, preserving any existing providers.
+    // A disabled v1 block without a URL has nothing to preserve as an
+    // endpoint: strip the YAML but record no provider.
+    // L6-4: a `.done` marker under the snapshot root records that this
+    // migration completed once. If the marker exists, the `manifest:` block
+    // can only be here because the operator RE-ADDED it after the
+    // migration: their provider record is authoritative — never clobber
+    // the existing `manifest` entry (its models/budget edits survive).
+    let marker = root.join(".done");
+    let rerun = marker.exists();
+    let store = crate::providers::ProviderStore::load(providers_path.to_path_buf())?;
+    let preserved = rerun && store.get("manifest").is_some();
+    let recorded = if manifest.base_url.is_empty() || preserved {
+        false
+    } else {
+        store.upsert(record)?;
+        true
+    };
+
+    // Budget accumulator (0600; restart cannot reset it, calendar rollover).
+    crate::provider_budget::ProviderBudget::ensure_file(budget_path)?;
+
+    // Strip `manifest.*` from the YAML. Textual, line-preserving removal:
+    // a serde round-trip would normalize EVERY other key's spelling
+    // (e.g. a pre-p7 `llama_swap:` section would be re-emitted as `swap:`),
+    // turning a manifest-only migration into an unrelated config rewrite.
+    let source = String::from_utf8_lossy(&original);
+    let out = remove_manifest_block(&source);
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+    // Completion marker: a later boot that finds `manifest:` again sees a
+    // re-added block, not a first migration (see the record-preservation
+    // guard above). Written only after every other write succeeded.
+    std::fs::write(&marker, "v2.0-p6\n").with_context(|| format!("writing {}", marker.display()))?;
+
+    Ok(vec![format!(
+        "migrated manifest.* ({}, auto: true, models: [],          credential {}); key block removed from {} (backup: {}.bak); monthly budget ledger at          {}; pre-migration snapshot: {}",
+        if preserved {
+            "re-added after migration: existing provider 'manifest' record preserved"
+        } else if recorded {
+            "provider 'manifest' recorded"
+        } else {
+            "no URL in the disabled v1 block; no record created"
+        },
+        manifest
+            .api_key_env
+            .map(|var| format!("env:{var}"))
+            .unwrap_or_else(|| "none".to_string()),
+        config_path.display(),
+        config_path.display(),
+        budget_path.display(),
+        root.display()
+    )])
+}
+
+/// Restore `v2.0-p6`: put the pre-migration YAML back and return
+/// `providers.json` / the budget ledger to their pre-migration state.
+pub fn restore_v2_p6(
+    state_root: &Path,
+    config_path: &Path,
+    providers_path: &Path,
+    budget_path: &Path,
+) -> Result<String> {
+    let root = snapshot_root(state_root, PHASE_V2_P6);
+    let snapshot_config = root.join("config.yaml");
+    if !snapshot_config.exists() {
+        anyhow::bail!(
+            "no {PHASE_V2_P6} migration snapshot found under {}",
+            root.display()
+        );
+    }
+    let bytes = std::fs::read(&snapshot_config)
+        .with_context(|| format!("reading {}", snapshot_config.display()))?;
+    crate::plugins::store::atomic_write_0600(config_path, &bytes)
+        .with_context(|| format!("restoring config to {}", config_path.display()))?;
+    let mut restored = vec!["config YAML (v1 manifest.* block)".to_string()];
+    for (name, target, label) in [
+        (
+            crate::providers::PROVIDERS_FILE,
+            providers_path,
+            "providers store",
+        ),
+        (
+            crate::provider_budget::LEDGER_FILE,
+            budget_path,
+            "monthly budget ledger",
+        ),
+    ] {
+        let snapshot = root.join(name);
+        if snapshot.exists() {
+            let bytes = std::fs::read(&snapshot)
+                .with_context(|| format!("reading {}", snapshot.display()))?;
+            crate::plugins::store::atomic_write_0600(target, &bytes)
+                .with_context(|| format!("restoring {label} to {}", target.display()))?;
+            restored.push(label.to_string());
+        } else if target.exists() {
+            std::fs::remove_file(target)
+                .with_context(|| format!("removing {}", target.display()))?;
+            restored.push(format!("{label} (removed: absent before the migration)"));
+        }
+    }
+    // The restore returns the config to its pre-migration shape, so the
+    // completion marker goes with it: a re-run of the first migration must
+    // snapshot and record afresh.
+    let _ = std::fs::remove_file(root.join(".done"));
+
+    Ok(format!(
+        "restored {PHASE_V2_P6} from {} ({})",
+        root.display(),
+        restored.join(", ")
+    ))
+}
+
+/// The L7 phase tag: `brainrouter migration restore v2.0-p7`.
+///
+/// Renames the config section `llama_swap:` to `swap:` (every kept key moves
+/// verbatim) and removes `base_url` with a "no longer used" note. Idempotent:
+/// a file without the old section is a no-op (the same key-absence contract
+/// `v2.0-p6` uses — a restore followed by a boot re-migrates).
+pub const PHASE_V2_P7: &str = "v2.0-p7";
+
+/// The kept `swap:` keys (the enumeration the migration must preserve).
+pub const SWAP_KEPT_KEYS: &[&str] = &[
+    "fallback_model",
+    "subs_model",
+    "local_models",
+    "local_system_prompt",
+    "nudge",
+];
+
+/// The pre-migration `llama_swap:` section, read from raw YAML (runs before
+/// `config::load`, so a pre-migration file always inspects).
+#[derive(Debug, Clone)]
+pub struct V1SwapSection {
+    /// Section keys in file order (verbatim values are not decoded).
+    pub keys: Vec<String>,
+    /// `base_url` value when present (removed by the migration).
+    pub base_url: Option<String>,
+    /// `config_path`, the L7 import source, when the operator set it.
+    pub config_path: Option<PathBuf>,
+}
+
+fn read_yaml_root(config_path: &Path) -> Result<Option<YamlValue>> {
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading config for v2.0-p7"),
+    };
+    let root: YamlValue = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} for v2.0-p7", config_path.display()))?;
+    Ok(Some(root))
+}
+
+/// Read the pre-migration `llama_swap:` block (None = already migrated).
+pub fn read_v1_swap_section(config_path: &Path) -> Result<Option<V1SwapSection>> {
+    let Some(root) = read_yaml_root(config_path)? else {
+        return Ok(None);
+    };
+    let Some(value) = root.get("llama_swap") else {
+        return Ok(None);
+    };
+    // An empty/null section still needs the rename (the resulting `swap:`
+    // section then fails validation honestly on `fallback_model`).
+    let section = match value.as_mapping() {
+        Some(mapping) => mapping.clone(),
+        None => serde_yaml::Mapping::new(),
+    };
+    let section = &section;
+    let keys = section
+        .keys()
+        .filter_map(YamlValue::as_str)
+        .map(str::to_string)
+        .collect();
+    let base_url = section
+        .get(YamlValue::String("base_url".into()))
+        .and_then(YamlValue::as_str)
+        .map(str::to_string);
+    let config_path = section
+        .get(YamlValue::String("config_path".into()))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    Ok(Some(V1SwapSection {
+        keys,
+        base_url,
+        config_path,
+    }))
+}
+
+/// The L7 catalog import source: `swap.config_path` (or its pre-migration
+/// spelling), defaulting to the llama-swap default path.
+pub fn read_swap_config_path(config_path: &Path) -> Result<PathBuf> {
+    let Some(root) = read_yaml_root(config_path)? else {
+        return Ok(crate::config::default_import_config_path());
+    };
+    for section in ["swap", "llama_swap"] {
+        if let Some(value) = root
+            .get(section)
+            .and_then(|s| s.get("config_path"))
+            .and_then(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(PathBuf::from(value));
+        }
+    }
+    Ok(crate::config::default_import_config_path())
+}
+
+/// `--dry-run` preview for `v2.0-p7` — describes the rename, never writes.
+pub fn preview_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P7} (state untouched)"));
+    match read_v1_swap_section(config_path)? {
+        Some(section) => {
+            lines.push(format!(
+                "  would rename llama_swap: → swap: in {} (keys verbatim: {})",
+                config_path.display(),
+                section.keys.join(", ")
+            ));
+            match section.base_url.as_deref() {
+                Some(base_url)
+                    if base_url.trim().is_empty()
+                        || base_url.trim_end_matches('/')
+                            == crate::config::DEFAULT_SHIM_BASE_URL.trim_end_matches('/') =>
+                {
+                    lines.push(format!(
+                        "  would remove swap.base_url ({base_url}) — no longer used: the shim URL \
+                         has a fixed default and native mode uses the supervisor"
+                    ));
+                }
+                Some(base_url) => lines.push(format!(
+                    "  would keep swap.base_url ({base_url}) — a non-default shim endpoint is \
+                     honored (deprecated; drop it once the shim is deleted)"
+                )),
+                None => {}
+            }
+            lines.push(format!(
+                "  would snapshot the pre-migration config under {}",
+                snapshot_root(state_root, PHASE_V2_P7).display()
+            ));
+        }
+        None => lines.push(format!(
+            "  no llama_swap: section in {} — migration {PHASE_V2_P7} has nothing to do",
+            config_path.display()
+        )),
+    }
+    Ok(lines)
+}
+
+fn base_url_note(base_url: Option<&str>, keeps_base_url: bool) -> String {
+    match base_url {
+        Some(value) if keeps_base_url => {
+            format!("kept: non-default endpoint {value} — deprecated")
+        }
+        Some(_) => "dropped with a migration note".to_string(),
+        None => "absent".to_string(),
+    }
+}
+
+/// Rename the top-level `llama_swap:` section header to `swap:` in text,
+/// byte-preserving every other line. `None` when the file is not safe for
+/// the textual edit: a top-level `swap:` already exists (merge semantics
+/// belong to the structured path) or the section header carries an inline
+/// value / is not a plain column-0 `llama_swap:` mapping opener.
+fn text_rename_llama_swap(original: &str, drop_base_url: bool) -> Option<String> {
+    if original.lines().any(|line| line.starts_with("swap:"))
+        || !original.lines().any(|line| line == "llama_swap:")
+    {
+        return None;
+    }
+    let top_level_key = |line: &str| {
+        !line.is_empty()
+            && !line.starts_with([' ', '\t', '#', '-'])
+            && line.split_once(':').is_some()
+    };
+    let mut out = String::with_capacity(original.len());
+    let mut in_section = false;
+    let mut dropped_base_url = false;
+    for line in original.lines() {
+        if line == "llama_swap:" {
+            out.push_str(
+                "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n\
+                 # (every kept key moved verbatim; see docs/design/v2-streamlining.L7.log.md).\n",
+            );
+            out.push_str("swap:\n");
+            in_section = true;
+            continue;
+        }
+        if in_section && top_level_key(line) {
+            in_section = false;
+        }
+        if in_section && drop_base_url {
+            if line.starts_with("  base_url:") {
+                dropped_base_url = true;
+                continue;
+            }
+            // ONLY contiguous deeper-indented lines continue a removed block
+            // scalar — any other line ends the removal. (Without the reset,
+            // the first nested key under a later mapping was eaten.)
+            if dropped_base_url && line.starts_with("    ") && !line.trim().is_empty() {
+                continue;
+            }
+        }
+        dropped_base_url = false;
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// The `v2.0-p7` migration: `llama_swap:` ⇒ `swap:` (kept keys move verbatim,
+/// `base_url` dropped with a note). Snapshot + `.bak` first. Idempotent.
+pub fn run_v2_p7(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let Some(section) = read_v1_swap_section(config_path)? else {
+        return Ok(Vec::new());
+    };
+    let original = std::fs::read(config_path)
+        .with_context(|| format!("reading {} for v2.0-p7", config_path.display()))?;
+    let mut root: YamlValue =
+        serde_yaml::from_slice(&original).context("re-parsing config YAML for v2.0-p7")?;
+
+    // Snapshot the exact pre-migration YAML (stable per-phase directory).
+    let snapshot_dir = snapshot_root(state_root, PHASE_V2_P7);
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+    let _ = std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700));
+    crate::plugins::store::atomic_write_0600(&snapshot_dir.join("config.yaml"), &original)?;
+
+    // `.bak` sidecar (oldest pre-migration copy; never clobbered).
+    if !bak_path(config_path).exists() {
+        std::fs::write(bak_path(config_path), &original).context("writing config .bak backup")?;
+    }
+
+    let old = root
+        .get("llama_swap")
+        .cloned()
+        .unwrap_or(YamlValue::Null);
+    let mut moved = match old {
+        YamlValue::Mapping(map) => map,
+        _ => serde_yaml::Mapping::new(),
+    };
+    // `base_url` dies for the default shim endpoint; a NON-default value is an
+    // operator's deliberate endpoint (and the frozen v1 fixtures' mock port),
+    // so it survives with the deprecation note — the shim floor stays
+    // byte-identical until the deletion pass.
+    let keeps_base_url = section
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| {
+            value.trim_end_matches('/') != crate::config::DEFAULT_SHIM_BASE_URL.trim_end_matches('/')
+        });
+
+    // Textual rename first: the structured path below re-serializes the WHOLE
+    // file through serde_yaml, silently rewriting every comment, key order,
+    // quote style, and anchor in the operator's config. The rename only needs
+    // to touch the section header (and possibly one `base_url` line), so do
+    // it in text and leave everything else byte-identical (the p6 approach).
+    if let Some(text) = text_rename_llama_swap(
+        std::str::from_utf8(&original).context("config YAML is not UTF-8")?,
+        !keeps_base_url,
+    ) {
+        crate::plugins::store::atomic_write_0600(config_path, text.as_bytes())
+            .context("writing migrated config YAML")?;
+        return Ok(vec![format!(
+            "renamed llama_swap: → swap: in {} (textual rename; other lines, comments, and \
+             ordering untouched); swap.base_url: {}; pre-migration snapshot: {}",
+            config_path.display(),
+            base_url_note(section.base_url.as_deref(), keeps_base_url),
+            snapshot_dir.display()
+        )]);
+    }
+    if !keeps_base_url {
+        moved.remove(YamlValue::String("base_url".into()));
+    }
+    let map = root
+        .as_mapping_mut()
+        .context("config YAML root is not a mapping")?;
+    map.remove(YamlValue::String("llama_swap".into()));
+    // If a `swap:` section already exists, its values win; missing keys move
+    // over from the old section.
+    let existing_base_url = map
+        .get(YamlValue::String("swap".into()))
+        .and_then(|s| s.get("base_url"))
+        .is_some();
+    let mut merged = match map
+        .get(YamlValue::String("swap".into()))
+        .and_then(YamlValue::as_mapping)
+        .cloned()
+    {
+        Some(existing) => {
+            let mut existing = existing;
+            for (key, value) in moved {
+                existing.entry(key).or_insert(value);
+            }
+            existing
+        }
+        None => moved,
+    };
+    // The drop decision may only act on the OLD section's value: an
+    // `base_url` the operator already spells under `swap:` is their current
+    // config, not migration residue.
+    if !keeps_base_url && !existing_base_url {
+        merged.remove(YamlValue::String("base_url".into()));
+    }
+    map.insert(YamlValue::String("swap".into()), YamlValue::Mapping(merged));
+
+    // Structured merge fallback (a top-level `swap:` section already exists,
+    // or the section is not a plain column-0 mapping header).
+    let mut out = String::from(
+        "# v2.0-p7 migration: the former llama_swap section was renamed to swap\n# (keys merged; see docs/design/v2-streamlining.L7.log.md).\n",
+    );
+    out.push_str(&serde_yaml::to_string(&root).context("serializing migrated config YAML")?);
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+
+    let kept: Vec<&str> = section
+        .keys
+        .iter()
+        .filter(|key| SWAP_KEPT_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    Ok(vec![format!(
+        "renamed llama_swap: → swap: in {} (kept keys verbatim: {}); swap.base_url: {}; \
+         pre-migration snapshot: {}",
+        config_path.display(),
+        kept.join(", "),
+        base_url_note(section.base_url.as_deref(), keeps_base_url),
+        snapshot_dir.display()
+    )])
+}
+
+/// Restore `v2.0-p7`: put the pre-migration YAML back (the `llama_swap:`
+/// section returns with `base_url`).
+pub fn restore_v2_p7(state_root: &Path, config_path: &Path) -> Result<String> {
+    let root = snapshot_root(state_root, PHASE_V2_P7);
+    let snapshot_config = root.join("config.yaml");
+    if !snapshot_config.exists() {
+        anyhow::bail!(
+            "no {PHASE_V2_P7} migration snapshot found under {}",
+            root.display()
+        );
+    }
+    let bytes = std::fs::read(&snapshot_config)
+        .with_context(|| format!("reading {}", snapshot_config.display()))?;
+    crate::plugins::store::atomic_write_0600(config_path, &bytes)
+        .with_context(|| format!("restoring config to {}", config_path.display()))?;
+    Ok(format!(
+        "restored {PHASE_V2_P7} from {} (config YAML: llama_swap: section + base_url)",
+        root.display()
+    ))
+}
+
+/// The L4 phase tag: `brainrouter migration restore v2.0-p4`. On first boot it
+/// imports the live llama-swap `config.yaml` into `swap_catalog.json`
+/// (snapshot + dry-run + restore, one stable snapshot directory per phase —
+/// the v2.0-p3 shape).
+pub const PHASE_V2_P4: &str = "v2.0-p4";
+pub const SNAPSHOT_SWAP_CATALOG_FILE: &str = "swap_catalog.json";
+pub const SNAPSHOT_BUDGET_FILE: &str = "budget.json";
+
+/// `--dry-run` preview for `v2.0-p4` — describes the import, never writes.
+pub fn preview_v2_p4(
+    llama_swap_config_path: &Path,
+    state_root: &Path,
+    catalog_path: &Path,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P4} (state untouched)"));
+    if !llama_swap_config_path.exists() {
+        lines.push(format!(
+            "  no llama-swap config at {} — import would be a no-op",
+            llama_swap_config_path.display()
+        ));
+        return Ok(lines);
+    }
+    match crate::swap_catalog::import_llama_swap_file(llama_swap_config_path) {
+        Ok(plan) => lines.extend(plan.summary_lines()),
+        Err(e) => lines.push(format!("  llama-swap config unreadable: {e}")),
+    }
+    if catalog_path.exists() {
+        match crate::swap_catalog::SwapCatalog::load(catalog_path.to_path_buf()) {
+            Ok(catalog) if catalog.migration_done(PHASE_V2_P4) => lines.push(format!(
+                "  {} already carries the {PHASE_V2_P4} marker — nothing to do",
+                catalog_path.display()
+            )),
+            Ok(_) => lines.push(format!(
+                "  would merge into {} (CLI-added entries are preserved)",
+                catalog_path.display()
+            )),
+            Err(e) => lines.push(format!("  existing catalog unreadable: {e}")),
+        }
+    } else {
+        lines.push(format!(
+            "  would create {}",
+            catalog_path.display()
+        ));
+    }
+    lines.push(format!(
+        "  would snapshot the pre-migration catalog + budget under {}",
+        snapshot_root(state_root, PHASE_V2_P4).display()
+    ));
+    Ok(lines)
+}
+
+/// The `v2.0-p4` migration: import the live llama-swap config into the swap
+/// catalog. Idempotent (a catalog already carrying the phase marker is a
+/// no-op); snapshots the pre-migration catalog + budget ledger first.
+pub fn run_v2_p4(
+    llama_swap_config_path: &Path,
+    state_root: &Path,
+    catalog_path: &Path,
+    budget_path: &Path,
+) -> Result<Vec<String>> {
+    let catalog = crate::swap_catalog::SwapCatalog::load(catalog_path.to_path_buf())?;
+    if catalog.migration_done(PHASE_V2_P4) {
+        return Ok(Vec::new());
+    }
+    if !llama_swap_config_path.exists() {
+        // No llama-swap here (e.g. a native-only host): nothing to import, and
+        // no marker — a later config appearing still migrates on some boot.
+        return Ok(Vec::new());
+    }
+    let plan = crate::swap_catalog::import_llama_swap_file(llama_swap_config_path)?;
+    let snapshot_dir = snapshot_root(state_root, PHASE_V2_P4);
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+    let _ = std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700));
+    for (source, name) in [
+        (catalog_path, SNAPSHOT_SWAP_CATALOG_FILE),
+        (budget_path, SNAPSHOT_BUDGET_FILE),
+    ] {
+        if source.exists() {
+            let bytes = std::fs::read(source)
+                .with_context(|| format!("reading {} for snapshot", source.display()))?;
+            crate::plugins::store::atomic_write_0600(&snapshot_dir.join(name), &bytes)?;
+        }
+    }
+    let outcome = catalog.apply_import(&plan)?;
+    catalog.mark_migration(PHASE_V2_P4)?;
+    Ok(vec![format!(
+        "imported llama-swap config {} into {} (added {}, updated {}, unchanged {}, skipped {} CLI-owned);          pre-migration snapshot: {}",
+        llama_swap_config_path.display(),
+        catalog_path.display(),
+        outcome.added,
+        outcome.updated,
+        outcome.unchanged,
+        outcome.skipped.len(),
+        snapshot_dir.display()
+    )])
+}
+
+/// Restore `v2.0-p4`: put the pre-migration catalog + budget ledger back
+/// (absent in the snapshot = remove, the pre-migration state).
+pub fn restore_v2_p4(
+    state_root: &Path,
+    catalog_path: &Path,
+    budget_path: &Path,
+) -> Result<String> {
+    let latest = newest_snapshot(PHASE_V2_P4, state_root)?.with_context(|| {
+        format!(
+            "no {PHASE_V2_P4} migration snapshot found under {}",
+            snapshot_root(state_root, PHASE_V2_P4).display()
+        )
+    })?;
+    let mut restored = Vec::new();
+    for (name, target, label) in [
+        (
+            SNAPSHOT_SWAP_CATALOG_FILE,
+            catalog_path,
+            "swap catalog",
+        ),
+        (SNAPSHOT_BUDGET_FILE, budget_path, "budget ledger"),
+    ] {
+        let snapshot = latest.join(name);
+        if snapshot.exists() {
+            std::fs::copy(&snapshot, target)
+                .with_context(|| format!("restoring {label} to {}", target.display()))?;
+            restored.push(label);
+        } else if target.exists() {
+            std::fs::remove_file(target)
+                .with_context(|| format!("removing {} (absent before the migration)", target.display()))?;
+            restored.push(match label {
+                "swap catalog" => "swap catalog (removed: absent before the migration)",
+                _ => "budget ledger (removed: absent before the migration)",
+            });
+        }
+    }
+    if restored.is_empty() {
+        anyhow::bail!("snapshot {} contains no restorable swap state", latest.display());
+    }
+    Ok(format!(
+        "restored {PHASE_V2_P4} from {} ({})",
+        latest.display(),
+        restored.join(", ")
+    ))
+}
+
 /// `--dry-run` preview: describe exactly what the `v2.0-p2` migration would
 /// do, without touching any state. Token values are never rendered.
 pub fn preview_v2_p2(
@@ -487,6 +1294,28 @@ pub fn restore(
     state_root: &Path,
     config_dir: &Path,
 ) -> Result<String> {
+    // v2 L6: p6 owns the config YAML + providers.json + the monthly ledger.
+    if phase == PHASE_V2_P6 {
+        return restore_v2_p6(
+            state_root,
+            config_path,
+            &crate::providers::default_path(),
+            &crate::provider_budget::default_path(),
+        );
+    }
+    // v2 L7: p7 owns the config YAML only (section rename).
+    if phase == PHASE_V2_P7 {
+        return restore_v2_p7(state_root, config_path);
+    }
+    // v2 L4: the p4 snapshot holds swap state only (no config/credentials/
+    // cards); restoring it must not touch those unrelated files.
+    if phase == PHASE_V2_P4 {
+        return restore_v2_p4(
+            state_root,
+            &state_root.join(crate::swap_catalog::CATALOG_FILE),
+            &state_root.join(crate::swap_scheduler::BUDGET_FILE),
+        );
+    }
     let latest = newest_snapshot(phase, state_root)?.with_context(|| {
         format!(
             "no {phase} migration snapshot found under {}",
@@ -596,7 +1425,12 @@ pub fn newest_snapshot(phase: &str, state_root: &Path) -> Result<Option<PathBuf>
     // timestamps). Accept the legacy timestamped layout too (restore of a
     // pre-B1 state dir): if the phase root directly contains a snapshot
     // file, it IS the snapshot.
-    if root.join(SNAPSHOT_CONFIG_FILE).exists() {
+    // The phase root IS the snapshot for the stable layout. p2/p3 carry a
+    // config snapshot; p4 carries swap state only — accept either marker.
+    if root.join(SNAPSHOT_CONFIG_FILE).exists()
+        || root.join(SNAPSHOT_SWAP_CATALOG_FILE).exists()
+        || root.join(SNAPSHOT_BUDGET_FILE).exists()
+    {
         return Ok(Some(root));
     }
     let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
@@ -702,6 +1536,18 @@ fn bak_path(config_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_block_removal_is_byte_preserving() {
+        let yaml = "manifest:\n  enabled: true\n  base_url: http://x/v1\nllama_swap:\n  port: 8081\n# tail\n";
+        let out = super::remove_manifest_block(yaml);
+        assert_eq!(out, "llama_swap:\n  port: 8081\n# tail\n");
+        let inline = "manifest: {enabled: false}\nmodels:\n  dir: /m\n";
+        assert_eq!(super::remove_manifest_block(inline), "models:\n  dir: /m\n");
+        let absent = "models:\n  dir: /m\n";
+        assert_eq!(super::remove_manifest_block(absent), absent);
+    }
+
+
     use super::*;
 
     fn v1_yaml(token: &str) -> String {
@@ -919,4 +1765,344 @@ mod tests {
         assert!(!dir.path().join("state").exists());
         assert!(std::fs::read_to_string(&config).unwrap().contains("TOK-DRY"));
     }
+    // ── v2.0-p4 (L4 swap catalog import) ───────────────────────────────────
+
+    fn llama_swap_fixture() -> &'static str {
+        r#"
+startPort: 5800
+macros:
+  ls: /usr/bin/llama-server
+  common: >-
+    --jinja -ngl 999
+groups:
+  pair:
+    swap: false
+    members: [m1, m2]
+models:
+  m1:
+    cmd: |
+      ${ls} --port ${PORT} ${common} --model /models/m1.gguf
+  m2:
+    cmd: |
+      ${ls} --port ${PORT} --model /models/m2.gguf
+"#
+    }
+
+    #[test]
+    fn p4_imports_once_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let llama = dir.path().join("llama-swap.yaml");
+        std::fs::write(&llama, llama_swap_fixture()).unwrap();
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let budget_path = dir.path().join(crate::swap_scheduler::BUDGET_FILE);
+
+        // Pre-migration state: one CLI-owned entry.
+        let mut cli_entry = crate::swap_catalog::CatalogEntry::default();
+        cli_entry.id = "cli-model".into();
+        cli_entry.files = vec!["/models/cli.gguf".into()];
+        let catalog = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        catalog.upsert_entry(cli_entry).unwrap();
+
+        let actions = run_v2_p4(&llama, &state, &catalog_path, &budget_path).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let after_import = std::fs::read_to_string(&catalog_path).unwrap();
+        let loaded = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        assert!(loaded.migration_done(PHASE_V2_P4));
+        assert_eq!(loaded.entries().len(), 3, "two imported + one CLI entry");
+        assert!(loaded.entry("m1").is_some() && loaded.entry("m2").is_some());
+        assert_eq!(loaded.groups().get("pair").unwrap().members.len(), 2);
+
+        // Second boot: one-shot no-op, bytes untouched.
+        let actions = run_v2_p4(&llama, &state, &catalog_path, &budget_path).unwrap();
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(std::fs::read_to_string(&catalog_path).unwrap(), after_import);
+
+        // Mutate, then restore the pre-migration catalog (CLI entry only).
+        std::fs::write(&catalog_path, "{}").unwrap();
+        let msg = restore_v2_p4(&state, &catalog_path, &budget_path).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        let restored = crate::swap_catalog::SwapCatalog::load(catalog_path.clone()).unwrap();
+        assert_eq!(restored.entries().len(), 1);
+        assert!(restored.entry("cli-model").is_some());
+    }
+
+    #[test]
+    fn p4_dry_run_is_inert_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let llama = dir.path().join("llama-swap.yaml");
+        std::fs::write(&llama, llama_swap_fixture()).unwrap();
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let first = preview_v2_p4(&llama, &state, &catalog_path).unwrap();
+        let second = preview_v2_p4(&llama, &state, &catalog_path).unwrap();
+        assert_eq!(first, second);
+        let text = first.join("\n");
+        assert!(text.contains("would import 2 model"), "{text}");
+        assert!(text.contains("dry-run"));
+        assert!(!state.exists(), "dry-run writes no state");
+        assert!(!catalog_path.exists(), "dry-run writes no catalog");
+    }
+
+    fn p7_config() -> &'static str {
+        "manifest:\n  enabled: false\n  base_url: \"http://localhost:3001/v1\"\nllama_swap:\n  base_url: \"http://localhost:8081/v1\"\n  fallback_model: dirk-main\n  subs_model: dirk-subs\n  local_models:\n    - dirk-main\n    - dirk-subs\n  local_system_prompt: /tmp/prompt.md\n  nudge:\n    enabled: true\n    model_key: dirk-nudge\n    budgets:\n      light: 10240\n      deep: 12288\n"
+    }
+
+    #[test]
+    fn p7_renames_the_section_verbatim_and_drops_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        let actions = run_v2_p7(&config, &state).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(actions[0].contains("renamed"), "{actions:?}");
+
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(
+            root.get("llama_swap").is_none(),
+            "old section must be absent post-migration"
+        );
+        let swap = root.get("swap").expect("swap: section");
+        assert_eq!(
+            swap.get("fallback_model").and_then(YamlValue::as_str),
+            Some("dirk-main")
+        );
+        assert_eq!(
+            swap.get("subs_model").and_then(YamlValue::as_str),
+            Some("dirk-subs")
+        );
+        assert_eq!(
+            swap.get("local_system_prompt").and_then(YamlValue::as_str),
+            Some("/tmp/prompt.md")
+        );
+        assert_eq!(
+            swap.get("nudge")
+                .and_then(|n| n.get("model_key"))
+                .and_then(YamlValue::as_str),
+            Some("dirk-nudge")
+        );
+        assert_eq!(
+            swap.get("nudge")
+                .and_then(|n| n.get("budgets"))
+                .and_then(|b| b.get("deep"))
+                .and_then(YamlValue::as_u64),
+            Some(12288)
+        );
+        assert!(
+            swap.get("base_url").is_none(),
+            "base_url is removed (no longer used)"
+        );
+        // Snapshot + `.bak` hold the pre-migration bytes.
+        let snapshot = snapshot_root(&state, PHASE_V2_P7).join("config.yaml");
+        assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), p7_config());
+        assert_eq!(
+            std::fs::read_to_string(config.with_extension("yaml.bak")).unwrap(),
+            p7_config()
+        );
+    }
+
+    #[test]
+    fn p7_rename_is_textual_and_preserves_comments_and_ordering() {
+        // serde_yaml re-serialization would have wiped every comment, quote
+        // style, and the operator's key ordering. The rename may only touch
+        // the section header line and the dropped base_url line.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        let source = "# top comment — operator kept\nmanifest:\n  enabled: false\nllama_swap:\n  # keep me\n  base_url: \"http://localhost:8081/v1\"\n  subs_model: 'dirk-subs' # trailing comment\n  fallback_model: dirk-main\nlogging:\n  level: debug\n";
+        std::fs::write(&config, source).unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(after.contains("# top comment — operator kept"), "{after}");
+        assert!(after.contains("  # keep me"), "{after}");
+        assert!(after.contains("'dirk-subs' # trailing comment"), "{after}");
+        assert!(!after.contains("base_url"), "{after}");
+        // Order: manifest, swap (with its keys in the original relative
+        // order: subs_model before fallback_model), logging.
+        let pos = |needle: &str| after.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(pos("manifest:") < pos("swap:"));
+        assert!(pos("subs_model") < pos("fallback_model"));
+        assert!(pos("swap:") < pos("logging:"));
+        // Everything outside the edit points is byte-identical.
+        assert!(after.contains("  subs_model: 'dirk-subs' # trailing comment\n  fallback_model: dirk-main\nlogging:\n  level: debug\n"), "{after}");
+    }
+
+    #[test]
+    fn p7_keeps_a_non_default_shim_endpoint() {
+        // The frozen v1 fixtures point `base_url` at a mock port; dropping it
+        // would silently repoint the shim. A non-default endpoint survives
+        // (deprecated) so the shim floor stays byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "llama_swap:\n  base_url: \"http://127.0.0.1:19999/v1\"\n  fallback_model: m\n",
+        )
+        .unwrap();
+        let actions = run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        assert!(actions[0].contains("kept"), "{actions:?}");
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let swap = root.get("swap").expect("swap: section");
+        assert_eq!(
+            swap.get("base_url").and_then(YamlValue::as_str),
+            Some("http://127.0.0.1:19999/v1")
+        );
+        let loaded = crate::config::load(&config).unwrap();
+        assert_eq!(loaded.swap.shim_base_url(), "http://127.0.0.1:19999/v1");
+    }
+
+    #[test]
+    fn p7_is_idempotent_and_boots_as_the_new_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let after_first = std::fs::read_to_string(&config).unwrap();
+        assert!(run_v2_p7(&config, &dir.path().join("state"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), after_first);
+        // The migrated file parses through the live config loader.
+        let loaded = crate::config::load(&config).unwrap();
+        assert_eq!(loaded.swap.fallback_model, "dirk-main");
+        assert_eq!(loaded.swap.mode, crate::config::SwapMode::Shim);
+    }
+
+    #[test]
+    fn p7_dry_run_is_inert_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        let first = preview_v2_p7(&config, &state).unwrap();
+        let second = preview_v2_p7(&config, &state).unwrap();
+        assert_eq!(first, second);
+        let text = first.join("\n");
+        assert!(text.contains("llama_swap: → swap:"), "{text}");
+        assert!(text.contains("no longer used"), "{text}");
+        assert!(!state.exists(), "dry-run writes no state");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), p7_config());
+    }
+
+    #[test]
+    fn p7_restore_round_trips_the_old_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p7_config()).unwrap();
+        let state = dir.path().join("state");
+        run_v2_p7(&config, &state).unwrap();
+        std::fs::write(&config, "swap:\n  fallback_model: mutated\n").unwrap();
+        let msg = restore_v2_p7(&state, &config).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), p7_config());
+    }
+
+    #[test]
+    fn p7_merges_into_an_existing_swap_section_without_losing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "swap:\n  mode: native\n  fallback_model: new-main\nllama_swap:\n  fallback_model: old-main\n  subs_model: old-subs\n  base_url: http://localhost:8081/v1\n",
+        )
+        .unwrap();
+        run_v2_p7(&config, &dir.path().join("state")).unwrap();
+        let root: YamlValue =
+            serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(root.get("llama_swap").is_none());
+        let swap = root.get("swap").unwrap();
+        assert_eq!(
+            swap.get("mode").and_then(YamlValue::as_str),
+            Some("native"),
+            "existing values win"
+        );
+        assert_eq!(
+            swap.get("fallback_model").and_then(YamlValue::as_str),
+            Some("new-main")
+        );
+        assert_eq!(
+            swap.get("subs_model").and_then(YamlValue::as_str),
+            Some("old-subs"),
+            "missing keys move over"
+        );
+        assert!(swap.get("base_url").is_none());
+    }
+
+    #[test]
+    fn p7_import_path_reads_the_new_and_old_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "swap:\n  config_path: /opt/ai/llama-swap/config.yaml\n  fallback_model: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_swap_config_path(&config).unwrap(),
+            PathBuf::from("/opt/ai/llama-swap/config.yaml")
+        );
+        std::fs::write(
+            &config,
+            "llama_swap:\n  config_path: /srv/llama-swap.yaml\n  fallback_model: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_swap_config_path(&config).unwrap(),
+            PathBuf::from("/srv/llama-swap.yaml")
+        );
+        // (`swap.mode` parsing itself is covered by config::tests — a raw
+        // second reader of the same key would only drift.)
+    }
+
+    /// L6-4: after p6 ran once, a RE-ADDED `manifest:` block must not
+    /// clobber the operator's edited `manifest` provider record, and the
+    /// restore must remove the completion marker.
+    #[test]
+    fn p6_readded_manifest_preserves_the_operator_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let config = dir.path().join("config.yaml");
+        let providers = dir.path().join("providers.json");
+        let budget = dir.path().join("budget.json");
+        let v1 = "manifest:\n  base_url: http://127.0.0.1:3001/v1\n  enabled: true\n";
+        std::fs::write(&config, v1).unwrap();
+
+        run_v2_p6(&config, &state, &providers, &budget).unwrap();
+        assert!(snapshot_root(&state, PHASE_V2_P6).join(".done").exists(), "marker written");
+
+        // The operator edits the migrated record (models + budget).
+        let mut text = std::fs::read_to_string(&providers).unwrap();
+        text = text.replace(
+            "\"models\": []",
+            "\"models\": [{\"id\": \"opus-4.5\"}]",
+        );
+        std::fs::write(&providers, text).unwrap();
+
+        // The operator re-adds the manifest block; boot re-runs p6.
+        std::fs::write(&config, v1).unwrap();
+        run_v2_p6(&config, &state, &providers, &budget).unwrap();
+        let kept = std::fs::read_to_string(&providers).unwrap();
+        assert!(kept.contains("opus-4.5"), "operator record survives the re-add: {kept}");
+        assert!(!std::fs::read_to_string(&config).unwrap().contains("manifest:"), "block stripped again");
+
+        // Restore: pre-migration YAML back, marker gone.
+        restore_v2_p6(&state, &config, &providers, &budget).unwrap();
+        assert!(std::fs::read_to_string(&config).unwrap().contains("manifest:"), "v1 back");
+        assert!(!snapshot_root(&state, PHASE_V2_P6).join(".done").exists(), "marker removed");
+    }
+
+    #[test]
+    fn p4_without_a_llama_swap_config_is_a_quiet_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let catalog_path = dir.path().join(crate::swap_catalog::CATALOG_FILE);
+        let budget_path = dir.path().join(crate::swap_scheduler::BUDGET_FILE);
+        let actions = run_v2_p4(&dir.path().join("missing.yaml"), &state, &catalog_path, &budget_path).unwrap();
+        assert!(actions.is_empty());
+        assert!(!catalog_path.exists());
+    }
+
+
 }

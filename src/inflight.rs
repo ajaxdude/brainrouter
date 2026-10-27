@@ -79,6 +79,10 @@ pub struct InflightRow {
     pub generated_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// v2 L4 additive: the swap-catalog id routed/queued for this row. LRU
+    /// eviction matches on it; absent for non-swap rows (v1 behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -104,6 +108,9 @@ pub struct InflightEntry {
     pub generated_tokens: AtomicU64,
     /// Requested or slot-reported output-token ceiling; zero means unknown.
     pub max_tokens: AtomicU64,
+    /// v2 L4 additive: catalog id + clean-completion flag for the LRU clock.
+    catalog_id: std::sync::Mutex<Option<String>>,
+    stream_completed: AtomicBool,
     cancelled: AtomicBool,
     cancel_tx: watch::Sender<bool>,
     started_ms: AtomicU64,
@@ -133,6 +140,30 @@ impl InflightHandle {
         if activity_rank(code) >= activity_rank(cur) {
             self.entry.activity.store(code, AtomicOrdering::Relaxed);
         }
+    }
+
+    /// v2 L4 additive: stamp the swap-catalog id (route/queue time). The
+    /// scheduler's LRU matches on this, never on alias-window strings.
+    pub fn set_catalog_id(&self, catalog_id: impl Into<String>) {
+        *self
+            .entry
+            .catalog_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(catalog_id.into());
+    }
+
+    pub fn catalog_id(&self) -> Option<String> {
+        self.entry
+            .catalog_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Mark a clean stream end (called by [`SniffStream`] on EOF). Only a
+    /// completed stream writes the registry clock; cancellations do not.
+    pub fn mark_stream_completed(&self) {
+        self.entry.stream_completed.store(true, AtomicOrdering::SeqCst);
     }
 
     pub fn set_model(&self, model: String) {
@@ -179,6 +210,18 @@ impl std::fmt::Debug for InflightHandle {
 
 impl Drop for InflightHandle {
     fn drop(&mut self) {
+        // v2 L4 additive: the registry clock is "last STREAM COMPLETION".
+        if self.entry.stream_completed.load(AtomicOrdering::SeqCst) {
+            let catalog_id = self
+                .entry
+                .catalog_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(id) = catalog_id {
+                self.registry.notify_completed(&id);
+            }
+        }
         self.registry.remove(self.entry.id);
     }
 }
@@ -186,6 +229,8 @@ impl Drop for InflightHandle {
 pub struct InflightRegistry {
     entries: std::sync::Mutex<Vec<Arc<InflightEntry>>>,
     next_id: AtomicU64,
+    /// v2 L4 additive: completion hook (the swap registry's LRU clock).
+    on_stream_completed: std::sync::Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl Default for InflightRegistry {
@@ -207,6 +252,7 @@ impl InflightRegistry {
         Self {
             entries: std::sync::Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            on_stream_completed: std::sync::Mutex::new(None),
         }
     }
 
@@ -235,6 +281,11 @@ impl InflightRegistry {
                     0 => None,
                     value => Some(value),
                 },
+                catalog_id: e
+                    .catalog_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
             })
             .collect()
     }
@@ -285,6 +336,26 @@ impl InflightRegistry {
         }
     }
 
+    /// v2 L4 additive: install the completion sink (the swap registry's LRU
+    /// clock). One hook per registry; replacing it is intentional.
+    pub fn set_completion_hook(&self, hook: Arc<dyn Fn(&str) + Send + Sync>) {
+        *self
+            .on_stream_completed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    fn notify_completed(&self, catalog_id: &str) {
+        let hook = self
+            .on_stream_completed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(catalog_id);
+        }
+    }
+
     pub fn json(&self) -> serde_json::Value {
         json!({ "requests": self.snapshot() })
     }
@@ -317,6 +388,8 @@ impl InflightRegistry {
             pp_progress: AtomicU64::new(0f64.to_bits()),
             generated_tokens: AtomicU64::new(0),
             max_tokens: AtomicU64::new(max_tokens.unwrap_or(0) as u64),
+            catalog_id: std::sync::Mutex::new(None),
+            stream_completed: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             cancel_tx,
             started_ms: AtomicU64::new(now_ms()),
@@ -426,6 +499,9 @@ where
             }
             Poll::Ready(None) => {
                 s.finished = true;
+                // v2 L4 additive: clean EOF is a stream completion (the
+                // handle's Drop writes the LRU clock).
+                s.handle.mark_stream_completed();
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,

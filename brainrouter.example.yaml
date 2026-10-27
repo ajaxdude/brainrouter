@@ -19,9 +19,19 @@ manifest:
   # NOT the key itself — the daemon does std::env::var(api_key_env).
   api_key_env: MANIFEST_API_KEY
 
-llama_swap:
-  # URL of your llama-swap instance
-  base_url: "http://localhost:8081/v1"
+# v2 L7 `swap:` section (pre-v2.0-p7 name: `llama_swap:`; the migration renames
+# it in place — key values move verbatim and `base_url` is dropped, because the
+# shim URL is fixed and native mode uses the swap supervisor).
+swap:
+  # Which engine serves local traffic:
+  #   shim   — llama-swap (today's behavior; the default)
+  #   native — the swap supervisor (boot refuses while the shim holds loaded
+  #            models: flush them, then restart)
+  mode: shim
+  # Import source for the native catalog (the llama-swap config to take over).
+  # Default: ~/.config/llama-swap/config.yaml. Fedora hosts point this at the
+  # docker-mounted file, e.g. /opt/ai/llama-swap/config.yaml.
+  # config_path: "/opt/ai/llama-swap/config.yaml"
   # Model key to use when Manifest fails, or when Bonsai picks Local
   # without a specific model. Must match a key in your llama-swap config.
   fallback_model: "your-local-model-key"

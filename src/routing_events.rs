@@ -118,6 +118,48 @@ pub struct RouteEvent {
     /// v2 L3 additive: the model the route actually chose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_model: Option<String>,
+    /// v2 L4 additive: the swap supervisor's lifecycle state for the routed
+    /// model (`ready`/`loading`) when the catalog owned the route. Carried,
+    /// not rendered, until the Engines tab consumes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_state: Option<String>,
+    /// v2 L4 additive: where the residency came from (`shim`/`native`/
+    /// `container`/`external`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_source: Option<String>,
+    /// v2 L6 additive: the provider registry id that served (or was
+    /// attempted for) this route. `effective_provider` keeps the v1 spelling
+    /// for the migrated manifest (`manifest`) and llama-swap (`llama-swap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// v2 L6 additive: the LAN hop for provider routes with a non-loopback
+    /// base_url (`{host, endpoint}`); absent for loopback providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<HopInfo>,
+    /// v2 L6 additive: the budget guard's state for this request
+    /// (`warn`-mode over-budget badge/event; `stop` refusals).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetEvent>,
+}
+
+/// v2 L6: a provider route's network hop (Sankey renders it).
+#[derive(Debug, Clone, Serialize)]
+pub struct HopInfo {
+    pub host: String,
+    pub endpoint: String,
+}
+
+/// v2 L6: the budget guard's record for one request.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetEvent {
+    pub provider: String,
+    /// `warn` or `stop`.
+    pub mode: String,
+    /// `ok` or `over`.
+    pub state: String,
+    pub month: String,
+    pub spent_usd: f64,
+    pub monthly_budget_usd: f64,
 }
 
 fn is_zero_f64(f: &f64) -> bool {
@@ -138,7 +180,16 @@ fn is_zero_f64(f: &f64) -> bool {
 /// against the registered serving identity for whichever provider actually
 /// served the request — it is not meant to be extended by more hardcoded
 /// provider-string matches as new backends are added.
-pub fn derive_serving_identity(effective_provider: Option<&str>) -> (Option<String>, Option<String>) {
+pub fn derive_serving_identity(
+    effective_provider: Option<&str>,
+    engine_hint: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(engine) = engine_hint {
+        // Supervisor-served: the catalog's real engine, and no compute-API
+        // invention — Vulkan is this box's llama.cpp fact, not a property
+        // of every engine (a native vllm/llg engine would be mislabeled).
+        return (Some(engine.to_string()), None);
+    }
     match effective_provider {
         Some("llama-swap") => (Some("llama_cpp".to_string()), Some("vulkan".to_string())),
         _ => (None, None),
@@ -256,6 +307,19 @@ impl RoutingEvents {
             if e.conv_id == conv_id && e.success {
                 e.pp_tps = pp_tps;
                 e.tg_tps = tg_tps;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// v2 L6: backfill the budget badge after the stream's accrual lands
+    /// (post-accrual spend, not the pre-dispatch estimate).
+    pub fn update_budget(&self, event_id: u64, budget: BudgetEvent) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        for event in inner.events.iter_mut().rev() {
+            if event.id == event_id {
+                event.budget = Some(budget);
                 return true;
             }
         }
@@ -410,6 +474,11 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 
@@ -430,15 +499,29 @@ mod tests {
     #[test]
     fn derive_serving_identity_maps_llama_swap_to_llama_cpp_vulkan() {
         assert_eq!(
-            derive_serving_identity(Some("llama-swap")),
+            derive_serving_identity(Some("llama-swap"), None),
             (Some("llama_cpp".to_string()), Some("vulkan".to_string()))
         );
     }
 
     #[test]
     fn derive_serving_identity_is_none_for_manifest_and_absent_provider() {
-        assert_eq!(derive_serving_identity(Some("manifest")), (None, None));
-        assert_eq!(derive_serving_identity(None), (None, None));
+        assert_eq!(derive_serving_identity(Some("manifest"), None), (None, None));
+        assert_eq!(derive_serving_identity(None, None), (None, None));
+    }
+
+    #[test]
+    fn derive_serving_identity_prefers_the_real_engine_over_the_provider_guess() {
+        // A supervisor-served engine reports its catalog engine, and never a
+        // fabricated compute API — Vulkan is this box's llama.cpp fact only.
+        assert_eq!(
+            derive_serving_identity(Some("llama-swap"), Some("llama_cpp")),
+            (Some("llama_cpp".to_string()), None)
+        );
+        assert_eq!(
+            derive_serving_identity(Some("native"), Some("vllm")),
+            (Some("vllm".to_string()), None)
+        );
     }
 
     #[test]

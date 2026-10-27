@@ -478,6 +478,54 @@ fn allowed_proxy(proxy: &str, backend: &str) -> bool {
         Some(url::Host::Ipv6(ip)) if ip.is_loopback())
 }
 
+/// Native-mode counterpart of [`poll_backend`]: the snapshot comes from the
+/// swap supervisor's registry + catalog, so no `:8081` traffic exists after
+/// the flip. State vocabulary matches the shim mapping (`loaded`/`loading`/
+/// `stopping`), keeping the observability UI byte-identical.
+fn poll_backend_native(
+    swap: &std::sync::Arc<crate::swap_scheduler::SwapScheduler>,
+) -> BackendSnapshot {
+    let status = swap.status();
+    let mut snapshot = BackendSnapshot {
+        sampled_at: Some(Utc::now()),
+        running_error: None,
+        catalog_error: None,
+        models: BTreeMap::new(),
+    };
+    let runtime: BTreeMap<String, (String, Option<String>)> = status
+        .models
+        .into_iter()
+        .map(|model| (model.id, (model.state, model.endpoint)))
+        .collect();
+    for entry in swap.catalog().entries() {
+        let (state, _endpoint) = runtime
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_else(|| ("stopped".to_string(), None));
+        let state = match state.as_str() {
+            "ready" => "loaded",
+            "loading" | "draining" => "loading",
+            "waiting" => "loading",
+            "failed" => "stopping",
+            _ => "stopped",
+        };
+        snapshot.models.insert(
+            entry.id.clone(),
+            BackendModel {
+                model_key: entry.id.clone(),
+                state: state.to_string(),
+                reported_state: Some(state.to_string()),
+                quantization: entry.quant.clone(),
+                artifact_path: entry.files.first().cloned(),
+                runtime_build: None,
+                context_tokens: entry.ctx,
+                metadata_error: None,
+            },
+        );
+    }
+    snapshot
+}
+
 async fn poll_backend(client: &reqwest::Client, url: &str) -> BackendSnapshot {
     let catalog_url = format!("{url}/v1/models");
     let running_url = format!("{url}/running");
@@ -917,7 +965,11 @@ pub fn start(state: &Arc<crate::server::AppState>) {
         let mut latches = BTreeMap::new();
         let mut revision = 0;
         loop {
-            let backend = poll_backend(&client, &state.llama_swap_url).await;
+            let backend = if state.swap_mode.is_native() {
+                poll_backend_native(&state.swap)
+            } else {
+                poll_backend(&client, &state.llama_swap_url).await
+            };
             let (settings, next_revision) = {
                 let current = state.observability.settings.lock().unwrap();
                 (current.settings.clone(), current.revision)
@@ -945,10 +997,86 @@ pub fn start(state: &Arc<crate::server::AppState>) {
             snapshot["measurement_definitions"] =
                 json!(crate::routing_events::STREAM_MEASUREMENT_DEFINITION);
             snapshot["service_versions"] = state.versions_cache.borrow().clone();
+            // v2 L6: the provider fan-out — every enabled registry entry is
+            // reported with its breaker state, budget badge, and a cheap
+            // metadata probe (never inference). Read-only and additive.
+            snapshot["providers"] =
+                poll_providers(&client, &state, &state.routing_events).await;
             *state.observability.snapshot.lock().unwrap() = snapshot;
             tokio::time::sleep(Duration::from_secs(POLL_SECONDS)).await;
         }
     });
+}
+
+/// v2 L6 provider fan-out: registry state + breaker + budget + a cheap
+/// `/models` metadata probe per enabled provider (no inference).
+async fn poll_providers(
+    client: &reqwest::Client,
+    state: &Arc<crate::server::AppState>,
+    _events: &Arc<crate::routing_events::RoutingEvents>,
+) -> Value {
+    let records = state.providers.snapshot();
+    let month = state.budget.month();
+    let mut out = Vec::new();
+    for provider in records {
+        let spent = state.budget.spent(&provider.id);
+        let mut reachable: Option<bool> = None;
+        let mut probe_error: Option<String> = None;
+        if provider.enabled && provider.kind != crate::providers::ProviderKind::Anthropic {
+            let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+            let mut request = client.get(&url).timeout(Duration::from_millis(1500));
+            if let Some(credential) = provider.credential_id.as_deref() {
+                let resolved = if let Some(var) = credential.strip_prefix("env:") {
+                    std::env::var(var).ok()
+                } else if let Some(path) = credential.strip_prefix("file:") {
+                    std::fs::read_to_string(path).ok().map(|v| v.trim().to_string())
+                } else {
+                    state
+                        .credentials
+                        .resolve(credential)
+                        .ok()
+                        .map(|secret| secret.expose().to_string())
+                };
+                if let Some(secret) = resolved {
+                    request = request.bearer_auth(secret);
+                }
+            }
+            match request.send().await {
+                Ok(response) => reachable = Some(response.status().is_success()),
+                Err(error) => {
+                    reachable = Some(false);
+                    probe_error = Some(error.to_string());
+                }
+            }
+        }
+        out.push(serde_json::json!({
+            "id": provider.id,
+            "kind": provider.kind.as_str(),
+            "base_url": provider.base_url,
+            "lan_peer": provider.lan_peer,
+            "enabled": provider.enabled,
+            "breaker": state.router.health_state(&provider.id),
+            "reachable": reachable,
+            "probe_error": probe_error,
+            "models": provider.models.iter().map(|m| serde_json::json!({
+                "id": m.id,
+                "alias": m.alias,
+                "ctx": m.ctx,
+                "tools": m.tools,
+                "tier": m.tier.as_str(),
+            })).collect::<Vec<_>>(),
+            "budget": {
+                "month": month,
+                "mode": provider.budget_mode.as_str(),
+                "monthly_budget_usd": provider.monthly_budget_usd,
+                "spent_usd": spent,
+                "state": provider.monthly_budget_usd
+                    .map(|budget| if spent >= budget { "over" } else { "ok" })
+                    .unwrap_or("none"),
+            },
+        }));
+    }
+    Value::Array(out)
 }
 
 fn validate_configuration(configuration: &Value) -> Result<(), String> {
@@ -1338,6 +1466,11 @@ mod tests {
             rationale: None,
             decision_fallback: None,
             chosen_model: None,
+            swap_state: None,
+            swap_source: None,
+            provider: None,
+            hop: None,
+            budget: None,
         }
     }
 

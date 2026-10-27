@@ -111,6 +111,18 @@ fn deserialize_secret<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resu
     String::deserialize(deserializer).map(SecretString)
 }
 
+/// A shell-identifier name for an exported credential id.
+pub fn env_name(id: &str) -> String {
+    let mut name: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    if name.is_empty() || name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        name.insert(0, '_');
+    }
+    name
+}
+
 /// One credential: an id, where its value lives, and the plugin ids it grants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialRecord {
@@ -217,6 +229,14 @@ impl CredentialStore {
         }
     }
 
+    /// In-memory vault for unit tests / degraded boot (never writes).
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            data: Mutex::new(StoreData::default()),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -230,6 +250,9 @@ impl CredentialStore {
     /// Atomic owner-only write: temp file in the same directory, then rename.
     /// `NamedTempFile` creates the file with mode 0600 on Unix.
     fn save_locked(&self, data: &StoreData) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let dir = self
             .path
             .parent()
@@ -360,6 +383,79 @@ impl CredentialStore {
         let data = self.lock()?;
         Ok(data.credentials.values().cloned().collect())
     }
+
+    /// Resolve a credential with the VAULT FILE authoritative (rotations
+    /// written by a CLI/owner after boot are observed immediately; the
+    /// in-memory copy is the fallback for in-memory stores).
+    pub fn resolve_live(&self, credential_id: &str) -> Result<SecretString> {
+        let path = self.path();
+        if !path.as_os_str().is_empty() && path.exists() {
+            if let Ok(fresh) = CredentialStore::load(path.to_path_buf()) {
+                if let Ok(secret) = fresh.resolve(credential_id) {
+                    return Ok(secret);
+                }
+            }
+        }
+        self.resolve(credential_id)
+    }
+
+    /// Append one owner-audit record next to the store
+    /// (`credentials.audit.jsonl`, 0600, atomic rewrite). Values are NEVER
+    /// recorded — ids/actions/paths only.
+    pub fn append_audit_event(&self, action: &str, detail: serde_json::Value) -> Result<()> {
+        let path = self.path();
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let mut audit = path.with_extension("audit.jsonl");
+        if audit.as_os_str().is_empty() {
+            audit = path.with_file_name("credentials.audit.jsonl");
+        }
+        let mut text = std::fs::read_to_string(&audit).unwrap_or_default();
+        let record = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "actor": "owner-cli",
+            "action": action,
+            "detail": detail,
+        });
+        text.push_str(&record.to_string());
+        text.push('\n');
+        crate::plugins::store::atomic_write_0600(&audit, text.as_bytes())
+            .with_context(|| format!("appending to {}", audit.display()))?;
+        Ok(())
+    }
+
+    /// v2 L6 credential env-line export (R7 reverse path): `NAME=VALUE` lines
+    /// for `store`-kind credentials; `env`/`file` kinds pass their REFERENCES
+    /// through as comments (never their values). Masked list rendering is
+    /// untouched.
+    pub fn env_line_export(&self) -> Result<String> {
+        let data = self.lock()?;
+        let mut out = String::from(
+            "# brainrouter credential export - NAME=VALUE lines for a reverted v1\n",
+        );
+        for (id, record) in &data.credentials {
+            let name = env_name(id);
+            match &record.kind {
+                CredentialKind::Store { value } => {
+                    out.push_str(&format!("{name}={}\n", value.expose()));
+                }
+                CredentialKind::Env { var } => {
+                    out.push_str(&format!(
+                        "# {name} references environment variable {var} (kind env)\n"
+                    ));
+                }
+                CredentialKind::File { path } => {
+                    out.push_str(&format!(
+                        "# {name} references file {} (kind file)\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
 }
 
 /// Create an owner-only temp file in `dir` (NamedTempFile is 0600 on Unix).

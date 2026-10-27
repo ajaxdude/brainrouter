@@ -7,8 +7,16 @@ use std::path::{Path, PathBuf};
 /// Top-level brainrouter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainrouterConfig {
+    /// v1 cloud gateway. Migrated into a `manifest`-kind provider record by
+    /// `v2.0-p6`, which REMOVES this block from the YAML post-migration; the
+    /// field stays parse-compatible so pre-migration files boot.
+    #[serde(default)]
     pub manifest: ManifestConfig,
-    pub llama_swap: LlamaSwapConfig,
+    /// v2 L7: the swap supervisor section. Pre-`v2.0-p7` configs spell the
+    /// section `llama_swap:`; the alias keeps them booting until the migration
+    /// renames it in place (keys move verbatim).
+    #[serde(default, alias = "llama_swap")]
+    pub swap: SwapConfig,
     /// v2 L3: the decision-model slot (R4). Replaces the v1 `bonsai:` block
     /// (which migrates into `kind: openai-compatible, prompt_profile: bonsai`,
     /// with the launch backend config preserved under `launch:`) and the v1
@@ -28,6 +36,68 @@ pub struct BrainrouterConfig {
     /// Persistent imported benchmark results and explorer.
     #[serde(default)]
     pub benchmarks: BenchmarkConfig,
+    /// v2 L6: LAN federation listener (default off = v1 attack surface).
+    #[serde(default)]
+    pub lan: LanConfig,
+}
+
+/// v2 L6 LAN federation config (spec "LAN federation").
+///
+/// Default `enabled: false` means the listener is never created; the primary
+/// loopback surface is byte-unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address for the SECOND listener, e.g. `0.0.0.0:9099`.
+    #[serde(default)]
+    pub bind: String,
+    /// Credential id holding the bearer token (store-managed, rotate + revoke).
+    #[serde(default)]
+    pub token_credential: String,
+    /// Model keys a token holder may address (double-enforced: raw + resolved).
+    #[serde(default)]
+    pub expose: Vec<String>,
+    #[serde(default)]
+    pub rate: LanRate,
+}
+
+impl Default for LanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: String::new(),
+            token_credential: String::new(),
+            expose: Vec::new(),
+            rate: LanRate::default(),
+        }
+    }
+}
+
+/// Per-token token bucket (spec defaults: burst 20, 4 requests/second).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanRate {
+    #[serde(default = "default_lan_burst")]
+    pub burst: u64,
+    #[serde(default = "default_lan_per_sec")]
+    pub per_sec: u64,
+}
+
+fn default_lan_burst() -> u64 {
+    20
+}
+
+fn default_lan_per_sec() -> u64 {
+    4
+}
+
+impl Default for LanRate {
+    fn default() -> Self {
+        Self {
+            burst: default_lan_burst(),
+            per_sec: default_lan_per_sec(),
+        }
+    }
 }
 
 /// Storage settings for the benchmark explorer.
@@ -151,7 +221,7 @@ fn default_plumebench_thinking() -> String {
 /// Configuration for the Manifest cloud LLM router.
 /// Manifest exposes an OpenAI-compatible endpoint; brainrouter delegates all
 /// managed cloud routing decisions to Manifest with model="auto"; explicit IDs pass through.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManifestConfig {
     /// Master switch for the cloud backend. Off by default: `model=cloud` and
     /// Bonsai-classified cloud requests skip Manifest and fall back to
@@ -160,6 +230,8 @@ pub struct ManifestConfig {
     pub enabled: bool,
 
     /// Base URL of the Manifest instance. Example: "http://localhost:2099".
+    /// Optional post-`v2.0-p6` (the migrated provider record owns it).
+    #[serde(default)]
     pub base_url: String,
 
     /// Name of the environment variable holding the Manifest API key (mnfst_*).
@@ -168,25 +240,69 @@ pub struct ManifestConfig {
     pub api_key_env: Option<String>,
 }
 
-/// Configuration for the local llama-swap server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlamaSwapConfig {
-    /// Base URL of llama-swap. Example: "http://localhost:8080".
-    pub base_url: String,
+/// Engine mode for the local serving layer (v2 L7 "the flip").
+///
+/// * `shim` (default) — today's behavior: every local route dials the
+///   llama-swap shim. Byte-identical to v1 through the whole leg.
+/// * `native` — the swap supervisor owns every local model. Boot REFUSES while
+///   the shim still reports loaded models, and no component dials `:8081`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapMode {
+    /// llama-swap shim serves local traffic (default; floor mode).
+    #[default]
+    Shim,
+    /// Native swap supervisor serves local traffic.
+    Native,
+}
 
-    /// The model key to use when falling back from Manifest, or when the user
-    /// sends model="auto" and Bonsai classifies the query as local without a
-    /// specific model hint. Must match an entry in the llama-swap config.
+impl SwapMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shim => "shim",
+            Self::Native => "native",
+        }
+    }
+    pub fn is_native(self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
+/// Configuration for the local serving layer (v2 L7 `swap:` section; the
+/// pre-`v2.0-p7` name is `llama_swap:`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapConfig {
+    /// Which engine serves local traffic. Default `shim` — the whole leg keeps
+    /// the v1 floor; the flip is `mode: native` + restart.
+    #[serde(default)]
+    pub mode: SwapMode,
+
+    /// Import source for the swap catalog: the llama-swap config the native
+    /// supervisor imports at boot. Defaults to
+    /// `~/.config/llama-swap/config.yaml`; fedora hosts point it at their
+    /// docker-mounted config (e.g. `/opt/ai/llama-swap/config.yaml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
+
+    /// Deprecated: the shim URL is fixed (`http://localhost:8081/v1`) in the
+    /// end state. The key is still HONORED in shim mode so fixtures and
+    /// non-default shim ports keep working, and `v2.0-p7` removes it from the
+    /// YAML with a "no longer used" note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// The model key to use when falling back from cloud, or when the user
+    /// sends model="auto" and the classifier picks local without a specific
+    /// model hint. Must match an entry in the swap catalog.
     pub fallback_model: String,
 
-    /// Explicit list of model keys served by llama-swap. When a request arrives
+    /// Explicit list of model keys served locally. When a request arrives
     /// with `model` set to one of these names, brainrouter routes directly to
-    /// llama-swap without consulting Bonsai — the user's model choice is
-    /// authoritative. Omit or leave empty to rely on the `brainrouter/<model>`
-    /// prefix convention for direct-local routing.
+    /// the local engine without consulting the classifier — the user's model
+    /// choice is authoritative. Omit or leave empty to rely on the
+    /// `brainrouter/<model>` prefix convention for direct-local routing.
     ///
-    /// Matching is case-sensitive; model names must exactly match the keys in
-    /// your llama-swap config (e.g. the key in llama-swap's `models:` map).
+    /// Matching is case-sensitive; model names must exactly match catalog keys.
     #[serde(default)]
     pub local_models: Vec<String>,
 
@@ -196,21 +312,65 @@ pub struct LlamaSwapConfig {
     pub local_system_prompt: Option<String>,
 
     /// Optional subs-pool model key. Requests targeting `subs` or
-    /// `brainrouter/subs` route directly to this llama-swap key, bypassing
-    /// Bonsai classification — intended for a multi-slot pool serving
-    /// subagent traffic. Must match an entry in the llama-swap config.
-    /// Absent → `subs` requests fall back to normal auto routing.
+    /// `brainrouter/subs` route directly to this catalog key, bypassing
+    /// classification — intended for a multi-slot pool serving subagent
+    /// traffic. Absent → `subs` requests fall back to normal auto routing.
     #[serde(default)]
     pub subs_model: Option<String>,
 
     /// Optional reasoning-budget nudge settings (voidsurfer/llama.cpp-nudge
     /// fork). When enabled, auto-routed local requests are sent to
-    /// `model_key` — a llama-swap entry that must be launched with
+    /// `model_key` — a catalog entry that must be launched with
     /// `--reasoning-budget-enable` — carrying a per-request
-    /// `reasoning_budget_tokens` field chosen from `budgets` by Bonsai's tier
-    /// ("light" vs "deep") or the dashboard tier override.
+    /// `reasoning_budget_tokens` field chosen from `budgets` by the
+    /// classifier's tier ("light" vs "deep") or the dashboard tier override.
     #[serde(default)]
     pub nudge: NudgeConfig,
+}
+
+/// The shim's fixed URL in the end state (no `base_url` key post-migration).
+pub const DEFAULT_SHIM_BASE_URL: &str = "http://localhost:8081/v1";
+
+impl SwapConfig {
+    /// The shim URL (deprecated override honored, fixed default otherwise).
+    pub fn shim_base_url(&self) -> &str {
+        self.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_SHIM_BASE_URL)
+    }
+
+    /// Import source for the swap catalog: the configured path or the
+    /// pre-flip llama-swap default.
+    pub fn import_config_path(&self) -> PathBuf {
+        match self.config_path.as_ref() {
+            Some(path) if !path.as_os_str().is_empty() => path.clone(),
+            _ => default_import_config_path(),
+        }
+    }
+}
+
+impl Default for SwapConfig {
+    fn default() -> Self {
+        Self {
+            mode: SwapMode::Shim,
+            config_path: None,
+            base_url: None,
+            fallback_model: String::new(),
+            local_models: Vec::new(),
+            local_system_prompt: None,
+            subs_model: None,
+            nudge: NudgeConfig::default(),
+        }
+    }
+}
+
+/// Default import source: the llama-swap config the native supervisor takes
+/// over. Fedora hosts override `swap.config_path` (docker-mounted file).
+pub fn default_import_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".config/llama-swap/config.yaml")
 }
 
 /// Reasoning-budget nudge settings. The master switch can also be flipped at
@@ -538,6 +698,15 @@ pub struct ReviewConfig {
     /// while integration is on ⇒ the review fails closed (escalates).
     #[serde(default)]
     pub design_doc_path: Option<String>,
+
+    /// Second-chance reviewer selector (e.g. `cloud/deepseek-ai/DeepSeek-V4-Flash`).
+    /// When the primary reviewer backend fails — cloud credits exhausted, circuit
+    /// open, unreachable — the review retries ONCE against this selector before
+    /// escalating to a human. Cloud reviews only: a local review never migrates
+    /// to another model (its rubric and admission permit are model-specific).
+    /// Must be a `cloud/...` selector.
+    #[serde(default)]
+    pub fallback_selector: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -550,6 +719,7 @@ impl Default for ReviewConfig {
             max_iterations: default_max_iterations(),
             hankndory_integration: false,
             design_doc_path: None,
+            fallback_selector: None,
         }
     }
 }
@@ -557,6 +727,15 @@ impl Default for ReviewConfig {
 impl ReviewConfig {
     pub fn validate(&self) -> Result<()> {
         crate::roles::validate_iterations(self.max_iterations)?;
+        if let Some(sel) = self.fallback_selector.as_deref() {
+            let choice = crate::roles::ModelChoice::from_selector(sel)
+                .map_err(|e| anyhow::anyhow!("review.fallback_selector: {e}"))?;
+            if choice.backend() != "cloud" {
+                bail!(
+                    "review.fallback_selector must be a cloud selector (cloud/...), got {sel:?}"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -613,11 +792,14 @@ pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
         }
     }
 
-    // Validate manifest.base_url
+    // Validate manifest.base_url. Post-`v2.0-p6` the YAML block is removed
+    // (the provider record owns the URL), so only a present value is checked;
+    // an enabled block still requires one.
     if config.manifest.base_url.is_empty() {
-        bail!("manifest.base_url must not be empty");
-    }
-    if !config.manifest.base_url.starts_with("http://")
+        if config.manifest.enabled {
+            bail!("manifest.base_url must not be empty when manifest.enabled is true");
+        }
+    } else if !config.manifest.base_url.starts_with("http://")
         && !config.manifest.base_url.starts_with("https://")
     {
         bail!(
@@ -625,25 +807,54 @@ pub fn validate(config: &mut BrainrouterConfig, path: &Path) -> Result<()> {
             config.manifest.base_url
         );
     }
+    // v2 L6: the LAN second listener is opt-in; when enabled every field it
+    // needs must be present so a typo cannot silently bind an unauthenticated
+    // or rate-unlimited surface.
+    if config.lan.enabled {
+        if config.lan.bind.trim().is_empty() {
+            bail!("lan.bind must not be empty when lan.enabled is true");
+        }
+        if config.lan.bind.parse::<std::net::SocketAddr>().is_err() {
+            bail!(
+                "lan.bind must be a socket address (ip:port), got: {}",
+                config.lan.bind
+            );
+        }
+        if config.lan.token_credential.trim().is_empty() {
+            bail!("lan.token_credential must not be empty when lan.enabled is true");
+        }
+        if config.lan.rate.burst == 0 {
+            bail!("lan.rate.burst must be greater than zero");
+        }
+        if config.lan.rate.per_sec == 0 {
+            bail!("lan.rate.per_sec must be greater than zero");
+        }
+    }
 
-    // Validate llama_swap.base_url
-    if config.llama_swap.base_url.is_empty() {
-        bail!("llama_swap.base_url must not be empty");
+    // v2 L7: validate the swap section. `base_url` is optional post-`v2.0-p7`
+    // (the shim URL has a fixed default); when present it must be a URL.
+    if let Some(base_url) = config.swap.base_url.as_deref() {
+        if !base_url.is_empty()
+            && !base_url.starts_with("http://")
+            && !base_url.starts_with("https://")
+        {
+            bail!(
+                "swap.base_url must start with http:// or https://, got: {}",
+                base_url
+            );
+        }
     }
-    if !config.llama_swap.base_url.starts_with("http://")
-        && !config.llama_swap.base_url.starts_with("https://")
-    {
-        bail!(
-            "llama_swap.base_url must start with http:// or https://, got: {}",
-            config.llama_swap.base_url
-        );
+    if let Some(path) = config.swap.config_path.as_ref() {
+        if path.as_os_str().is_empty() {
+            bail!("swap.config_path must not be empty when set");
+        }
     }
-    if config.llama_swap.fallback_model.is_empty() {
-        bail!("llama_swap.fallback_model must not be empty");
+    if config.swap.fallback_model.is_empty() {
+        bail!("swap.fallback_model must not be empty");
     }
-    if let Some(model) = config.llama_swap.subs_model.as_deref() {
+    if let Some(model) = config.swap.subs_model.as_deref() {
         if model.is_empty() {
-            bail!("llama_swap.subs_model must not be empty");
+            bail!("swap.subs_model must not be empty");
         }
     }
     if config.benchmarks.database_path.as_os_str().is_empty() {
@@ -778,19 +989,19 @@ pub fn default_config_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    fn parse_llama_swap(yaml: &str) -> LlamaSwapConfig {
+    fn parse_swap(yaml: &str) -> SwapConfig {
         serde_yaml::from_str(yaml).expect("parse failed")
     }
 
     #[test]
     fn local_models_defaults_to_empty() {
-        let cfg = parse_llama_swap("base_url: http://localhost:8081/v1\nfallback_model: default\n");
+        let cfg = parse_swap("base_url: http://localhost:8081/v1\nfallback_model: default\n");
         assert!(cfg.local_models.is_empty());
     }
 
     #[test]
     fn local_models_parses_list() {
-        let cfg = parse_llama_swap(
+        let cfg = parse_swap(
             "base_url: http://localhost:8081/v1\nfallback_model: default\nlocal_models:\n  - qwen3\n  - mistral-7b\n",
         );
         assert_eq!(cfg.local_models, vec!["qwen3", "mistral-7b"]);
@@ -799,7 +1010,7 @@ mod tests {
     #[test]
     fn local_models_membership_check() {
         // Mirrors the router check: `self.local_models.contains(&requested_model)`
-        let cfg = parse_llama_swap(
+        let cfg = parse_swap(
             "base_url: http://localhost:8081/v1\nfallback_model: default\nlocal_models:\n  - qwen3\n",
         );
         assert!(cfg.local_models.contains(&"qwen3".to_string()));
@@ -807,6 +1018,75 @@ mod tests {
         // The brainrouter/ prefix is handled before the local_models check in the
         // router, so the raw prefix form is not expected to match here.
         assert!(!cfg.local_models.contains(&"brainrouter/qwen3".to_string()));
+    }
+
+    #[test]
+    fn swap_mode_defaults_to_shim_and_parses_native() {
+        let cfg = parse_swap("fallback_model: m\n");
+        assert_eq!(cfg.mode, SwapMode::Shim);
+        let cfg = parse_swap("mode: native\nfallback_model: m\n");
+        assert_eq!(cfg.mode, SwapMode::Native);
+        assert!(cfg.mode.is_native());
+        // An unknown spelling is a parse error, not a silent shim fallback.
+        assert!(serde_yaml::from_str::<SwapConfig>("mode: turbo\nfallback_model: m\n").is_err());
+    }
+
+    #[test]
+    fn swap_section_accepts_the_pre_migration_spelling() {
+        // v2.0-p7 renames `llama_swap:` → `swap:`; pre-migration files (and
+        // frozen v1 fixtures) keep booting through the serde alias.
+        let migrated: BrainrouterConfig =
+            serde_yaml::from_str("swap:\n  fallback_model: a\n").expect("swap: parses");
+        assert_eq!(migrated.swap.fallback_model, "a");
+        let legacy: BrainrouterConfig =
+            serde_yaml::from_str("llama_swap:\n  fallback_model: b\n").expect("alias parses");
+        assert_eq!(legacy.swap.fallback_model, "b");
+        // The end-state serialization writes `swap:` only, and the section
+        // itself carries no `base_url`.
+        let yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(yaml.contains("\nswap:"), "{yaml}");
+        assert!(!yaml.contains("llama_swap:"), "{yaml}");
+        let reparsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let swap = reparsed.get("swap").expect("swap: section");
+        assert!(swap.get("base_url").is_none(), "{yaml}");
+    }
+
+    #[test]
+    fn outbound_validation_accepts_a_post_migration_swap_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brainrouter.yaml");
+        std::fs::write(&path, "swap:\n  mode: shim\n  fallback_model: m\n").unwrap();
+        let mut config = load(&path).expect("post-migration config boots");
+        assert_eq!(config.swap.shim_base_url(), "http://localhost:8081/v1");
+        assert_eq!(
+            config.swap.import_config_path(),
+            default_import_config_path()
+        );
+        assert!(validate(&mut config, &path).is_ok());
+    }
+
+    #[test]
+    fn swap_base_url_override_is_honored_in_shim_mode_only_input() {
+        let cfg = parse_swap("base_url: http://127.0.0.1:19999/v1\nfallback_model: m\n");
+        assert_eq!(cfg.shim_base_url(), "http://127.0.0.1:19999/v1");
+        let cfg = parse_swap("fallback_model: m\n");
+        assert_eq!(cfg.shim_base_url(), DEFAULT_SHIM_BASE_URL);
+    }
+
+    #[test]
+    fn swap_config_path_defaults_to_the_llama_swap_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &path,
+            "swap:\n  config_path: /opt/ai/llama-swap/config.yaml\n  fallback_model: m\n",
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(
+            config.swap.import_config_path(),
+            PathBuf::from("/opt/ai/llama-swap/config.yaml")
+        );
     }
 
     #[test]

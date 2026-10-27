@@ -222,6 +222,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">⬢</span>
       <span>Models</span>
     </button>
+    <button class="nav-item" id="nav-engines" onclick="switchView('engines')">
+      <span class="nav-icon">▤</span>
+      <span>Engines</span>
+    </button>
     <a class="nav-item" id="nav-benchmarks" href="/benchmarks">
       <span class="nav-icon">◇</span>
       <span>Benchmarks</span>
@@ -415,6 +419,27 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <h2 style="font-size:14px;margin:18px 0 8px">Usage audit</h2>
         <div style="margin-bottom:8px"><button class="br-btn" onclick="credentialAudit()">Refresh audit</button></div>
         <div id="credentials-audit" class="muted" style="font-size:12px">Grants consumers per credential (plugins referencing it).</div>
+        <!-- v2 L6: Providers — cloud/LAN endpoints bound to vault credentials.
+             Values never render here; only credential ids, breaker state, and
+             the budget badge. -->
+        <h2 style="font-size:14px;margin:18px 0 8px">Providers</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px">
+          <div style="display:flex;flex-direction:column;gap:2px"><label style="font-size:11px;color:var(--textMute)" for="prov-id">id</label><input id="prov-id" class="config-input" placeholder="deepinfra"></div>
+          <div style="display:flex;flex-direction:column;gap:2px"><label style="font-size:11px;color:var(--textMute)" for="prov-kind">kind</label><select id="prov-kind" class="config-input"><option value="openai-compatible">openai-compatible</option><option value="anthropic">anthropic</option><option value="manifest">manifest</option></select></div>
+          <div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:200px"><label style="font-size:11px;color:var(--textMute)" for="prov-base-url">base_url</label><input id="prov-base-url" class="config-input" placeholder="https://api.deepinfra.com/v1/openai"></div>
+          <div style="display:flex;flex-direction:column;gap:2px"><label style="font-size:11px;color:var(--textMute)" for="prov-credential">credential_id</label><input id="prov-credential" class="config-input" placeholder="deepinfra-key"></div>
+          <div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:180px"><label style="font-size:11px;color:var(--textMute)" for="prov-models">models (comma-separated ids)</label><input id="prov-models" class="config-input" placeholder="deepseek-ai/DeepSeek-V4-Flash"></div>
+          <label style="font-size:11px;color:var(--textMute);display:flex;gap:4px;align-items:center"><input id="prov-auto" type="checkbox"> auto (manifest)</label>
+          <label style="font-size:11px;color:var(--textMute);display:flex;gap:4px;align-items:center"><input id="prov-lan-peer" type="checkbox"> lan_peer</label>
+          <label style="font-size:11px;color:var(--textMute);display:flex;gap:4px;align-items:center"><input id="prov-enabled" type="checkbox" checked> enabled</label>
+          <div style="display:flex;flex-direction:column;gap:2px"><label style="font-size:11px;color:var(--textMute)" for="prov-budget">monthly budget USD</label><input id="prov-budget" class="config-input" placeholder="optional"></div>
+          <div style="display:flex;flex-direction:column;gap:2px"><label style="font-size:11px;color:var(--textMute)" for="prov-budget-mode">mode</label><select id="prov-budget-mode" class="config-input"><option value="warn">warn</option><option value="stop">stop</option></select></div>
+          <button class="br-btn" onclick="providerSave()">Add / update</button>
+          <button class="br-btn" onclick="providerDiscoverPeer()">Discover peer</button>
+          <button class="br-btn" onclick="loadProviders()">Refresh</button>
+        </div>
+        <div id="providers-list" style="display:flex;flex-direction:column;gap:6px"></div>
+        <div id="providers-message" role="status" style="color:var(--amber);font-size:11px"></div>
       </div>
       <h2 style="font-size:14px;margin:18px 0 8px">Decisions (read-only)</h2>
       <div id="decision-panel" class="recent-events">
@@ -620,6 +645,14 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <div id="models-list" style="display:flex;flex-direction:column;gap:8px">
         <div style="color:var(--textMute);font-size:12px">Loading...</div>
       </div>
+      <div style="font-size:13px;font-weight:600;margin:22px 0 6px">Provider models (cloud + LAN peers)</div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">
+        Address a provider model as <code style="font-family:'JetBrains Mono',monospace">cloud/&lt;id&gt;</code>
+        or <code style="font-family:'JetBrains Mono',monospace">cloud/&lt;provider&gt;/&lt;id&gt;</code>.
+      </div>
+      <div id="models-provider-groups" style="display:flex;flex-direction:column;gap:10px">
+        <div style="color:var(--textMute);font-size:12px">Loading...</div>
+      </div>
     </div>
 
     <!-- PR6: toolbox model catalog browsing + native download orchestration
@@ -662,6 +695,36 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
          panels this page shipped in v1 (design doc §13/§14/§15) were
          removed; server-mode is ds4 + gufo, and those feed ids are
          browse-only catalog data. -->
+    <!-- v2 L4: Engines — platform probe, engine offers, lifecycle, queue,
+         budget gauge (residents by source + pins), pins, llama-swap import. -->
+    <div id="engines-view" style="display:none;max-width:980px">
+      <div id="platform-banner" role="status" data-testid="platform-banner" style="display:none;background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:10px;padding:10px 12px;font-size:12px;margin-bottom:12px"></div>
+      <div id="engines-platform" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Budget</div>
+      <div id="engines-budget" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Lifecycle</div>
+      <div id="engines-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Queue</div>
+      <div id="engines-queue" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <!-- v2 L5: external (icon-launched) residents + takeover units + the
+           Active-Consumer Set. Additive: attach/adopt/takeover only. -->
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">External engines (attach-only until adopted)</div>
+      <div id="engines-external" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Takeover units</div>
+      <div id="engines-units" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Active consumers</div>
+      <div id="engines-consumers" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Import from llama-swap</div>
+      <div id="engines-import" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="br-btn" data-eng-action="import-preview">Preview import</button>
+          <button class="br-btn" data-eng-action="import-apply">Apply import</button>
+          <span id="engines-import-msg" role="status" style="color:var(--textMute)"></span>
+        </div>
+        <pre id="engines-import-out" style="margin:0;white-space:pre-wrap;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim);max-height:220px;overflow:auto"></pre>
+      </div>
+    </div>
+
     <div id="server-mode-view" style="display:none;max-width:900px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
@@ -955,12 +1018,16 @@ function switchView(view) {
   document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
   document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
   document.getElementById('plugins-view').style.display   = view === 'plugins' ? 'block' : 'none';
+  const enginesView = document.getElementById('engines-view');
+  if (enginesView) enginesView.style.display = view === 'engines' ? 'block' : 'none';
   const credView = document.getElementById('credentials-view');
   if (credView) credView.style.display = view === 'credentials' ? 'block' : 'none';
-  if (view === 'credentials') loadCredentials();
+  if (view === 'credentials') { loadCredentials(); loadProviders(); }
+  if (view === 'models') loadProviderModelGroups();
+  if (view === 'engines') loadEngines();
 
   const modelsActive = isModelsView(view);
-  ['stream','config','models','plugins','credentials'].forEach(v => {
+  ['stream','config','models','plugins','credentials','engines'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (!btn) return;
     const active = v === 'models' ? modelsActive : v === view;
@@ -979,7 +1046,7 @@ function switchView(view) {
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
   });
 
-  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins' };
+  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins', credentials: 'Credentials', engines: 'Engines' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
@@ -989,6 +1056,7 @@ function switchView(view) {
     'toolbox-models': 'Catalog models for ds4 / llama.cpp / gufo — browse, download, verify',
     'server-mode': 'Launch/stop headless inference servers — ds4 and gufo',
     plugins: 'Sidecar plugins over UDS JSON-RPC — status, config, and logs (v2 L2)',
+    engines: 'Platform probe, engine offers, lifecycle, queue, budget and pins (v2 L4)',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -1684,10 +1752,18 @@ function skRouting(e) {
   let rt;
   if (e.decision) rt = e.decision.route + '/' + e.decision.tier;
   else {
-    const backend = (e.effective_provider || '').includes('manifest') ? 'cloud'
-      : (e.effective_provider || '').includes('llama') ? 'local' : null;
+    // v2 L6: any provider id (manifest, deepinfra, a LAN peer, ...) is a
+    // cloud route; llama-swap/native are local. The legacy string match on
+    // `manifest` alone mislabeled provider routes as `unrouted`.
+    const cloudish = (e.bonsai_decision || '').startsWith('cloud')
+      || (e.routing_class || '').startsWith('cloud');
+    const backend = cloudish ? 'cloud' : (e.effective_provider ? 'local' : null);
     rt = backend ? (e.bonsai_decision && e.bonsai_decision.includes('direct') ? 'explicit ' + backend : backend) : 'unrouted';
   }
+  // Map R7: the LAN hop is visible in the ROUTING column (provider routes with
+  // a non-loopback base_url). Cards grouping is unaffected (conv fingerprints
+  // come from request content, not origin).
+  if (e.hop && e.hop.host) rt += ' · lan ' + e.hop.host;
   return role + ' → ' + rt;
 }
 
@@ -2314,6 +2390,13 @@ async function loadModels() {
     const r = await fetch('/api/models/llama-swap');
     const j = await r.json().catch(() => ({}));
     const models = (j && j.data) || [];
+    // v2 L4: "serve via" column — catalog engine per model id.
+    let serveVia = {};
+    try {
+      const er = await fetch('/api/engines');
+      const ej = await er.json();
+      (ej.models || []).forEach(m => { serveVia[m.id] = m.engine + (m.resident ? ' · resident' : ''); });
+    } catch (e) {}
     if (!models.length) {
       list.innerHTML = '<div style="color:var(--textMute);font-size:12px">No models reported by llama-swap.</div>';
       return;
@@ -2328,7 +2411,7 @@ async function loadModels() {
         + '<span style="width:8px;height:8px;border-radius:50%;background:' + dot + '"></span>'
         + '<div style="flex:1;min-width:0">'
         + '  <div style="font-size:12px;font-weight:600;color:var(--text)">' + key + ' <span style="font-size:10px;color:var(--textMute);font-weight:400">' + (loaded ? 'loaded' : 'unloaded') + port + '</span></div>'
-        + '  <div style="font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--textMute)">' + val + '</div>'
+        + '  <div style="font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--textMute)">' + val + (serveVia[key] ? ' · serve via ' + escHtml(serveVia[key]) : '') + '</div>'
         + '</div>'
         + '<button onclick="copyOmpValue(\'' + key + '\')" style="font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;white-space:nowrap">Copy for OMP</button>'
         + '</div>';
@@ -2815,6 +2898,151 @@ async function credentialAudit() {
   }
 }
 
+// ── v2 L6: Providers (cloud + LAN peers) ─────────────────────────────────
+// Peer-discovery tier prefill (from the peer's peer-info menu).
+let peerModelTiers = {};
+
+async function providerSave() {
+  const val = id => (document.getElementById(id) || {}).value || '';
+  const msg = document.getElementById('providers-message');
+  const id = val('prov-id').trim();
+  if (!id) { if (msg) msg.textContent = 'provider id required'; return; }
+  const models = val('prov-models').split(',').map(m => m.trim()).filter(Boolean)
+    .map(m => ({ id: m, ctx: 0, tools: true, tier: peerModelTiers[m] || 'balanced' }));
+  const record = {
+    id,
+    kind: val('prov-kind'),
+    base_url: val('prov-base-url').trim(),
+    auto: !!(document.getElementById('prov-auto') || {}).checked,
+    lan_peer: !!(document.getElementById('prov-lan-peer') || {}).checked,
+    enabled: !!(document.getElementById('prov-enabled') || {}).checked,
+    models,
+    budget_mode: val('prov-budget-mode') || 'warn',
+  };
+  const credential = val('prov-credential').trim();
+  if (credential) record.credential_id = credential;
+  const budget = val('prov-budget').trim();
+  if (budget) record.monthly_budget_usd = Number(budget);
+  try {
+    await routingFetch('/api/providers/add', record);
+    if (msg) msg.textContent = 'saved ' + id;
+    await loadProviders();
+  } catch (e) { if (msg) msg.textContent = 'save failed: ' + e.message; }
+}
+
+// Federation editor flow: pull a peer brainrouter's `peer-info` menu and
+// prefill the models field (the peer's exposed keys become this provider's
+// models; tier comes from the peer).
+async function providerDiscoverPeer() {
+  const val = id => (document.getElementById(id) || {}).value || '';
+  const msg = document.getElementById('providers-message');
+  const base_url = val('prov-base-url').trim();
+  if (!base_url) { if (msg) msg.textContent = 'base_url required for discovery'; return; }
+  const body = { base_url };
+  const credential = val('prov-credential').trim();
+  if (credential) body.credential_id = credential;
+  try {
+    const out = await routingFetch('/api/providers/peer-info', body);
+    const info = out.peer_info || {};
+    peerModelTiers = {};
+    for (const m of (info.models || [])) {
+      if (m.key) peerModelTiers[m.key] = m.tier || 'balanced';
+    }
+    const keys = (info.models || []).map(m => m.key).filter(Boolean);
+    const models = (document.getElementById('prov-models') || {});
+    if (keys.length) models.value = keys.join(', ');
+    const peer = (document.getElementById('prov-lan-peer') || {});
+    if (peer) peer.checked = true;
+    if (msg) msg.textContent = 'peer ' + (info.host_id || '') + ' exposes ' + keys.length + ' model(s)'
+      + (info.version ? ' (v' + info.version + ')' : '');
+  } catch (e) { if (msg) msg.textContent = 'discovery failed: ' + e.message; }
+}
+
+async function providerTest(id) {
+  const msg = document.getElementById('providers-message');
+  try {
+    const out = await routingFetch('/api/providers/' + encodeURIComponent(id) + '/test', {});
+    if (msg) msg.textContent = out.ok ? ('✓ ' + id + ' answered') : ('✗ ' + id);
+  } catch (e) { if (msg) msg.textContent = '✗ ' + id + ': ' + e.message; }
+}
+
+async function providerRemove(id) {
+  const msg = document.getElementById('providers-message');
+  try {
+    await routingFetch('/api/providers/remove', { id });
+    if (msg) msg.textContent = 'removed ' + id;
+    await loadProviders();
+  } catch (e) { if (msg) msg.textContent = 'remove failed: ' + e.message; }
+}
+
+function providerBadge(label, value, color) {
+  return '<span style="font-size:10px;letter-spacing:.5px;text-transform:uppercase;border:1px solid var(--border);border-radius:6px;padding:2px 6px;color:' + (color || 'var(--textMute)') + '">' + esc(label) + ' ' + esc(value) + '</span>';
+}
+
+async function loadProviders() {
+  const list = document.getElementById('providers-list');
+  if (!list) return;
+  try {
+    const data = await routingFetch('/api/providers');
+    list.replaceChildren();
+    for (const p of data.providers || []) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12px';
+      const breaker = p.breaker || 'healthy';
+      const breakerColor = (breaker === 'open' || breaker === 'broken') ? 'var(--red)' : breaker === 'degraded' ? 'var(--amber)' : 'var(--green)';
+      const budget = p.budget || {};
+      const budgetColor = budget.state === 'over' ? 'var(--red)' : 'var(--textMute)';
+      const models = (p.models || []).map(m => esc(m.id) + (m.tier ? ' (' + esc(m.tier) + ')' : '')).join(', ') || '<span class="muted">no declared models (passthrough)</span>';
+      row.innerHTML = '<b>' + esc(p.id) + '</b><span class="muted">' + esc(p.kind || 'openai-compatible') + ' · ' + esc(p.base_url || '') + '</span>'
+        + '<span class="muted">credential: ' + esc(p.credential_id || 'none (auth-less)') + '</span>'
+        + (p.lan_peer ? providerBadge('peer', 'lan') : '')
+        + (p.enabled ? '' : providerBadge('disabled', 'off', 'var(--amber)'))
+        + '<span style="flex:1"></span>'
+        + providerBadge('breaker', breaker, breakerColor)
+        + (budget.monthly_budget_usd != null
+            ? providerBadge('budget', budget.state + ' · $' + Number(budget.spent_usd || 0).toFixed(4) + '/' + Number(budget.monthly_budget_usd).toFixed(2) + ' (' + budget.mode + ')', budgetColor)
+            : providerBadge('budget', 'none'))
+        + '<div style="flex-basis:100%;font-size:11px;color:var(--textDim)">models: ' + models + '</div>';
+      const test = document.createElement('button');
+      test.className = 'br-btn'; test.textContent = 'Test'; test.onclick = () => providerTest(p.id);
+      const del = document.createElement('button');
+      del.className = 'br-btn'; del.textContent = 'Remove'; del.onclick = () => providerRemove(p.id);
+      row.append(test, del);
+      list.appendChild(row);
+    }
+    if (!(data.providers || []).length) list.innerHTML = '<div class="muted" style="font-size:12px">no providers registered</div>';
+  } catch (e) {
+    list.innerHTML = '<div class="muted" style="font-size:12px">providers unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+// Models page: one group per provider (id, kind, breaker, model ids/aliases).
+async function loadProviderModelGroups() {
+  const box = document.getElementById('models-provider-groups');
+  if (!box) return;
+  try {
+    const data = await routingFetch('/api/providers');
+    box.replaceChildren();
+    for (const p of data.providers || []) {
+      const group = document.createElement('div');
+      group.style.cssText = 'background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12px';
+      const models = (p.models || []).map(m =>
+        '<div style="font-size:11px;color:var(--textDim)">cloud/' + esc(p.id) + '/' + esc(m.id)
+        + (m.alias ? ' <span class="muted">(alias ' + esc(m.alias) + ')</span>' : '')
+        + ' <span class="muted">tier ' + esc(m.tier || 'balanced') + ' · ctx ' + esc(m.ctx || 0)
+        + (m.price ? ' · $' + esc(m.price['in']) + '/' + esc(m.price['out']) + ' per 1K' : '')
+        + '</span></div>').join('');
+      group.innerHTML = '<div><b>' + esc(p.id) + '</b> <span class="muted">' + esc(p.kind || '') + ' · breaker ' + esc(p.breaker || 'healthy')
+        + (p.lan_peer ? ' · LAN peer' : '') + '</span></div>'
+        + (models || '<div style="font-size:11px;color:var(--textMute)">no declared models (verbatim passthrough)</div>');
+      box.appendChild(group);
+    }
+    if (!(data.providers || []).length) box.innerHTML = '<div class="muted" style="font-size:12px">no providers registered</div>';
+  } catch (e) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">provider models unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
 // Decisions panel (read-only): the additive L3 event fields.
 function renderDecisions() {
   const panel = document.getElementById('decision-panel');
@@ -3127,7 +3355,7 @@ const TOOLBOX_BACKEND_LABELS = {
 // existing hardcoded defaults already assume (`docker.io/kyuz0/amd-strix-
 // halo-toolboxes:...`), matching current behavior rather than guessing new
 // behavior. Revisit once Q1 lands real detection.
-const CURRENT_PLATFORM_ID = 'strix-halo';
+const CURRENT_PLATFORM_ID = '__CURRENT_PLATFORM_ID__';
 
 // PR3 §4: cockpit's own per-backend override (`config.json`'s
 // `backends.<id>.default_toolboxes.<platform>`) takes precedence; the
@@ -4214,6 +4442,241 @@ setInterval(refreshFast, 3000);
 setInterval(refreshHealth, 10000);
 setInterval(refreshBonsai, 10000);
 setInterval(refreshSlow, 30000);
+
+// ─── v2 L4: Engines (platform probe + swap supervisor) ──────────────────────
+function enginesSetMessage(text, color) {
+  const el = document.getElementById('engines-import-msg');
+  if (el) { el.textContent = text || ''; el.style.color = color || 'var(--textMute)'; }
+}
+async function enginesPost(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, body: j };
+}
+async function loadEngines() {
+  const view = document.getElementById('engines-view');
+  if (!view) return;
+  try {
+    const [pr, er] = await Promise.all([fetch('/api/platform'), fetch('/api/engines')]);
+    const platform = await pr.json();
+    const engines = await er.json();
+    const banner = document.getElementById('platform-banner');
+    if (banner) {
+      if (platform.known === false && platform.banner) {
+        banner.style.display = 'block';
+        banner.textContent = platform.banner;
+      } else {
+        banner.style.display = 'none';
+      }
+    }
+    const plat = document.getElementById('engines-platform');
+    if (plat) {
+      const gpus = (platform.facts && platform.facts.gpus || [])
+        .map(g => escHtml(g.arch || 'unknown') + (g.device ? ' (' + escHtml(g.device) + ')' : ''))
+        .join(', ') || 'none detected';
+      const offers = (platform.offers || []).map(o =>
+        '<div style="display:flex;gap:8px"><span style="color:' + (o.offered ? 'var(--green)' : 'var(--textMute)') + '">' + (o.offered ? '●' : '○') +
+        '</span><strong>' + escHtml(o.engine) + '</strong><span style="color:var(--textMute)">' + escHtml(o.reason) + '</span></div>'
+      ).join('');
+      plat.innerHTML =
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">' +
+        '<span><span style="color:var(--textMute)">platform</span> <strong>' + escHtml(platform.id) + '</strong>' +
+        (platform.known ? '' : ' <span style="color:var(--amber)">(unknown — fail-open)</span>') + '</span>' +
+        '<span><span style="color:var(--textMute)">budget</span> ' + Number(platform.budget_gib || 0).toFixed(0) + ' GiB</span>' +
+        '<span><span style="color:var(--textMute)">mem</span> ' + Number((platform.facts || {}).mem_total_gib || 0).toFixed(0) + ' GiB</span>' +
+        '<span><span style="color:var(--textMute)">feed</span> ' + escHtml(platform.feed_origin || '') + '</span>' +
+        '<span><span style="color:var(--textMute)">gpus</span> ' + gpus + '</span>' +
+        (engines.swap ? '<span><span style="color:var(--textMute)">mode</span> <strong>' + escHtml(engines.swap.mode) + '</strong>' +
+          (engines.swap.mode === 'native'
+            ? ' <span style="color:var(--textMute)">catalog ' + escHtml(String(engines.swap.catalog_keys)) + ' keys · ' + escHtml(String(engines.swap.groups_count)) + ' groups</span>'
+            : ' <span style="color:var(--textMute)">import ' + escHtml(engines.swap.import_source) + '</span>') + '</span>' : '') +
+        '</div><div style="display:flex;flex-direction:column;gap:3px">' + offers + '</div>' +
+        ((engines.adapter_detail || []).length
+          ? '<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">' +
+            (engines.adapter_detail || []).map(function(a) {
+              var schema = a.schema ? (' · schema ' + escHtml(a.schema.version || 'unknown')) : '';
+              var drift = (a.schema && a.schema_drift) ? ' <span style="color:var(--amber)">(drift: re-derived)</span>' : '';
+              var cards = a.cards ? (' · ' + Number(a.cards.length) + ' card(s)') : '';
+              var warn = (a.warnings && a.warnings.length) ? (' <span style="color:var(--amber)">' + escHtml(a.warnings.join('; ')) + '</span>') : '';
+              return '<div><span style="color:var(--textMute)">adapter</span> <strong>' + escHtml(a.engine || '') + '</strong>' +
+                schema + drift + cards + warn + '</div>';
+            }).join('') + '</div>'
+          : '');
+    }
+    const budget = engines.budget || {};
+    const bud = document.getElementById('engines-budget');
+    if (bud) {
+      const cap = Number(budget.cap_gib || 0);
+      const used = Number(budget.used_gib || 0);
+      const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+      const lines = (budget.residents || []).map(b =>
+        '<div>' + escHtml(b.model) + ' <span style="color:var(--textMute)">' + escHtml(b.source) + '</span> · ' + Number(b.gib).toFixed(1) + ' GiB</div>'
+      ).join('');
+      const pins = (budget.pins || []).map(b =>
+        '<div style="color:var(--amber)">pin ' + escHtml(b.model) + ' · ' + Number(b.gib).toFixed(1) + ' GiB</div>'
+      ).join('');
+      bud.innerHTML =
+        '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>' + used.toFixed(1) + ' / ' + cap.toFixed(1) + ' GiB</span>' +
+        '<span style="color:var(--textMute)">headroom ' + Number(budget.headroom_gib || 0).toFixed(1) + ' GiB · evictions today ' + Number(budget.evictions_today || 0) + '</span></div>' +
+        '<div style="height:8px;background:var(--bg3);border-radius:99px;overflow:hidden;margin-bottom:8px">' +
+        '<div style="height:8px;width:' + pct.toFixed(1) + '%;background:' + (pct > 90 ? 'var(--amber)' : 'var(--green)') + '"></div></div>' +
+        lines + pins;
+    }
+    const list = document.getElementById('engines-list');
+    if (list) {
+      const models = engines.models || [];
+      if (!models.length) {
+        list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Swap catalog is empty — import llama-swap or add a launch spec.</div>';
+      } else {
+        list.innerHTML = models.map(m => {
+          const color = m.state === 'ready' ? 'var(--green)' : (m.state === 'failed' ? 'var(--red,var(--amber))' : (m.state === 'loading' ? 'var(--amber)' : 'var(--textMute)'));
+          const progress = m.progress ? (m.progress.fraction != null
+            ? ' · ' + (m.progress.fraction * 100).toFixed(0) + '%'
+            : ' · ' + Number(m.progress.elapsed_ms || 0) + ' ms' + (m.progress.eta_ms != null ? ' (ETA ' + m.progress.eta_ms + ' ms)' : '')) : '';
+          const pin = m.pinned_gib != null ? ' · pin ' + Number(m.pinned_gib).toFixed(1) + ' GiB' : '';
+          return '<div style="display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:9px 12px">' +
+            '<span style="width:8px;height:8px;border-radius:50%;background:' + color + '"></span>' +
+            '<div style="flex:1;min-width:0">' +
+            '<div style="font-size:12px;font-weight:600">' + escHtml(m.id) +
+            (m.spec_stale ? ' <span style="color:var(--amber);font-size:10px">spec stale</span>' : '') + '</div>' +
+            '<div style="font-size:11px;color:var(--textMute);font-family:\'JetBrains Mono\',monospace">' +
+            escHtml(m.engine) + ' · ' + escHtml(m.state) + (m.source ? ' · ' + escHtml(m.source) : '') +
+            (m.endpoint ? ' · ' + escHtml(m.endpoint) : '') + progress + pin + '</div>' +
+            (m.last_error ? '<div style="font-size:11px;color:var(--amber)">' + escHtml(m.last_error) + '</div>' : '') +
+            '</div>' +
+            (m.gate ? '<div style="font-size:11px;color:var(--amber)">waiting(gate): needs ' + Number(m.gate.threshold_gib || 0).toFixed(1) + ' GiB, have ' + Number(m.gate.current_gib || 0).toFixed(1) + ' GiB</div>' : '') +
+            (m.active_consumer && m.active_consumer.protected ? '<div style="font-size:11px;color:var(--amber)">active consumer' + (m.active_consumer.active ? ' (live)' : ' (grace)') + '</div>' : '') +
+            '<button class="br-btn" data-eng-action="ensure" data-model="' + escHtml(m.id) + '">Ensure</button>' +
+            '<button class="br-btn" data-eng-action="ensure-override" data-model="' + escHtml(m.id) + '">Swap anyway</button>' +
+            '<button class="br-btn" data-eng-action="takeover" data-model="' + escHtml(m.id) + '">Takeover</button>' +
+            '<button class="br-btn" data-eng-action="evict" data-model="' + escHtml(m.id) + '">Evict</button>' +
+            '<button class="br-btn" data-eng-action="pin" data-model="' + escHtml(m.id) + '">Pin</button>' +
+            '<button class="br-btn" data-eng-action="unpin" data-model="' + escHtml(m.id) + '">Unpin</button>' +
+            '</div>';
+        }).join('');
+      }
+    }
+    const q = document.getElementById('engines-queue');
+    if (q) {
+      const queue = engines.queue || [];
+      q.innerHTML = queue.length
+        ? queue.map(e => '<div style="display:flex;gap:10px;align-items:center">' +
+            '<span style="color:var(--textMute)">#' + e.position + '</span><span>' + escHtml(e.model) + '</span>' +
+            '<span style="color:var(--textMute)">' + Number(e.waited_ms || 0) + ' ms</span>' +
+            '<button class="br-btn" data-eng-action="cancel" data-queue-id="' + escHtml(String(e.id)) + '">Cancel</button></div>').join('')
+        : '<span style="color:var(--textMute)">empty (the queue is in-memory and resets on daemon restart)</span>';
+    }
+    const ext = document.getElementById('engines-external');
+    if (ext) {
+      const rows = (engines.external || []).map(x =>
+        '<div style="display:flex;align-items:center;gap:8px;padding:4px 0">' +
+        '<span style="width:8px;height:8px;border-radius:50%;background:' + (x.adopted ? 'var(--green)' : 'var(--amber)') + '"></span>' +
+        '<div style="flex:1;min-width:0"><div>' + escHtml(x.engine) + ' · pid ' + escHtml(String(x.pid)) +
+        (x.catalog_id ? ' · ' + escHtml(x.catalog_id) : ' · unregistered') +
+        (x.adopted ? ' · adopted' : ' · attach-only') + '</div>' +
+        '<div style="font-size:11px;color:var(--textMute);font-family:\'JetBrains Mono\',monospace">' + escHtml(x.endpoint) +
+        (x.stems && x.stems.length ? ' · ' + escHtml(x.stems.join(',')) : '') + '</div></div>' +
+        '<button class="br-btn" data-eng-action="adopt" data-model="' + escHtml(x.catalog_id || '') + '" data-endpoint="' + escHtml(x.endpoint || '') + '" data-pid="' + escHtml(String(x.pid)) + '">Adopt</button>' +
+        (x.catalog_id ? '<button class="br-btn" data-eng-action="ensure" data-model="' + escHtml(x.catalog_id) + '">Attach</button>' : '') +
+        '</div>').join('');
+      ext.innerHTML = rows || '<span style="color:var(--textMute)">none observed (read-only /proc scan every 2 s)</span>';
+    }
+    const units = document.getElementById('engines-units');
+    if (units) {
+      const rows = (engines.units || []).map(u =>
+        '<div style="display:flex;gap:8px;align-items:center">' +
+        '<span style="width:8px;height:8px;border-radius:50%;background:' + (u.active ? 'var(--green)' : 'var(--textMute)') + '"></span>' +
+        '<strong>' + escHtml(u.unit) + '</strong><span style="color:var(--textMute)">' + escHtml(u.engine) + '</span>' +
+        '<span style="color:var(--textMute)">' + (u.active ? 'active' : 'inactive') + (u.main_pid ? ' · pid ' + escHtml(String(u.main_pid)) : '') + '</span>' +
+        (u.error ? '<span style="color:var(--amber)">' + escHtml(u.error) + '</span>' : '') +
+        '</div>').join('');
+      units.innerHTML = rows || '<span style="color:var(--textMute)">no units configured for this fleet profile</span>';
+    }
+    const consumers = document.getElementById('engines-consumers');
+    if (consumers) {
+      const rows = (engines.active_consumers || []).filter(c => c.protected).map(c =>
+        '<div>' + escHtml(c.key) + ' <span style="color:var(--textMute)">' +
+        (c.active ? c.active + ' live stream(s)' : 'grace until ' + new Date(Number(c.protected_until_ms || 0)).toLocaleTimeString()) +
+        '</span></div>').join('');
+      consumers.innerHTML = rows || '<span style="color:var(--textMute)">none (evictions are never blocked)</span>';
+    }
+    if (engines.shim_error) enginesSetMessage('shim: ' + engines.shim_error, 'var(--amber)');
+    const adoption = engines.adoption || {};
+    const missing = adoption.catalog_missing || [];
+    if (missing.length) {
+      const list = document.getElementById('engines-list');
+      if (list) {
+        list.insertAdjacentHTML(
+          'afterbegin',
+          '<div style="background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:8px;padding:8px 12px;font-size:12px">' +
+            'Unnamed native resident(s) ' + missing.map(escHtml).join(', ') +
+            ' — serving without a catalog entry; never killed, but no spec comparison is possible.</div>'
+        );
+      }
+    }
+    if ((adoption.warnings || []).length) {
+      enginesSetMessage(adoption.warnings.join(' · '), 'var(--amber)');
+    }
+  } catch (e) {
+    const list = document.getElementById('engines-list');
+    if (list) list.innerHTML = '<div style="color:var(--textMute);font-size:12px">Failed to load engine state.</div>';
+  }
+}
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('[data-eng-action]');
+  if (!btn) return;
+  const action = btn.dataset.engAction;
+  const model = btn.dataset.model || '';
+  try {
+    if (action === 'ensure' || action === 'ensure-override') {
+      enginesSetMessage((action === 'ensure-override' ? 'swap anyway: ' : 'ensuring ') + model + '…');
+      const body = { model: model };
+      if (action === 'ensure-override') body.override = true;
+      const r = await enginesPost('/api/engines/ensure', body);
+      enginesSetMessage(r.ok ? 'ready at ' + (r.body.endpoint || '') : ('failed: ' + ((r.body.error && r.body.error.message) || r.body.error || 'error')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'adopt') {
+      const body = { pid: Number(btn.dataset.pid || 0) };
+      if (model) body.model = model; else body.endpoint = btn.dataset.endpoint || '';
+      const r = await enginesPost('/api/engines/adopt', body);
+      enginesSetMessage(r.ok ? ('adopted pid ' + r.body.pid + ' at ' + r.body.endpoint) : ('adopt failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'takeover') {
+      enginesSetMessage('taking over ' + model + '…');
+      const r = await enginesPost('/api/engines/takeover', { model: model });
+      enginesSetMessage(r.ok ? (r.body.attached ? 'attached at ' + r.body.endpoint : 'spawned at ' + r.body.endpoint) : ('takeover failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'evict') {
+      const r = await enginesPost('/api/engines/evict', { model: model });
+      enginesSetMessage(r.ok ? 'stopped ' + model : 'evict failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'pin') {
+      const value = window.prompt('Reserved GiB to pin for ' + model, '10');
+      if (value === null) return;
+      const r = await enginesPost('/api/engines/pin', { model: model, reserved_gib: Number(value) });
+      enginesSetMessage(r.ok ? 'pinned ' + model : ('pin failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'unpin') {
+      const r = await enginesPost('/api/engines/unpin', { model: model });
+      enginesSetMessage(r.ok ? 'unpinned ' + model : 'unpin failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'cancel') {
+      const r = await fetch('/api/engines/queue/' + encodeURIComponent(btn.dataset.queueId || ''), { method: 'DELETE' });
+      enginesSetMessage(r.ok ? 'queue entry cancelled' : 'cancel failed', r.ok ? 'var(--green)' : 'var(--amber)');
+    } else if (action === 'import-preview') {
+      const r = await fetch('/api/engines/import/preview');
+      const j = await r.json().catch(() => ({}));
+      const out = document.getElementById('engines-import-out');
+      if (out) out.textContent = r.ok ? (j.lines || []).join('\n') : (j.error || 'preview failed');
+      enginesSetMessage(r.ok ? (j.would_import + ' model(s) would import') : 'preview failed', r.ok ? 'var(--textMute)' : 'var(--amber)');
+    } else if (action === 'import-apply') {
+      const r = await enginesPost('/api/engines/import/apply', {});
+      enginesSetMessage(r.ok ? ('imported: +' + r.body.added + ' updated ' + r.body.updated + ' unchanged ' + r.body.unchanged) : ('import failed: ' + (r.body.error || '')), r.ok ? 'var(--green)' : 'var(--amber)');
+    }
+    if (action !== 'import-preview') await loadEngines();
+  } catch (e) {
+    enginesSetMessage('engine action failed: ' + e, 'var(--amber)');
+  }
+});
+
 </script>
 </body>
 </html>

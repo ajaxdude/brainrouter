@@ -68,6 +68,30 @@ impl HealthTracker {
         };
     }
 
+    /// v2 L6: additive read API for live per-provider breaker state
+    /// (dashboard Providers section; provider list payloads).
+    ///
+    /// `healthy` / `degraded` / `open`. A broken key whose cooldown elapsed
+    /// reads healthy (the same transition `is_healthy` performs).
+    pub fn state(&self, provider_id: &str) -> &'static str {
+        let mut states = self.states.lock().unwrap();
+        let state = states
+            .entry(provider_id.to_string())
+            .or_insert(HealthState::Healthy);
+        match state {
+            HealthState::Healthy => "healthy",
+            HealthState::Degraded(_, _) => "degraded",
+            HealthState::Broken(broken_at) => {
+                if broken_at.elapsed() > COOLDOWN_PERIOD {
+                    *state = HealthState::Healthy;
+                    "healthy"
+                } else {
+                    "open"
+                }
+            }
+        }
+    }
+
     pub fn report_success(&self, provider_id: &str) {
         let mut states = self.states.lock().unwrap();
         if let Some(state) = states.get_mut(provider_id) {
