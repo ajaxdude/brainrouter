@@ -25,3 +25,6 @@ brainrouter-headless.yaml*
 # Machine-local runtime state (written by the daemon on this box; N8).
 managed_toolboxes.json
 brainrouter-headless.yaml
+
+# machine-local operational handoff notes (owner-specific topology/ops detail)
+HANDOFF-*.md

@@ -6,7 +6,7 @@
 **Implementation baseline:** `3691dcc9ee7dee98f8355328d7e2e75f99faafdb` (2026-09-07); extended through `32935d1` by the ai-toolbox-cockpit integration rollout, gufo overlay backend, dashboard navigation redesign, per-project pins, and review hardening — see [Toolbox Backend Management](#toolbox-backend-management) and `docs/design/ai-toolbox-cockpit-integration.md`
 **Config:** `$XDG_CONFIG_HOME/brainrouter/brainrouter.yaml` or `~/.config/brainrouter/brainrouter.yaml`; `serve --config` overrides it. Service environment files supply credentials; the daemon resolves configured environment-variable names.
 **Repository:** https://github.com/ajaxdude/brainrouter
-**Validation:** 391 Rust tests and 38 Node browser-logic tests passed at this baseline; see [Validation](#validation)
+**Validation:** 501 Rust library tests and 65 Node browser-logic tests passed at this baseline; see [Validation](#validation)
 
 ---
 
@@ -53,10 +53,10 @@ A developer running multiple LLM subscriptions (Anthropic, OpenAI/Copilot, Googl
 A single Rust daemon that:
 
 1. **Separates routing roles.** Role cards (`main`, `review`, `subagent`) at global and per-Git-root scope resolve every managed request through one selector grammar; explicit client selectors bypass cards. The `auto` path answers through the decision slot with guardrail clamps. v2 L3.
-2. **Preserves explicit choices and fallback semantics.** Bare model IDs and `brainrouter/<id>` select that local model with no rewrite or model substitution on failure. `cloud/<id>` sends the exact ID to Manifest. Explicit `local`/`cloud` aliases select backend defaults, not the Main override. Cloud requests retain the existing local fallback policy on disabled/unavailable Manifest; errors after streaming begins surface to the client rather than replaying output.
+2. **Preserves explicit choices and fallback semantics.** Bare model IDs and `brainrouter/<id>` select that local model with no rewrite or model substitution on failure. `cloud/<id>` sends the exact ID to the cloud provider. Explicit `local`/`cloud` aliases select backend defaults, not the Main override. Cloud requests retain the existing local fallback policy when cloud routing is disabled or no provider is available; errors after streaming begins surface to the client rather than replaying output.
 3. **Reviews code with runtime policy controls**, with explicit local or cloud reviewer IDs, requested-versus-actual reporting, and a reviewer snapshot retained for the lifetime of each review and its continuations. Runtime state can disable review, enable PR-generation guidance injection, and enable HankNDory design-aware review. Review prompts are token-budgeted before dispatch and escalate instead of approving when required evidence is truncated.
 4. **Manages system state** via the dashboard: one-click upgrades of llama-swap, resets of the llama.cpp toolbox, start/stop of the Bonsai classifier, and flushing of loaded models — full VRAM control without a terminal. This extends to **native, dashboard-driven management of ds4/gufo toolboxes, models, and detached servers** (halogen/vllm/r9v were v1 scope, removed by the v2 L1 purge; their catalog feed ids parse as browse-only data) — brainrouter is a native Rust webui for `ai-toolbox-cockpit`, sharing its catalog and config.json rather than a divergent brainrouter-only store (see [Toolbox Backend Management](#toolbox-backend-management)).
-5. **Keeps opt-ins explicit.** The decision model and Manifest are disabled by default. An `auto` card with the slot off routes local (the v1 classifier-off anchor). Card writes never enable Manifest.
+5. **Keeps opt-ins explicit.** The decision model and cloud routing are disabled by default. An `auto` card with the slot off routes local (the v1 classifier-off anchor). Card writes never enable cloud routing.
 6. **Presents a single OpenAI-compatible endpoint** to all harnesses, plus an Anthropic-compatible endpoint for harnesses (Claude Code, droid) that speak Anthropic's protocol natively.
 7. **Bridges chat platforms** -- Discord and Signal ship as the `bridge` sidecar plugin (v2 L2), shelling out to `omp` CLI, bringing LLM access to messaging apps with session management, model selection, and working directory tracking. Commands use the `!br` prefix.
 8. **Presents a simplified dashboard IA.** The primary dashboard destinations are Overview, Models, Benchmarks, and Config; an always-visible command strip exposes model scope/role controls, flush/restart/sync actions, health, and quality posture.
@@ -77,18 +77,18 @@ The configured Bonsai model runs as an external llama-server process (PrismML fo
 
 Bonsai was chosen specifically because it is purpose-trained to understand task complexity and model capability -- not as a general assistant. Using it only for routing preserves VRAM for llama-swap models.
 
-### Manifest handles all cloud routing
+### Provider registry handles cloud routing (v2 L6)
 
-Brainrouter connects to one OpenAI-compatible Manifest endpoint and one configured API-key environment variable. Default cloud selections send `model: "auto"`; explicit cloud role IDs and `cloud/<id>` pass the provider ID unchanged. Manifest selects the downstream cloud provider. The actual model is taken from reported response metadata, not assumed from the requested name. **Manifest is off by default**; cloud-disabled requests preserve local fallback behavior and expose that outcome.
+Cloud backends live in the **provider registry** (`$XDG_STATE_HOME/brainrouter/providers.json`, 0600, single-writer through `brainrouter cli provider ...` or the dashboard Providers section). Each record carries a kind (`openai-compatible`, `manifest`, or a `--lan-peer` federation peer), base URL, credential reference into the credentials store, optional declared models, a per-provider circuit breaker, and a monthly budget (`warn`, or `stop` to exclude it from the cloud pool while over). Default cloud selections send `model: "auto"` to Manifest-kind providers; explicit cloud role IDs and `cloud/<id>` pass the model ID unchanged to the selected provider — the three-part `cloud/<provider>/<model>` form names one registry provider exactly. The actual model is taken from reported response metadata, not assumed from the requested name. **Cloud routing is off by default** (no enabled non-peer provider registered); cloud-disabled requests preserve local fallback behavior and expose that outcome. A legacy `manifest:` YAML block is absorbed into a registry record by the `v2.0-p6` boot migration.
 
-The coupling is minimal: if Manifest is replaced with LiteLLM or OpenRouter, one URL in `brainrouter.yaml` changes.
+The coupling stays minimal: adding LiteLLM or OpenRouter is one `cli provider add`, no code change. Federation (`--lan-peer`) records forward by explicit selector only and are never pooled as cloud. Naming note: `v2.0-p4` is the release tag whose binary carries all merged legs; `v2.0-p6`/`v2.0-p7` are boot-MIGRATION phase names (restore points via `brainrouter migration restore <phase>`) that run once when that binary first boots a pre-L6/pre-L7 config.
 
 ### Two wire protocols on one port
 
 - `POST /v1/chat/completions` -- OpenAI format. Covers vibe, opencode, codex, omp, pi (via extension).
 - `POST /v1/messages` -- Anthropic Messages API format. Covers Claude Code (via `ANTHROPIC_BASE_URL`) and droid (via `provider: "anthropic"` in custom_models).
 
-Internally the request is immediately translated to OpenAI format and routed through the same Bonsai / Manifest / llama-swap pipeline. Response is translated back to Anthropic SSE events at the edge.
+Internally the request is immediately translated to OpenAI format and routed through the same Bonsai / cloud-provider / local pipeline (shim llama-swap or the native supervisor). Response is translated back to Anthropic SSE events at the edge.
 Proxy responses are streaming SSE; non-streaming provider completion APIs and
 OpenAI Responses endpoints are not implemented.
 
@@ -105,7 +105,7 @@ The `brainrouter mcp` process does not load Bonsai and does not run the review l
 When an agent requests a review, the service snapshots its Reviewer choice and iteration settings. The loop uses `Router::route_with_choice`, independently of the Main and subagent choices. This means:
 
 - Explicit local/cloud reviewer IDs are honored; an Auto reviewer follows classifier behavior, not the current Main override.
-- If Manifest is down, review calls fall back to llama-swap automatically.
+- If the primary reviewer backend fails, the review retries ONCE on `review.fallback_selector` (a named cloud provider, restart-applied YAML), then escalates to a human. The router passes `allow_local_fallback=false` for reviewer calls, so an explicit cloud reviewer card never silently executes on a local model (wrong rubric); the surfaced failure is what the review loop maps to `escalated`. Local-only reviews stay on their admitted model.
 - The same provider clients, circuit breakers, and streaming protections are reused.
 - Changing global preferences affects new reviews, not the reviewer of an existing session or continuation.
 
@@ -117,7 +117,7 @@ Role precedence is deliberately role-specific (v2 L3): **explicit request select
 
 ### Circuit breaker
 
-Two independent circuit breakers: one for `manifest`, one for `llama-swap`. Three failures within a window open the breaker; 60-second cooldown before retry. This prevents hammering a degraded provider while allowing automatic recovery.
+Per-backend circuit breakers in one `HealthTracker`: one per registered provider (keyed by provider id, v2 L6) plus one for the llama-swap shim while `swap.mode: shim`. Three failures within a window open the breaker; 60-second cooldown before retry. States: `healthy | degraded | broken`. HTTP 429/5xx from an OpenAI-compatible provider count as faults; Manifest-kind providers additionally classify in-stream "credits exhausted"/rate-limit payloads as `PseudoError` — reachable-but-unfulfillable, so they do NOT open the breaker (failover handles them instead).
 
 ### Robust Anthropic SSE adapter
 
@@ -167,7 +167,7 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | HTTP server | `src/server.rs` | Route `/v1/*`, `/review/*`, `/api/*`, and `/dashboard` |
 | Classifier | `src/classifier.rs` | Bonsai-based cloud/local decision |
 | Bonsai server lifecycle | `src/bonsai_server.rs` | `BonsaiServer`: spawn, 60s health poll, SIGTERM→SIGKILL stop. `BonsaiControl`: runtime start/stop from the dashboard, shared enabled flag for the classifier |
-| Router | `src/router.rs` | Dispatch to Manifest or llama-swap; fallback; timeout |
+| Router | `src/router.rs` | Dispatch to cloud providers or local (shim/native); fallback; timeout |
 | Role cards | `src/roles.rs` | Selector grammar + validation, per-scope cards, policy records, review-card extras, atomic 0600 state, the exact v1 migration table |
 | Decision slot | `src/decision.rs` | Features → {route, tier} with per-kind failure matrices, guardrail clamps, pool ranking |
 | Project cards | `src/roles.rs` (v2 L3; replaced `src/project_pins.rs`) | Per-Git-repository card scopes, canonical key resolution, atomic owner-only state |
@@ -206,6 +206,8 @@ A stream wrapper records successful measurements only after `[DONE]` and clean E
 | In-flight registry | `src/inflight.rs` | `InflightRegistry` + `InflightHandle` + `SniffStream`: per-request live rows (elapsed, model, UA, address, session, bytes, PP, activity) with dashboard cancel; sticky head-window activity sniff |
 | Provider adapter | `src/provider/mod.rs` | Provider trait and common types |
 | OpenAI provider | `src/provider/openai.rs` | OpenAI-compatible HTTP client with fault-aware circuit breaking (429/5xx) |
+| Provider registry | `src/providers.rs`, `src/provider_budget.rs` | `providers.json` (0600) store, kinds, breakers, monthly budget metering and `stop` pool exclusion (v2 L6) |
+| Swap supervisor (native) | `src/swap_scheduler.rs`, `src/swap_catalog.rs`, `src/engine_*.rs` | Native local-model supervision, catalog import, engine adapters — engine ids `llama_cpp` (toolbox llama-server), `strixite` (Strix Point / gfx1151 runners), `hipfire` (fedora1 host); inactive while `swap.mode: shim` (v2 L4/L7; engine fleet defined in `docs/design/v2-streamlining.md`) |
 | Plugin core | `src/plugins/` | Manifest, registry, supervisor, per-plugin UDS JSON-RPC (v2 L2) |
 | Credentials store | `src/credentials.rs` | `credentials.json` (0600), `resolve()`, grant model (v2 L2) |
 | Migration framework | `src/migration.rs` | Snapshot-first boot migrations + named restore (v2 L2) |
@@ -245,7 +247,11 @@ When installed via `install.sh` on a shared Fedora machine:
 
 ### YAML Configuration (`brainrouter.yaml`)
 
-#### manifest.*
+#### manifest.* *(superseded by the provider registry, v2 L6)*
+
+> The `v2.0-p6` boot migration absorbs this block into a registry provider record
+> and strips the consumed keys; after migration the registry (CLI/dashboard) is the
+> source of truth. Fresh configs should register providers directly.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -253,11 +259,17 @@ When installed via `install.sh` on a shared Fedora machine:
 | `base_url` | `String` | *(required)* | URL of the Manifest instance. Validated: must start with `http://` or `https://` |
 | `api_key_env` | `String?` | `None` | Name of the environment variable holding the `mnfst_*` API key (NOT the key itself) |
 
-#### llama_swap.*
+#### llama_swap.* *(renamed `swap.*` in v2.0-p7; old name accepted as alias)*
+
+> v2 L7 adds `mode: shim | native` (default `shim`; `native` hands local models to
+> the in-daemon swap supervisor and refuses boot while llama-swap still reports
+> loaded models) and `config_path` for the catalog import source.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `base_url` | `String` | *(required)* | URL of the llama-swap instance |
+| `mode` | `shim \| native` | `shim` | v2 L7: `native` hands local models to the in-daemon swap supervisor; boot refuses while the shim still reports loaded models |
+| `config_path` | `PathBuf?` | `~/.config/llama-swap/config.yaml` | v2 L7: llama-swap config the native catalog imports from at boot |
 | `fallback_model` | `String` | *(required)* | Model key to use when Manifest fails or Bonsai picks local. Must match a key in llama-swap config |
 | `local_models` | `Vec<String>?` | `[]` | Explicit llama-swap model keys; a request using one of them as `model=` routes straight to llama-swap, bypassing Bonsai |
 | `subs_model` | `String?` | `None` | Subs-pool model key; `model=subs` / `brainrouter/subs` routes here, bypassing Bonsai. Absent → `subs` falls back to auto |
@@ -290,6 +302,7 @@ When installed via `install.sh` on a shared Fedora machine:
 | (v2 L3) | — | — | The reviewer MODEL moved to the review role card; the v1 `forced_mode`/`forced_model` keys migrate once at boot (exact table) and are stripped from the YAML |
 | `hankndory_integration` | `bool` | `false` | YAML seed for design-aware review. Runtime `/api/review/hankndory` can override it without editing YAML |
 | `design_doc_path` | `String?` | `None` | Repo-relative design doc under `docs/design/` used when design-aware review is enabled |
+| `fallback_selector` | `String?` | `None` | Second-chance reviewer backend (v2 L6, e.g. `cloud/deepinfra/<model>`). On primary-reviewer cloud failure the review retries ONCE on this selector, then escalates. Cloud selectors only; read at boot (restart to apply); not part of the review card store |
 
 #### decision_model (v2 L3) + role cards
 
@@ -402,6 +415,7 @@ Thin client for core management, roles, and reviews. `--socket <path>` selects t
 | `routing-mode status` / `set <auto\|cloud\|local>` | Routing-mode override |
 | `roles get` / `roles set <role> <selector> [--project <path>]` / `roles remove` | Inspect and assign role cards (mutations via daemon HTTP; reads direct-state when the daemon is down) |
 | `decision show` / `decision test "<text>"` | Describe the decision slot; run one prompt through it (full Decision JSON incl. fallback) |
+| `provider list` / `add` / `remove` / `test <id>` | Provider registry CRUD + health probe of declared models (v2 L6). `add` flags: `--kind openai-compatible\|manifest`, `--lan-peer`, `--base-url`, `--credential <id\|env:VAR\|file:PATH>`, `--model`, `--monthly-budget-usd`, `--budget-mode warn\|stop` |
 | `credential list` / `add` / `remove` / `test` | Masked credentials CRUD + resolve-test verdicts (values never printed) |
 | `plugin install <dir>` / `list` / `enable` / `disable` / `remove` / `status [id]` | Sidecar plugin management (v2 L2) |
 | `plugin config set <id> k=v [...]` / `plugin config show <id>` | Plugin-namespaced config (v2 L2) |
@@ -503,8 +517,8 @@ Incoming request (OpenAI or Anthropic format)
   +-- model="local" --> prompt_rewriter.rs only when rewriting is enabled
   |                  --> llama-swap (fallback_model)
   |
-  +-- model="cloud" --> manifest (if enabled + healthy) --> llama-swap fallback
-  +-- model="cloud/<id>" --> exact Manifest model --> same cloud fallback policy
+  +-- model="cloud" --> enabled healthy cloud provider (registry pool, v2 L6) --> llama-swap fallback
+  +-- model="cloud/<id>" --> exact model ID on the selected provider --> same cloud fallback policy
   |
   +-- model="subs" / "brainrouter/subs" --> project subagent pin if present, else
   |     current local pool, bypassing Bonsai; unconfigured -> classifier/auto,
@@ -536,7 +550,7 @@ Incoming request (OpenAI or Anthropic format)
 
 Every failed hop is recorded in `RouteInfo.failed_attempts` (stage, provider, model_key, error) and the router emits one `RouteEvent` **per failed hop** plus one for the winner. The dashboard therefore renders multi-hop routes as a hop chain (e.g. `manifest ✗ → local ✓`) inside the card body; the Sankey ROUTING column embeds the chain in the routing node key itself.
 
-Both Bonsai and Manifest disabled (the default): `auto` → local, `cloud` → local — every request is a single hop to llama-swap.
+Both Bonsai and cloud routing disabled (the default): `auto` → local, `cloud` → local — every request is a single hop to llama-swap.
 
 ---
 
@@ -1120,6 +1134,8 @@ Each transport maintains per-channel (Discord) or per-user/group (Signal) state:
 | `GET` | `/api/routing-stats` | Aggregate routing statistics |
 | `GET` | `/api/inference-status` | Current inference state, model, elapsed time, token progress. `n_tokens` = total tokens decoded on the llama-server slot (monotonic within a request) — the progress bar is `n_tokens / max_tokens`. Slot data comes from the llama-server `/slots` endpoint (served as a bare JSON array on this build; both shapes are tolerated), with the live per-request count read from `next_token.n_decoded` (object or single-element array) |
 | `GET` | `/api/service-health` | Service reachability probes and fallback overview, not an exhaustive stream/circuit history |
+| `GET` | `/api/providers` (`/list`) | Provider registry records with breaker state and budget status (v2 L6) |
+| `POST` | `/api/providers` (`/add`, `/upsert`, `/remove`, `/<id>/test`, `/peer-info`) | Registry mutations (validated; credential must exist or be an `env:`/`file:` ref) and declared-model probes (v2 L6) |
 | `GET` | `/api/versions` | Version information for brainrouter and dependencies |
 | `GET` | `/api/review-config` | Current review configuration (mode, model) |
 | `POST` | `/api/review-config` | Update review configuration |
@@ -1297,9 +1313,9 @@ Resolve a review session with feedback.
 
 | Failure | Detection | Mitigation |
 |---|---|---|
-| Manifest returns 429 / 5xx | HTTP status code | Report failure to health tracker; try llama-swap fallback |
-| Manifest stream stalls after output begins | `TimeoutStream` (180s per chunk) | Error surfaces in SSE; no output replay or successful completed measurement |
-| Manifest circuit open | Health tracker (3 failures) | Skip Manifest, route directly to llama-swap |
+| Cloud provider returns 429 / 5xx | HTTP status code | Report failure to that provider's health tracker; on the `auto` path try the next pooled candidate, then llama-swap fallback |
+| Cloud provider stream stalls after output begins | `TimeoutStream` (180s per chunk) | Error surfaces in SSE; no output replay or successful completed measurement |
+| Cloud provider circuit open | Health tracker (3 failures) | Skip that provider (`auto`-path pool rotation); with nothing healthy left, route to llama-swap |
 | llama-swap returns error / 404 | HTTP status code | Error returned to caller; next request may load a different model |
 | llama-swap circuit open | Health tracker (3 failures) | Error: no backend available. 60s cooldown before retry |
 | Both circuits open | Health tracker | Error returned to caller; both providers on 60s cooldown |
@@ -1375,7 +1391,7 @@ Working directory tracking (for bridge sessions and review context gathering) en
 
 Required configuration is validated at daemon startup:
 
-- `manifest.base_url` must start with `http://` or `https://`
+- `manifest.base_url` must start with `http://` or `https://` (legacy pre-migration configs; the value lands in the registry record after the `v2.0-p6` migration)
 - `bonsai.model_path` must exist on disk — **only when `bonsai.enabled: true`**; a missing file with Bonsai off does not crash startup (Bonsai can be enabled later at runtime once the model is in place)
 - `llama_swap.fallback_model` is required
 
@@ -1399,7 +1415,7 @@ normalization, not weakened validation for new writes.
 
 ## What This Is Not
 
-- **Not a multi-provider cloud backend.** Brainrouter implements OpenAI-compatible proxying and an Anthropic wire shim; Manifest handles downstream cloud providers and pricing.
+- **Not a general multi-tenant cloud gateway.** Brainrouter implements OpenAI-compatible proxying and an Anthropic wire shim; the provider registry (v2 L6) is single-writer and loopback-trusted for one operator's fleet. Downstream providers keep their own accounts, pricing, and model management; brainrouter meters spend against declared monthly budgets but does not bill.
 - **Not a general request-time model runner.** brainrouter proxies chat traffic to Manifest/llama-swap and manages detached Server Mode containers for status/operations; the request router does not dispatch to Server Mode containers. It only spawns the single classifier llama-server for Bonsai.
 - **Not an auth layer.** Loopback is the default trust boundary, not user authentication. Credentials live in provider configuration/environment.
 - **Not a conversation store.** Chat history is managed by the harness. brainrouter is stateless for proxy calls; review sessions are in-memory and lost on daemon restart.
@@ -1438,10 +1454,16 @@ data and unit-tested in isolation, not integration-tested end-to-end on a real
 podman/GPU host. Ship behind an explicit "unverified" badge until a real host
 confirms them.
 
+The v2 program (legs L1–L7, release tag `v2.0-p4`) extended this to **501 Rust
+library tests** (`cargo test --lib`) and **65 Node browser-logic tests**
+(`node --test scripts/test-*.cjs`, sum across the six `scripts/test-*.cjs`
+files), measured at this baseline; the `tests/` integration suites (L4/L7
+acceptance) run on top of these counts in CI.
+
 ```bash
 cargo test --locked
 cargo clippy --locked --all-targets
-node --test scripts/test-benchmark-ui.cjs
+node --test scripts/test-*.cjs
 bash scripts/check-html-js.sh
 cargo build --locked --bin brainrouter
 ```
@@ -1457,8 +1479,9 @@ These are ideas requiring separate approval, not acceptance claims for this rele
 - Bonsai as a Strategic Context Expert -- real-time synthesis of cloud agent output
 - Interrupt-and-redirect: user types a correction mid-stream; brainrouter cancels and re-prompts
 - Persistent review sessions (SQLite) so they survive daemon restarts
-- Persistent request history, per-request token costs and budget enforcement
+- Persistent request history and per-request token costs (provider-level monthly budget metering and `stop` enforcement shipped with v2 L6)
 - Non-model per-project settings, optional strict cloud fallback consent, reviewer diversity rules, and escalation ladders
+- **Native-swap flip.** The swap supervisor and engine adapters ship (v2 L4/L7) but boot stays `swap.mode: shim`; the flip requires the documented soak (`docs/design/v2-streamlining.L7.soak.md`) and an operator change. Leg L8 — additional engine hardware targets (mac/ds4 Metal hosts) — is pending hardware.
 - **Quant Lab:** actual llama-perplexity/PPL/KLD execution, compatible same-family reference checking, queued/sequential runs with cancellation/progress, per-token distributions and GGUF parsing
 - **Model Compare:** complete common-suite execution across unrelated families, token-space compatibility checks, and blind human evaluation
 - Automated benchmark scheduling, controlled regression campaigns, outbound notifications, or automatic model switching
@@ -1467,10 +1490,10 @@ These are ideas requiring separate approval, not acceptance claims for this rele
 - Runtime context-selection controls: the retained `cli context` command has no implemented `/api/context` server route
 - **`brainrouter cli` parity for ds4/gufo.** The toolbox backends are dashboard/API-only; `cli toolboxes`/`cli upgrade toolbox` remain llama.cpp-only. (v1's halogen/vllm/r9v scope in this item was removed by the v2 L1 purge.)
 - **Register downloaded GGUFs into llama-swap.** Designed in `docs/design/llama-swap-register-downloaded-gguf.md`, not implemented.
-- **Router integration for Server Mode backends ("PR 11b" / Feature B).** Server Mode containers are not dispatchable as real request traffic; `Router`/`route()` still only knows Manifest + llama-swap. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
+- **Router integration for Server Mode backends ("PR 11b" / Feature B).** Server Mode containers are not dispatchable as real request traffic; the `Router`'s local layer still serves only shim (llama-swap) or native-supervisor models. This is the prerequisite for `status_only` Sankey/benchmark entries to ever become real routed traffic, and needs its own pre-implementation design note plus a live deployment to validate against before it touches request dispatch.
 - ~~R9V functional validation on real 2×AMD R9700 hardware.~~ v1 scope; the r9v backend was removed by the v2 L1 purge (see `docs/design/v2-streamlining.md` L1) — re-validating this hardware path requires a new backend per the v2 engine-adapters plan (R6), not a revival of v1 code.
 - **Bidirectional/continuous config.json sync with ai-toolbox-cockpit.** Only an explicit, user-triggered single-write "apply" path exists; no locking/conflict protocol is defined for concurrent brainrouter+cockpit writes.
-- **ROCm/AMD-GPU auto-detection.** brainrouter has no `rocminfo`/sysfs-based hardware detection; R9V is offered as a selectable option and fails loudly on unsupported hardware rather than being auto-hidden.
+- **ROCm/AMD-GPU auto-detection.** brainrouter has no `rocminfo`/sysfs-based hardware detection; future AMD engine adapters (leg L8) must fail loudly on unsupported hardware rather than being auto-hidden.
 
 The notes motivating Quant Lab/Model Compare are not fully implemented by the
 current explorer. Ember/Flash environment, cache-building, or provisioning work

@@ -5,6 +5,13 @@
 > breaking changes to configuration, CLI, and HTTP surfaces between releases; every
 > migrating release ships automatic config migration with a named restore point
 > (`brainrouter migration restore <phase>`), and v1-era configs keep booting.
+> As of **v2.0-p4**, legs L1–L7 are merged: provider registry (L6), swap supervisor
+> and native engine adapters (L4/L7), and review-backend failover
+> (`review.fallback_selector`) all ship — but the daemon still **boots in shim
+> mode against llama-swap by default** (shim mode requires llama-swap installed
+> and enabled); the native-swap flip is a separate, soak-gated operator action,
+> and leg L8 (additional engine hardware) is pending. `QA.md` ships the
+> end-to-end operational scenario suite.
 
 <p align="center">
   <img src="assets/brainrouter-logo.svg" alt="brainrouter logo" width="600">
@@ -140,9 +147,34 @@ The script installs (idempotent — safe to re-run):
 
 ### Optional cloud setup
 
-For cloud use, create the Manifest API key in its browser wizard and enable
-`manifest.enabled` in the selected Brainrouter YAML. A cloud profile does not
-enable the backend. Local-only operation needs no cloud key.
+Cloud backends live in the **provider registry** (`$XDG_STATE_HOME/brainrouter/
+providers.json`, default `~/.local/state/...`, mode 0600; mutate through
+`brainrouter cli provider ...` or the dashboard Providers section — single-writer).
+Each provider record holds a base URL, a credential reference into the credentials
+store (values never printed), optional declared models, a live circuit breaker
+(`healthy | degraded | broken`, keyed per provider — three failures open it, 60s
+cooldown), and a monthly spend budget (`warn`, or `stop` to drop the provider from
+the cloud pool once over). Credentials bind either inline (`--credential
+env:VAR` / `file:PATH`) or by id from the credentials store:
+
+```bash
+brainrouter cli credential add NAME --kind env --env API_KEY_ENV --grants cloud
+brainrouter cli provider add NAME --kind openai-compatible \
+  --base-url https://gateway.example/v1 --credential NAME --model some/model
+```
+
+Federation peers (`--lan-peer`, e.g. a second box serving one pinned model) are
+reachable only by explicit selector and are never pooled as cloud; budgets and
+limits set via `--monthly-budget-usd` / `--budget-mode warn|stop`. Manifest-kind
+providers additionally do not trip their breaker on in-band "credits exhausted"
+or rate-limit pseudo-errors in the stream — a reachable-but-unfulfillable
+Manifest is not a dead backend. On upgrade, the `v2.0-p6` migration absorbs a
+legacy `manifest:` YAML block into a registry record automatically (backup kept;
+after that the YAML key is no longer read). For a **self-hosted Manifest** app,
+finish its browser wizard first, then register it like any provider
+(`--kind manifest`) or keep the legacy `manifest:` YAML block and let the
+migration convert it at first boot. A cloud profile does not enable the backend;
+local-only operation needs no cloud key.
 
 1. Open **http://localhost:3001**, complete the setup wizard, add your cloud API keys
 2. Go to **Settings → API Keys → Create key** — copy the `mnfst_…` key
@@ -1441,6 +1473,11 @@ brainrouter cli brainrouter-config show # current brainrouter.yaml (raw YAML); `
 brainrouter cli brainrouter-config set ./new.yaml  # replace it; "-" reads stdin
 brainrouter cli llama-swap-config show   # llama-swap's config.yaml
 brainrouter cli llama-swap-config set ./config.yaml
+brainrouter cli provider list            # registry (v2 L6): kinds, breakers, budgets
+brainrouter cli provider add NAME --kind openai-compatible --base-url URL --credential env:VAR
+brainrouter cli provider test NAME       # probes declared models (openai-compatible: /models)
+brainrouter cli credential list          # vault; values are never printed
+brainrouter cli credential add NAME --kind env --env VAR --grants cloud
 ```
 
 CLI spelling vs dashboard: `llama-cpp` (CLI value) is the `llama.cpp` row in the dashboard sidebar — same component. `toolbox` (upgrade value) is the `toolboxes` container image.
@@ -1955,9 +1992,13 @@ plans found in the separate Quant Lab / Model Compare notes:
   parsing, and per-token distributions.
 - **Model Compare:** complete common-suite execution for unrelated model
   families, compatible token-space/KLD checks, and blind human evaluation.
-- Persistent request/review history, cloud cost/budget enforcement, non-model
+- Persistent request/review history, non-model
   per-project settings, optional strict cloud fallback consent, reviewer-diversity
   policies, or review escalation ladders.
+- The native-swap flip: the swap supervisor and engine adapters ship in v2.0-p4,
+  but boot stays in shim mode (llama-swap) until the documented soak
+  (`docs/design/v2-streamlining.L7.soak.md`) passes and an operator flips
+  `swap.mode`. Leg L8 (additional engine hardware, e.g. Metal/ds4 hosts) is pending.
 - Automatic benchmark scheduling, controlled regression campaigns, model
   switching, outbound alerts, Parquet export, or runtime-loaded-asset attestation.
 - A working `/api/context` control/automatic runtime context selection; the
