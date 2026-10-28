@@ -102,7 +102,7 @@ def _decide(features: dict) -> dict:
         # from missing data (would defeat min_confidence gating).
         raise ValueError("mica response missing noul probability")
     p_cloud = float(noul)
-    depth = ans.get("depth", {})
+    depth = ans.get("depth") if isinstance(ans.get("depth"), dict) else {}
     # Schema carries both: discrete `level` (int) and `expected_level` (float).
     raw = depth.get("level")
     if raw is None:
@@ -135,8 +135,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length > MAX_BODY_BYTES:
-                self.send_error(413, "body too large")
+            if not 0 <= length <= MAX_BODY_BYTES:
+                self.send_error(413, "invalid content length")
                 return
             body = json.loads(self.rfile.read(length))
             decision = _decide(_features_from_messages(body))
@@ -154,7 +154,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            except OSError as exc:  # headers already sent; cannot send_error
+                log.write(f"mica adapter write failed: {exc!r}\n")
         except Exception as exc:  # 503 -> slot sees Unavailable -> heuristic
             log.write(f"mica adapter failure: {exc!r}\n")
             log.flush()

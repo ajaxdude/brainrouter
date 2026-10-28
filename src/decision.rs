@@ -331,15 +331,10 @@ impl DecisionModel for OpenAiCompatibleModel {
             // Generic prompt profile: the endpoint answers with the decision
             // JSON in choices[0].message.content.
             let base = self.config.base_url.clone().unwrap_or_default();
-            let body = json!({
-                "model": self.config.model.clone().unwrap_or_default(),
-                "messages": [
-                    {"role": "system", "content": "You are a routing classifier. Reply with JSON {\"route\":\"local|cloud\",\"tier\":\"fast|balanced|deep\",\"confidence\":0.0-1.0,\"rationale\":\"...\"} and nothing else."},
-                    {"role": "user", "content": features.to_json(true)},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 64,
-            });
+            let body = generic_profile_body(
+                &features.to_json(true),
+                self.config.model.clone().unwrap_or_default(),
+            );
             let text = post_json(&base, "/v1/chat/completions", body, timeout_of(&self.config)).await?;
             parse_decision_json(&text).map(|mut d| {
                 d.rationale = format!("openai-compatible: {}", d.rationale);
@@ -699,6 +694,22 @@ async fn post_json(base: &str, path: &str, body: Value, timeout: Duration) -> Re
 
 /// Parse a chat-completion reply, extracting the decision JSON from
 /// `choices[0].message.content` (STRICT JSON — no fences, no prose).
+/// The generic openai-compatible prompt-profile body. The features JSON is
+/// STRING-encoded message content: OpenAI-compatible servers (llama-server
+/// included) reject object content with 400, which would make every
+/// llama.cpp-hosted classifier Unavailable.
+fn generic_profile_body(features: &Value, model: String) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a routing classifier. Reply with JSON {\"route\":\"local|cloud\",\"tier\":\"fast|balanced|deep\",\"confidence\":0.0-1.0,\"rationale\":\"...\"} and nothing else."},
+            {"role": "user", "content": features.to_string()},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 64,
+    })
+}
+
 fn parse_decision_json(raw: &str) -> Result<Decision, DecisionError> {
     let v: Value = serde_json::from_str(raw)
         .map_err(|e| DecisionError::Parse(format!("chat completion envelope: {e}")))?;
@@ -951,6 +962,21 @@ mod tests {
     }
 
     #[test]
+    fn generic_profile_body_sends_string_content() {
+        // llama-server 400s on object message content; the generic profile
+        // must ship a JSON STRING that still parses back to the features.
+        let body = generic_profile_body(
+            &json!({"role": "main", "last_user_excerpt": "hello"}),
+            "lfm3-classifier".into(),
+        );
+        let content = body["messages"][1]["content"].clone();
+        let s = content.as_str().expect("user content must be a string");
+        let parsed: Value = serde_json::from_str(s).expect("content is JSON");
+        assert_eq!(parsed["last_user_excerpt"], "hello");
+        assert_eq!(body["model"], "lfm3-classifier");
+    }
+
+    #[test]
     fn adapter_tier_vocabulary_round_trips() {
         // The Mica adapter (scripts/mica-router-adapter.py) emits exactly
         // these tier spellings; a mismatch would fail the whole decision and
@@ -961,6 +987,11 @@ mod tests {
             );
             let decision = decision_from_value_str(&raw).expect(tier);
             assert_eq!(decision.tier.as_str(), tier);
+            // Full-shape pin: route/confidence/rationale parse too, so shim
+            // envelope drift fails here instead of silently at the slot.
+            assert_eq!(decision.route, crate::decision::Route::Local);
+            assert!((decision.confidence - 0.9).abs() < 1e-9);
+            assert_eq!(decision.rationale, "x");
         }
     }
 }

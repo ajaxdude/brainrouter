@@ -1160,6 +1160,9 @@ impl Router {
     /// The auto-path candidate chain (L3 "Auto-path selection"): pool =
     /// llama-swap models (config keys + `/v1/models`) + server-mode
     /// identities; the chain seed is `fallback_model` (v1's compat seed;
+    /// `nudge_model_key` replaces it when nudge is enabled, and with `fast`
+    /// a configured `tiny_model` — pool member, known-ctx fit — is promoted
+    /// ahead of both.)
     /// logged deprecated in favor of the L4 catalog). Ranking: the seed, then
     /// known-ctx fits (llama-swap `parameters.ctx` where readable, unknown
     /// ctx ranked last for large requests — logged), then the rest in
@@ -1192,7 +1195,9 @@ impl Router {
                 }
             }
         }
-        let ctx = self.ctx_snapshot();
+        // One ctx read per chain build, but only when something consumes it.
+        let need_ctx = pool.len() > 1 || (fast && self.tiny_model.is_some());
+        let ctx = if need_ctx { self.ctx_snapshot() } else { None };
         if pool.len() > 1 {
             self.rank_by_ctx(&mut pool, &seed, approx_tokens, ctx.as_ref());
         }
@@ -1246,7 +1251,13 @@ impl Router {
             );
         }
         let path = self.llama_swap_config_path.as_ref()?;
-        read_llama_swap_ctx(path).ok()
+        match read_llama_swap_ctx(path) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                debug!(error = %e, "shim ctx config unreadable; ctx-dependent ranking skipped");
+                None
+            }
+        }
     }
 
     /// Pool ranking by KNOWN ctx only (L3 spec): "unknown ctx = ranked last
@@ -4057,7 +4068,14 @@ mod tests {
 
     #[tokio::test]
     async fn fast_tiny_skipped_when_known_ctx_too_small_but_stays_in_chain() {
-        let dir = std::env::temp_dir().join(format!("br-ctx-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "br-ctx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
         std::fs::write(
