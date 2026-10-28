@@ -272,6 +272,7 @@ When installed via `install.sh` on a shared Fedora machine:
 | `config_path` | `PathBuf?` | `~/.config/llama-swap/config.yaml` | v2 L7: llama-swap config the native catalog imports from at boot |
 | `fallback_model` | `String` | *(required)* | Model key to use when the cloud provider fails or Bonsai picks local. Must match a key in llama-swap config |
 | `local_models` | `Vec<String>?` | `[]` | Explicit llama-swap model keys; a request using one of them as `model=` routes straight to llama-swap, bypassing Bonsai |
+| `tiny_model` | `String?` | `None` | llama-swap key for the `fast` decision tier (an LFM3-class small model). An `auto` request whose decision comes back `tier: fast` puts this key first in the local chain. Must be a pool member (swap catalog or `local_models`) to take effect; unset or absent leaves the seed first. A *known* context too small for the request also skips the preference |
 | `subs_model` | `String?` | `None` | Subs-pool model key; `model=subs` / `brainrouter/subs` routes here, bypassing Bonsai. Absent → `subs` falls back to auto |
 | `local_system_prompt` | `String?` | `None` | Path to a custom system prompt file for `model=local` mode. Built-in lean prompt used if absent |
 | `nudge.enabled` | `bool` | `false` | Thinking-budget nudge: inject `reasoning_budget_tokens` into local routes when the client didn't set one |
@@ -329,7 +330,7 @@ pre-check); low confidence ⇒ heuristic + `fallback=heuristic`; fresh-config
 kinds (structured-schema/webhook/plugin) ⇒ heuristic +
 `fallback=unavailable`. `auto` local selection uses the pool (llama-swap
 models + server-mode identities, `parameters.ctx` ranking when known, chain
-seed = `fallback_model`) and chains on connect/response-headline failure
+seed = `fallback_model`; `nudge.model_key` replaces the seed when enabled, and a `tier: fast` decision with `swap.tiny_model` set moves the tiny key ahead of both) and chains on connect/response-headline failure
 only — never mid-stream.
 
 The `v2.0-p3` boot migration consumes v1 `routing:` blocks (presets
@@ -341,6 +342,17 @@ Cloud{Some}→cloud/<id>`), strips the consumed YAML keys (snapshot + `.bak`
 first), and `brainrouter migration restore v2.0-p3` round-trips the
 pre-migration YAML byte-for-byte. `serve --dry-run` previews without
 writing.
+
+> **Local adapters (operator note).** `kind: openai-compatible` can also target
+> a local decision adapter such as `scripts/mica-router-adapter.py`: an
+> OpenAI-compatible `/v1/chat/completions` endpoint on `127.0.0.1:9210` backed
+> by the Mica `/v1/systemone` runtime on `127.0.0.1:8010` (both CPU-only
+> llama.cpp; no VRAM). Env: `MICA_UPSTREAM`, `MICA_PORT`,
+> `MICA_CLOUD_THRESHOLD` (route cloud at/above this noul probability, default
+> 0.55 — biased to local by design), `MICA_TIMEOUT_S`. Runs under the user
+> systemd units `mica-router.service` + `mica-router-adapter.service`; an
+> upstream failure returns 503, which the slot treats as Unavailable and
+> falls back to the heuristic.
 
 #### benchmarks.*
 

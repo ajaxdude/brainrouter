@@ -322,6 +322,8 @@ pub struct Router {
     /// llama-swap model key that runs the nudge fork (chain seed when the
     /// nudge switch is on — v1 `Classifier::default_local_model` parity).
     nudge_model_key: Option<String>,
+    /// llama-swap key for the `fast` decision tier (see `SwapConfig::tiny_model`).
+    tiny_model: Option<String>,
     /// (v2 L3 Step 9 I4: the per-request grace clock travels as a tokio
     /// task-local — the Router is shared by every connection, and a slot
     /// on it let a concurrent request clear/overwrite the window of the
@@ -373,6 +375,7 @@ pub struct RouterArgs {
     pub nudge_enabled: Arc<AtomicBool>,
     pub nudge_tier: Arc<AtomicU8>,
     pub nudge_model_key: Option<String>,
+    pub tiny_model: Option<String>,
     pub prompt_rewrite: Arc<AtomicBool>,
     pub llama_swap_config_path: Option<std::path::PathBuf>,
     pub serving_identities: Option<Arc<ServingIdentityRegistry>>,
@@ -400,6 +403,7 @@ impl Router {
             nudge_enabled: args.nudge_enabled,
             nudge_tier: args.nudge_tier,
             nudge_model_key: args.nudge_model_key,
+            tiny_model: args.tiny_model,
             prompt_rewrite: args.prompt_rewrite,
             llama_swap_config_path: args.llama_swap_config_path,
             serving_identities: args.serving_identities,
@@ -1135,7 +1139,10 @@ impl Router {
             SlotRoute::Local => {
                 request.messages = self.maybe_rewrite_local(request.messages);
                 self.inject_nudge_budget(&mut request, decision.tier);
-                let candidates = self.chain_candidates(features.approx_prompt_tokens).await;
+                let fast = matches!(decision.tier, crate::decision::Tier::Fast);
+                let candidates = self
+                    .chain_candidates(features.approx_prompt_tokens, fast)
+                    .await;
                 info!(?candidates, tier = decision.tier.as_str(), "Slot local chain");
                 let (class, tag) = (routing_local, "local");
                 tracker.set(
@@ -1157,7 +1164,7 @@ impl Router {
     /// known-ctx fits (llama-swap `parameters.ctx` where readable, unknown
     /// ctx ranked last for large requests — logged), then the rest in
     /// configured order.
-    async fn chain_candidates(&self, approx_tokens: u64) -> Vec<String> {
+    async fn chain_candidates(&self, approx_tokens: u64, fast: bool) -> Vec<String> {
         let mut seed = None;
         if self.nudge_enabled.load(Ordering::Relaxed) {
             seed = self.nudge_model_key.clone();
@@ -1185,41 +1192,77 @@ impl Router {
                 }
             }
         }
+        let ctx = self.ctx_snapshot();
         if pool.len() > 1 {
-            self.rank_by_ctx(&mut pool, &seed, approx_tokens);
+            self.rank_by_ctx(&mut pool, &seed, approx_tokens, ctx.as_ref());
+        }
+        // `fast` tier (decision slot): the configured tiny model leads the
+        // chain when it is in the pool and its KNOWN ctx fits the request
+        // (an LFM3-class tiny serving a 30k-token request would be truncated
+        // by the chain only after a failed attempt, so known-too-small ctx
+        // skips the preference). When nudge is also on, the tiny preference
+        // wins over the nudge seed — both are cost-reductions; tiny first is
+        // the strictly cheaper ordering.
+        if fast {
+            if let Some(tiny) = &self.tiny_model {
+                match pool.iter().position(|k| k == tiny) {
+                    Some(pos) => {
+                        let fits = ctx
+                            .as_ref()
+                            .and_then(|m| m.get(tiny))
+                            .map(|known| *known >= approx_tokens)
+                            .unwrap_or(true);
+                        if fits {
+                            let key = pool.remove(pos);
+                            pool.insert(0, key);
+                        } else {
+                            debug!("tiny model {tiny:?} ctx too small for {approx_tokens} tokens; chain seed unchanged");
+                        }
+                    }
+                    None => {
+                        debug!("tiny model {tiny:?} not in local pool; chain seed unchanged");
+                    }
+                }
+            }
         }
         pool
+    }
+
+    /// One ctx read per chain build (L3 sources: native catalog or the
+    /// shim's config file). `None` = source unknown/unreadable; callers skip
+    /// ctx-dependent ranking.
+    fn ctx_snapshot(&self) -> Option<HashMap<String, u64>> {
+        if self.swap_mode.is_native() {
+            let entries = self
+                .swap
+                .as_ref()
+                .map(|swap| swap.catalog().entries())
+                .unwrap_or_default();
+            return Some(
+                entries
+                    .into_iter()
+                    .filter_map(|e| e.ctx.map(|ctx| (e.id, ctx)))
+                    .collect(),
+            );
+        }
+        let path = self.llama_swap_config_path.as_ref()?;
+        read_llama_swap_ctx(path).ok()
     }
 
     /// Pool ranking by KNOWN ctx only (L3 spec): "unknown ctx = ranked last
     /// for large requests, clamp not applied, logged". The ctx source is
     /// llama-swap's own config (`parameters.ctx`); when the file is
     /// unreadable every ctx is unknown and the configured order stands.
-    fn rank_by_ctx(&self, pool: &mut Vec<String>, seed: &str, approx_tokens: u64) {
-        // Native mode: the catalog owns ctx (no shim config read).
-        let ctx: HashMap<String, u64> = if self.swap_mode.is_native() {
-            self.swap
-                .as_ref()
-                .map(|swap| {
-                    swap.catalog()
-                        .entries()
-                        .into_iter()
-                        .filter_map(|e| e.ctx.map(|ctx| (e.id, ctx)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            let Some(path) = &self.llama_swap_config_path else {
-                debug!("shim config path unknown; ctx ranking skipped");
-                return;
-            };
-            match read_llama_swap_ctx(path) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    debug!(error = %e, "shim config unreadable; ctx ranking skipped");
-                    return;
-                }
-            }
+    fn rank_by_ctx(
+        &self,
+        pool: &mut Vec<String>,
+        seed: &str,
+        approx_tokens: u64,
+        ctx: Option<&HashMap<String, u64>>,
+    ) {
+        let Some(ctx) = ctx else {
+            debug!("ctx source unknown or unreadable; ctx ranking skipped");
+            return;
         };
         if ctx.is_empty() {
             return;
@@ -1987,8 +2030,10 @@ impl Router {
                         self.push_expose_candidate(&mut out, &self.fallback_model);
                     }
                     SlotRoute::Local => {
-                        let candidates =
-                            self.chain_candidates(features.approx_prompt_tokens).await;
+                        let fast = matches!(outcome.decision.tier, crate::decision::Tier::Fast);
+                        let candidates = self
+                            .chain_candidates(features.approx_prompt_tokens, fast)
+                            .await;
                         for candidate in candidates {
                             self.push_expose_candidate(&mut out, &candidate);
                         }
@@ -3929,5 +3974,119 @@ mod tests {
         assert!(frames.iter().all(|frame| frame.is_ok()));
         assert!(frames.iter().any(|frame| String::from_utf8_lossy(frame.as_ref().unwrap()).contains(&content)));
         assert_eq!(events.get_measurements().len(), 1);
+    }
+
+    fn chain_router(tiny: Option<&str>) -> Router {
+        chain_router_ex(tiny, None, None)
+    }
+
+    fn chain_router_ex(
+        tiny: Option<&str>,
+        swap_ctx_file: Option<&std::path::Path>,
+        nudge: Option<&str>,
+    ) -> Router {
+        use crate::config::{DecisionKind, DecisionModelConfig};
+        let classifier = Arc::new(crate::classifier::Classifier::new(
+            "http://127.0.0.1:1/classifier".into(),
+            "default-local".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        ));
+        let slot = Arc::new(crate::decision::DecisionSlot::new(
+            DecisionModelConfig {
+                enabled: false,
+                kind: DecisionKind::Heuristic,
+                ..Default::default()
+            },
+            classifier,
+            None,
+        ));
+        Router::new(RouterArgs {
+            slot,
+            cards: Arc::new(crate::roles::RoleCardStore::memory(Default::default())),
+            providers: Arc::new(crate::providers::ProviderStore::in_memory_with(vec![])),
+            credentials: Arc::new(crate::credentials::CredentialStore::in_memory()),
+            budget: Arc::new(crate::provider_budget::ProviderBudget::in_memory()),
+            llama_swap: Arc::new(crate::provider::openai::OpenAiProvider::new(
+                "test-shim".into(),
+                "http://127.0.0.1:1/v1".into(),
+                None,
+            )),
+            fallback_model: "big-model".into(),
+            local_models: vec!["big-model".into(), "lfm3-1.7b".into()],
+            subs_model: None,
+            health: Arc::new(crate::health::HealthTracker::new()),
+            routing_events: Arc::new(RoutingEvents::new()),
+            local_system_prompt: None,
+            inference_tracker: Arc::new(crate::inference_state::InferenceTracker::new()),
+            nudge_budgets: Default::default(),
+            nudge_enabled: Arc::new(std::sync::atomic::AtomicBool::new(nudge.is_some())),
+            nudge_tier: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            nudge_model_key: nudge.map(str::to_string),
+            tiny_model: tiny.map(str::to_string),
+            prompt_rewrite: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            llama_swap_config_path: swap_ctx_file.map(std::path::PathBuf::from),
+            serving_identities: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn fast_tier_leads_chain_with_tiny_model_when_configured() {
+        let router = chain_router(Some("lfm3-1.7b"));
+        let chain = router.chain_candidates(100, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("lfm3-1.7b"));
+        assert!(chain.contains(&"big-model".to_string()));
+    }
+
+    #[tokio::test]
+    async fn non_fast_tier_and_missing_tiny_keep_seed_first() {
+        let router = chain_router(Some("lfm3-1.7b"));
+        let chain = router.chain_candidates(100, false).await;
+        assert_eq!(chain.first().map(String::as_str), Some("big-model"));
+        // tiny unset: fast changes nothing
+        let router = chain_router(None);
+        let chain = router.chain_candidates(100, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("big-model"));
+        // tiny configured but NOT in the pool (misconfiguration): seed stays first
+        let router = chain_router(Some("not-in-pool"));
+        let chain = router.chain_candidates(100, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("big-model"));
+        assert!(!chain.iter().any(|k| k == "not-in-pool"));
+    }
+
+    #[tokio::test]
+    async fn fast_tiny_skipped_when_known_ctx_too_small_but_stays_in_chain() {
+        let dir = std::env::temp_dir().join(format!("br-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "models:\n  - name: lfm3-1.7b\n    parameters:\n      ctx: 4096\n  - name: big-model\n    parameters:\n      ctx: 131072\n",
+        )
+        .unwrap();
+        let router = chain_router_ex(Some("lfm3-1.7b"), Some(&path), None);
+        // Request too large for the tiny's known ctx: seed stays first, tiny still present.
+        let chain = router.chain_candidates(8_000, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("big-model"));
+        let tiny_pos = chain.iter().position(|k| k == "lfm3-1.7b").expect("tiny in chain");
+        assert!(tiny_pos > 0);
+        // Same config, small request: tiny preference applies.
+        let chain = router.chain_candidates(100, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("lfm3-1.7b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fast_tiny_wins_over_nudge_seed() {
+        // Documented precedence: with nudge on AND a fast-tier tiny hit, the
+        // tiny key leads the chain ahead of the nudge seed.
+        let router = chain_router_ex(Some("lfm3-1.7b"), None, Some("nudge-model"));
+        let chain = router.chain_candidates(100, true).await;
+        assert_eq!(chain.first().map(String::as_str), Some("lfm3-1.7b"));
+        assert!(chain.contains(&"nudge-model".to_string()));
+        // Non-fast with nudge: nudge seed leads.
+        let chain = router.chain_candidates(100, false).await;
+        assert_eq!(chain.first().map(String::as_str), Some("nudge-model"));
     }
 }

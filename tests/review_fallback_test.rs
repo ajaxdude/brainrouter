@@ -178,6 +178,7 @@ fn router(fleet_url: &str, cards: Arc<RoleCardStore>) -> Arc<Router> {
         nudge_enabled: Arc::new(AtomicBool::new(false)),
         nudge_tier: Arc::new(AtomicU8::new(0)),
         nudge_model_key: None,
+        tiny_model: None,
         prompt_rewrite: Arc::new(AtomicBool::new(false)),
         llama_swap_config_path: None,
         serving_identities: None,

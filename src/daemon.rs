@@ -906,6 +906,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         nudge_enabled: Arc::clone(&nudge_enabled),
         nudge_tier: Arc::clone(&nudge_tier),
         nudge_model_key: config.swap.nudge.model_key.clone(),
+        tiny_model: config.swap.tiny_model.clone(),
         prompt_rewrite: Arc::clone(&prompt_rewrite),
         llama_swap_config_path,
         serving_identities: Some(Arc::clone(&serving_identities)),

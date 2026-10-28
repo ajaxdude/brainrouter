@@ -296,6 +296,13 @@ pub struct SwapConfig {
     /// model hint. Must match an entry in the swap catalog.
     pub fallback_model: String,
 
+    /// Optional tiny-model catalog key (LFM3-class) for the `fast` decision
+    /// tier. When an auto request's decision classifies as `tier: fast`, the
+    /// local chain prefers this key ahead of the `fallback_model` seed. A
+    /// missing key is harmless: the seed stays first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiny_model: Option<String>,
+
     /// Explicit list of model keys served locally. When a request arrives
     /// with `model` set to one of these names, brainrouter routes directly to
     /// the local engine without consulting the classifier — the user's model
@@ -358,6 +365,7 @@ impl Default for SwapConfig {
             config_path: None,
             base_url: None,
             fallback_model: String::new(),
+            tiny_model: None,
             local_models: Vec::new(),
             local_system_prompt: None,
             subs_model: None,

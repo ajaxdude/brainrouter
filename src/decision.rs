@@ -949,4 +949,18 @@ mod tests {
         assert_eq!(RequestFeatures::approx_tokens_of_body(4), 1);
         assert_eq!(RequestFeatures::approx_tokens_of_body(5), 2);
     }
+
+    #[test]
+    fn adapter_tier_vocabulary_round_trips() {
+        // The Mica adapter (scripts/mica-router-adapter.py) emits exactly
+        // these tier spellings; a mismatch would fail the whole decision and
+        // silently drop to heuristic.
+        for tier in ["fast", "balanced", "deep"] {
+            let raw = format!(
+                "{{\"route\":\"local\",\"tier\":\"{tier}\",\"confidence\":0.9,\"rationale\":\"x\"}}"
+            );
+            let decision = decision_from_value_str(&raw).expect(tier);
+            assert_eq!(decision.tier.as_str(), tier);
+        }
+    }
 }
