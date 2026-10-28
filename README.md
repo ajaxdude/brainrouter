@@ -147,8 +147,7 @@ The script installs (idempotent — safe to re-run):
 
 ### Optional cloud setup
 
-Cloud backends live in the **provider registry** (`$XDG_STATE_HOME/brainrouter/
-providers.json`, default `~/.local/state/...`, mode 0600; mutate through
+Cloud backends live in the **provider registry** (file `providers.json` under `$XDG_STATE_HOME/brainrouter/`, default `~/.local/state`, mode 0600; mutate through
 `brainrouter cli provider ...` or the dashboard Providers section — single-writer).
 Each provider record holds a base URL, a credential reference into the credentials
 store (values never printed), optional declared models, a live circuit breaker

@@ -270,7 +270,7 @@ When installed via `install.sh` on a shared Fedora machine:
 | `base_url` | `String` | *(required)* | URL of the llama-swap instance |
 | `mode` | `shim \| native` | `shim` | v2 L7: `native` hands local models to the in-daemon swap supervisor; boot refuses while the shim still reports loaded models |
 | `config_path` | `PathBuf?` | `~/.config/llama-swap/config.yaml` | v2 L7: llama-swap config the native catalog imports from at boot |
-| `fallback_model` | `String` | *(required)* | Model key to use when Manifest fails or Bonsai picks local. Must match a key in llama-swap config |
+| `fallback_model` | `String` | *(required)* | Model key to use when the cloud provider fails or Bonsai picks local. Must match a key in llama-swap config |
 | `local_models` | `Vec<String>?` | `[]` | Explicit llama-swap model keys; a request using one of them as `model=` routes straight to llama-swap, bypassing Bonsai |
 | `subs_model` | `String?` | `None` | Subs-pool model key; `model=subs` / `brainrouter/subs` routes here, bypassing Bonsai. Absent → `subs` falls back to auto |
 | `local_system_prompt` | `String?` | `None` | Path to a custom system prompt file for `model=local` mode. Built-in lean prompt used if absent |
@@ -1318,8 +1318,8 @@ Resolve a review session with feedback.
 | Cloud provider circuit open | Health tracker (3 failures) | Skip that provider (`auto`-path pool rotation); with nothing healthy left, route to llama-swap |
 | llama-swap returns error / 404 | HTTP status code | Error returned to caller; next request may load a different model |
 | llama-swap circuit open | Health tracker (3 failures) | Error: no backend available. 60s cooldown before retry |
-| Both circuits open | Health tracker | Error returned to caller; both providers on 60s cooldown |
-| Enabled Bonsai classification fails | HTTP/parse error or timeout | Auto roles choose the cloud path, still respecting Manifest's enabled flag and local fallback policy |
+| Both circuits open | Health tracker | Error returned to caller; cloud provider and local shim each on 60s cooldown |
+| Enabled Bonsai classification fails | HTTP/parse error or timeout | Auto roles choose the cloud path, still respecting the cloud-routing opt-in and local fallback policy |
 | Bonsai server OOM / crash | Process exits; next health probe fails | Default to `Cloud` until the server is started again from the dashboard |
 | Bonsai server stopped from dashboard | Shared `enabled` flag cleared before kill | Auto roles skip classification and choose local; pinned roles remain pinned |
 | Daemon not running when MCP connects | UDS connect error | `brainrouter mcp` exits with a clear error message |
@@ -1416,7 +1416,7 @@ normalization, not weakened validation for new writes.
 ## What This Is Not
 
 - **Not a general multi-tenant cloud gateway.** Brainrouter implements OpenAI-compatible proxying and an Anthropic wire shim; the provider registry (v2 L6) is single-writer and loopback-trusted for one operator's fleet. Downstream providers keep their own accounts, pricing, and model management; brainrouter meters spend against declared monthly budgets but does not bill.
-- **Not a general request-time model runner.** brainrouter proxies chat traffic to Manifest/llama-swap and manages detached Server Mode containers for status/operations; the request router does not dispatch to Server Mode containers. It only spawns the single classifier llama-server for Bonsai.
+- **Not a general request-time model runner.** brainrouter proxies chat traffic to cloud providers and the local serving layer (llama-swap shim or native supervisor) and manages detached Server Mode containers for status/operations; the request router does not dispatch to Server Mode containers. It only spawns the single classifier llama-server for Bonsai.
 - **Not an auth layer.** Loopback is the default trust boundary, not user authentication. Credentials live in provider configuration/environment.
 - **Not a conversation store.** Chat history is managed by the harness. brainrouter is stateless for proxy calls; review sessions are in-memory and lost on daemon restart.
 - **Not a chat application.** The Discord/Signal bridges are thin wrappers around the `omp` CLI, not standalone chat bots with their own reasoning.
