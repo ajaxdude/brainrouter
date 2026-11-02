@@ -90,9 +90,454 @@
         "--ulimit",
         "memlock=-1:-1"
       ]
+    },
+    "vulkan-r9700": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "video",
+        "--security-opt",
+        "seccomp=unconfined",
+        "-e",
+        "RADV_PERFTEST=nogttspill"
+      ]
+    },
+    "intel-vllm": {
+      "engine_args": [
+        "--device",
+        "/dev/dri",
+        "--group-add",
+        "video",
+        "--group-add",
+        "render",
+        "--security-opt",
+        "seccomp=unconfined",
+        "-v",
+        "/dev/dri/by-path:/dev/dri/by-path:ro"
+      ]
     }
   },
   "toolboxes": [
+    {
+      "id": "r9700-ggz14-mxfp4-tp1",
+      "backend": "vllm",
+      "name": "GGZ14 MXFP4",
+      "container_name": "r9700-ggz14-tp1",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:ggz14-tp1",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "GGZ14 with one-card RX9 and two-card RX6 builds selected in Server Mode.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "supported_model_ids": [
+          "vllm-amd-qwen3-8-27b-mxfp4-mtpfp8"
+        ],
+        "policy_overrides": {
+          "valid_tp": [
+            1
+          ],
+          "attention_backend": "R4D",
+          "ctx": "67840",
+          "gpu_memory_utilization": 0.92,
+          "env": {
+            "HIP_VISIBLE_DEVICES": "0",
+            "VLLM_NO_USAGE_STATS": "1",
+            "RADIANCE_RUN_BWTEST": "0",
+            "RADIANCE_GDN_LAZY": "0",
+            "RADIANCE_FAST_DRAFT": "0",
+            "RADIANCE_VERIFY_HEAD": "0",
+            "RADIANCE_DYNAMIC_DRAFT": "0",
+            "RADIANCE_FP8_STREAM": "0",
+            "RADIANCE_FP8_STREAM_TP1": "1",
+            "RADIANCE_GDN_FUSED_MAX_ITEMS": "48",
+            "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+            "TORCHINDUCTOR_CACHE_DIR": "/workspace/.cache/vllm/inductor",
+            "TRITON_CACHE_DIR": "/workspace/.cache/triton",
+            "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+            "VLLM_ROCM_USE_AITER_MHA": "0",
+            "VLLM_ROCM_USE_AITER_MLA": "0",
+            "VLLM_ROCM_USE_AITER_MOE": "0",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0",
+            "VLLM_ROCM_USE_AITER_FP8BMM": "0",
+            "VLLM_ROCM_USE_AITER_FP4BMM": "0",
+            "VLLM_ROCM_USE_AITER_RMSNORM": "0"
+          },
+          "extra_flags": [
+            "--served-model-name",
+            "Qwen3.8-27B",
+            "--max-num-batched-tokens",
+            "4096",
+            "--kv-cache-dtype",
+            "fp8",
+            "--enable-prefix-caching",
+            "--enable-prompt-tokens-details",
+            "--mamba-cache-mode",
+            "align",
+            "--generation-config",
+            "vllm",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3",
+            "--no-async-scheduling",
+            "--mamba-cache-dtype",
+            "bfloat16",
+            "--mamba-ssm-cache-dtype",
+            "float16",
+            "--compilation-config.cudagraph_capture_sizes",
+            "[1]"
+          ],
+          "speculation": {
+            "dflash2": {
+              "local_directory": "~/models/hf/Qwen3.8-27B-DFlash2-FP8-f02593d0ea2e",
+              "gpu_memory_utilization": 0.95,
+              "config": {
+                "method": "dflash",
+                "num_speculative_tokens": 7,
+                "attention_backend": "TRITON_ATTN",
+                "disable_padded_drafter_batch": true,
+                "draft_sample_method": "greedy"
+              },
+              "env": {
+                "RADIANCE_DRAFT_RERANK": "80",
+                "RADIANCE_FAST_DRAFT": "1",
+                "RADIANCE_VERIFY_HEAD": "1"
+              },
+              "extra_flags": [
+                "--served-model-name",
+                "Qwen3.8-27B",
+                "--max-num-batched-tokens",
+                "4096",
+                "--kv-cache-dtype",
+                "fp8",
+                "--enable-prefix-caching",
+                "--enable-prompt-tokens-details",
+                "--mamba-cache-mode",
+                "align",
+                "--generation-config",
+                "vllm",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--reasoning-parser",
+                "qwen3",
+                "--no-async-scheduling",
+                "--mamba-cache-dtype",
+                "bfloat16",
+                "--mamba-ssm-cache-dtype",
+                "float16",
+                "--compilation-config.cudagraph_capture_sizes",
+                "[1,2,4,8]"
+              ]
+            }
+          }
+        },
+        "kernel_profile": "single-rx9",
+        "checkpoint_preparation": "ggz14-mtp-fp8",
+        "performance_profiles": {
+          "16": {
+            "name": "Measured allocation \u00b7 16 sequences",
+            "client_concurrency": [
+              1,
+              4,
+              8,
+              16
+            ],
+            "server_defaults": {
+              "max_num_seqs": 16
+            },
+            "note": "Concurrent throughput is aggregate and includes cache replay. This allocation does not mean sixteen resident 64K histories."
+          }
+        },
+        "gpu_profiles": {
+          "r9700-ggz14-mxfp4-tp1": {
+            "name": "One R9700 \u00b7 RX9",
+            "image": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:ggz14-tp1",
+            "policy_overrides": {
+              "valid_tp": [
+                1
+              ],
+              "attention_backend": "R4D",
+              "ctx": "67840",
+              "gpu_memory_utilization": 0.92,
+              "env": {
+                "HIP_VISIBLE_DEVICES": "0",
+                "VLLM_NO_USAGE_STATS": "1",
+                "RADIANCE_RUN_BWTEST": "0",
+                "RADIANCE_GDN_LAZY": "0",
+                "RADIANCE_FAST_DRAFT": "0",
+                "RADIANCE_VERIFY_HEAD": "0",
+                "RADIANCE_DYNAMIC_DRAFT": "0",
+                "RADIANCE_FP8_STREAM": "0",
+                "RADIANCE_FP8_STREAM_TP1": "1",
+                "RADIANCE_GDN_FUSED_MAX_ITEMS": "48",
+                "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+                "TORCHINDUCTOR_CACHE_DIR": "/workspace/.cache/vllm/inductor",
+                "TRITON_CACHE_DIR": "/workspace/.cache/triton",
+                "VLLM_ROCM_USE_AITER": "1",
+                "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+                "VLLM_ROCM_USE_AITER_MHA": "0",
+                "VLLM_ROCM_USE_AITER_MLA": "0",
+                "VLLM_ROCM_USE_AITER_MOE": "0",
+                "VLLM_ROCM_USE_AITER_LINEAR": "0",
+                "VLLM_ROCM_USE_AITER_FP8BMM": "0",
+                "VLLM_ROCM_USE_AITER_FP4BMM": "0",
+                "VLLM_ROCM_USE_AITER_RMSNORM": "0"
+              },
+              "extra_flags": [
+                "--served-model-name",
+                "Qwen3.8-27B",
+                "--max-num-batched-tokens",
+                "4096",
+                "--kv-cache-dtype",
+                "fp8",
+                "--enable-prefix-caching",
+                "--enable-prompt-tokens-details",
+                "--mamba-cache-mode",
+                "align",
+                "--generation-config",
+                "vllm",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--reasoning-parser",
+                "qwen3",
+                "--no-async-scheduling",
+                "--mamba-cache-dtype",
+                "bfloat16",
+                "--mamba-ssm-cache-dtype",
+                "float16",
+                "--compilation-config.cudagraph_capture_sizes",
+                "[1]"
+              ],
+              "speculation": {
+                "dflash2": {
+                  "local_directory": "~/models/hf/Qwen3.8-27B-DFlash2-FP8-f02593d0ea2e",
+                  "gpu_memory_utilization": 0.95,
+                  "config": {
+                    "method": "dflash",
+                    "num_speculative_tokens": 7,
+                    "attention_backend": "TRITON_ATTN",
+                    "disable_padded_drafter_batch": true,
+                    "draft_sample_method": "greedy"
+                  },
+                  "env": {
+                    "RADIANCE_DRAFT_RERANK": "80",
+                    "RADIANCE_FAST_DRAFT": "1",
+                    "RADIANCE_VERIFY_HEAD": "1"
+                  },
+                  "extra_flags": [
+                    "--served-model-name",
+                    "Qwen3.8-27B",
+                    "--max-num-batched-tokens",
+                    "4096",
+                    "--kv-cache-dtype",
+                    "fp8",
+                    "--enable-prefix-caching",
+                    "--enable-prompt-tokens-details",
+                    "--mamba-cache-mode",
+                    "align",
+                    "--generation-config",
+                    "vllm",
+                    "--enable-auto-tool-choice",
+                    "--tool-call-parser",
+                    "qwen3_coder",
+                    "--reasoning-parser",
+                    "qwen3",
+                    "--no-async-scheduling",
+                    "--mamba-cache-dtype",
+                    "bfloat16",
+                    "--mamba-ssm-cache-dtype",
+                    "float16",
+                    "--compilation-config.cudagraph_capture_sizes",
+                    "[1,2,4,8]"
+                  ]
+                }
+              }
+            }
+          },
+          "r9700-ggz14-mxfp4-tp2": {
+            "name": "Two R9700 cards \u00b7 RX6",
+            "image": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:ggz14-tp2",
+            "policy_overrides": {
+              "valid_tp": [
+                2
+              ],
+              "attention_backend": "R4D",
+              "ctx": "67840",
+              "gpu_memory_utilization": 0.92,
+              "env": {
+                "HIP_VISIBLE_DEVICES": "0,1",
+                "VLLM_NO_USAGE_STATS": "1",
+                "RADIANCE_RUN_BWTEST": "0",
+                "RADIANCE_GDN_LAZY": "0",
+                "RADIANCE_FAST_DRAFT": "0",
+                "RADIANCE_VERIFY_HEAD": "0",
+                "RADIANCE_DYNAMIC_DRAFT": "0",
+                "RADIANCE_FP8_STREAM": "1",
+                "RADIANCE_FP8_STREAM_TP1": "0",
+                "RADIANCE_GDN_FUSED_MAX_ITEMS": "32",
+                "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+                "TORCHINDUCTOR_CACHE_DIR": "/workspace/.cache/vllm/inductor",
+                "TRITON_CACHE_DIR": "/workspace/.cache/triton",
+                "VLLM_ROCM_USE_AITER": "1",
+                "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+                "VLLM_ROCM_USE_AITER_MHA": "0",
+                "VLLM_ROCM_USE_AITER_MLA": "0",
+                "VLLM_ROCM_USE_AITER_MOE": "0",
+                "VLLM_ROCM_USE_AITER_LINEAR": "0",
+                "VLLM_ROCM_USE_AITER_FP8BMM": "0",
+                "VLLM_ROCM_USE_AITER_FP4BMM": "0",
+                "VLLM_ROCM_USE_AITER_RMSNORM": "0"
+              },
+              "extra_flags": [
+                "--served-model-name",
+                "Qwen3.8-27B",
+                "--max-num-batched-tokens",
+                "8192",
+                "--kv-cache-dtype",
+                "fp8",
+                "--enable-prefix-caching",
+                "--enable-prompt-tokens-details",
+                "--mamba-cache-mode",
+                "align",
+                "--generation-config",
+                "vllm",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--reasoning-parser",
+                "qwen3",
+                "--no-async-scheduling"
+              ],
+              "speculation": {
+                "dflash2": {
+                  "local_directory": "~/models/hf/Qwen3.8-27B-DFlash2-FP8-f02593d0ea2e",
+                  "gpu_memory_utilization": 0.92,
+                  "config": {
+                    "method": "dflash",
+                    "num_speculative_tokens": 7,
+                    "attention_backend": "TRITON_ATTN",
+                    "disable_padded_drafter_batch": true,
+                    "draft_sample_method": "greedy"
+                  },
+                  "env": {
+                    "RADIANCE_DRAFT_RERANK": "80",
+                    "RADIANCE_FAST_DRAFT": "1",
+                    "RADIANCE_VERIFY_HEAD": "1"
+                  },
+                  "extra_flags": [
+                    "--served-model-name",
+                    "Qwen3.8-27B",
+                    "--max-num-batched-tokens",
+                    "8192",
+                    "--kv-cache-dtype",
+                    "fp8",
+                    "--enable-prefix-caching",
+                    "--enable-prompt-tokens-details",
+                    "--mamba-cache-mode",
+                    "align",
+                    "--generation-config",
+                    "vllm",
+                    "--enable-auto-tool-choice",
+                    "--tool-call-parser",
+                    "qwen3_coder",
+                    "--reasoning-parser",
+                    "qwen3",
+                    "--no-async-scheduling",
+                    "--compilation-config.pass_config.fuse_allreduce_rms",
+                    "false"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "legacy_toolbox_ids": [
+          "r9700-ggz14-mxfp4-tp2"
+        ],
+        "engine_selector": {
+          "id": "ggz14",
+          "label": "GGZ14"
+        }
+      }
+    },
+    {
+      "id": "r9700-vllm-714-fp8",
+      "toolbox_compatible": false,
+      "backend": "vllm",
+      "name": "vLLM \u00b7 TheRock",
+      "container_name": "r9700-vllm-714-fp8",
+      "group": "Stable Toolboxes",
+      "image": "docker.io/kyuz0/vllm-therock-gfx1201:native-fp8",
+      "channel": "stable",
+      "maturity": "stable",
+      "description": "Latest stable vLLM on its complete supported AMD wheel stack, native FP8 weights and aligned hybrid prefix caching.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "features": {
+        "interactive": "unavailable",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "supported_model_ids": [
+          "vllm-qwen-qwen3-8-27b-fp8"
+        ],
+        "policy_overrides": {
+          "valid_tp": [
+            2
+          ],
+          "attention_backend": "TRITON_ATTN",
+          "ctx": "67840",
+          "gpu_memory_utilization": 0.9,
+          "env": {
+            "HIP_VISIBLE_DEVICES": "0,1",
+            "VLLM_ROCM_USE_AITER": "0",
+            "VLLM_ROCM_USE_AITER_LINEAR": "0",
+            "VLLM_CACHE_ROOT": "/workspace/.cache/vllm"
+          }
+        },
+        "performance_profiles": {
+          "4": {
+            "name": "Measured allocation \u00b7 4 sequences",
+            "client_concurrency": [
+              1,
+              4
+            ],
+            "server_defaults": {
+              "max_num_seqs": 4
+            },
+            "note": "Concurrent throughput is aggregate and includes cache replay. This allocation does not mean sixteen resident 64K histories."
+          },
+          "16": {
+            "name": "Measured allocation \u00b7 16 sequences",
+            "client_concurrency": [
+              1,
+              4,
+              8,
+              16
+            ],
+            "server_defaults": {
+              "max_num_seqs": 16
+            },
+            "note": "Concurrent throughput is aggregate and includes cache replay. This allocation does not mean sixteen resident 64K histories."
+          }
+        },
+        "engine_selector": {
+          "id": "vllm",
+          "label": "vLLM TheRock"
+        }
+      }
+    },
     {
       "id": "strix-halo-llama-rocm-10-0",
       "backend": "llama_cpp",
@@ -109,6 +554,29 @@
         "interactive": "supported",
         "server": "supported",
         "models": "supported"
+      }
+    },
+    {
+      "id": "strix-halo-gufo-rocm-10-0",
+      "backend": "gufo",
+      "name": "gufo-rocm-10.0",
+      "container_name": "gufo-rocm-10.0",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-gufo",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Experimental Gufo ROCm 10.0 backend for Qwen3.8 Flash Next, Qwen3.8 27B and DeepSeek V4 Flash 0731 on Strix Halo",
+      "runtime_profile": "amd-rocm",
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "source_revision": "b42fa8c89cbbeb0941f8deb7947f598702ed5125",
+        "source_pr": "https://github.com/gufo-org/gufo/pull/286",
+        "published_digest": "sha256:cf41f792fe1594121178974fa3354fad9f88be798bdecc3583422d6e84481295"
       }
     },
     {
@@ -155,55 +623,6 @@
       }
     },
     {
-      "id": "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next",
-      "backend": "llama_cpp",
-      "name": "llama-rocm-10.0-qwen-3.8-flash-next",
-      "container_name": "llama-rocm-10.0-qwen-3.8-flash-next",
-      "group": "Dev/Experimental Toolboxes",
-      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next",
-      "channel": "experimental",
-      "maturity": "experimental",
-      "description": "Purpose-built Qwen3.8 Flash Next fork with GPU TOP_K, native MTP, and ngram-mod (Strix Halo only)",
-      "runtime_profile": "amd-rocm",
-      "supports_load_mode": true,
-      "features": {
-        "interactive": "experimental",
-        "server": "experimental",
-        "models": "experimental"
-      },
-      "backend_config": {
-        "recommended_use": {
-          "platform_id": "strix-halo",
-          "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
-          "model_filename_pattern": "*UD-IQ4_XS*.gguf",
-          "model_display_name": "Qwen 3.8 Flash Next UD-IQ4_XS",
-          "message": "Validated for Qwen 3.8 Flash Next UD-IQ4_XS on AMD Strix Halo / gfx1151 with drluoto's Q8_0 MTP sidecar.",
-          "documentation_url": "https://github.com/drluoto/flash-next-strix-halo",
-          "sidecar": {
-            "repo": "drluoto/Qwen3.8-Flash-Next-MTP-GGUF",
-            "filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
-          },
-          "server_defaults": {
-            "context_size": 262144,
-            "gpu_layers": 999,
-            "parallel_sequences": 1,
-            "load_mode": "dio",
-            "flash_attention": true,
-            "mtp": {
-              "default_draft_n": 3,
-              "default_np": 1,
-              "spec_types": [
-                "draft-mtp",
-                "ngram-mod"
-              ],
-              "ngram_mod_n_max": 64,
-              "ngram_mod_n_match": 24
-            }
-          }
-        }
-      }
-    },
-    {
       "id": "strix-halo-llama-rocm-10-0-engramhalo",
       "backend": "llama_cpp",
       "name": "llama-rocm-10.0-engramhalo",
@@ -233,7 +652,7 @@
           "documentation_url": "https://github.com/Aristo94/EngramHalo.cpp/blob/strix-halo-qwen4exp/docs/strix-halo/README.md",
           "notes": [
             "Validated main-model quants: UD-IQ3_XXS and UD-IQ4_XS.",
-            "SSD default: mmap with --lazy-mode on keeps the 26.8 GiB engram table SSD-backed, with about 1–1.5 GiB resident.",
+            "SSD default: mmap with --lazy-mode on keeps the 26.8 GiB engram table SSD-backed, with about 1\u20131.5 GiB resident.",
             "RAM option: select load mode none and replace --lazy-mode on with --lazy-mode off; budget another 26.8 GiB of RAM.",
             "MTP is validated at 163840 context with one slot. Disable MTP for 262144 context or multiple parallel slots."
           ],
@@ -375,7 +794,7 @@
     {
       "id": "r9700-llama-rocm-10-0",
       "backend": "llama_cpp",
-      "name": "r9700-llama-rocm-10.0",
+      "name": "llama.cpp \u00b7 ROCm 10.0",
       "container_name": "r9700-llama-rocm-10.0",
       "group": "Official Toolboxes",
       "image": "docker.io/kyuz0/amd-r9700-toolboxes:rocm-10.0",
@@ -399,12 +818,12 @@
           "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
           "notes": [
             "Requires two AMD Radeon AI PRO R9700 devices; HIP_VISIBLE_DEVICES=0,1 is preset when this profile is selected.",
-            "Validated on mainline llama.cpp build 10789 with ROCm 10.0/HIP at native 262144 context using q8_0 KV cache and lazy ngram loading.",
-            "ROCm/HIP is recommended over Vulkan for Qwen 3.8 Flash Next on R9700 for now.",
+            "Validated on mainline llama.cpp build 11347 with ROCm 10.0/HIP through 64K history at context 68096 using q8_0 KV cache.",
+            "Disk-backed PLE uses mmap and lazy loading; no full RAM preload is required.",
             "MTP is intentionally disabled for this mainline profile."
           ],
           "server_defaults": {
-            "context_size": 262144,
+            "context_size": 68096,
             "batch_size": 2048,
             "ubatch_size": 1024,
             "gpu_layers": null,
@@ -412,23 +831,422 @@
             "kv_cache_type": "q8_0",
             "load_mode": "mmap",
             "flash_attention": true,
-            "hip_devices": "0,1",
             "mtp_enabled": false,
-            "extra_args": "--split-mode layer --fit on --fit-target 2048,2048 --lazy-mode on -t 4 --cache-ram 0"
+            "extra_args": "--jinja --split-mode layer --fit on --fit-target 2048,2048 --lazy-mode on -t 4 --cache-ram 0"
           }
-        }
+        },
+        "launch_profiles": {
+          "r9700-llama-rocm-10-deepvision-q2xl-four": {
+            "name": "DeepSeek V4 Flash Vision Q2XL \u00b7 four R9700s \u00b7 ROCm 10",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-deepseek-v4-flash-vision-exp-gguf",
+              "model_filename_pattern": "*UD-Q2_K_XL*.gguf",
+              "model_display_name": "DeepSeek V4 Flash Vision Exp UD-Q2_K_XL",
+              "message": "Four-card DeepSeek V4 Flash Vision baseline with the matching BF16 projector.",
+              "documentation_url": "https://github.com/kyuz0/ai-toolbox-cockpit/blob/main/docs/R9700_LLAMA.md",
+              "notes": [
+                "Validated sampled text, maximum-effort thinking, single/two-image input and required tool calls with llama.cpp build 11872 (344be0a6).",
+                "Uses Unsloth revision 87ce1581, all three UD-Q2_K_XL shards and mmproj-BF16.gguf.",
+                "Select ROCm devices 0,1,2,3 with equal layer splitting. Baseline only; this profile does not enable DSpark.",
+                "Select the matching projector explicitly for image input; it is shared above the quantization directory.",
+                "The standard C1 workload completed all nine history depths through 64K with calibrated ubatch 512."
+              ],
+              "server_defaults": {
+                "context_size": 8192,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "hip_devices": "0,1,2,3",
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1,1,1"
+              }
+            },
+            "performance_profiles": {
+              "depth64k": {
+                "name": "Measured C1 allocation \u00b7 64K history",
+                "client_concurrency": [
+                  1
+                ],
+                "server_defaults": {
+                  "context_size": 68096,
+                  "parallel_sequences": 1,
+                  "batch_size": 2048,
+                  "ubatch_size": 512
+                },
+                "note": "Standard C1 depth curve; context includes the 2048-token append, output and allocation padding."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-flash-q4xl-four": {
+            "name": "Qwen3.8 Flash Next Q4XL \u00b7 four R9700s \u00b7 ROCm 10",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 Flash Next UD-Q4_K_XL",
+              "message": "Four-card Flash Next Q4XL baseline with optional image input.",
+              "documentation_url": "https://github.com/kyuz0/ai-toolbox-cockpit/blob/main/docs/R9700_LLAMA.md",
+              "notes": [
+                "Validated with llama.cpp build 11872 (344be0a6), Unsloth revision 766911a6 and the matching BF16 projector.",
+                "Sampled text, thinking, image input and required tool calls passed. All nine C1 depths through 64K history completed.",
+                "The preset selects ROCm devices 0,1,2,3 with equal layer splitting; baseline only.",
+                "Select the matching mmproj-BF16.gguf for image input; it is shared above the quantization directory."
+              ],
+              "server_defaults": {
+                "context_size": 8192,
+                "batch_size": 2048,
+                "ubatch_size": 2048,
+                "gpu_layers": 999,
+                "hip_devices": "0,1,2,3",
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1,1,1"
+              }
+            },
+            "performance_profiles": {
+              "depth64k": {
+                "name": "Measured C1 allocation \u00b7 64K history",
+                "client_concurrency": [
+                  1
+                ],
+                "server_defaults": {
+                  "context_size": 68096,
+                  "parallel_sequences": 1,
+                  "batch_size": 2048,
+                  "ubatch_size": 2048
+                },
+                "note": "Standard C1 depth curve; context includes the 2048-token append, output and allocation padding."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-qwen27-single": {
+            "name": "Qwen3.8 27B Q4 \u00b7 one R9700 \u00b7 rocm-10",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "One-card Qwen3.8 27B Q4 baseline with F16 KV.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "Validated with llama.cpp build 11872 (344be0a6), Unsloth revision 4ca72078 and the matching BF16 projector at all standard 0\u201364K history depths; sampled text, thinking, vision and tools passed.",
+                "The preset uses device index 0. Check llama-server --list-devices and adjust GPU devices to your selected R9700.",
+                "Baseline only; MTP is disabled for this tested profile.",
+                "The current C1 profile uses batch 2048 and calibrated ubatch 512; the retained episode allocation below records the earlier build."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "hip_devices": "0",
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 1 slots",
+                "client_concurrency": [
+                  1
+                ],
+                "server_defaults": {
+                  "context_size": 68096,
+                  "parallel_sequences": 1,
+                  "batch_size": 2048,
+                  "ubatch_size": 1024
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-qwen27-dual-f16": {
+            "name": "Qwen3.8 27B Q4 \u00b7 two R9700 cards \u00b7 ROCm 10 \u00b7 F16 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "Two-card Qwen3.8 27B Q4 with F16 KV and layer splitting.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "64K capacity qualified at 8 simultaneous requests; full speed curves are tracked separately.",
+                "The preset starts one sequence. For multiple 64K histories, set total context to 68,096 times the selected number of sequences.",
+                "The preset uses ROCm device indices 0,1. Check llama-server --list-devices and select the intended R9700 pair.",
+                "F16 KV was qualified through eight simultaneous 64K histories.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 8 slots",
+                "client_concurrency": [
+                  1,
+                  4,
+                  8
+                ],
+                "server_defaults": {
+                  "context_size": 544768,
+                  "parallel_sequences": 8,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-qwen27-dual-q8": {
+            "name": "Qwen3.8 27B Q4 \u00b7 two R9700 cards \u00b7 ROCm 10 \u00b7 Q8 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "Two-card Qwen3.8 27B Q4 with Q8 KV and layer splitting.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "64K capacity qualified at 16 simultaneous requests; full speed curves are tracked separately.",
+                "The preset starts one sequence. For multiple 64K histories, set total context to 68,096 times the selected number of sequences.",
+                "The preset uses ROCm device indices 0,1. Check llama-server --list-devices and select the intended R9700 pair.",
+                "C16 Q8 KV left about 206 MiB free on the tighter card in the capacity check; check available memory before choosing sixteen sequences.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 16 slots",
+                "client_concurrency": [
+                  1,
+                  4,
+                  8,
+                  16
+                ],
+                "server_defaults": {
+                  "context_size": 1089536,
+                  "parallel_sequences": 16,
+                  "batch_size": 2048,
+                  "ubatch_size": 512
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-qwen27-single-q8": {
+            "name": "Qwen3.8 27B Q4 \u00b7 one R9700 \u00b7 ROCm 10 \u00b7 Q8 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "One-card Qwen3.8 27B Q4 with Q8 KV.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "All nine standard 0\u201364K history depths passed at C1 and C4 with full prefix reuse.",
+                "The preset starts one sequence. For four 64K histories, set parallel sequences to four and total context to 272,384.",
+                "The preset uses ROCm device index 0; check llama-server --list-devices.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 1024,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 4 slots",
+                "client_concurrency": [
+                  1,
+                  4
+                ],
+                "server_defaults": {
+                  "context_size": 272384,
+                  "parallel_sequences": 4,
+                  "batch_size": 2048,
+                  "ubatch_size": 1024
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-rocm-10-flash-next-disk-ple": {
+            "name": "Qwen3.8 Flash Next Q2 \u00b7 two R9700 cards \u00b7 rocm-10 \u00b7 disk PLE",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+              "model_filename_pattern": "*UD-Q2_K_XL*.gguf",
+              "model_display_name": "Qwen 3.8 Flash Next UD-Q2_K_XL",
+              "message": "Tested dual-R9700 rocm-10 capacity profile for Flash Next UD-Q2_K_XL with disk-backed PLE.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "Requires two R9700 devices. The preset uses rocm-10 indices 0,1; check llama-server --list-devices.",
+                "All nine standard 0\u201364K history depths passed; the PLE mapping remained file-backed with bounded residency.",
+                "Disk-backed PLE uses mmap and lazy loading; no full RAM preload is required.",
+                "One sequence, Q8 KV and context 68,096 are the qualified settings.",
+                "MTP is disabled for this profile."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 1024,
+                "gpu_layers": null,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "mmap",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --fit on --fit-target 2048,2048 --lazy-mode on -t 4 --cache-ram 0"
+              }
+            }
+          },
+          "r9700-llama-rocm-10-qwen27-q4xl-four": {
+            "name": "Qwen3.8 27B Q4XL \u00b7 four R9700s \u00b7 ROCm 10",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "Four-card Qwen3.8 27B Q4XL baseline with optional image input.",
+              "documentation_url": "https://github.com/kyuz0/ai-toolbox-cockpit/blob/main/docs/R9700_LLAMA.md",
+              "notes": [
+                "Qualified with llama.cpp build 11872 (344be0a6), Unsloth revision 4ca72078 and the matching BF16 projector.",
+                "Uses ROCm devices 0,1,2,3 with equal layer splitting, F16 KV, batch 2048 and calibrated ubatch 256; MTP is disabled.",
+                "Starts one sequence at 8,192 tokens. Choose a 64K-history allocation for one, four, eight or sixteen simultaneous requests.",
+                "Each 64K-history sequence reserves 68,096 context tokens, including append, output and allocation padding. Client concurrency is a separate setting.",
+                "Select the matching mmproj-BF16.gguf for image input."
+              ],
+              "server_defaults": {
+                "context_size": 8192,
+                "batch_size": 2048,
+                "ubatch_size": 256,
+                "gpu_layers": 999,
+                "hip_devices": "0,1,2,3",
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1,1,1"
+              }
+            },
+            "performance_profiles": {
+              "depth64k-c1": {
+                "name": "64K history \u00b7 1 sequence",
+                "client_concurrency": [
+                  1
+                ],
+                "server_defaults": {
+                  "context_size": 68096,
+                  "parallel_sequences": 1,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "1 sequence with 68,096 context tokens each. Total context includes history, 2,048-token append, output and allocation padding; client concurrency is separate."
+              },
+              "depth64k-c4": {
+                "name": "64K history \u00b7 4 sequences",
+                "client_concurrency": [
+                  4
+                ],
+                "server_defaults": {
+                  "context_size": 272384,
+                  "parallel_sequences": 4,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "4 sequences with 68,096 context tokens each. Total context includes history, 2,048-token append, output and allocation padding; client concurrency is separate."
+              },
+              "depth64k-c8": {
+                "name": "64K history \u00b7 8 sequences",
+                "client_concurrency": [
+                  8
+                ],
+                "server_defaults": {
+                  "context_size": 544768,
+                  "parallel_sequences": 8,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "8 sequences with 68,096 context tokens each. Total context includes history, 2,048-token append, output and allocation padding; client concurrency is separate."
+              },
+              "depth64k-c16": {
+                "name": "64K history \u00b7 16 sequences",
+                "client_concurrency": [
+                  16
+                ],
+                "server_defaults": {
+                  "context_size": 1089536,
+                  "parallel_sequences": 16,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "16 sequences with 68,096 context tokens each. Total context includes history, 2,048-token append, output and allocation padding; client concurrency is separate."
+              }
+            }
+          }
+        },
+        "legacy_toolbox_ids": [
+          "r9700-llama-rocm-10-qwen27-single",
+          "r9700-llama-rocm-10-qwen27-dual-f16",
+          "r9700-llama-rocm-10-qwen27-dual-q8",
+          "r9700-llama-rocm-10-qwen27-single-q8",
+          "r9700-llama-rocm-10-flash-next-disk-ple"
+        ]
       }
     },
     {
-      "id": "r9700-r9v-rocm-10-0",
+      "id": "r9700-r9v-v044-rocm-10",
       "backend": "r9v",
-      "name": "R9V Qwen3.8 Flash Next (ROCm 10)",
-      "container_name": "r9700-r9v-shell",
-      "group": "Official Toolboxes",
-      "image": "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0",
-      "channel": "stable",
+      "name": "R9V",
+      "container_name": "r9700-r9v-current",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0-current",
+      "channel": "experimental",
       "maturity": "experimental",
-      "description": "Tested Qwen3.8 Flash Next IQ4_XS + FP8 MTP on 2× R9700 32 GB, 64 GB RAM and NVMe. Download the exact R9V package and prepare PLE in Models. Manual image releases.",
+      "description": "Latest stable R9V with reviewed serialized expert loading, dual R9700, 64 GB host RAM and SSD-backed PLE.",
       "runtime_profile": "amd-rocm",
       "server_binary": "r9v-serve",
       "toolbox_compatible": true,
@@ -441,49 +1259,268 @@
         "model_id": "r9v-qwen38-flash-next-iq4-xs",
         "required_gpus": 2,
         "host_ram_gb": 64,
-        "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes/blob/main/docs/r9v-rocm-10.0.md"
+        "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes/blob/main/docs/r9v-rocm-10.0.md",
+        "server_defaults": {
+          "context": "67840",
+          "batch": "1024",
+          "sequences": "1",
+          "kv_bytes": "1748799488",
+          "expert_cache_slots": "16",
+          "offload": "112.5",
+          "offload_devices": "112.5,112.5"
+        },
+        "serving_note": "First startup takes minutes. This v0.4.4 image is qualified for text at 67,840 context, one sequence, MTP-2 and disk-backed PLE. Vision has not been qualified for this image. Ctrl+C stops the server and returns to Cockpit.",
+        "legacy_toolbox_ids": [
+          "r9700-r9v-rocm-10-0"
+        ]
       }
     },
     {
       "id": "r9700-llama-vulkan-radv",
       "backend": "llama_cpp",
-      "name": "r9700-llama-vulkan-radv",
+      "name": "llama.cpp \u00b7 Vulkan RADV",
       "container_name": "r9700-llama-vulkan-radv",
       "group": "Official Toolboxes",
       "image": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-radv",
       "channel": "stable",
       "maturity": "stable",
       "description": "Mesa RADV Vulkan backend (recommended for stability)",
-      "runtime_profile": "vulkan",
+      "runtime_profile": "vulkan-r9700",
       "supports_load_mode": true,
       "features": {
         "interactive": "supported",
         "server": "supported",
         "models": "supported"
-      }
-    },
-    {
-      "id": "r9700-llama-vulkan-rocmfpx",
-      "backend": "llama_cpp",
-      "name": "r9700-llama-vulkan-rocmfpx",
-      "container_name": "r9700-llama-vulkan-rocmfpx",
-      "group": "Dev/Experimental Toolboxes",
-      "image": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-rocmfpx",
-      "channel": "experimental",
-      "maturity": "experimental",
-      "description": "ROCmFPX build \u2014 ROCmFP3/FP4/FP6/FP8 weight formats with MTP (Vulkan only)",
-      "runtime_profile": "vulkan",
-      "supports_load_mode": false,
-      "features": {
-        "interactive": "supported",
-        "server": "supported",
-        "models": "supported"
+      },
+      "backend_config": {
+        "launch_profiles": {
+          "r9700-llama-vulkan-qwen27-single": {
+            "name": "Qwen3.8 27B Q4 \u00b7 one R9700 \u00b7 vulkan",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "One-card Qwen3.8 27B Q4 baseline with F16 KV.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "Validated with llama.cpp build 11347 and Unsloth revision 4ca72078 at all standard 0\u201364K history depths.",
+                "The preset uses device index 1. Check llama-server --list-devices and adjust GPU devices to your selected R9700.",
+                "Baseline only; MTP is disabled for this tested profile."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 2048,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --cache-ram 0"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 1 slots",
+                "client_concurrency": [
+                  1
+                ],
+                "server_defaults": {
+                  "context_size": 68096,
+                  "parallel_sequences": 1,
+                  "batch_size": 2048,
+                  "ubatch_size": 2048
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-vulkan-qwen27-dual-f16": {
+            "name": "Qwen3.8 27B Q4 \u00b7 two R9700 cards \u00b7 Vulkan \u00b7 F16 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "Two-card Qwen3.8 27B Q4 with F16 KV and layer splitting.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "64K capacity qualified at 8 simultaneous requests; full speed curves are tracked separately.",
+                "The preset starts one sequence. For multiple 64K histories, set total context to 68,096 times the selected number of sequences.",
+                "The preset uses Vulkan device indices 1,2. Check llama-server --list-devices and select the intended R9700 pair.",
+                "F16 KV was qualified through eight simultaneous 64K histories.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "f16",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1 --cache-ram 0"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 8 slots",
+                "client_concurrency": [
+                  1,
+                  4,
+                  8
+                ],
+                "server_defaults": {
+                  "context_size": 544768,
+                  "parallel_sequences": 8,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-vulkan-qwen27-dual-q8": {
+            "name": "Qwen3.8 27B Q4 \u00b7 two R9700 cards \u00b7 Vulkan \u00b7 Q8 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "Two-card Qwen3.8 27B Q4 with Q8 KV and layer splitting.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "64K capacity qualified at 16 simultaneous requests; full speed curves are tracked separately.",
+                "The preset starts one sequence. For multiple 64K histories, set total context to 68,096 times the selected number of sequences.",
+                "The preset uses Vulkan device indices 1,2. Check llama-server --list-devices and select the intended R9700 pair.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 512,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --tensor-split 1,1 --cache-ram 0"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 16 slots",
+                "client_concurrency": [
+                  1,
+                  4,
+                  8,
+                  16
+                ],
+                "server_defaults": {
+                  "context_size": 1089536,
+                  "parallel_sequences": 16,
+                  "batch_size": 2048,
+                  "ubatch_size": 256
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-vulkan-qwen27-single-q8": {
+            "name": "Qwen3.8 27B Q4 \u00b7 one R9700 \u00b7 Vulkan \u00b7 Q8 KV",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+              "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+              "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+              "message": "One-card Qwen3.8 27B Q4 with Q8 KV.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "All nine standard 0\u201364K history depths passed at C1 and C4 with full prefix reuse.",
+                "The preset starts one sequence. For four 64K histories, set parallel sequences to four and total context to 272,384.",
+                "The preset uses Vulkan device index 1; check llama-server --list-devices.",
+                "Baseline only; MTP is disabled."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 2048,
+                "gpu_layers": 999,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "none",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --cache-ram 0"
+              }
+            },
+            "performance_profiles": {
+              "episode": {
+                "name": "Measured allocation \u00b7 4 slots",
+                "client_concurrency": [
+                  1,
+                  4
+                ],
+                "server_defaults": {
+                  "context_size": 272384,
+                  "parallel_sequences": 4,
+                  "batch_size": 2048,
+                  "ubatch_size": 2048
+                },
+                "note": "Historical episode allocation. Context is the total server allocation; client concurrency is selected in the benchmark. Check VRAM headroom before running."
+              }
+            }
+          },
+          "r9700-llama-vulkan-flash-next-disk-ple": {
+            "name": "Qwen3.8 Flash Next Q2 \u00b7 two R9700 cards \u00b7 vulkan \u00b7 disk PLE",
+            "recommended_use": {
+              "platform_id": "r9700",
+              "model_id": "llama-unsloth-qwen3-8-flash-next-gguf",
+              "model_filename_pattern": "*UD-Q2_K_XL*.gguf",
+              "model_display_name": "Qwen 3.8 Flash Next UD-Q2_K_XL",
+              "message": "Tested dual-R9700 vulkan capacity profile for Flash Next UD-Q2_K_XL with disk-backed PLE.",
+              "documentation_url": "https://github.com/kyuz0/amd-r9700-ai-toolboxes",
+              "notes": [
+                "Requires two R9700 devices. The preset uses vulkan indices 1,2; check llama-server --list-devices.",
+                "All nine standard 0\u201364K history depths passed; live PLE mappings at 8K, 40K and 64K stayed file-backed with bounded residency.",
+                "Disk-backed PLE uses mmap and lazy loading; no full RAM preload is required.",
+                "One sequence, Q8 KV and context 68,096 are the qualified settings.",
+                "MTP is disabled for this profile."
+              ],
+              "server_defaults": {
+                "context_size": 68096,
+                "batch_size": 2048,
+                "ubatch_size": 1024,
+                "gpu_layers": null,
+                "parallel_sequences": 1,
+                "kv_cache_type": "q8_0",
+                "load_mode": "mmap",
+                "flash_attention": true,
+                "mtp_enabled": false,
+                "extra_args": "--jinja --split-mode layer --fit on --fit-target 2048,2048 --lazy-mode on -t 4 --cache-ram 0"
+              }
+            }
+          }
+        },
+        "legacy_toolbox_ids": [
+          "r9700-llama-vulkan-qwen27-single",
+          "r9700-llama-vulkan-qwen27-dual-f16",
+          "r9700-llama-vulkan-qwen27-dual-q8",
+          "r9700-llama-vulkan-qwen27-single-q8",
+          "r9700-llama-vulkan-flash-next-disk-ple",
+          "r9700-llama-vulkan-rocmfpx"
+        ]
       }
     },
     {
       "id": "r9700-llama-therock-nightly",
       "backend": "llama_cpp",
-      "name": "r9700-llama-therock-nightly",
+      "name": "llama.cpp \u00b7 TheRock nightly",
       "container_name": "r9700-llama-therock-nightly",
       "group": "Dev/Experimental Toolboxes",
       "image": "docker.io/kyuz0/amd-r9700-toolboxes:therock-nightly",
@@ -496,7 +1533,8 @@
         "interactive": "supported",
         "server": "supported",
         "models": "supported"
-      }
+      },
+      "backend_config": {}
     },
     {
       "id": "intel-b70-b70-llama-sycl",
@@ -507,13 +1545,48 @@
       "image": "docker.io/kyuz0/intel-b70-ai-toolboxes:sycl",
       "channel": "stable",
       "maturity": "stable",
-      "description": "oneAPI SYCL backend (recommended)",
+      "description": "Intel oneAPI SYCL backend",
       "runtime_profile": "intel-level-zero",
       "supports_load_mode": true,
       "features": {
         "interactive": "supported",
         "server": "supported",
         "models": "supported"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "intel-b70",
+          "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+          "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+          "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+          "message": "One B70 with Qwen3.8 27B Q4, F16 KV and embedded MTP3.",
+          "documentation_url": "https://github.com/kyuz0/intel-b70-ai-toolboxes",
+          "notes": [
+            "Uses one 32 GB B70, one sequence and 67,840 context tokens.",
+            "Check llama-server --list-devices and select the intended B70 in GPU devices. Vulkan and SYCL use different device indices.",
+            "The selected GGUF includes the MTP head; no separate draft model is required."
+          ],
+          "server_defaults": {
+            "context_size": 67840,
+            "batch_size": 2048,
+            "ubatch_size": 512,
+            "gpu_layers": 999,
+            "parallel_sequences": 1,
+            "kv_cache_type": "f16",
+            "load_mode": "none",
+            "flash_attention": true,
+            "hip_devices": "1",
+            "mtp_enabled": true,
+            "mtp": {
+              "default_draft_n": 3,
+              "default_np": 1,
+              "spec_types": [
+                "draft-mtp"
+              ]
+            },
+            "extra_args": "--jinja --fit off --cache-ram 0"
+          }
+        }
       }
     },
     {
@@ -532,6 +1605,41 @@
         "interactive": "supported",
         "server": "supported",
         "models": "supported"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "intel-b70",
+          "model_id": "llama-unsloth-qwen3-8-27b-gguf",
+          "model_filename_pattern": "*UD-Q4_K_XL*.gguf",
+          "model_display_name": "Qwen3.8 27B UD-Q4_K_XL",
+          "message": "One B70 with Qwen3.8 27B Q4, F16 KV and embedded MTP3.",
+          "documentation_url": "https://github.com/kyuz0/intel-b70-ai-toolboxes",
+          "notes": [
+            "Uses one 32 GB B70, one sequence and 67,840 context tokens.",
+            "Check llama-server --list-devices and select the intended B70 in GPU devices. Vulkan and SYCL use different device indices.",
+            "The selected GGUF includes the MTP head; no separate draft model is required."
+          ],
+          "server_defaults": {
+            "context_size": 67840,
+            "batch_size": 2048,
+            "ubatch_size": 512,
+            "gpu_layers": 999,
+            "parallel_sequences": 1,
+            "kv_cache_type": "f16",
+            "load_mode": "none",
+            "flash_attention": true,
+            "hip_devices": "2",
+            "mtp_enabled": true,
+            "mtp": {
+              "default_draft_n": 3,
+              "default_np": 1,
+              "spec_types": [
+                "draft-mtp"
+              ]
+            },
+            "extra_args": "--jinja --fit off --cache-ram 0"
+          }
+        }
       }
     },
     {
@@ -708,7 +1816,7 @@
       "container_name": "halogen-flash",
       "group": "Server only",
       "image": "ghcr.io/peonist-ai/halogen-flash-server:latest",
-      "channel": "stable",
+      "channel": "experimental",
       "maturity": "experimental",
       "description": "Qwen3.8-Flash-Next HGN server for Strix Halo (gfx1151). Pull the image here; start it in Server Mode. Not a Toolbx/Distrobox image.",
       "runtime_profile": "halogen-strix-halo",
@@ -716,6 +1824,601 @@
       "features": {
         "interactive": "unavailable",
         "models": "supported",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "r9700-radiance-fp8-tp2",
+      "backend": "vllm",
+      "name": "vLLM Radiance (legacy)",
+      "container_name": "r9700-radiance-fp8-tp2",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:radiance",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Radiance engine for two R9700 cards. Select FP8 or MXFP4 weights in Server Mode.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "features": {
+        "interactive": "experimental",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "supported_model_ids": [
+          "vllm-qwen-qwen3-8-27b-fp8",
+          "vllm-amd-qwen3-8-27b-mxfp4-mtpfp8"
+        ],
+        "checkpoint_preparation": "ggz14-mtp-fp8",
+        "performance_profiles": {
+          "16": {
+            "name": "Measured allocation \u00b7 16 sequences",
+            "client_concurrency": [
+              1,
+              4,
+              8,
+              16
+            ],
+            "server_defaults": {
+              "max_num_seqs": 16
+            },
+            "note": "Concurrent throughput is aggregate and includes cache replay. This allocation does not mean sixteen resident 64K histories."
+          }
+        },
+        "model_policy_overrides": {
+          "vllm-qwen-qwen3-8-27b-fp8": {
+            "valid_tp": [
+              2
+            ],
+            "attention_backend": "R4D",
+            "ctx": "67840",
+            "max_num_seqs": "4",
+            "gpu_memory_utilization": 0.9,
+            "speculation": {},
+            "env": {
+              "RADIANCE_MXFP4": "0",
+              "RADIANCE_MXFP4_W4A8": "0",
+              "HIP_VISIBLE_DEVICES": "0,1",
+              "VLLM_NO_USAGE_STATS": "1",
+              "VLLM_ROCM_USE_AITER": "1",
+              "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+              "VLLM_ROCM_USE_AITER_MHA": "0",
+              "VLLM_ROCM_USE_AITER_MLA": "0",
+              "VLLM_ROCM_USE_AITER_MOE": "0",
+              "VLLM_ROCM_USE_AITER_LINEAR": "0",
+              "VLLM_ROCM_USE_AITER_FP8BMM": "0",
+              "VLLM_ROCM_USE_AITER_FP4BMM": "0",
+              "VLLM_ROCM_USE_AITER_RMSNORM": "0",
+              "RADIANCE_RUN_BWTEST": "0",
+              "RADIANCE_FAST_DRAFT": "0",
+              "RADIANCE_VERIFY_HEAD": "0",
+              "RADIANCE_DYNAMIC_DRAFT": "0",
+              "RADIANCE_FP8_STREAM": "0",
+              "RADIANCE_GDN_FUSED_MAX_ITEMS": "32",
+              "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+              "TORCHINDUCTOR_CACHE_DIR": "/workspace/.cache/vllm/inductor",
+              "TRITON_CACHE_DIR": "/workspace/.cache/triton"
+            },
+            "extra_flags": [
+              "--served-model-name",
+              "Qwen3.8-27B",
+              "--max-num-batched-tokens",
+              "4096",
+              "--kv-cache-dtype",
+              "fp8",
+              "--enable-prefix-caching",
+              "--enable-prompt-tokens-details",
+              "--mamba-cache-mode",
+              "align",
+              "--generation-config",
+              "vllm",
+              "--enable-auto-tool-choice",
+              "--tool-call-parser",
+              "qwen3_coder",
+              "--reasoning-parser",
+              "qwen3",
+              "--no-async-scheduling"
+            ]
+          },
+          "vllm-amd-qwen3-8-27b-mxfp4-mtpfp8": {
+            "valid_tp": [
+              2
+            ],
+            "attention_backend": "R4D",
+            "ctx": "67840",
+            "max_num_seqs": "8",
+            "gpu_memory_utilization": 0.9,
+            "speculation": {},
+            "env": {
+              "RADIANCE_MXFP4": "1",
+              "RADIANCE_MXFP4_W4A8": "1",
+              "RADIANCE_MXFP4_W4A8_MIN_M": "0",
+              "RADIANCE_MXFP4_DECODE_MAX_M": "64",
+              "RADIANCE_MXFP4_TN4_MIN_M": "2048",
+              "RADIANCE_MXFP4_WPERM": "1",
+              "RADIANCE_MXFP4_DECODE_NT": "1",
+              "RADIANCE_NORMQUANT_FUSION": "0",
+              "HIP_VISIBLE_DEVICES": "0,1",
+              "VLLM_NO_USAGE_STATS": "1",
+              "VLLM_ROCM_USE_AITER": "1",
+              "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+              "VLLM_ROCM_USE_AITER_MHA": "0",
+              "VLLM_ROCM_USE_AITER_MLA": "0",
+              "VLLM_ROCM_USE_AITER_MOE": "0",
+              "VLLM_ROCM_USE_AITER_LINEAR": "0",
+              "VLLM_ROCM_USE_AITER_FP8BMM": "0",
+              "VLLM_ROCM_USE_AITER_FP4BMM": "0",
+              "VLLM_ROCM_USE_AITER_RMSNORM": "0",
+              "RADIANCE_RUN_BWTEST": "0",
+              "RADIANCE_FAST_DRAFT": "0",
+              "RADIANCE_VERIFY_HEAD": "0",
+              "RADIANCE_DYNAMIC_DRAFT": "0",
+              "RADIANCE_FP8_STREAM": "0",
+              "RADIANCE_GDN_FUSED_MAX_ITEMS": "32",
+              "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+              "TORCHINDUCTOR_CACHE_DIR": "/workspace/.cache/vllm/inductor",
+              "TRITON_CACHE_DIR": "/workspace/.cache/triton"
+            },
+            "extra_flags": [
+              "--served-model-name",
+              "Qwen3.8-27B",
+              "--max-num-batched-tokens",
+              "4096",
+              "--kv-cache-dtype",
+              "fp8",
+              "--enable-prefix-caching",
+              "--enable-prompt-tokens-details",
+              "--mamba-cache-mode",
+              "align",
+              "--generation-config",
+              "vllm",
+              "--enable-auto-tool-choice",
+              "--tool-call-parser",
+              "qwen3_coder",
+              "--reasoning-parser",
+              "qwen3",
+              "--no-async-scheduling"
+            ]
+          }
+        },
+        "legacy_toolbox_ids": [
+          "r9700-radiance-mxfp4-tp2"
+        ],
+        "legacy_default_models": {
+          "r9700-radiance-mxfp4-tp2": "vllm-amd-qwen3-8-27b-mxfp4-mtpfp8"
+        },
+        "engine_selector": {
+          "id": "vllm-radiance",
+          "label": "vLLM Radiance (legacy)"
+        }
+      }
+    },
+    {
+      "id": "r9700-tcclaviger-flash-next-tp2",
+      "backend": "vllm",
+      "name": "tcclaviger",
+      "container_name": "r9700-tcclaviger-flash-next",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/tcclaviger/vllm:latest",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Publisher vLLM image with TP2/MTP-3, 36 GiB expert offload and NVMe PLE with a 4 GiB row cache. Tested with a 56 GiB container cap; limited host headroom and concurrency scaling.",
+      "runtime_profile": "amd-rocm",
+      "toolbox_compatible": false,
+      "features": {
+        "interactive": "unavailable",
+        "server": "experimental",
+        "models": "experimental"
+      },
+      "backend_config": {
+        "supported_model_ids": [
+          "vllm-tcclaviger-qwen3-8-flash-next-mxfp4"
+        ],
+        "policy_overrides": {
+          "runtime_variant": "tcclaviger"
+        },
+        "engine_selector": {
+          "id": "tcclaviger",
+          "label": "tcclaviger"
+        }
+      }
+    },
+    {
+      "id": "r9700-radiance-rocm-10-1",
+      "backend": "radiance",
+      "name": "Standalone Radiance",
+      "container_name": "radiance-rocm-10.1",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:radiance-rocm-10.1",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Standalone Radiance 1.12.0, ROCm 10.1 and stock compiler for R9700. Native .rad Qwen models with bundled vision and drafting heads.",
+      "runtime_profile": "amd-rocm",
+      "toolbox_compatible": true,
+      "features": {
+        "interactive": "supported",
+        "models": "experimental",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "intel-b70-vllm-upstream",
+      "backend": "vllm",
+      "name": "B70 upstream vLLM",
+      "container_name": "intel-b70-vllm-upstream",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-vllm-toolbox:upstream",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Qwen3.8 27B INT4 on one or two B70 cards; native FP8 on two cards.",
+      "runtime_profile": "intel-vllm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "accelerator": "xpu",
+        "engine_selector": {
+          "id": "vllm-xpu",
+          "label": "vLLM XPU"
+        },
+        "supported_model_ids": [
+          "vllm-redhatai-qwen3-8-27b-int4",
+          "vllm-qwen-qwen3-8-27b-fp8"
+        ],
+        "policy_overrides": {
+          "valid_tp": [
+            1,
+            2
+          ],
+          "speculation": {
+            "mtp": {
+              "config": {
+                "method": "mtp",
+                "num_speculative_tokens": 3
+              }
+            }
+          }
+        },
+        "model_policy_overrides": {
+          "vllm-qwen-qwen3-8-27b-fp8": {
+            "attention_backend": null,
+            "attention_backend_label": "Intel XPU automatic",
+            "ctx": "67840",
+            "default_max_num_seqs": 1,
+            "max_num_seqs": "4",
+            "max_tokens": "32768",
+            "gpu_memory_utilization": 0.9,
+            "enforce_eager": true,
+            "host_memory_gib_by_tp": {
+              "1": 26,
+              "2": 48
+            },
+            "env": {
+              "VLLM_TARGET_DEVICE": "xpu",
+              "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+              "CCL_ENABLE_SYCL_KERNELS": "1"
+            },
+            "extra_flags": [
+              "--served-model-name",
+              "Qwen3.8-27B",
+              "--max-num-batched-tokens",
+              "2048",
+              "--enable-prefix-caching",
+              "--generation-config",
+              "vllm",
+              "--reasoning-parser",
+              "qwen3",
+              "--enable-auto-tool-choice",
+              "--tool-call-parser",
+              "qwen3_coder",
+              "--language-model-only"
+            ],
+            "valid_tp": [
+              2
+            ],
+            "profile_note": "Native FP8 text serving requires two 32 GB B70 cards. Select both Intel GPU indices; the preset uses one sequence and 67,840 context tokens."
+          },
+          "vllm-redhatai-qwen3-8-27b-int4": {
+            "ctx": "67840",
+            "enforce_eager": false,
+            "default_max_num_seqs": 1,
+            "profile_note": "Episode configuration: RedHatAI INT4, graph execution and embedded MTP3, one or two 32 GB B70 GPUs. Select MTP for the measured speculative profile. Uses 67,840 context positions and one sequence; select the intended Intel device indices."
+          }
+        }
+      }
+    },
+    {
+      "id": "intel-b70-vllm-scaler",
+      "backend": "vllm",
+      "name": "B70 Intel LLM Scaler",
+      "container_name": "intel-b70-vllm-scaler",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-vllm-toolbox:latest",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Qwen3.8 27B compressed-tensors INT4 on Intel Arc Pro B70",
+      "runtime_profile": "intel-vllm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "accelerator": "xpu",
+        "engine_selector": {
+          "id": "llm-scaler",
+          "label": "Intel LLM Scaler"
+        },
+        "supported_model_ids": [
+          "vllm-redhatai-qwen3-8-27b-int4"
+        ],
+        "policy_overrides": {
+          "valid_tp": [
+            1
+          ],
+          "speculation": {}
+        }
+      }
+    },
+    {
+      "id": "intel-b70-strata",
+      "backend": "strata",
+      "name": "Strata B70",
+      "container_name": "b70-strata",
+      "group": "Official Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-ai-toolboxes:strata-sycl",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Flash Next AtomicChat AD4.27 and MTP on two 32 GB Intel B70 GPUs.",
+      "runtime_profile": "intel-level-zero",
+      "features": {
+        "interactive": "supported",
+        "models": "experimental",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "intel-b70-llama-sycl-flash-next",
+      "backend": "llama_cpp",
+      "name": "llama.cpp SYCL Flash Next (patched)",
+      "container_name": "b70-llama-sycl-flash-next",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-ai-toolboxes:sycl-flash-next",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Patched SYCL engine for AtomicChat Flash Next AD4.27 and separate Q4 MTP on two B70s.",
+      "runtime_profile": "intel-level-zero",
+      "supports_load_mode": true,
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "recommended_use": {
+          "platform_id": "intel-b70",
+          "model_id": "llama-atomicchat-qwen3-8-flash-next-ad427",
+          "model_filename_pattern": "*AD-4.27bpw-Q4_K_M-M64*.gguf",
+          "model_display_name": "Flash Next AtomicChat AD4.27 \u00b7 two B70s",
+          "message": "Two B70s, layer split, Q8 K / Q4 V cache and separate Q4 MTP head.",
+          "documentation_url": "https://github.com/kyuz0/intel-b70-ai-toolboxes",
+          "notes": [
+            "Select the complete 33-shard AD4.27 model and download the separate Q4 MTP head in Models.",
+            "Uses both cards, one sequence and 68,096 context tokens. Uncheck MTP for the target-only configuration."
+          ],
+          "sidecar": {
+            "repo": "dzannotti/Qwen3.8-Flash-Next-MTP-GGUF",
+            "filename": "Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf"
+          },
+          "server_defaults": {
+            "context_size": 68096,
+            "batch_size": 512,
+            "ubatch_size": 512,
+            "gpu_layers": 99,
+            "parallel_sequences": 1,
+            "kv_cache_type": "q8_0",
+            "load_mode": "none",
+            "flash_attention": true,
+            "hip_devices": "0,1",
+            "mtp_enabled": true,
+            "mtp": {
+              "default_draft_n": 3,
+              "default_np": 1,
+              "spec_types": [
+                "draft-mtp"
+              ],
+              "spec_draft_p_min": 0.75,
+              "draft_gpu_layers": 999,
+              "draft_device": "SYCL1",
+              "backend_sampling": true
+            },
+            "extra_args": "--device SYCL0,SYCL1 --tensor-split 1,1 --split-mode layer --override-tensor per_layer_token_embd=CPU --threads 6 --threads-batch 14 --cache-type-v q4_1 --no-warmup --jinja --fit off --cache-ram 0"
+          }
+        }
+      }
+    },
+    {
+      "id": "intel-b70-trellis-xpu",
+      "backend": "vllm",
+      "name": "B70 Trellis",
+      "container_name": "b70-trellis-xpu",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-vllm-toolbox:trellis-xpu",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Trellis, the successor to EXL3-XPU: Qwen3.8 27B EXL3 with MTP3 on one B70; prefix caching disabled.",
+      "runtime_profile": "intel-vllm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "accelerator": "xpu",
+        "engine_selector": {
+          "id": "trellis-xpu",
+          "label": "Trellis"
+        },
+        "supported_model_ids": [
+          "vllm-turboderp-qwen3-8-27b-exl3-4bpw"
+        ]
+      }
+    },
+    {
+      "id": "intel-b70-fp8-onecard",
+      "backend": "vllm",
+      "name": "B70 Optimization Lab FP8",
+      "container_name": "b70-fp8-onecard",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/intel-b70-vllm-toolbox:fp8-onecard",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Official Qwen3.8 27B FP8 on one B70, MTP5 and CPU embeddings; pinned publisher binary with matching overlays.",
+      "runtime_profile": "intel-vllm",
+      "features": {
+        "interactive": "supported",
+        "server": "experimental",
+        "models": "supported"
+      },
+      "backend_config": {
+        "accelerator": "xpu",
+        "engine_selector": {
+          "id": "b70-fp8-onecard",
+          "label": "Optimization Lab FP8"
+        },
+        "supported_model_ids": [
+          "vllm-qwen-qwen3-8-27b-fp8"
+        ],
+        "policy_overrides": {
+          "valid_tp": [
+            1
+          ],
+          "attention_backend": null,
+          "attention_backend_label": "Optimization Lab XPU",
+          "ctx": "32768",
+          "default_max_num_seqs": 1,
+          "max_num_seqs": "1",
+          "gpu_memory_utilization": 0.975,
+          "enforce_eager": false,
+          "dtype": "float16",
+          "host_memory_gib_by_tp": {
+            "1": 12
+          },
+          "default_speculation": "mtp",
+          "speculation": {
+            "mtp": {
+              "config": {
+                "method": "qwen3_next_mtp",
+                "num_speculative_tokens": 5
+              }
+            }
+          },
+          "env": {
+            "VLLM_TARGET_DEVICE": "xpu",
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "TRITON_CACHE_DIR": "/workspace/.cache/triton/b70-fp8-onecard",
+            "TILELANG_CACHE_DIR": "/workspace/.cache/triton/b70-fp8-onecard/tilelang"
+          },
+          "extra_flags": [
+            "--served-model-name",
+            "Qwen3.8-27B",
+            "--quantization",
+            "fp8",
+            "--kv-cache-dtype",
+            "auto",
+            "--block-size",
+            "64",
+            "--max-num-batched-tokens",
+            "2048",
+            "--no-enable-prefix-caching",
+            "--enable-prompt-tokens-details",
+            "--language-model-only",
+            "--generation-config",
+            "vllm",
+            "--reasoning-parser",
+            "qwen3",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--compilation-config",
+            "{\"cudagraph_mode\":\"PIECEWISE\",\"cudagraph_capture_sizes\":[1],\"max_cudagraph_capture_size\":1,\"splitting_ops\":[],\"inductor_compile_config\":{\"combo_kernels\":false,\"benchmark_combo_kernel\":false,\"deterministic\":true,\"triton.autotune_pointwise\":false,\"benchmark_epilogue_fusion\":false}}"
+          ],
+          "profile_note": "Official FP8 checkpoint on one 32 GB B70 using the Optimization Lab image, CPU embeddings and an INT4 shortlist for MTP5. One sequence, 32,768 context, 97.5% GPU allocation and prefix caching off. Close other GPU applications first."
+        }
+      }
+    },
+    {
+      "id": "r9700-affinity-rocm-10-1",
+      "backend": "affinity",
+      "name": "Affinity",
+      "container_name": "affinity-rocm-10.1",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:affinity-rocm-10.1",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "DeepSeek-V4-Flash-0731 custom2.875bpw native .aff; four R9700 GPUs, GPU-resident target experts, C1 baseline or DSpark.",
+      "runtime_profile": "amd-rocm",
+      "toolbox_compatible": true,
+      "features": {
+        "interactive": "experimental",
+        "models": "experimental",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "r9700-hipfire-rocm-10-1",
+      "backend": "hipfire",
+      "name": "hipfire",
+      "container_name": "hipfire-rocm-10.1",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:hipfire-rocm-10.1",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "DeepSeek-V4-Flash-0731 native MQ2R; four R9700 GPUs, C1 target-only decoding with legacy F32 KV.",
+      "runtime_profile": "amd-rocm",
+      "toolbox_compatible": true,
+      "features": {
+        "interactive": "experimental",
+        "models": "experimental",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "r9700-strata-rocm-10-1",
+      "backend": "strata",
+      "name": "Strata",
+      "container_name": "strata-rocm-10.1",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-r9700-toolboxes:strata-rocm-10.1",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS2.00bpw; four R9700 GPUs, six-expert routing with offload, C1 baseline or DSpark.",
+      "runtime_profile": "amd-rocm",
+      "toolbox_compatible": true,
+      "features": {
+        "interactive": "experimental",
+        "models": "experimental",
+        "server": "experimental"
+      }
+    },
+    {
+      "id": "strix-halo-maya-rocm-10-0",
+      "backend": "maya",
+      "name": "maya-rocm-10.0",
+      "container_name": "maya-rocm-10.0",
+      "group": "Dev/Experimental Toolboxes",
+      "image": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-maya",
+      "channel": "experimental",
+      "maturity": "experimental",
+      "description": "Maya for GLM-5.3-Flash S24/MTP and DeepSeek-V4.1-Flash-1017 S/DSpark on 128 GB Strix Halo.",
+      "runtime_profile": "amd-rocm-keep-groups",
+      "toolbox_compatible": true,
+      "supports_load_mode": false,
+      "features": {
+        "interactive": "experimental",
+        "models": "experimental",
         "server": "experimental"
       }
     }
@@ -727,8 +2430,8 @@
       "description": "Ryzen AI Max, gfx1151",
       "toolbox_ids": [
         "strix-halo-llama-rocm-10-0",
+        "strix-halo-gufo-rocm-10-0",
         "strix-halo-llama-hrx-staging",
-        "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next",
         "strix-halo-llama-rocm-10-0-engramhalo",
         "strix-halo-llama-vulkan-radv",
         "strix-halo-llama-vulkan-radv-performance",
@@ -742,14 +2445,17 @@
         "strix-vllm-dev",
         "strix-comfyui-latest",
         "strix-comfyui-dev",
-        "strix-halo-halogen-flash"
+        "strix-halo-halogen-flash",
+        "strix-halo-maya-rocm-10-0"
       ],
       "defaults": {
         "llama_cpp": "strix-halo-llama-rocm-10-0",
+        "gufo": "strix-halo-gufo-rocm-10-0",
         "ds4": "strix-halo-ds4-rocm-10-0",
         "vllm": "strix-vllm-latest",
         "comfyui": "strix-comfyui-latest",
-        "halogen": "strix-halo-halogen-flash"
+        "halogen": "strix-halo-halogen-flash",
+        "maya": "strix-halo-maya-rocm-10-0"
       }
     },
     {
@@ -760,12 +2466,24 @@
         "r9700-llama-rocm-10-0",
         "r9700-llama-therock-nightly",
         "r9700-llama-vulkan-radv",
-        "r9700-llama-vulkan-rocmfpx",
-        "r9700-r9v-rocm-10-0"
+        "r9700-r9v-v044-rocm-10",
+        "r9700-vllm-714-fp8",
+        "r9700-ggz14-mxfp4-tp1",
+        "r9700-radiance-fp8-tp2",
+        "r9700-tcclaviger-flash-next-tp2",
+        "r9700-radiance-rocm-10-1",
+        "r9700-affinity-rocm-10-1",
+        "r9700-hipfire-rocm-10-1",
+        "r9700-strata-rocm-10-1"
       ],
       "defaults": {
         "llama_cpp": "r9700-llama-rocm-10-0",
-        "r9v": "r9700-r9v-rocm-10-0"
+        "r9v": "r9700-r9v-v044-rocm-10",
+        "vllm": "r9700-vllm-714-fp8",
+        "radiance": "r9700-radiance-rocm-10-1",
+        "affinity": "r9700-affinity-rocm-10-1",
+        "hipfire": "r9700-hipfire-rocm-10-1",
+        "strata": "r9700-strata-rocm-10-1"
       }
     },
     {
@@ -789,10 +2507,18 @@
       "description": "Battlemage / Level Zero",
       "toolbox_ids": [
         "intel-b70-b70-llama-sycl",
-        "intel-b70-b70-llama-vulkan"
+        "intel-b70-b70-llama-vulkan",
+        "intel-b70-vllm-upstream",
+        "intel-b70-vllm-scaler",
+        "intel-b70-strata",
+        "intel-b70-llama-sycl-flash-next",
+        "intel-b70-trellis-xpu",
+        "intel-b70-fp8-onecard"
       ],
       "defaults": {
-        "llama_cpp": "intel-b70-b70-llama-sycl"
+        "llama_cpp": "intel-b70-b70-llama-sycl",
+        "vllm": "intel-b70-vllm-upstream",
+        "strata": "intel-b70-strata"
       }
     }
   ]
