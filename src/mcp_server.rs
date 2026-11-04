@@ -110,7 +110,7 @@ async fn handle_message(client: &DaemonClient, msg: Value) -> Value {
             "tools": [
                 {
                     "name": "request_review",
-                    "description": "Request a code review for a task. After calling this tool, wait for expert feedback.",
+                    "description": "Request a code review for a task. By default waits for expert feedback. Set wait:false to return immediately with {status:\"pending\", sessionId} and keep working; fetch the verdict later with wait_review (preferred) or get_session_details. NEVER re-call request_review to fetch a verdict - it starts a duplicate review.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -118,9 +118,22 @@ async fn handle_message(client: &DaemonClient, msg: Value) -> Value {
                             "summary": { "type": "string", "description": "Brief summary of the task" },
                             "details": { "type": "string", "description": "Additional details about the task" },
                             "conversationHistory": { "type": "array", "items": { "type": "string" }, "description": "Conversation history as context" },
-                            "cwd": { "type": "string", "description": "Absolute path to the project directory being reviewed. Optional but strongly recommended for accurate git diff collection; falls back to peer-cred-resolved cwd if omitted." }
+                            "cwd": { "type": "string", "description": "Absolute path to the project directory being reviewed. Optional but strongly recommended for accurate git diff collection; falls back to peer-cred-resolved cwd if omitted." },
+                            "wait": { "type": "boolean", "description": "true (default): block until the review reaches a terminal status. false: return immediately with {status:\"pending\", sessionId} so the caller can keep working, then call wait_review(sessionId) before committing." }
                         },
                         "required": ["taskId", "summary"]
+                    }
+                },
+                {
+                    "name": "wait_review",
+                    "description": "Wait for a review session (from request_review with wait:false) to reach a terminal status. Returns the verdict (status/feedback/reviewerType/reviewModel) when terminal, or the current status with timedOut:true after the timeout (call again). Keys on sessionId - do NOT re-call request_review to fetch a verdict.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sessionId": { "type": "string", "description": "The sessionId returned by request_review with wait:false" },
+                            "timeoutSeconds": { "type": "number", "description": "Max seconds to wait (default 300, range 1-1800)." }
+                        },
+                        "required": ["sessionId"]
                     }
                 },
                 {
@@ -185,6 +198,34 @@ async fn handle_message(client: &DaemonClient, msg: Value) -> Value {
     }
 }
 
+/// Terminal review statuses (v1 spelling kept: `failed` is reserved for the
+/// background-task error path).
+const REVIEW_TERMINAL: &[&str] = &["approved", "needs_revision", "escalated", "failed"];
+
+/// Path-traversal guard for session ids used in URL paths.
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("Invalid sessionId: must be alphanumeric, dashes, or underscores");
+    }
+    Ok(())
+}
+
+/// The shared terminal-review verdict shape (same as the old blocking
+/// endpoint, plus the reviewer provenance `reviewModel`).
+fn normalized_terminal(detail: &Value, session_id: &str) -> Value {
+    serde_json::json!({
+        "status": detail.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "feedback": detail.get("llm_feedback").or_else(|| detail.get("human_feedback")).cloned().unwrap_or(serde_json::Value::Null),
+        "sessionId": session_id,
+        "iterationCount": detail.get("iteration_count").cloned().unwrap_or(serde_json::Value::Null),
+        "reviewerType": detail.get("reviewer_type").cloned().unwrap_or(serde_json::Value::Null),
+        "reviewModel": brainrouter::daemon_client::review_model_from_detail(detail),
+    })
+}
+
 /// Forward a tool call to the daemon via the shared thin client.
 async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result<Value> {
     match tool {
@@ -197,7 +238,17 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
             //
             // Terminal statuses: approved, needs_revision, escalated, failed.
             // We poll for up to 30 minutes (360 × 5s) before giving up.
-            let start_resp = client.post_json("/review/api/request-async", args).await?;
+            // `wait:false` (parallel workflow) skips step 2 entirely: the caller
+            // keeps working and fetches the verdict via wait_review(sessionId).
+            let wait = args
+                .get("wait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let mut request_body = args;
+            if let Some(obj) = request_body.as_object_mut() {
+                obj.remove("wait"); // client-side flag; not part of the daemon's ReviewRequest
+            }
+            let start_resp = client.post_json("/review/api/request-async", request_body).await?;
 
             // FR-A: the code reviewer can be switched off. The async start then
             // returns a terminal `disabled` status with no session to poll, so
@@ -216,16 +267,16 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
                 .context("request-async response missing sessionId")?
                 .to_string();
 
-            // Validate before using in a URL path.
-            if !session_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                bail!("Invalid sessionId returned by daemon: {:?}", session_id);
+            validate_session_id(&session_id)?;
+
+            if !wait {
+                return Ok(serde_json::json!({
+                    "status": "pending",
+                    "sessionId": session_id,
+                }));
             }
 
             let poll_path = format!("/review/api/sessions/{}", session_id);
-            const TERMINAL: &[&str] = &["approved", "needs_revision", "escalated", "failed"];
             const POLL_INTERVAL_SECS: u64 = 5;
             const MAX_POLLS: u32 = 360; // 30 minutes
 
@@ -239,19 +290,8 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                if TERMINAL.contains(&status) {
-                    // Normalise to the shape the old blocking endpoint returned.
-                    // `reviewModel` names the reviewer model and its backend;
-                    // the shared rule lives in daemon_client::review_model_from_detail.
-                    let review_model = brainrouter::daemon_client::review_model_from_detail(&detail);
-                    return Ok(serde_json::json!({
-                        "status": status,
-                        "feedback": detail.get("llm_feedback").or_else(|| detail.get("human_feedback")).unwrap_or(&serde_json::Value::Null),
-                        "sessionId": session_id,
-                        "iterationCount": detail.get("iteration_count").unwrap_or(&serde_json::Value::Null),
-                        "reviewerType": detail.get("reviewer_type").unwrap_or(&serde_json::Value::Null),
-                        "reviewModel": review_model,
-                    }));
+                if REVIEW_TERMINAL.contains(&status) {
+                    return Ok(normalized_terminal(&detail, &session_id));
                 }
             }
 
@@ -262,6 +302,52 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
                 session_id
             )
         }
+        "wait_review" => {
+            // Verdict fetch for the async (wait:false) workflow. Keys on the
+            // sessionId so the review loop is never duplicated. Check first
+            // (the verdict is usually already in by the time the caller asks),
+            // then long-poll to the deadline. On timeout, report the current
+            // status — NOT an error: the caller may keep waiting.
+            let session_id = args
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .context("missing sessionId")?
+                .to_string();
+            validate_session_id(&session_id)?;
+            let timeout_secs = args
+                .get("timeoutSeconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300)
+                .clamp(1, 1800);
+
+            let poll_path = format!("/review/api/sessions/{}", session_id);
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+            loop {
+                let detail = client.get_json(&poll_path).await?;
+                let status = detail
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if REVIEW_TERMINAL.contains(&status) {
+                    return Ok(normalized_terminal(&detail, &session_id));
+                }
+
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(serde_json::json!({
+                        "status": status,
+                        "sessionId": session_id,
+                        "timedOut": true,
+                        "iterationCount": detail.get("iteration_count").cloned().unwrap_or(serde_json::Value::Null),
+                        "reviewModel": brainrouter::daemon_client::review_model_from_detail(&detail),
+                    }));
+                }
+                // Sleep at most until the deadline (2s cadence).
+                let nap = tokio::time::Duration::from_secs(2).min(deadline - now);
+                tokio::time::sleep(nap).await;
+            }
+        }
         "get_session_list" => {
             client.get_json("/review/api/sessions").await
         }
@@ -271,10 +357,7 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
                 .and_then(|v| v.as_str())
                 .context("missing sessionId")?
                 .to_string();
-            // Validate session_id to prevent path traversal
-            if !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                bail!("Invalid sessionId: must be alphanumeric, dashes, or underscores");
-            }
+            validate_session_id(&session_id)?; // path-traversal guard
             let path = format!("/review/api/sessions/{}", session_id);
             client.get_json(&path).await
         }
@@ -392,5 +475,60 @@ mod tests {
             .await
             .expect("stubbed review must terminate");
         assert_eq!(out["reviewModel"], "cloud/vendor/rev");
+    }
+
+    #[tokio::test]
+    async fn wait_false_returns_pending_immediately_without_polling() {
+        // The stub's detail route would answer `approved` if polled; the async
+        // path must instead return `pending` + sessionId without ever polling
+        // (that is the whole point: the caller keeps working).
+        let detail = r#"{"status":"approved","llm_feedback":"SHIP IT","iteration_count":1,"reviewer_type":"llm","review_model":"requested cloud/vendor/rev; actual cloud → mock (vendor/rev)","review_selector":"cloud/vendor/rev"}"#;
+        let client = DaemonClient::new(DaemonEndpoint::Url(stub_daemon(detail)));
+        let out = dispatch_tool(
+            &client,
+            "request_review",
+            json!({ "taskId": "t", "summary": "s", "wait": false }),
+        )
+        .await
+        .expect("async start must return immediately");
+        assert_eq!(out["status"], "pending");
+        assert_eq!(out["sessionId"], "stub-session-1");
+    }
+
+    #[tokio::test]
+    async fn wait_review_returns_terminal_verdict_on_first_check() {
+        let detail = r#"{"status":"approved","llm_feedback":"SHIP IT","iteration_count":1,"reviewer_type":"llm","review_model":"requested cloud/vendor/rev; actual cloud → mock (vendor/rev)","review_selector":"cloud/vendor/rev"}"#;
+        let client = DaemonClient::new(DaemonEndpoint::Url(stub_daemon(detail)));
+        let out = dispatch_tool(
+            &client,
+            "wait_review",
+            json!({ "sessionId": "stub-session-1", "timeoutSeconds": 5 }),
+        )
+        .await
+        .expect("terminal session must resolve immediately");
+        assert_eq!(out["status"], "approved");
+        assert_eq!(out["feedback"], "SHIP IT");
+        assert_eq!(out["reviewModel"], "requested cloud/vendor/rev; actual cloud → mock (vendor/rev)");
+        assert!(out.get("timedOut").is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_review_timeout_reports_current_status_not_an_error() {
+        // Still pending: the caller gets the live status with timedOut:true and
+        // may call again — a timeout is not a failure.
+        let detail = r#"{"status":"pending","iteration_count":0,"reviewer_type":null,"review_model":null,"review_selector":"cloud/vendor/rev"}"#;
+        let client = DaemonClient::new(DaemonEndpoint::Url(stub_daemon(detail)));
+        let started = std::time::Instant::now();
+        let out = dispatch_tool(
+            &client,
+            "wait_review",
+            json!({ "sessionId": "stub-session-1", "timeoutSeconds": 1 }),
+        )
+        .await
+        .expect("timeout must be a value, not an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "must bound by the deadline");
+        assert_eq!(out["status"], "pending");
+        assert_eq!(out["timedOut"], true);
+        assert_eq!(out["reviewModel"], "cloud/vendor/rev", "provenance visible while pending too");
     }
 }
