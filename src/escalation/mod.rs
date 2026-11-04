@@ -145,6 +145,16 @@ fn review_disabled_response() -> Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
     }))
 }
 
+/// Reviewer provenance for client responses: the actual served model/provider
+/// recorded by the review loop, falling back to the requested card selector
+/// when no LLM call ever succeeded (same display rule as the dashboard; the
+/// JSON-level twin for thin clients lives in `daemon_client::review_model_from_detail`).
+fn review_provenance(sessions: &crate::session::SessionManager, session_id: &str) -> Option<String> {
+    sessions
+        .get_session(session_id)
+        .and_then(|s| s.review_model.or(s.review_selector))
+}
+
 /// POST /review/api/request — legacy blocking review trigger.
 /// Long-running: blocks until the review loop completes.
 /// CLI and the MCP thin client use /review/api/request-async + polling instead.
@@ -213,13 +223,17 @@ async fn handle_request_review(
         .start_review(body.task_id, body.summary, body.details, body.conversation_history, safe_cwd)
         .await
     {
-        Ok(result) => json_ok(&serde_json::json!({
-            "status": result.status.as_str(),
-            "feedback": result.feedback,
-            "sessionId": result.session_id,
-            "iterationCount": result.iteration_count,
-            "reviewerType": format!("{:?}", result.reviewer_type).to_lowercase()
-        })),
+        Ok(result) => {
+            let review_model = review_provenance(review_service.session_manager(), &result.session_id);
+            json_ok(&serde_json::json!({
+                "status": result.status.as_str(),
+                "feedback": result.feedback,
+                "sessionId": result.session_id,
+                "iterationCount": result.iteration_count,
+                "reviewerType": format!("{:?}", result.reviewer_type).to_lowercase(),
+                "reviewModel": review_model,
+            }))
+        }
         Err(e) => {
             let message = e.to_string();
             let status = if message.contains("is already running") {
@@ -381,12 +395,16 @@ async fn handle_continue_review(
     };
 
     match review_service.continue_review(&body.session_id, body.iterations).await {
-        Ok(result) => json_ok(&serde_json::json!({
-            "status": result.status.as_str(),
-            "feedback": result.feedback,
-            "sessionId": result.session_id,
-            "iterationCount": result.iteration_count,
-        })),
+        Ok(result) => {
+            let review_model = review_provenance(review_service.session_manager(), &result.session_id);
+            json_ok(&serde_json::json!({
+                "status": result.status.as_str(),
+                "feedback": result.feedback,
+                "sessionId": result.session_id,
+                "iterationCount": result.iteration_count,
+                "reviewModel": review_model,
+            }))
+        }
         Err(e) => {
             let message = e.to_string();
             let status = if message.contains("is already running") {
@@ -436,7 +454,8 @@ fn extract_session_id_from_resolve_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::review_start_is_gated;
+    use super::{review_provenance, review_start_is_gated};
+    use crate::session::{SessionManager, SessionUpdate};
 
     #[test]
     fn master_switch_gates_only_review_start_endpoints_when_disabled() {
@@ -468,6 +487,60 @@ mod tests {
         ] {
             assert!(!review_start_is_gated(true, "POST", p), "{p} must not be gated when enabled");
         }
+    }
+
+    #[test]
+    fn review_provenance_prefers_actual_model_then_selector_then_none() {
+        let sessions = SessionManager::new();
+
+        // Actual served provenance wins over the requested card.
+        let served = sessions.create_session(
+            "prov-1".into(),
+            "s".into(),
+            None,
+            Vec::new(),
+            "/tmp".into(),
+        );
+        sessions.set_review_selector(&served.id, "cloud/vendor/card");
+        sessions.update_session(
+            &served.id,
+            SessionUpdate {
+                status: None,
+                feedback: None,
+                reviewer_type: None,
+                escalation_reason: None,
+                review_model: Some("requested cloud/vendor/card; actual local → llama-swap (m)".into()),
+                llm_turns: None,
+            },
+        );
+        assert_eq!(
+            review_provenance(&sessions, &served.id).as_deref(),
+            Some("requested cloud/vendor/card; actual local → llama-swap (m)")
+        );
+
+        // No LLM call ever succeeded: the requested card selector is reported.
+        let started = sessions.create_session(
+            "prov-2".into(),
+            "s".into(),
+            None,
+            Vec::new(),
+            "/tmp".into(),
+        );
+        sessions.set_review_selector(&started.id, "cloud/vendor/card");
+        assert_eq!(
+            review_provenance(&sessions, &started.id).as_deref(),
+            Some("cloud/vendor/card")
+        );
+
+        // Neither recorded (session predating the selector snapshot): null.
+        let bare = sessions.create_session(
+            "prov-3".into(),
+            "s".into(),
+            None,
+            Vec::new(),
+            "/tmp".into(),
+        );
+        assert_eq!(review_provenance(&sessions, &bare.id), None);
     }
 
     #[test]

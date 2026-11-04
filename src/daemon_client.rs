@@ -95,6 +95,20 @@ impl DaemonClient {
     }
 }
 
+/// Reviewer provenance from a session-detail JSON, shared by both thin
+/// clients: the actual served model/provider recorded by the review loop,
+/// falling back to the requested card selector when no LLM call ever
+/// succeeded (same rule the dashboard's card display uses). Null only when a
+/// session somehow carries neither — the field is then reported as `null`.
+pub fn review_model_from_detail(detail: &Value) -> Value {
+    detail
+        .get("review_model")
+        .filter(|v| !v.is_null())
+        .or_else(|| detail.get("review_selector"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 fn check_ok(resp: &DaemonResponse) -> Result<()> {
     if (200..300).contains(&resp.status) {
         Ok(())

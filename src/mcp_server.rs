@@ -241,12 +241,16 @@ async fn dispatch_tool(client: &DaemonClient, tool: &str, args: Value) -> Result
 
                 if TERMINAL.contains(&status) {
                     // Normalise to the shape the old blocking endpoint returned.
+                    // `reviewModel` names the reviewer model and its backend;
+                    // the shared rule lives in daemon_client::review_model_from_detail.
+                    let review_model = brainrouter::daemon_client::review_model_from_detail(&detail);
                     return Ok(serde_json::json!({
                         "status": status,
                         "feedback": detail.get("llm_feedback").or_else(|| detail.get("human_feedback")).unwrap_or(&serde_json::Value::Null),
                         "sessionId": session_id,
                         "iterationCount": detail.get("iteration_count").unwrap_or(&serde_json::Value::Null),
                         "reviewerType": detail.get("reviewer_type").unwrap_or(&serde_json::Value::Null),
+                        "reviewModel": review_model,
                     }));
                 }
             }
@@ -297,4 +301,96 @@ fn json_error(id: Value, code: i64, message: &str) -> Value {
         "id": id,
         "error": { "code": code, "message": message }
     })
+}
+
+// ─── tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Minimal stub daemon: `request-async` hands out a session id; the detail
+    /// poll returns `detail_json` (a terminal status). One request per
+    /// connection (`connection: close`); the accept loop lives for the test.
+    fn stub_daemon(detail_json: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut text = String::new();
+                let mut buf = [0u8; 8192];
+                while !text.contains("\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                }
+                let content_length = text
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0usize);
+                let mut have = text.split_once("\r\n\r\n").map(|(_, b)| b.len()).unwrap_or(0);
+                while have < content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            have += n;
+                        }
+                    }
+                }
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = if path.starts_with("/review/api/request-async") {
+                    r#"{"sessionId":"stub-session-1","status":"pending"}"#.to_string()
+                } else {
+                    detail_json.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn request_review_result_names_the_reviewer_model() {
+        let detail = r#"{"status":"approved","llm_feedback":"SHIP IT","iteration_count":1,"reviewer_type":"llm","review_model":"requested cloud/vendor/rev; actual cloud → mock (vendor/rev)","review_selector":"cloud/vendor/rev"}"#;
+        let client = DaemonClient::new(DaemonEndpoint::Url(stub_daemon(detail)));
+        let out = dispatch_tool(&client, "request_review", json!({ "taskId": "t", "summary": "s" }))
+            .await
+            .expect("stubbed review must terminate");
+        assert_eq!(out["status"], "approved");
+        // The OMP tool result must name the reviewer model and its backend.
+        assert_eq!(
+            out["reviewModel"],
+            "requested cloud/vendor/rev; actual cloud → mock (vendor/rev)"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_model_falls_back_to_the_requested_card_selector() {
+        // No LLM call ever succeeded (escalated llm_error at iteration 0): the
+        // requested card is the best available reviewer provenance.
+        let detail = r#"{"status":"escalated","escalation_reason":"llm_error","iteration_count":0,"reviewer_type":null,"review_model":null,"review_selector":"cloud/vendor/rev"}"#;
+        let client = DaemonClient::new(DaemonEndpoint::Url(stub_daemon(detail)));
+        let out = dispatch_tool(&client, "request_review", json!({ "taskId": "t", "summary": "s" }))
+            .await
+            .expect("stubbed review must terminate");
+        assert_eq!(out["reviewModel"], "cloud/vendor/rev");
+    }
 }

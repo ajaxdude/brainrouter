@@ -6,7 +6,8 @@ Pi uses extensions, not MCP. To call brainrouter reviews from a pi extension:
 
 - `POST http://127.0.0.1:9099/review/api/request` — start a review
   Body: `{ "taskId": "task-xxx", "summary": "...", "details": "..." }`
-  Returns: `{ "status": "approved|needs_revision|escalated", "feedback": "...", "sessionId": "...", "iterationCount": N }`
+  Returns: `{ "status": "approved|needs_revision|escalated", "feedback": "...", "sessionId": "...", "iterationCount": N, "reviewerType": "llm|human", "reviewModel": "requested <selector>; actual <backend> → <provider> (<model>)" }`
+  (`reviewModel` names the reviewer model and whether it ran local or cloud; falls back to the requested card selector if no LLM call succeeded, and is `null` only if the session carries neither — e.g. a session predating the card snapshot.)
 
 - `GET http://127.0.0.1:9099/review/api/sessions` — list sessions
 

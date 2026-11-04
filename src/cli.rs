@@ -899,12 +899,16 @@ async fn print_review_progress(client: &DaemonClient, session_id: &str) -> Resul
                 .get("llm_feedback")
                 .or_else(|| detail.get("human_feedback"))
                 .unwrap_or(&Value::Null);
+            // Same reviewer provenance the MCP thin client reports; shared rule
+            // in daemon_client::review_model_from_detail.
+            let review_model = brainrouter::daemon_client::review_model_from_detail(&detail);
             print_json(&json!({
                 "status": status,
                 "feedback": feedback,
                 "sessionId": session_id,
                 "iterationCount": detail.get("iteration_count").unwrap_or(&Value::Null),
                 "reviewerType": detail.get("reviewer_type").unwrap_or(&Value::Null),
+                "reviewModel": review_model,
             }));
             return Ok(());
         }
