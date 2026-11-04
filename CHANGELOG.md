@@ -508,6 +508,20 @@ quarantined (`.corrupt-<ts>`, daemon stays up); CI covers the
 `plugins/bridge` workspace; plugin log/status text is scrubbed of control
 characters; snapshot files and the migration snapshot set are written 0600.
 
+### Fixed: descriptor leak in the atomic writers (2026-11-04)
+
+`plugins::store::atomic_write_0600` (plugin state/status, tokens, kv) and
+`CredentialStore::save_locked` no longer `mem::forget` the temp file after the
+rename. `TempPath::drop` swallows the ENOENT from the already-renamed path, so
+dropping the handle closes its descriptor; forgetting it leaked one descriptor
+per write. Plugin status persistence writes `plugins.json` ~1/minute, so the
+daemon — running under the default `LimitNOFILE` of 1024 — began failing
+`accept()` with `EMFILE` after ~14h, spinning a log storm and leaving every new
+review request unserved (the symptom: `request_review` hangs forever). Both
+writers now have `/proc/self/fd` regression tests. `openssl` 0.10.77 and
+`openssl-sys` 0.9.113 are bumped to 0.10.82/0.9.118, the first pair that builds
+against OpenSSL 4.0 (Fedora 45 ships 4.0.3; the old pair aborts the build).
+
 ### v2 L3 Step 9 (roles review pass)
 
 Migration: a v1 config without a `bonsai:` block now receives the

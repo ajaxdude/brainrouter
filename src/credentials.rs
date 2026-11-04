@@ -269,9 +269,10 @@ impl CredentialStore {
             .context("chmod 0600 on credentials temp file")?;
         std::fs::rename(tmp.path(), &self.path)
             .with_context(|| format!("installing {}", self.path.display()))?;
-        // The temp path is gone after the rename; `keep` prevents the
-        // destructor from trying (and silently failing) to delete it.
-        std::mem::forget(tmp);
+        // Dropping `tmp` closes the temp-file descriptor; the destructor's
+        // unlink of the (already renamed) temp path is a swallowed ENOENT.
+        // Forgetting it instead leaked one descriptor per save.
+        drop(tmp);
         Ok(())
     }
 
@@ -517,6 +518,37 @@ mod tests {
         assert_eq!(mode, 0o600);
         // missing id is an error, not a panic
         assert!(st2.resolve("nope").is_err());
+    }
+
+    /// Descriptors this process still holds under `dir`. Scoped to the test's
+    /// own temp dir: sibling tests in the same process open their own.
+    /// Linux-only: `/proc/self/fd` has no portable equivalent here.
+    #[cfg(target_os = "linux")]
+    fn fds_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter(|target| target.starts_with(dir))
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_saves_do_not_leak_descriptors() {
+        // Regression: `mem::forget(tmp)` in `save_locked` leaked one fd per save.
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(dir.path());
+        st.put(rec("a", "1", &["bridge"])).unwrap();
+        let before = fds_under(dir.path());
+        for i in 0..64 {
+            st.put(rec("a", &format!("v{i}"), &["bridge"])).unwrap();
+        }
+        assert_eq!(
+            fds_under(dir.path()),
+            before,
+            "credential save leaked a descriptor"
+        );
+        assert_eq!(st.resolve("a").unwrap().expose(), "v63");
     }
 
     #[test]

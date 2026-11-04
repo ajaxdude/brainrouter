@@ -60,7 +60,11 @@ pub fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("chmod 0600 on plugin temp file")?;
     std::fs::rename(tmp.path(), path)
         .with_context(|| format!("installing {}", path.display()))?;
-    std::mem::forget(tmp);
+    // Drop `tmp` so the temp-file descriptor closes. `TempPath::drop` then
+    // unlinks `tmp.path()`, which the rename already consumed, and swallows
+    // the ENOENT. Never `mem::forget` it: that leaks one descriptor per write
+    // and starves `accept()` with EMFILE after ~1000 status updates.
+    drop(tmp);
     Ok(())
 }
 
@@ -142,6 +146,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello");
         atomic_write_0600(&p, b"world").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "world");
+    }
+
+    /// Descriptors this process still holds under `dir`. Scoped to the test's
+    /// own temp dir: sibling tests in the same process open their own.
+    /// Linux-only: `/proc/self/fd` has no portable equivalent here.
+    #[cfg(target_os = "linux")]
+    fn fds_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter(|target| target.starts_with(dir))
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_write_closes_its_temp_file() {
+        // Regression: `mem::forget(tmp)` after the rename leaked one fd per
+        // write. Plugin status persistence writes this file ~1/minute, so the
+        // daemon ran out of descriptors and `accept()` failed with EMFILE.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("plugins").join("plugins.json");
+        atomic_write_0600(&p, b"{}").unwrap();
+        let before = fds_under(dir.path());
+        for _ in 0..64 {
+            atomic_write_0600(&p, b"{\"plugins\":{}}").unwrap();
+        }
+        assert_eq!(
+            fds_under(dir.path()),
+            before,
+            "atomic_write_0600 leaked a descriptor"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"plugins\":{}}");
     }
 
     #[test]
