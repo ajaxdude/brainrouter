@@ -126,6 +126,7 @@ fn make_router(
             enabled: true,
             monthly_budget_usd: None,
             budget_mode: brainrouter::providers::BudgetMode::Warn,
+            peer_info: None,
         },
     ]));
 

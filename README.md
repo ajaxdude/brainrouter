@@ -1,13 +1,14 @@
 # brainrouter
 
-> **⚠️ Under heavy development.** The v2 program (role cards, decision slot, plugins,
+> **⚠ Under heavy development.** The v2 program (role cards, decision slot, plugins,
 > credentials store, swap supervisor, distributed roles) is landing leg by leg. Expect
 > breaking changes to configuration, CLI, and HTTP surfaces between releases; every
 > migrating release ships automatic config migration with a named restore point
 > (`brainrouter migration restore <phase>`), and v1-era configs keep booting.
 > As of **v2.0-p4**, legs L1–L7 are merged: provider registry (L6), swap supervisor
 > and native engine adapters (L4/L7), and review-backend failover
-> (`review.fallback_selector`) all ship — but the daemon still **boots in shim
+> (`review.fallback_chain`, the ordered chain replacing `review.fallback_selector`;
+> boot migration `v2.0-p8`) all ship — but the daemon still **boots in shim
 > mode against llama-swap by default** (shim mode requires llama-swap installed
 > and enabled); the native-swap flip is a separate, soak-gated operator action,
 > and leg L8 (additional engine hardware) is pending. `QA.md` ships the
@@ -1685,16 +1686,22 @@ benchmarks:
 
 review:
   max_iterations: 5           # LLM review rounds before escalating to human
-  # fallback_selector: cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash
-  # Second-chance reviewer backend. If the primary review-card model's cloud
-  # provider fails (credits exhausted, circuit open, unreachable), the review
-  # retries ONCE on this selector before escalating to a human. Must be a
-  # cloud selector; the qualified cloud/<provider>/<model> form names a
-  # distinct provider. Cloud reviews only — local reviews never migrate off
-  # their admitted model. Read from this file at boot (restart to apply); it
-  # is not part of the review card store and the POST /api/review-config body
-  # ignores it. Applies to explicitly-cloud review cards; an `auto` card
-  # resolving to cloud keeps the single-attempt escalation contract.
+  # fallback_chain:                     # ordered reviewer failover (v2.0-p8)
+  #   - cloud/fedora1/swift-1.5-qwen3.8-27b.mq4
+  #   - auto                            # (omit; a bare cloud selector means the cloud pool)
+  #   - cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash
+  # Ordered reviewer failover chain. When the primary review-card backend
+  # fails (credits exhausted, circuit open, unreachable), the review walks
+  # this list in order — ONE attempt per member — before escalating to a
+  # human. Members must be cloud selectors; the qualified
+  # cloud/<provider>/<model> form names a distinct provider, and a member
+  # pointing at a LAN peer is health-probed pre-dispatch (breaker + /models
+  # liveness) — an unreachable peer is skipped, never dialed. Every hop and
+  # skip is recorded in the session's review provenance. Replaces the old
+  # single `fallback_selector` (boot migration `v2.0-p8` rewrites it into a
+  # one-element chain). Read from this file at boot (restart to apply); it
+  # is not part of the review card store and the POST /api/review-config
+  # body ignores it. Applies to any review card, peers included.
 # v2 L3: the reviewer MODEL lives on the review role card
 # (`brainrouter roles set review cloud/vendor/review-model`); the v1
 # `forced_mode`/`forced_model` keys and the `routing:` block (including

@@ -157,6 +157,26 @@ pub struct ProviderRecord {
     pub monthly_budget_usd: Option<f64>,
     #[serde(default)]
     pub budget_mode: BudgetMode,
+    /// P5 Part C: last successful peer-info probe for a LAN peer (read-only
+    /// capability cache for dashboards/pickers — liveness is still probed at
+    /// use time; never authoritative for routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_info: Option<PeerInfoCache>,
+}
+
+/// Cached `peer-info` payload persisted per provider (P5 Part C).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfoCache {
+    /// Peer-reported host id (`/api/peer-info` host_id).
+    pub host_id: String,
+    /// Peer-reported brainrouter version.
+    #[serde(default)]
+    pub version: String,
+    /// Served models with ctx/tools/tier/state as last reported.
+    #[serde(default)]
+    pub models: Vec<serde_json::Value>,
+    /// RFC 3339 UTC timestamp of the probe that filled this cache.
+    pub last_seen: String,
 }
 
 fn default_true() -> bool {
@@ -288,6 +308,18 @@ impl ProviderStore {
             Some(existing) => *existing = record,
             None => data.providers.push(record),
         }
+        persist(&self.path, &data)
+    }
+
+    /// Persist the peer-info capability cache for one provider (P5 Part C).
+    /// A no-op returning Ok when the provider is unknown (the probe may be
+    /// issued pre-registration).
+    pub fn set_peer_info(&self, id: &str, info: PeerInfoCache) -> Result<()> {
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = data.providers.iter_mut().find(|p| p.id == id) else {
+            return Ok(());
+        };
+        record.peer_info = Some(info);
         persist(&self.path, &data)
     }
 
@@ -574,6 +606,7 @@ mod tests {
             enabled: true,
             monthly_budget_usd: None,
             budget_mode: BudgetMode::Warn,
+            peer_info: None,
         }
     }
 

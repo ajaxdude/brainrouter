@@ -352,6 +352,7 @@ mod tests {
                     enabled: true,
                     monthly_budget_usd: None,
                     budget_mode: crate::providers::BudgetMode::Warn,
+                    peer_info: None,
                 },
             ]),
         );

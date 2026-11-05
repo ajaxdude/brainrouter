@@ -186,6 +186,7 @@ fn provider_store(enabled: bool) -> Arc<brainrouter::providers::ProviderStore> {
             enabled,
             monthly_budget_usd: None,
             budget_mode: brainrouter::providers::BudgetMode::Warn,
+            peer_info: None,
         },
     ]))
 }
@@ -226,6 +227,7 @@ fn router_args(upstream: &SyntheticProviders, enabled: bool, classify: bool) -> 
                 enabled,
                 monthly_budget_usd: None,
                 budget_mode: brainrouter::providers::BudgetMode::Warn,
+                peer_info: None,
             },
         ])),
         credentials: {
@@ -767,7 +769,7 @@ async fn cli_uses_the_same_typed_cards_and_reduced_review_api() {
         (
             &["review-config", "update", "--max-iterations", "7"],
             "/api/review-config",
-            json!({"max_iterations":7,"hankndory_integration":false,"design_doc_path":null,"fallback_selector":null}),
+            json!({"max_iterations":7,"hankndory_integration":false,"design_doc_path":null,"fallback_chain":[]}),
         ),
     ];
     for (args, path, expected) in cases {

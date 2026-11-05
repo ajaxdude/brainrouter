@@ -334,6 +334,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         )? {
             println!("{line}");
         }
+        for line in brainrouter::migration::preview_v2_p8(
+            &config_path,
+            &brainrouter::paths::brainrouter_state(),
+        )? {
+            println!("{line}");
+        }
         println!("dry-run complete: no state written");
         return Ok(());
     }
@@ -418,6 +424,14 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         &brainrouter::paths::brainrouter_state(),
     )? {
         warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P7);
+    }
+    // P5 Part C: `review.fallback_selector` ⇒ one-element
+    // `review.fallback_chain` (ordered failover chain; snapshot + restore).
+    for action in brainrouter::migration::run_v2_p8(
+        &config_path,
+        &brainrouter::paths::brainrouter_state(),
+    )? {
+        warn!("Migration {}: {action}", brainrouter::migration::PHASE_V2_P8);
     }
     // Config
     let config = config::load(&config_path)

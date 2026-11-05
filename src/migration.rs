@@ -639,6 +639,7 @@ pub fn run_v2_p6(
         enabled: manifest.enabled,
         monthly_budget_usd: None,
         budget_mode: crate::providers::BudgetMode::Warn,
+        peer_info: None,
     };
     // A missing file is an empty registry; the upsert creates it (0600
     // atomic) with the migrated record, preserving any existing providers.
@@ -1097,6 +1098,219 @@ pub fn restore_v2_p7(state_root: &Path, config_path: &Path) -> Result<String> {
     ))
 }
 
+/// The P5 (Part C) phase tag: `brainrouter migration restore v2.0-p8`.
+///
+/// Rewrites `review.fallback_selector: <string>` into a one-element
+/// `review.fallback_chain:` list (the ordered chain replaces the single
+/// retry; see docs/design/p5-ops-redesign.md). If the file already carries a
+/// `fallback_chain`, the old selector line is dropped (the chain wins).
+/// Idempotent: a file without the old key is a no-op.
+pub const PHASE_V2_P8: &str = "v2.0-p8";
+
+/// Read the config YAML as text (None = missing file).
+fn read_config_text(config_path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(config_path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", config_path.display())),
+    }
+}
+
+/// Textual scan: is there a `fallback_selector:` key inside the top-level
+/// `review:` block (column-0 `review:` header, indented key)? Returns the
+/// raw value text of the first such line.
+fn review_fallback_selector_line(text: &str) -> Option<String> {
+    let top_level_key = |line: &str| {
+        !line.is_empty()
+            && !line.starts_with([' ', '\t', '#', '-'])
+            && line.split_once(':').is_some()
+    };
+    let mut in_review = false;
+    for line in text.lines() {
+        if line.starts_with("review:") {
+            in_review = true;
+            continue;
+        }
+        if in_review && top_level_key(line) {
+            in_review = false;
+        }
+        if in_review {
+            let trimmed = line.trim_start();
+            if line.starts_with([' ', '\t']) && !trimmed.starts_with('#') {
+                if let Some(value) = trimmed.strip_prefix("fallback_selector:") {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn review_block_has(text: &str, key: &str) -> bool {
+    let mut in_review = false;
+    for line in text.lines() {
+        if line.starts_with("review:") {
+            in_review = true;
+            continue;
+        }
+        if in_review && !line.starts_with([' ', '\t']) && line.split_once(':').is_some() {
+            in_review = false;
+        }
+        if in_review && line.trim_start().starts_with(&format!("{key}:")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `--dry-run` preview for `v2.0-p8` — describes the rewrite, never writes.
+pub fn preview_v2_p8(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    lines.push(format!("dry-run preview: phase {PHASE_V2_P8} (state untouched)"));
+    let Some(text) = read_config_text(config_path)? else {
+        lines.push(format!(
+            "  no config at {} — migration {PHASE_V2_P8} has nothing to do",
+            config_path.display()
+        ));
+        return Ok(lines);
+    };
+    match review_fallback_selector_line(&text) {
+        Some(value) => {
+            lines.push(format!(
+                "  would rewrite review.fallback_selector ({value}) into a one-element \
+                 review.fallback_chain list in {}",
+                config_path.display()
+            ));
+            lines.push(format!(
+                "  would snapshot the pre-migration config under {}",
+                snapshot_root(state_root, PHASE_V2_P8).display()
+            ));
+        }
+        None => lines.push(format!(
+            "  no review.fallback_selector in {} — migration {PHASE_V2_P8} has nothing to do",
+            config_path.display()
+        )),
+    }
+    Ok(lines)
+}
+
+/// Textual rewrite: replace the `fallback_selector:` line inside the
+/// `review:` block with a one-element `fallback_chain` list (or drop the
+/// line when a chain already exists), byte-preserving every other line.
+/// `None` when the value carries a YAML anchor/alias (structured edit would
+/// be required; those configs keep the key and fail validation honestly).
+fn text_rewrite_fallback_selector(
+    original: &str,
+    chain_exists: bool,
+) -> Option<(String, String)> {
+    let top_level_key = |line: &str| {
+        !line.is_empty()
+            && !line.starts_with([' ', '\t', '#', '-'])
+            && line.split_once(':').is_some()
+    };
+    let mut out = String::with_capacity(original.len());
+    let mut in_review = false;
+    let mut rewritten_value: Option<String> = None;
+    for line in original.lines() {
+        if line.starts_with("review:") {
+            in_review = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_review && top_level_key(line) {
+            in_review = false;
+        }
+        if in_review && rewritten_value.is_none() {
+            let trimmed = line.trim_start();
+            if line.starts_with([' ', '\t'])
+                && !trimmed.starts_with('#')
+                && trimmed.starts_with("fallback_selector:")
+            {
+                let value = trimmed["fallback_selector:".len()..].trim();
+                if !value.is_empty() && !value.contains(['*', '&']) {
+                    if chain_exists {
+                        // An explicit chain already wins; the stale line goes.
+                        out.push_str(&format!(
+                            "# v2.0-p8 migration: review.fallback_selector ({value}) removed — \
+                             the existing review.fallback_chain wins\n"
+                        ));
+                    } else {
+                        let indent = &line[..line.len() - trimmed.len()];
+                        out.push_str(&format!("{indent}fallback_chain:\n{indent}  - {value}\n"));
+                    }
+                    rewritten_value = Some(value.to_string());
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    rewritten_value.map(|value| (out, value))
+}
+
+/// The `v2.0-p8` migration: `review.fallback_selector` ⇒ one-element
+/// `review.fallback_chain`. Snapshot + `.bak` first. Idempotent.
+pub fn run_v2_p8(config_path: &Path, state_root: &Path) -> Result<Vec<String>> {
+    let Some(text) = read_config_text(config_path)? else {
+        return Ok(Vec::new());
+    };
+    if review_fallback_selector_line(&text).is_none() {
+        return Ok(Vec::new());
+    }
+    let original = std::fs::read(config_path)
+        .with_context(|| format!("reading {} for v2.0-p8", config_path.display()))?;
+
+    // Snapshot the pre-migration YAML (stable per-phase directory).
+    let snapshot_dir = snapshot_root(state_root, PHASE_V2_P8);
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+    let _ = std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700));
+    crate::plugins::store::atomic_write_0600(&snapshot_dir.join("config.yaml"), &original)?;
+
+    // `.bak` sidecar (oldest pre-migration copy; never clobbered).
+    if !bak_path(config_path).exists() {
+        std::fs::write(bak_path(config_path), &original).context("writing config .bak backup")?;
+    }
+
+    let chain_exists = review_block_has(&text, "fallback_chain");
+    let (out, value) = text_rewrite_fallback_selector(&text, chain_exists)
+        .context("review.fallback_selector value uses YAML anchors; rewrite manually")?;
+    crate::plugins::store::atomic_write_0600(config_path, out.as_bytes())
+        .context("writing migrated config YAML")?;
+    Ok(vec![format!(
+        "rewrote review.fallback_selector ({value}) into {} in {}; pre-migration snapshot: {}",
+        if chain_exists { "a note (existing review.fallback_chain wins)" } else { "a one-element review.fallback_chain" },
+        config_path.display(),
+        snapshot_dir.display()
+    )])
+}
+
+/// Restore `v2.0-p8`: put the pre-migration YAML back (the
+/// `fallback_selector:` key returns).
+pub fn restore_v2_p8(state_root: &Path, config_path: &Path) -> Result<String> {
+    let root = snapshot_root(state_root, PHASE_V2_P8);
+    let snapshot_config = root.join("config.yaml");
+    if !snapshot_config.exists() {
+        anyhow::bail!(
+            "no {PHASE_V2_P8} migration snapshot found under {}",
+            root.display()
+        );
+    }
+    let bytes = std::fs::read(&snapshot_config)
+        .with_context(|| format!("reading {}", snapshot_config.display()))?;
+    crate::plugins::store::atomic_write_0600(config_path, &bytes)
+        .with_context(|| format!("restoring config to {}", config_path.display()))?;
+    Ok(format!(
+        "restored {PHASE_V2_P8} from {} (config YAML: review.fallback_selector)",
+        root.display()
+    ))
+}
+
 /// The L4 phase tag: `brainrouter migration restore v2.0-p4`. On first boot it
 /// imports the live llama-swap `config.yaml` into `swap_catalog.json`
 /// (snapshot + dry-run + restore, one stable snapshot directory per phase —
@@ -1306,6 +1520,10 @@ pub fn restore(
     // v2 L7: p7 owns the config YAML only (section rename).
     if phase == PHASE_V2_P7 {
         return restore_v2_p7(state_root, config_path);
+    }
+    // P5 Part C: p8 owns the config YAML only (review chain key rewrite).
+    if phase == PHASE_V2_P8 {
+        return restore_v2_p8(state_root, config_path);
     }
     // v2 L4: the p4 snapshot holds swap state only (no config/credentials/
     // cards); restoring it must not touch those unrelated files.
@@ -2104,5 +2322,75 @@ models:
         assert!(!catalog_path.exists());
     }
 
+    fn p8_config() -> &'static str {
+        "review:\n  max_iterations: 5\n  # operator note\n  fallback_selector: cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash\nswap:\n  mode: shim\n  fallback_model: m\n"
+    }
 
+    #[test]
+    fn p8_rewrites_the_selector_into_a_one_element_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p8_config()).unwrap();
+        let state = dir.path().join("state");
+        let actions = run_v2_p8(&config, &state).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.contains("  fallback_chain:\n    - cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash"),
+            "{text}"
+        );
+        assert!(!text.contains("fallback_selector:"), "{text}");
+        assert!(text.contains("# operator note"), "comment preserved: {text}");
+        let review: crate::config::ReviewConfig = serde_yaml::from_str(
+            &serde_yaml::to_string(
+                serde_yaml::from_str::<YamlValue>(&text)
+                    .unwrap()
+                    .get("review")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(review.fallback_chain.len(), 1);
+        assert!(review.validate().is_ok());
+        // Idempotent: a second boot is a no-op, file unchanged.
+        let again = run_v2_p8(&config, &state).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    }
+
+    #[test]
+    fn p8_keeps_an_existing_chain_and_drops_the_stale_selector_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(
+            &config,
+            "review:\n  fallback_chain:\n    - cloud/fedora1/swift.mq4\n  fallback_selector: cloud/deep/x\nswap:\n  mode: shim\n",
+        )
+        .unwrap();
+        run_v2_p8(&config, &dir.path().join("state")).unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let root: YamlValue = serde_yaml::from_str(&text).unwrap();
+        let chain = root.get("review").unwrap().get("fallback_chain").unwrap();
+        assert_eq!(chain.as_sequence().unwrap().len(), 1, "existing chain wins");
+        assert!(!text.contains("fallback_selector:"), "{text}");
+        assert!(text.contains("v2.0-p8 migration"), "drop annotated: {text}");
+    }
+
+    #[test]
+    fn p8_dry_run_is_inert_and_restore_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("brainrouter.yaml");
+        std::fs::write(&config, p8_config()).unwrap();
+        let state = dir.path().join("state");
+        let first = preview_v2_p8(&config, &state).unwrap();
+        assert_eq!(first, preview_v2_p8(&config, &state).unwrap());
+        assert!(first.join("\n").contains("fallback_chain"));
+        assert!(!state.exists(), "dry-run writes no state");
+        run_v2_p8(&config, &state).unwrap();
+        std::fs::write(&config, "review:\n  fallback_chain: []\n").unwrap();
+        let msg = restore_v2_p8(&state, &config).unwrap();
+        assert!(msg.contains("restored"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), p8_config());
+    }
 }

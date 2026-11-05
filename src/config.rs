@@ -707,15 +707,20 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub design_doc_path: Option<String>,
 
-    /// Second-chance reviewer selector (e.g. `cloud/deepseek-ai/DeepSeek-V4-Flash`).
-    /// When the primary reviewer backend fails — cloud credits exhausted, circuit
-    /// open, unreachable — the review retries ONCE against this selector before
-    /// escalating to a human. Cloud reviews only: a local review never migrates
-    /// to another model (its rubric and admission permit are model-specific).
-    /// Must be a `cloud/...` selector.
+    /// Ordered reviewer failover chain (P5 Part C). When the primary reviewer
+    /// backend fails — credits exhausted, circuit open, unreachable — the
+    /// review walks this list in order, ONE attempt per member, before
+    /// escalating to a human. Members must be `cloud/...` selectors; a
+    /// qualified `cloud/<peer>/<model>` member targets a LAN peer and is
+    /// health-probed pre-dispatch (breaker + `/models`), skipped when down.
+    /// The chain applies to ANY primary; a local primary that fails migrates
+    /// to the chain (the hop is recorded in the session provenance).
+    /// Replaces the single `review.fallback_selector` (migrated at boot by
+    /// phase `v2.0-p8`; a one-element chain behaves as the old single retry).
     #[serde(default)]
-    pub fallback_selector: Option<String>,
+    pub fallback_chain: Vec<String>,
 }
+
 
 fn default_max_iterations() -> u32 {
     5
@@ -727,7 +732,7 @@ impl Default for ReviewConfig {
             max_iterations: default_max_iterations(),
             hankndory_integration: false,
             design_doc_path: None,
-            fallback_selector: None,
+            fallback_chain: Vec::new(),
         }
     }
 }
@@ -735,12 +740,12 @@ impl Default for ReviewConfig {
 impl ReviewConfig {
     pub fn validate(&self) -> Result<()> {
         crate::roles::validate_iterations(self.max_iterations)?;
-        if let Some(sel) = self.fallback_selector.as_deref() {
+        for sel in &self.fallback_chain {
             let choice = crate::roles::ModelChoice::from_selector(sel)
-                .map_err(|e| anyhow::anyhow!("review.fallback_selector: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("review.fallback_chain: {e}"))?;
             if choice.backend() != "cloud" {
                 bail!(
-                    "review.fallback_selector must be a cloud selector (cloud/...), got {sel:?}"
+                    "review.fallback_chain members must be cloud selectors (cloud/...), got {sel:?}"
                 );
             }
         }

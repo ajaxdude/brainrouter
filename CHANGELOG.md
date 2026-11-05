@@ -4,6 +4,45 @@ All notable changes to brainrouter are documented here. Phase tags and per-leg
 revert contract per `docs/design/v2-streamlining.md` ("Rollout, migration, and
 rollback").
 
+## P5 Part C: reviewer failover chain (design `docs/design/p5-ops-redesign.md`)
+
+Review backend selection gains an ordered, health-aware chain. `review.fallback_chain`
+replaces the single `review.fallback_selector`: on primary failure the review walks
+the chain in order, ONE attempt per member, before escalating. Chain members may be
+any cloud selector; `cloud/<peer>/<model>` members name a LAN peer and are probed
+pre-dispatch (per-provider breaker + 1.5 s `/models` liveness) — an unreachable peer
+is skipped, never dialed. Hops and skips are recorded in the session's review
+provenance. The chain applies to any primary, peers included.
+
+### Added
+
+- **`v2.0-p8` migration** (`migration::run_v2_p8`): rewrites
+  `review.fallback_selector` into a one-element `review.fallback_chain`
+  (textual, comment-preserving; existing chain wins with an annotated drop of
+  the stale key), snapshot + `.bak`, dry-run preview, `migration restore v2.0-p8`,
+  idempotent.
+- **Pre-dispatch peer probe** (`Router::chain_member_ready`): breaker check +
+  `GET {base_url}/models` with 1.5 s timeout; any HTTP response counts as up.
+- **Peer capability cache** (`providers::PeerInfoCache`): a successful
+  `POST /api/providers/peer-info` with a `provider_id` persists the reported
+  host_id/version/models + `last_seen` on the provider record (read-only
+  bookkeeping for dashboards and pickers; never authoritative for routing).
+
+### Changed
+
+- `ReviewConfig.fallback_selector` (Option) → `fallback_chain` (ordered list);
+  the old YAML key no longer parses (deny_unknown_fields; migration owns it).
+- Review failover is no longer cloud-primary-only and no longer single-shot;
+  the `POST /api/review-config` body carries `fallback_chain` instead of
+  `fallback_selector`.
+
+### Tests
+
+`tests/review_fallback_test.rs` rewritten for the chain contract (hop, walk
+past a dead member, unreachable-peer skip, breaker skip, exhaustion escalation,
+validation, YAML/migration boundary); migration p8 unit tests; peer-info
+persistence.
+
 ## v2 L7: llama-swap absorbed — the flip (branch `v2-p3-roles`, pre-merge)
 
 The local serving layer gains a mode switch and the whole `:8081` surface is

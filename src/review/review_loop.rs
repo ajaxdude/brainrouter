@@ -141,17 +141,19 @@ pub async fn run_loop(
     // the expansive guidance. The admitted backend is fixed for the whole run.
     let is_local = choice.backend() == "local";
 
-    // Infra failover (YAML `review.fallback_selector`): when the primary card
-    // selector's cloud backend fails (credits exhausted, circuit open,
-    // unreachable), retry once on this cloud selector before escalating.
-    // Cloud routes only — a local review never migrates off its admitted model.
-    let fallback_choice = match config.fallback_selector.as_deref() {
-        Some(sel) if choice.backend() == "cloud" => Some(
-            crate::roles::ModelChoice::from_selector(sel)
-                .map_err(|e| anyhow::anyhow!("review.fallback_selector `{sel}`: {e}"))?,
-        ),
-        _ => None,
-    };
+    // Infra failover (YAML `review.fallback_chain`, P5 Part C): when the
+    // primary backend fails — credits exhausted, circuit open, unreachable —
+    // the review walks the chain in order, ONE attempt per member, before
+    // escalating. The chain applies to any primary, peers included; members
+    // are validated cloud-qualified selectors (a `cloud/<peer>/<model>`
+    // member is health-probed pre-dispatch). The chain is a boot-time
+    // operator policy, not card state.
+    let mut fallback_chain: Vec<(String, crate::roles::ModelChoice)> = Vec::new();
+    for sel in &config.fallback_chain {
+        let member = crate::roles::ModelChoice::from_selector(sel)
+            .map_err(|e| anyhow::anyhow!("review.fallback_chain `{sel}`: {e}"))?;
+        fallback_chain.push((sel.clone(), member));
+    }
 
     let mut iteration_count: u32 = 0;
     let mut status = ReviewStatus::Pending;
@@ -208,7 +210,7 @@ pub async fn run_loop(
             &choice,
             project_dir,
             max_output_tokens,
-            fallback_choice.as_ref(),
+            &fallback_chain,
         )
         .await;
 
@@ -361,19 +363,18 @@ pub async fn run_loop(
     })
 }
 
-/// Send the review prompt through the Router, tagged with the session_id.
-/// Returns the full collected text response and routing metadata.
-async fn call_llm_for_review(
+/// One reviewer dial: build the payload and route it. The Router resolves the
+/// choice and overwrites the wire `model` with the target's own id.
+async fn review_attempt(
     router: &Arc<Router>,
-    prompt: String,
+    prompt: &str,
+    target: &crate::roles::ModelChoice,
     session_id: &str,
-    choice: &crate::roles::ModelChoice,
     project_dir: &str,
     max_output_tokens: usize,
-    fallback: Option<&crate::roles::ModelChoice>,
-) -> Result<(String, crate::router::RouteInfo, String)> {
+) -> Result<(crate::provider::ProviderResponse, crate::router::RouteInfo)> {
     let request = ChatCompletionRequest {
-        model: choice.selector(),
+        model: target.selector(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -386,7 +387,7 @@ async fn call_llm_for_review(
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: Some(serde_json::Value::String(prompt)),
+                content: Some(serde_json::Value::String(prompt.to_string())),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -399,62 +400,117 @@ async fn call_llm_for_review(
         stop: None,
         extra: serde_json::Value::Object(serde_json::Map::new()),
     };
-
-
-    // One primary attempt; on failure, one retry on the infra fallback selector
-    // (when configured). A second failure is terminal — surfaced to the loop,
-    // which escalates. The selector string records the hop for the session.
-    // Clone for the primary leg only when a fallback leg could consume the
-    // original (review prompts are token-budgeted; avoid duplicating them on
-    // the feature-off path). The retry leg owns its request by construction.
-    let (primary_request, retry_request) = match fallback {
-        Some(_) => (request.clone(), Some(request)),
-        None => (request, None),
-    };
-    let (provider_response, route_info, served_selector) = match router
+    router
         .route_with_choice(
-            primary_request,
-            choice,
+            request,
+            target,
             Some(session_id.to_string()),
             project_dir.to_string(),
             String::new(),
             false,
         )
         .await
-    {
-        Ok((provider_response, route_info)) => (provider_response, route_info, choice.selector()),
-        Err(e) => match fallback {
-            Some(fb) => {
-                warn!(
-                    error = %e,
-                    fallback = %fb.selector(),
-                    "review primary backend failed; retrying once on review.fallback_selector"
-                );
-                let retry_request = retry_request.expect("fallback configured ⇒ retry request kept");
-                match router
-                    .route_with_choice(
-                        retry_request,
-                        fb,
-                        Some(session_id.to_string()),
-                        project_dir.to_string(),
-                        String::new(),
-                        false,
-                    )
-                    .await
-                {
-                    Ok((provider_response, route_info)) => (
-                        provider_response,
-                        route_info,
-                        format!("{} (fell back to {})", choice.selector(), fb.selector()),
-                    ),
-                    Err(fe) => bail!(
-                        "review failed on primary backend ({e}); fallback `{}` failed too ({fe})",
-                        fb.selector()
-                    ),
+}
+
+/// Send the review prompt through the Router, tagged with the session_id.
+/// Returns the full collected text response and routing metadata.
+///
+/// Attempt order: the primary card choice, then the `review.fallback_chain`
+/// members in order (one attempt each). A member that targets a LAN peer is
+/// probed pre-dispatch (breaker + `/models`); an unhealthy peer is skipped
+/// and named in the outcome. Every hop is recorded in the selector string.
+async fn call_llm_for_review(
+    router: &Arc<Router>,
+    prompt: String,
+    session_id: &str,
+    choice: &crate::roles::ModelChoice,
+    project_dir: &str,
+    max_output_tokens: usize,
+    fallback_chain: &[(String, crate::roles::ModelChoice)],
+) -> Result<(String, crate::router::RouteInfo, String)> {
+    // Primary attempt, then one bounded chain walk: one attempt per chain
+    // member, in order. `outcome` carries the current attempt; on a skipped
+    // member it is put back untouched so the same failure walks to the next.
+    let mut failed_hops: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut primary_error: Option<String> = None;
+
+    let mut outcome =
+        review_attempt(router, &prompt, choice, session_id, project_dir, max_output_tokens).await;
+    let mut chain_iter = fallback_chain.iter();
+    let (provider_response, route_info, served_selector) = loop {
+        match outcome {
+            Ok((provider_response, route_info)) => {
+                let selector = if failed_hops.is_empty() {
+                    choice.selector()
+                } else {
+                    let mut note = format!(
+                        "{} (fell back to {}",
+                        choice.selector(),
+                        failed_hops.join(", then ")
+                    );
+                    if !skipped.is_empty() {
+                        note += &format!("; skipped unhealthy: {}", skipped.join(", "));
+                    }
+                    note.push(')');
+                    note
+                };
+                break (provider_response, route_info, selector);
+            }
+            Err(e) => {
+                let error_text = e.to_string();
+                match chain_iter.next() {
+                    None => {
+                        // Chain exhausted (or never configured): terminal —
+                        // the loop escalates. The last hop's error text closes
+                        // the message, matching the v2.0-p4 single-hop phrasing.
+                        let mut msg = match &primary_error {
+                            None => format!("review failed on primary backend ({error_text})"),
+                            Some(pe) => {
+                                let mut m = format!("review failed on primary backend ({pe})");
+                                for (i, hop) in failed_hops.iter().enumerate() {
+                                    let suffix = if i + 1 == failed_hops.len() {
+                                        format!(" ({error_text})")
+                                    } else {
+                                        String::new()
+                                    };
+                                    m += &format!("; fallback `{hop}` failed too{suffix}");
+                                }
+                                m
+                            }
+                        };
+                        if !skipped.is_empty() {
+                            msg += &format!("; skipped unhealthy: {}", skipped.join(", "));
+                        }
+                        bail!("{msg}");
+                    }
+                    Some((sel, member)) => {
+                        // P5 C2: peer members get a pre-dispatch probe — an
+                        // unreachable peer is skipped, not dialed.
+                        if !router.chain_member_ready(member).await {
+                            warn!(
+                                session_id,
+                                member = %sel,
+                                "review chain member is an unreachable peer; skipping"
+                            );
+                            skipped.push(sel.clone());
+                            outcome = Err(e);
+                            continue;
+                        }
+                        warn!(
+                            session_id,
+                            error = %error_text,
+                            fallback = %sel,
+                            "review backend failed; walking review.fallback_chain"
+                        );
+                        primary_error.get_or_insert(error_text);
+                        failed_hops.push(sel.clone());
+                        outcome =
+                            review_attempt(router, &prompt, member, session_id, project_dir, max_output_tokens).await;
+                    }
                 }
             }
-            None => return Err(e),
-        },
+        }
     };
 
     // Collect the SSE stream into a full text response

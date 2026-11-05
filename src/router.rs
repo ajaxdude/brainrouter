@@ -1568,6 +1568,7 @@ impl Router {
                     enabled: false,
                     monthly_budget_usd: None,
                     budget_mode: crate::providers::BudgetMode::Warn,
+                    peer_info: None,
                 };
                 return self
                     .cloud_fallback(
@@ -2107,6 +2108,65 @@ impl Router {
     /// selectable; `broken` selectable only after the cooldown).
     pub fn provider_is_healthy(&self, provider_id: &str) -> bool {
         self.health.is_healthy(provider_id)
+    }
+
+    /// P5 Part C: pre-dispatch probe for a `review.fallback_chain` member.
+    /// A member qualified to an enabled LAN-peer provider must pass both the
+    /// breaker and a 1.5 s liveness probe against its `/models` endpoint
+    /// (ANY HTTP response — including an auth rejection — counts as up; only
+    /// connect failure/timeout is down). All other members defer to the
+    /// dispatch-time breaker and are admitted here.
+    pub async fn chain_member_ready(&self, member: &crate::roles::ModelChoice) -> bool {
+        let Some(provider_id) = Self::qualified_provider_id(member) else {
+            return true;
+        };
+        let Some(record) = self.providers.get(&provider_id) else {
+            return true; // unknown provider: dispatch surfaces the config error
+        };
+        if !record.lan_peer || !record.enabled {
+            return true;
+        }
+        if !self.health.is_healthy(&provider_id) {
+            return false;
+        }
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1500))
+            .build()
+        else {
+            return true;
+        };
+        let url = format!("{}/models", record.base_url.trim_end_matches('/'));
+        let mut request = client.get(&url);
+        // Auth mirrors the peer-info probe; resolution failure probes unauth —
+        // a 401 still proves the peer is alive.
+        if let Some(id) = record.credential_id.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            let token = if let Some(var) = id.strip_prefix("env:") {
+                std::env::var(var).ok()
+            } else if let Some(path) = id.strip_prefix("file:") {
+                std::fs::read_to_string(path).ok().map(|v| v.trim().to_string())
+            } else {
+                self.credentials
+                    .resolve(id)
+                    .ok()
+                    .map(|secret| secret.expose().to_string())
+            };
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+        }
+        match request.send().await {
+            Ok(_response) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// First path segment of a qualified `cloud/<provider>/<model>` choice,
+    /// when qualified (`Some`).
+    fn qualified_provider_id(member: &crate::roles::ModelChoice) -> Option<String> {
+        let id = member.model()?;
+        let (first, rest) = id.split_once('/')?;
+        (!rest.is_empty() && !first.is_empty())
+            .then(|| first.to_string())
     }
 
     /// Managed local path (the `local` selector): v1 semantics — route to

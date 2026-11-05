@@ -113,6 +113,10 @@ impl Drop for MockFleet {
 }
 
 fn record(id: &str, url: String) -> ProviderRecord {
+    record_with(id, url, false)
+}
+
+fn record_with(id: &str, url: String, lan_peer: bool) -> ProviderRecord {
     ProviderRecord {
         id: id.into(),
         kind: ProviderKind::OpenaiCompatible,
@@ -120,10 +124,11 @@ fn record(id: &str, url: String) -> ProviderRecord {
         credential_id: None,
         auto: false,
         models: Vec::new(),
-        lan_peer: false,
+        lan_peer,
         enabled: true,
         monthly_budget_usd: None,
         budget_mode: BudgetMode::Warn,
+        peer_info: None,
     }
 }
 
@@ -132,10 +137,18 @@ fn fleet(url: &str) -> Arc<ProviderStore> {
         record("syn", format!("{url}/syn/v1")),
         record("down", format!("{url}/down/v1")),
         record("deep", format!("{url}/deep/v1")),
+        // P5 Part C chain members: a LIVE peer (serves the fleet) and a peer
+        // on a dead port (the listener was closed — connect-refused).
+        record_with("peerup", format!("{url}/syn/v1"), true),
+        record_with("peerdead", "http://127.0.0.1:9/v1".into(), true),
     ]))
 }
 
-fn router(fleet_url: &str, cards: Arc<RoleCardStore>) -> Arc<Router> {
+fn router_with(
+    fleet_url: &str,
+    cards: Arc<RoleCardStore>,
+    health: Arc<HealthTracker>,
+) -> Arc<Router> {
     let classifier = Arc::new(Classifier::new(
         format!("{fleet_url}/classifier"),
         "default-local".into(),
@@ -170,7 +183,7 @@ fn router(fleet_url: &str, cards: Arc<RoleCardStore>) -> Arc<Router> {
         fallback_model: "default-local".into(),
         local_models: vec!["known-local".into()],
         subs_model: None,
-        health: Arc::new(HealthTracker::new()),
+        health,
         routing_events: Arc::new(RoutingEvents::new()),
         local_system_prompt: None,
         inference_tracker: Arc::new(InferenceTracker::new()),
@@ -205,11 +218,14 @@ impl Drop for Dir {
 /// `human_resolves`: escalated reviews park until a human resolves the
 /// session (the MCP wait-for-human contract), so the escalation tests run a
 /// background "human" that resolves as soon as the session escalates.
+/// `trip_open`: pre-trip that provider's breaker (three failures) — P5
+/// chain tests for the pre-dispatch skip.
 async fn run_review(
     fleet_url: &str,
     review_selector: &str,
     config: ReviewConfig,
     human_resolves: bool,
+    trip_open: Option<&str>,
 ) -> (
     brainrouter::review::RequestReviewResult,
     Arc<SessionManager>,
@@ -220,8 +236,15 @@ async fn run_review(
         .set_assignment(GLOBAL_SCOPE, Role::Review, review_selector)
         .unwrap();
     let sessions = Arc::new(SessionManager::new());
+    let health = Arc::new(HealthTracker::new());
+    let router = router_with(fleet_url, cards.clone(), Arc::clone(&health));
+    if let Some(id) = trip_open {
+        for _ in 0..3 {
+            health.report_failure(id);
+        }
+    }
     let service = Arc::new(ReviewService::new(
-        router(fleet_url, cards.clone()),
+        router,
         sessions.clone(),
         cards,
         config,
@@ -259,27 +282,28 @@ async fn run_review(
     (result, sessions)
 }
 
-fn config_with_fallback(fallback: Option<&str>) -> ReviewConfig {
+fn config_with_chain(chain: &[&str]) -> ReviewConfig {
     ReviewConfig {
-        fallback_selector: fallback.map(str::to_string),
+        fallback_chain: chain.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     }
 }
 
 #[tokio::test]
-async fn dead_primary_retries_once_on_the_fallback_selector() {
+async fn dead_primary_hops_to_the_single_chain_member() {
     let fleet = MockFleet::start().await;
     let (result, sessions) = run_review(
         &fleet.url,
         "cloud/down/dead-reviewer",
-        config_with_fallback(Some("cloud/deep/model-b")),
+        config_with_chain(&["cloud/deep/model-b"]),
         false,
+        None,
     )
     .await;
     assert_eq!(
         result.status,
         ReviewStatus::Approved,
-        "fallback verdict must complete the review: {:?}",
+        "chain member verdict must complete the review: {:?}",
         result.feedback
     );
     assert_eq!(
@@ -291,7 +315,7 @@ async fn dead_primary_retries_once_on_the_fallback_selector() {
             ),
             ("/deep/v1/chat/completions".to_string(), "model-b".into()),
         ],
-        "exactly one primary attempt then one fallback hop"
+        "exactly one primary attempt then one chain hop"
     );
     let provenance = sessions
         .get_session(&result.session_id)
@@ -305,13 +329,131 @@ async fn dead_primary_retries_once_on_the_fallback_selector() {
 }
 
 #[tokio::test]
-async fn healthy_primary_never_dials_the_fallback() {
+async fn chain_walks_past_a_dead_member() {
+    let fleet = MockFleet::start().await;
+    let (result, sessions) = run_review(
+        &fleet.url,
+        "cloud/down/dead-reviewer",
+        config_with_chain(&["cloud/down/model-b", "cloud/deep/model-c"]),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ReviewStatus::Approved,
+        "second chain member must complete the review: {:?}",
+        result.feedback
+    );
+    assert_eq!(
+        fleet.calls(),
+        vec![
+            (
+                "/down/v1/chat/completions".to_string(),
+                "dead-reviewer".into()
+            ),
+            ("/down/v1/chat/completions".to_string(), "model-b".into()),
+            ("/deep/v1/chat/completions".to_string(), "model-c".into()),
+        ],
+        "one attempt per member in order — the chain never rewinds"
+    );
+    let provenance = sessions
+        .get_session(&result.session_id)
+        .unwrap()
+        .review_model
+        .expect("review_model recorded");
+    assert!(
+        provenance.contains("fell back to cloud/down/model-b, then cloud/deep/model-c"),
+        "session must record every hop: {provenance}"
+    );
+}
+
+#[tokio::test]
+async fn unreachable_peer_member_is_skipped_not_dialed() {
+    let fleet = MockFleet::start().await;
+    let (result, sessions) = run_review(
+        &fleet.url,
+        "cloud/down/dead-reviewer",
+        config_with_chain(&["cloud/peerdead/reviewer", "cloud/peerup/reviewer"]),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ReviewStatus::Approved,
+        "the live peer must finish the review: {:?}",
+        result.feedback
+    );
+    assert_eq!(
+        fleet.calls(),
+        vec![
+            (
+                "/down/v1/chat/completions".to_string(),
+                "dead-reviewer".into()
+            ),
+            ("/syn/v1/chat/completions".to_string(), "reviewer".into()),
+        ],
+        "the dead peer is probed (connect-refused) and skipped — never dialed"
+    );
+    let provenance = sessions
+        .get_session(&result.session_id)
+        .unwrap()
+        .review_model
+        .expect("review_model recorded");
+    assert!(
+        provenance.contains("fell back to cloud/peerup/reviewer")
+            && provenance.contains("skipped unhealthy: cloud/peerdead/reviewer"),
+        "session must record the hop and the skipped peer: {provenance}"
+    );
+}
+
+#[tokio::test]
+async fn open_breaker_skips_peer_member_before_any_dial() {
+    let fleet = MockFleet::start().await;
+    let (result, sessions) = run_review(
+        &fleet.url,
+        "cloud/down/dead-reviewer",
+        config_with_chain(&["cloud/peerup/reviewer"]),
+        true,
+        Some("peerup"),
+    )
+    .await;
+    let _ = result;
+    let session = sessions
+        .get_session(&sessions
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.task_id == "fb-test")
+            .expect("session")
+            .id)
+        .unwrap();
+    assert!(
+        session
+            .llm_feedback
+            .unwrap_or_default()
+            .contains("skipped unhealthy: cloud/peerup/reviewer"),
+        "breaker-open peer must be named as skipped, not attempted"
+    );
+    assert_eq!(
+        fleet.calls(),
+        vec![(
+            "/down/v1/chat/completions".to_string(),
+            "dead-reviewer".into()
+        )],
+        "breaker rule short-circuits the peer member before any HTTP dial"
+    );
+}
+
+#[tokio::test]
+async fn healthy_primary_never_dials_the_chain() {
     let fleet = MockFleet::start().await;
     let (result, sessions) = run_review(
         &fleet.url,
         "cloud/syn/healthy-reviewer",
-        config_with_fallback(Some("cloud/deep/model-b")),
+        config_with_chain(&["cloud/deep/model-b"]),
         false,
+        None,
     )
     .await;
     assert_eq!(result.status, ReviewStatus::Approved);
@@ -321,7 +463,7 @@ async fn healthy_primary_never_dials_the_fallback() {
             "/syn/v1/chat/completions".to_string(),
             "healthy-reviewer".into()
         )],
-        "fallback selector must be inert while the primary is healthy"
+        "chain members must be inert while the primary is healthy"
     );
     assert!(
         !sessions
@@ -335,13 +477,14 @@ async fn healthy_primary_never_dials_the_fallback() {
 }
 
 #[tokio::test]
-async fn double_failure_escalates_naming_both_backends() {
+async fn all_backends_down_escalates_naming_every_hop() {
     let fleet = MockFleet::start().await;
     let (result, sessions) = run_review(
         &fleet.url,
         "cloud/down/dead-reviewer",
-        config_with_fallback(Some("cloud/down/model-b")),
+        config_with_chain(&["cloud/down/model-b"]),
         true,
+        None,
     )
     .await;
     let session = sessions.get_session(&result.session_id).unwrap();
@@ -351,12 +494,12 @@ async fn double_failure_escalates_naming_both_backends() {
             .map(|r| format!("{r:?}"))
             .as_deref(),
         Some("LlmError"),
-        "double backend failure must land as an LLM-error escalation"
+        "full-chain backend failure must land as an LLM-error escalation"
     );
     let feedback = session.llm_feedback.unwrap_or_default();
     assert!(
         feedback.contains("fallback `cloud/down/model-b` failed too"),
-        "escalation must report the fallback attempt: {feedback}"
+        "escalation must report the chain attempt: {feedback}"
     );
     assert_eq!(
         fleet
@@ -365,27 +508,36 @@ async fn double_failure_escalates_naming_both_backends() {
             .filter(|c| c.0.ends_with("/chat/completions"))
             .count(),
         2,
-        "one primary + one fallback attempt, then stop"
+        "one primary + one chain attempt, then stop"
     );
 }
 
 #[tokio::test]
-async fn no_fallback_selector_keeps_the_single_attempt_contract() {
+async fn no_chain_keeps_the_single_attempt_contract() {
     let fleet = MockFleet::start().await;
     let (result, sessions) = run_review(
         &fleet.url,
         "cloud/down/dead-reviewer",
         ReviewConfig::default(),
         true,
+        None,
     )
     .await;
-    let session = sessions.get_session(&result.session_id).unwrap();
+    let _ = result;
+    let session = sessions
+        .get_session(&sessions
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.task_id == "fb-test")
+            .expect("session")
+            .id)
+        .unwrap();
     assert!(
         session
             .llm_feedback
             .unwrap_or_default()
             .contains("LLM error"),
-        "terminal single-attempt escalation with no fallback configured"
+        "terminal single-attempt escalation with no chain configured"
     );
     assert_eq!(
         fleet.calls(),
@@ -393,43 +545,44 @@ async fn no_fallback_selector_keeps_the_single_attempt_contract() {
             "/down/v1/chat/completions".to_string(),
             "dead-reviewer".into()
         )],
-        "unset fallback_selector: today's terminal single attempt"
+        "empty fallback_chain: the terminal single attempt"
     );
 }
 
 #[test]
-fn fallback_selector_validation() {
-    // Qualified and plain cloud selectors are accepted; anything that could
-    // migrate a local review is rejected.
-    assert!(
-        config_with_fallback(Some("cloud/deepseek-ai/DeepSeek-V4-Flash"))
-            .validate()
-            .is_ok()
-    );
-    assert!(config_with_fallback(Some("cloud/deep/model-b"))
-        .validate()
-        .is_ok());
-    let bare = config_with_fallback(Some("some-local-model"))
+fn chain_members_must_be_cloud() {
+    // Qualified and plain cloud selectors (peers included) are accepted.
+    assert!(config_with_chain(&[
+        "cloud/deepseek-ai/DeepSeek-V4-Flash",
+        "cloud/fedora1/swift-1.5-qwen3.8-27b.mq4"
+    ])
+    .validate()
+    .is_ok());
+    let bare = config_with_chain(&["cloud/deep/m1", "some-local-model"])
         .validate()
         .unwrap_err();
     assert!(bare.to_string().contains("cloud"), "{bare}");
-    let local = config_with_fallback(Some("local/model"))
-        .validate()
-        .unwrap_err();
+    let local = config_with_chain(&["local/model"]).validate().unwrap_err();
     assert!(local.to_string().contains("cloud"), "{local}");
-    assert!(config_with_fallback(None).validate().is_ok());
+    assert!(config_with_chain(&[]).validate().is_ok());
 }
 
 #[test]
-fn fallback_selector_defaults_off_and_parses_from_yaml() {
+fn chain_parses_from_yaml_and_the_old_key_is_migration_owned() {
     let plain: ReviewConfig = serde_yaml::from_str("max_iterations: 4\n").unwrap();
-    assert!(plain.fallback_selector.is_none());
-    let with: ReviewConfig =
-        serde_yaml::from_str("fallback_selector: cloud/deepseek-ai/DeepSeek-V4-Flash\n").unwrap();
-    assert_eq!(
-        with.fallback_selector.as_deref(),
-        Some("cloud/deepseek-ai/DeepSeek-V4-Flash")
-    );
+    assert!(plain.fallback_chain.is_empty());
+    let with: ReviewConfig = serde_yaml::from_str(
+        "fallback_chain:\n  - cloud/deepseek-ai/DeepSeek-V4-Flash\n  - cloud/fedora1/swift.mq4\n",
+    )
+    .unwrap();
+    assert_eq!(with.fallback_chain.len(), 2);
     assert!(with.validate().is_ok());
+    // The pre-chain spelling no longer parses — the v2.0-p8 boot migration
+    // owns the rewrite (deny_unknown_fields is the enforcement point).
+    assert!(serde_yaml::from_str::<ReviewConfig>(
+        "fallback_selector: cloud/deepseek-ai/DeepSeek-V4-Flash\n"
+    )
+    .is_err());
     let _ = ModelChoice::from_selector("cloud/x").unwrap(); // selector path sanity
 }
+

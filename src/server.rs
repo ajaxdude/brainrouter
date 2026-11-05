@@ -5799,6 +5799,14 @@ async fn handle_providers_api(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|v| !v.is_empty());
+            // P5 Part C: when probing for a REGISTERED provider, the successful
+            // payload is persisted as the provider's capability cache.
+            let provider_id = body
+                .get("provider_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
             let token = match credential {
                 Some(credential) => {
                     let resolved = if let Some(var) = credential.strip_prefix("env:") {
@@ -5840,10 +5848,37 @@ async fn handle_providers_api(
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<serde_json::Value>().await {
-                        Ok(info) => into_unsync(json_response(
-                            StatusCode::OK,
-                            &serde_json::json!({"peer_info": info}),
-                        )),
+                        Ok(info) => {
+                            // P5 Part C: persist the capability cache for the
+                            // registered provider this probe targeted.
+                            if let Some(pid) = provider_id.as_deref() {
+                                let cache = crate::providers::PeerInfoCache {
+                                    host_id: info
+                                        .get("host_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    version: info
+                                        .get("version")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    models: info
+                                        .get("models")
+                                        .and_then(|v| v.as_array())
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    last_seen: chrono::Utc::now().to_rfc3339(),
+                                };
+                                if let Err(error) = state.providers.set_peer_info(pid, cache) {
+                                    tracing::warn!(%error, provider = pid, "could not cache peer-info");
+                                }
+                            }
+                            into_unsync(json_response(
+                                StatusCode::OK,
+                                &serde_json::json!({"peer_info": info}),
+                            ))
+                        }
                         Err(error) => {
                             provider_api_error(StatusCode::BAD_GATEWAY, error)
                         }

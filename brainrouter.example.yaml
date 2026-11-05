@@ -119,6 +119,14 @@ models:
 #   max_iterations: 5          # LLM review rounds before escalating to human
 #   hankndory_integration: false
 #   design_doc_path: null
+#   # Ordered reviewer failover chain (boot migration v2.0-p8 rewrites the
+#   # old single `fallback_selector` into a one-element chain). On primary
+#   # failure, tried IN ORDER, one attempt each, before escalating to a human.
+#   # Members must be cloud selectors; a cloud/<peer>/<model> member names a
+#   # LAN peer and is health-probed (breaker + /models) before dialing.
+#   fallback_chain: []
+#     # - cloud/fedora1/swift-1.5-qwen3.8-27b.mq4   # LAN peer first (local-first)
+#     # - cloud/deepinfra/deepseek-ai/DeepSeek-V4-Flash  # cloud last resort
 
 # Role cards replace the v1 `routing:` profile block and per-project pins.
 # Set them via the dashboard (role-card strip) or CLI:
