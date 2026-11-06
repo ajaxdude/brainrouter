@@ -462,6 +462,9 @@ impl Router {
     pub async fn model_catalog(&self) -> serde_json::Value {
         let local = self.local_model_keys().await;
         let cloud_available = self.providers.cloud_available();
+        // P5 Part A: grouped entries for the per-role card pickers. Additive —
+        // `local`/`cloud` above stay byte-identical for existing consumers.
+        let mut cloud_entries: Vec<serde_json::Value> = Vec::new();
         let cloud = if cloud_available {
             let mut models: Vec<String> = Vec::new();
             for provider in self
@@ -477,10 +480,24 @@ impl Router {
                     if !models.contains(&model.id) {
                         models.push(model.id.clone());
                     }
+                    cloud_entries.push(serde_json::json!({
+                        "provider": provider.id,
+                        "id": model.id,
+                    }));
                 }
                 if let Ok(ProviderAdapter::OpenAi(adapter)) = self.adapter_for(&provider).await {
                     if let Ok(list) = adapter.list_models().await {
                         for model in list {
+                            let known_entry = cloud_entries.iter().any(|e| {
+                                e["provider"] == serde_json::Value::String(provider.id.clone())
+                                    && e["id"] == serde_json::Value::String(model.clone())
+                            });
+                            if !known_entry {
+                                cloud_entries.push(serde_json::json!({
+                                    "provider": provider.id,
+                                    "id": model.clone(),
+                                }));
+                            }
                             if !models.contains(&model) {
                                 models.push(model);
                             }
@@ -492,6 +509,69 @@ impl Router {
         } else {
             Err(anyhow!("Cloud is disabled; discovery was not attempted"))
         };
+        // LAN peers: registry models merged with the persisted peer-info cache
+        // (Part C3). `healthy` = breaker not open AND a short `/models` probe
+        // answered — any HTTP status proves the listener is alive, so a 401
+        // still counts as reachable (same rule as `chain_member_ready`).
+        async fn peer_reachable(base_url: &str, token: Option<String>) -> bool {
+            let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(1500))
+                .build()
+            else {
+                return true;
+            };
+            let url = format!("{}/models", base_url.trim_end_matches('/'));
+            let mut request = client.get(&url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send().await.is_ok()
+        }
+        let peer_records: Vec<crate::providers::ProviderRecord> = self
+            .providers
+            .snapshot()
+            .into_iter()
+            .filter(|p| p.enabled && p.lan_peer)
+            .collect();
+        let tokens: Vec<Option<String>> = peer_records
+            .iter()
+            .map(|p| {
+                p.credential_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| self.resolve_provider_credential(id).ok())
+            })
+            .collect();
+        let probes = futures_util::future::join_all(
+            peer_records
+                .iter()
+                .zip(tokens.iter())
+                .map(|(record, token)| peer_reachable(&record.base_url, token.clone())),
+        )
+        .await;
+        let mut peers: Vec<serde_json::Value> = Vec::new();
+        for (record, reachable) in peer_records.into_iter().zip(probes) {
+            let mut ids: Vec<String> = record.models.iter().map(|m| m.id.clone()).collect();
+            if let Some(info) = &record.peer_info {
+                for model in &info.models {
+                    if let Some(id) = model.get("id").and_then(|v| v.as_str()) {
+                        if !ids.iter().any(|known| known == id) {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            let breaker = self.health.state(&record.id);
+            peers.push(serde_json::json!({
+                "provider": record.id,
+                "models": ids,
+                "healthy": breaker != "open" && reachable,
+                "breaker": breaker,
+                "reachable": reachable,
+                "last_seen": record.peer_info.as_ref().map(|info| info.last_seen.clone()),
+            }));
+        }
         fn entry(result: Result<Vec<String>>) -> serde_json::Value {
             match result {
                 Ok(models) => serde_json::json!({ "models": models, "error": null }),
@@ -503,6 +583,8 @@ impl Router {
             "cloud_enabled": cloud_available,
             "local_default": self.fallback_model,
             "unknown_model_policy": "Explicit IDs are accepted without discovery; the provider validates availability. Explicit local failures are errors. Cloud failure or disabled cloud uses the existing local fallback.",
+            "peers": peers,
+            "cloud_entries": cloud_entries,
         })
     }
 

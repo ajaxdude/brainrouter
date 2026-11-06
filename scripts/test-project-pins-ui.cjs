@@ -92,10 +92,10 @@ function sandbox(functionNames, extra = {}) {
   return s;
 }
 
-// 1. The card strip exists exactly once: scope selector, three role pickers,
-//    model field, save button, policy chips.
+// 1. The card strip exists exactly once: scope selector, three per-role model
+//    pickers, save button, policy chips.
 test('role-card strip and policy chips exist exactly once', () => {
-  for (const id of ['role-scope', 'card-main', 'card-review', 'card-subagent', 'card-model',
+  for (const id of ['role-scope', 'card-main-model', 'card-review-model', 'card-subagent-model',
     'save-cards', 'roles-message',
     'chip-privacy-cloud-ok', 'chip-privacy-local-only',
     'chip-quality-fast', 'chip-quality-balanced', 'chip-quality-maximum']) {
@@ -115,22 +115,21 @@ test('removed v1 widgets are gone', () => {
   assert.ok(!html.includes('/api/project-pin'), 'project-pin endpoint must be gone');
 });
 
-// 3. cardAssignment: managed selectors verbatim; cloud/<id> composes from the
-//    model field (spec: "the card assignment compiles through the SAME
-//    selector path").
-test('cardAssignment compiles the selector vocabulary', () => {
-  const s = sandbox(['currentScope', 'cardAssignment']);
+// 3. cardAssignment: each role's picker value IS the assignment — the wire
+//    grammar never gets re-derived in the UI (P5 Part A1).
+test('cardAssignment reads the per-role picker verbatim', () => {
+  const s = sandbox(['currentScope', 'cardSelect', 'cardAssignment']);
   const scope = s.__get('role-scope'); scope.value = 'global';
-  const sel = s.__get('card-main');
-  const model = s.__get('card-model');
-  sel.value = 'auto'; model.value = '';
+  s.__get('card-main-model').value = 'auto';
+  s.__get('card-review-model').value = 'cloud/vendor/reviewer-2026';
+  s.__get('card-subagent-model').value = 'main-local';
   assert.equal(s.cardAssignment('main'), 'auto');
-  sel.value = 'local'; model.value = 'ignored-for-local';
-  assert.equal(s.cardAssignment('main'), 'local');
-  sel.value = 'cloud'; model.value = '';
-  assert.equal(s.cardAssignment('main'), 'cloud');
-  sel.value = 'cloud'; model.value = 'vendor/model-2026';
-  assert.equal(s.cardAssignment('main'), 'cloud/vendor/model-2026');
+  assert.equal(s.cardAssignment('review'), 'cloud/vendor/reviewer-2026');
+  assert.equal(s.cardAssignment('subagent'), 'main-local');
+  // An empty picker (no catalog loaded yet) falls back to `auto`, never to an
+  // empty assignment.
+  s.__get('card-main-model').value = '';
+  assert.equal(s.cardAssignment('main'), 'auto');
 });
 
 // 4. Save predicate: Save starts disabled; markCardDirty enables it (v1

@@ -46,7 +46,7 @@ coding harness -> brainrouter :9099 (OpenAI or Anthropic wire format)
 - **Subs pool routing.** `subs` / `brainrouter/subs` selects the separate local pool (initially `llama_swap.subs_model`). The pool is independent of Main and Reviewer; clearing it restores classifier/auto behavior, not the Main override.
 - **Manifest cloud failover.** When Manifest is enabled, `cloud` traffic goes through it (runs locally in Docker, picks the cloud provider) and falls back to llama-swap's `fallback_model` on failure.
 - **MCP code review.** `mcp_brainrouter_request_review` triggers an iterative review loop (up to 5 rounds by default). Runtime toggles control whether review runs, whether PR-structuring guidance is injected into agent requests, and whether HankNDory design-aware review must compare the diff with an approved design. The reviewer prompt is budgeted against a conservative local/cloud context window before any LLM call.
-- **Dashboard.** Overview, Models, Roles, Credentials, Decisions, Benchmarks, and Config are the primary destinations. A command strip keeps model scope and card controls, flush/restart actions, health, and quality posture visible at `http://127.0.0.1:9099`.
+- **Dashboard.** Overview, Ops, Credentials, Plugins, Benchmarks, and Config are the primary destinations. **Ops** is the single resident-first management page — live residents, swap catalog, providers & peers with a health column, and Downloads/Serving launch below the fold — replacing the old Models and Engines destinations. A command strip keeps model scope, three per-role card pickers, flush/restart actions, health, and quality posture visible at `http://127.0.0.1:9099`.
 - **Benchmark explorer.** Import reproducible model/runtime/hardware results, compare throughput, memory, context scaling, quantizations, runtimes, speculation, and quality, inspect configurations, and export filtered CSV or JSONL at `http://127.0.0.1:9099/benchmarks`.
 - **Headless CLI.** `brainrouter cli` covers status, operations, role cards, credentials, plugins, migrations, and reviews. Use HTTP for benchmark and observability workflows without a dedicated CLI command. See [Headless CLI](#headless-cli-brainrouter-cli).
 - **Model observability.** `/models` shows exact local model activity, available metadata, uniquely correlated completed measurements, indicative rolling warnings, and explicit benchmark references. Missing measurements and unverified comparability are visible, not fabricated.
@@ -528,14 +528,15 @@ benchmark pages.
 
 ### Navigation and command strip
 
-The dashboard left rail is intentionally small: **Overview**, **Models**, **Benchmarks**, and **Config**. **Models** opens internal sub-tabs for **Local models**, **Downloads**, and **Serving**, plus a **Model activity ↗** link to the standalone `/models` page. **Overview** keeps the live cards, Sankey, in-flight table, KPIs, and HankNDory verdict ledger. **Config** holds quality toggles, the Plugins tab (bridge and other sidecar plugins: status, config, HTML-escaped logs), toolbox management, service status, service restarts, raw YAML editors, and agent files.
+The dashboard left rail is intentionally small: **Overview**, **Ops**, **Benchmarks**, **Config**, **Credentials**, and **Plugins**. **Ops** is the single resident-first management page (P5): live residents with their budget/pins, lifecycle, queue, external engines and active consumers; the swap catalog plus the llama-swap import; providers & peers with a live **Health** column; and, below the fold in collapsible sections, **Downloads** and **Serving launch**. It replaces the former Models and Engines destinations, and it carries the **Model activity ↗** link to the standalone `/models` page. **Overview** keeps the live cards, Sankey, in-flight table, KPIs, and HankNDory verdict ledger. **Config** holds quality toggles, the Plugins tab (bridge and other sidecar plugins: status, config, HTML-escaped logs), toolbox management, service status, service restarts, raw YAML editors, and agent files.
 
 The always-visible command strip above the content contains:
 
 | Control | What it does |
 |---|---|
 | **Scope** | Switches between the global card scope and loaded Git projects with per-project role cards |
-| **Main backend/model** | Edits the active scope's Main role card; reviewer and subagent card controls live in the expander |
+| **main / review / subagent pickers** | One model picker per role (P5 A1); each offers `auto`, `local (backend default)`, `cloud (pool)`, and a **Pin exactly this model…** group built from `/api/routing-models` (local keys, cloud entries, LAN peers with health). A pin is stored verbatim as `cloud/<provider>/<id>` or a bare local key, so the card grammar and `/api/roles/set` are unchanged |
+| **Save cards** | Saves the active scope's three role cards (one request per role) |
 | **Flush Models** | Unloads every model from llama-swap memory (frees VRAM) without restarting |
 | **Restart Local Stack** | Restarts `llama-swap` |
 | **(v2 L3) `sync-omp` is gone** | Install templates carry one `auto` entry per harness; model lists are the L4 catalog's job |
@@ -1014,11 +1015,19 @@ brainrouter plugin disable bridge
 brainrouter plugin config set bridge discord.enabled=false
 ```
 
-The dashboard has independent Main and Reviewer backend/model selectors and a separate
-local Subagent pool selector. Model lists come from the configured providers' `/models`
-endpoints using their existing authentication. Discovery errors remain visible; manual
-explicit IDs are accepted even when discovery is unavailable. The provider validates
-model availability when called. Choosing or saving a profile does not perform inference.
+The dashboard gives each of the three role cards its own model picker (P5 A1:
+Main, Reviewer, Subagent — the former shared model text input is gone), so all
+three can pin different models and be saved together. Each picker offers
+`auto`, `local (backend default)`, `cloud (pool)` and a **Pin exactly this
+model…** group compiled from `/api/routing-models` (local keys, cloud entries,
+and LAN peer models with their health). A pin is stored verbatim as
+`cloud/<provider>/<id>` or a bare local key — the same assignment grammar the
+CLI uses — and an assignment the catalog cannot describe is kept as an explicit
+"pinned (unknown model)" option instead of being rewritten. Model lists come
+from the configured providers' `/models` endpoints using their existing
+authentication. Discovery errors remain visible; manual explicit IDs are
+accepted even when discovery is unavailable. The provider validates
+model availability when called. Choosing or saving a card does not perform inference.
 
 The older `brainrouter cli context` command still exists, but its `/api/context`
 server handler is absent at this baseline (404). Automatic/manual runtime context

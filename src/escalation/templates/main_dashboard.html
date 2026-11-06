@@ -218,13 +218,11 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <span class="nav-icon">◉</span>
       <span>Overview</span>
     </button>
-    <button class="nav-item" id="nav-models" onclick="switchView('models')">
-      <span class="nav-icon">⬢</span>
-      <span>Models</span>
-    </button>
-    <button class="nav-item" id="nav-engines" onclick="switchView('engines')">
+    <!-- P5 Part A2 (docs/design/p5-ops-redesign.md): Models + Engines collapse
+         into one resident-first Ops view. -->
+    <button class="nav-item" id="nav-ops" onclick="switchView('ops')">
       <span class="nav-icon">▤</span>
-      <span>Engines</span>
+      <span>Ops</span>
     </button>
     <a class="nav-item" id="nav-benchmarks" href="/benchmarks">
       <span class="nav-icon">◇</span>
@@ -286,27 +284,34 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
           <label for="role-scope" style="color:var(--textMute)">Scope</label>
           <select id="role-scope" class="config-input" onchange="loadRoleCards()" style="max-width:260px"><option value="global">Global (all projects)</option></select>
         </div>
+        <!-- P5 Part A1: one true picker per role. `auto` is the only selector
+             humans read; exact pins live behind the "Pin exactly this model…"
+             group and compile client-side to the existing assignment grammar
+             (cloud/<provider>/<id> or a bare local key) — the /api/roles/set
+             wire format is unchanged. -->
         <div style="display:flex;flex-direction:column;gap:2px">
-          <label for="card-main" style="color:var(--textMute)">main</label>
-          <select id="card-main" class="config-input" onchange="markCardDirty()">
-            <option value="auto">auto</option><option value="local">local</option><option value="cloud">cloud</option>
+          <label for="card-main-model" style="color:var(--textMute)">main</label>
+          <select id="card-main-model" class="config-input" style="max-width:280px" onchange="markCardDirty()">
+            <option value="auto">auto</option>
+            <option value="local">local (backend default)</option>
+            <option value="cloud">cloud (pool)</option>
           </select>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px">
-          <label for="card-review" style="color:var(--textMute)">review</label>
-          <select id="card-review" class="config-input" onchange="markCardDirty()">
-            <option value="auto">auto</option><option value="local">local</option><option value="cloud">cloud</option>
+          <label for="card-review-model" style="color:var(--textMute)">review</label>
+          <select id="card-review-model" class="config-input" style="max-width:280px" onchange="markCardDirty()">
+            <option value="auto">auto</option>
+            <option value="local">local (backend default)</option>
+            <option value="cloud">cloud (pool)</option>
           </select>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px">
-          <label for="card-subagent" style="color:var(--textMute)">subagent</label>
-          <select id="card-subagent" class="config-input" onchange="markCardDirty()">
-            <option value="auto">auto</option><option value="local">local</option><option value="cloud">cloud</option>
+          <label for="card-subagent-model" style="color:var(--textMute)">subagent</label>
+          <select id="card-subagent-model" class="config-input" style="max-width:280px" onchange="markCardDirty()">
+            <option value="auto">auto</option>
+            <option value="local">local (backend default)</option>
+            <option value="cloud">cloud (pool)</option>
           </select>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:150px">
-          <label for="card-model" style="color:var(--textMute)">model (cloud/&lt;id&gt; / bare key)</label>
-          <input id="card-model" class="config-input" placeholder="optional: cloud/vendor/id or a local key" list="routing-models-list" oninput="markCardDirty()">
         </div>
         <button id="save-cards" class="br-btn" onclick="saveRoleCards()" disabled>Save cards</button>
       </div>
@@ -324,7 +329,6 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         </div>
         <div id="roles-message" role="status" style="color:var(--amber);font-size:11px;overflow-wrap:anywhere"></div>
       </div>
-      <datalist id="routing-models-list"></datalist>
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         <button class="sidebar-btn" onclick="flushModels()" title="Unload all models from memory (frees VRAM)" style="width:auto;white-space:nowrap">⏏ Flush Models</button>
         <button class="sidebar-btn" onclick="restartService('llama-swap')" style="width:auto;white-space:nowrap">↻ Restart Local Stack</button>
@@ -624,14 +628,34 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       </div>
     </div>
 
-    <div id="models-subnav" role="tablist" aria-label="Models" style="display:none;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:16px">
-      <button class="filter-btn" id="models-tab-local" role="tab" aria-controls="models-view" onclick="switchView('models')">Local models</button>
-      <button class="filter-btn" id="models-tab-downloads" role="tab" aria-controls="toolbox-models-view" onclick="switchView('toolbox-models')">Downloads</button>
-      <button class="filter-btn" id="models-tab-serving" role="tab" aria-controls="server-mode-view" onclick="switchView('server-mode')">Serving</button>
-      <a class="filter-btn" id="models-activity-link" href="/models" style="text-decoration:none">Model activity ↗</a>
-    </div>
-
-    <div id="models-view" style="display:none;max-width:900px">
+    <!-- P5 Part A2 (docs/design/p5-ops-redesign.md): ONE Ops view. It replaces
+         the Models + Engines nav items and absorbs the Downloads and Serving
+         tabs (now below the fold in <details>). Resident-first order:
+         Residents (live) → Catalog → Providers & peers → Downloads / Serving.
+         Raw YAML editors stay in the Config view. -->
+    <div id="ops-view" style="display:none;max-width:1100px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+        <div style="font-size:13px;font-weight:600">Ops</div>
+        <div style="font-size:11px;color:var(--textMute)">live residents first · catalog · providers &amp; peers · downloads and serving launch below the fold</div>
+        <a class="filter-btn" id="models-activity-link" href="/models" style="margin-left:auto;text-decoration:none">Model activity ↗</a>
+      </div>
+      <div id="platform-banner" role="status" data-testid="platform-banner" style="display:none;background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:10px;padding:10px 12px;font-size:12px;margin-bottom:12px"></div>
+      <div id="engines-platform" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Residents (live)</div>
+      <div id="engines-budget" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Lifecycle</div>
+      <div id="engines-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Queue</div>
+      <div id="engines-queue" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <!-- v2 L5: external (icon-launched) residents + takeover units + the
+           Active-Consumer Set. Additive: attach/adopt/takeover only. -->
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">External engines (attach-only until adopted)</div>
+      <div id="engines-external" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Takeover units</div>
+      <div id="engines-units" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Active consumers</div>
+      <div id="engines-consumers" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Catalog</div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
         <div style="font-size:13px;font-weight:600">Local models (llama-swap)</div>
         <div style="margin-left:auto;display:flex;gap:8px">
@@ -645,6 +669,25 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <div id="models-list" style="display:flex;flex-direction:column;gap:8px">
         <div style="color:var(--textMute);font-size:12px">Loading...</div>
       </div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Import from llama-swap</div>
+      <div id="engines-import" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="br-btn" data-eng-action="import-preview">Preview import</button>
+          <button class="br-btn" data-eng-action="import-apply">Apply import</button>
+          <span id="engines-import-msg" role="status" style="color:var(--textMute)"></span>
+        </div>
+        <pre id="engines-import-out" style="margin:0;white-space:pre-wrap;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim);max-height:220px;overflow:auto"></pre>
+      </div>
+      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Providers &amp; peers</div>
+      <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">
+        Health is the provider breaker plus the live peer probe from
+        <code style="font-family:'JetBrains Mono',monospace">/api/routing-models</code>.
+        Peers answer <code style="font-family:'JetBrains Mono',monospace">cloud/&lt;provider&gt;/&lt;id&gt;</code>;
+        review-chain members show their live state here.
+      </div>
+      <div id="ops-peers" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+        <div style="color:var(--textMute);font-size:12px">Loading...</div>
+      </div>
       <div style="font-size:13px;font-weight:600;margin:22px 0 6px">Provider models (cloud + LAN peers)</div>
       <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">
         Address a provider model as <code style="font-family:'JetBrains Mono',monospace">cloud/&lt;id&gt;</code>
@@ -653,14 +696,10 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <div id="models-provider-groups" style="display:flex;flex-direction:column;gap:10px">
         <div style="color:var(--textMute);font-size:12px">Loading...</div>
       </div>
-    </div>
 
-    <!-- PR6: toolbox model catalog browsing + native download orchestration
-         (design doc §10). Distinct from #models-view above, which is the
-         unrelated OMP routing-model picker (llama-swap's already-loaded
-         models) — this view is about pulling catalog GGUF/HF assets onto
-         disk for the ds4/llama_cpp/gufo toolboxes to use. -->
-    <div id="toolbox-models-view" style="display:none;max-width:1100px">
+      <details style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:16px">
+        <summary style="cursor:pointer;font-size:12px;font-weight:600">Downloads — browse the catalog, pull GGUF/HF assets</summary>
+        <div style="margin-top:12px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <div id="toolbox-models-backend-tabs" style="display:flex;gap:6px"></div>
         <div style="margin-left:auto;display:flex;gap:8px">
@@ -682,50 +721,11 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
       <div id="toolbox-download-jobs" style="display:flex;flex-direction:column;gap:6px">
         <div style="color:var(--textMute);font-size:12px">No downloads started yet.</div>
       </div>
-    </div>
-
-    <!-- PR7 + gufo Server Mode (design doc §11/§12, DI-5/DI-7) —
-         headless detached `podman run` servers, structurally distinct from
-         the Toolboxes tab above (`toolbox create` dev-shells never receive
-         engine_args; only Server Mode's plain `podman run` does). Backend
-         tabs mirror the Downloads view's #toolbox-models-backend-tabs
-         pattern. ds4: single instance, standalone (single-node) launch —
-         multi-node/DSpark/SSD-streaming/MTP are reachable via the
-         custom-args escape hatch. v2 L1 purge: the three extra server-mode
-         panels this page shipped in v1 (design doc §13/§14/§15) were
-         removed; server-mode is ds4 + gufo, and those feed ids are
-         browse-only catalog data. -->
-    <!-- v2 L4: Engines — platform probe, engine offers, lifecycle, queue,
-         budget gauge (residents by source + pins), pins, llama-swap import. -->
-    <div id="engines-view" style="display:none;max-width:980px">
-      <div id="platform-banner" role="status" data-testid="platform-banner" style="display:none;background:var(--panel);border:1px solid var(--amber);color:var(--amber);border-radius:10px;padding:10px 12px;font-size:12px;margin-bottom:12px"></div>
-      <div id="engines-platform" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Budget</div>
-      <div id="engines-budget" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;font-size:12px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Lifecycle</div>
-      <div id="engines-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Queue</div>
-      <div id="engines-queue" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
-      <!-- v2 L5: external (icon-launched) residents + takeover units + the
-           Active-Consumer Set. Additive: attach/adopt/takeover only. -->
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">External engines (attach-only until adopted)</div>
-      <div id="engines-external" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Takeover units</div>
-      <div id="engines-units" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Active consumers</div>
-      <div id="engines-consumers" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px"></div>
-      <div style="font-size:10px;letter-spacing:1.5px;color:var(--textMute);text-transform:uppercase;margin:0 0 8px">Import from llama-swap</div>
-      <div id="engines-import" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;display:flex;flex-direction:column;gap:8px">
-        <div style="display:flex;gap:8px;align-items:center">
-          <button class="br-btn" data-eng-action="import-preview">Preview import</button>
-          <button class="br-btn" data-eng-action="import-apply">Apply import</button>
-          <span id="engines-import-msg" role="status" style="color:var(--textMute)"></span>
         </div>
-        <pre id="engines-import-out" style="margin:0;white-space:pre-wrap;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--textDim);max-height:220px;overflow:auto"></pre>
-      </div>
-    </div>
-
-    <div id="server-mode-view" style="display:none;max-width:900px">
+      </details>
+      <details style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:10px">
+        <summary style="cursor:pointer;font-size:12px;font-weight:600">Serving launch — headless ds4 / gufo servers</summary>
+        <div style="margin-top:12px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <div id="server-mode-backend-tabs" style="display:flex;gap:6px"></div>
       </div>
@@ -822,8 +822,9 @@ details.br-detail[open] > summary { color: var(--text); margin-bottom: 8px; }
         <div style="font-size:11px;color:var(--textMute);margin-bottom:10px">Currently-registered Server Mode backends — read-only, informational (§16). Populated when a backend above is started, cleared when stopped.</div>
         <div id="serving-identities-list" style="font-size:12px;color:var(--textMute)">Loading…</div>
       </div>
+        </div>
+      </details>
     </div>
-
 
   </div><!-- /content -->
 </div><!-- /main -->
@@ -1008,55 +1009,44 @@ function enrichEvents(events, sessions) {
 }
 
 // ─── View switching ──────────────────────────────────────────────────────────
-function isModelsView(view) { return view === 'models' || view === 'toolbox-models' || view === 'server-mode'; }
+// P5 Part A2: Models + Engines collapsed into one Ops view (Downloads and
+// Serving live inside it behind <details>). The retired view names stay
+// accepted and resolve to `ops` so old links/bookmarks keep working; their
+// per-tab loaders all render into the same view.
+const OPS_LEGACY_VIEWS = ['models', 'toolbox-models', 'server-mode', 'engines'];
+function canonicView(view) {
+  if (view === 'models-parent') return 'ops';
+  return OPS_LEGACY_VIEWS.includes(view) ? 'ops' : view;
+}
 function switchView(view) {
-  if (view === 'models-parent') view = 'models';
+  view = canonicView(view);
   activeView = view;
   document.getElementById('stream-view').style.display   = view === 'stream'  ? 'flex'  : 'none';
   document.getElementById('config-view').style.display   = view === 'config'  ? 'block' : 'none';
-  document.getElementById('models-view').style.display   = view === 'models'  ? 'block' : 'none';
-  document.getElementById('toolbox-models-view').style.display = view === 'toolbox-models' ? 'block' : 'none';
-  document.getElementById('server-mode-view').style.display = view === 'server-mode' ? 'block' : 'none';
   document.getElementById('plugins-view').style.display   = view === 'plugins' ? 'block' : 'none';
-  const enginesView = document.getElementById('engines-view');
-  if (enginesView) enginesView.style.display = view === 'engines' ? 'block' : 'none';
+  const opsView = document.getElementById('ops-view');
+  if (opsView) opsView.style.display = view === 'ops' ? 'block' : 'none';
   const credView = document.getElementById('credentials-view');
   if (credView) credView.style.display = view === 'credentials' ? 'block' : 'none';
   if (view === 'credentials') { loadCredentials(); loadProviders(); }
-  if (view === 'models') loadProviderModelGroups();
-  if (view === 'engines') loadEngines();
+  if (view === 'ops') loadOps();
 
-  const modelsActive = isModelsView(view);
-  ['stream','config','models','plugins','credentials','engines'].forEach(v => {
+  ['stream','config','ops','plugins','credentials'].forEach(v => {
     const btn = document.getElementById('nav-' + v);
     if (!btn) return;
-    const active = v === 'models' ? modelsActive : v === view;
+    const active = v === view;
     btn.classList.toggle('active', active);
     if (active) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
   });
 
-  const subnav = document.getElementById('models-subnav');
-  if (subnav) subnav.style.display = modelsActive ? 'flex' : 'none';
-  const tabs = { models: 'models-tab-local', 'toolbox-models': 'models-tab-downloads', 'server-mode': 'models-tab-serving' };
-  Object.entries(tabs).forEach(([target, id]) => {
-    const tab = document.getElementById(id);
-    if (!tab) return;
-    const active = target === view;
-    tab.classList.toggle('active', active);
-    tab.setAttribute('aria-selected', active ? 'true' : 'false');
-  });
-
-  const titles = { stream: 'Overview', config: 'Config', models: 'Models', 'toolbox-models': 'Models', 'server-mode': 'Models', plugins: 'Plugins', credentials: 'Credentials', engines: 'Engines' };
+  const titles = { stream: 'Overview', config: 'Config', ops: 'Ops', plugins: 'Plugins', credentials: 'Credentials' };
   document.getElementById('cmdbar-title').textContent = titles[view] || view;
 
   const subs = {
     stream: 'Live routing events · newest first · polling every 3s',
     config: 'Quality, integrations, toolbox management, service controls, and raw configuration',
-    models: 'Local models available through llama-swap',
-    'toolbox-models': 'Catalog models for ds4 / llama.cpp / gufo — browse, download, verify',
-    'server-mode': 'Launch/stop headless inference servers — ds4 and gufo',
+    ops: 'Residents (live) → catalog → providers & peers → downloads and serving launch',
     plugins: 'Sidecar plugins over UDS JSON-RPC — status, config, and logs (v2 L2)',
-    engines: 'Platform probe, engine offers, lifecycle, queue, budget and pins (v2 L4)',
   };
   document.getElementById('cmdbar-sub').textContent = subs[view] || '';
 
@@ -1065,10 +1055,20 @@ function switchView(view) {
 
   if (view === 'config') loadConfig();
   if (view === 'plugins') loadPlugins();
-  if (view === 'models') loadModels();
-  if (view === 'toolbox-models') loadToolboxModels();
-  if (view === 'server-mode') loadServerMode();
 }
+
+// One entry point for the Ops page: every section is read-only discovery over
+// the existing endpoints (no API changes with the P5 consolidation).
+function loadOps() {
+  loadEngines();
+  loadModels();
+  loadProviderModelGroups();
+  loadPeerHealth();
+  loadRoleModels();
+  loadToolboxModels();
+  loadServerMode();
+}
+
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
 function setFilter(f) {
@@ -2697,22 +2697,90 @@ function setRolesMessage(text) {
   if (el) el.textContent = text || '';
 }
 
+// P5 Part A1 (docs/design/p5-ops-redesign.md): one picker per role. The
+// shared text input is gone — each card's <select> carries the selector
+// vocabulary (auto/local/cloud) plus an exact-pin group whose option VALUES
+// *are* the existing assignment grammar (`cloud/<provider>/<id>` for cloud and
+// peer models, the bare key for local models). The /api/roles/set wire format
+// is unchanged: a pin round-trips verbatim.
+let routingCatalog = null;
+let cardAssignments = { main: 'auto', review: 'auto', subagent: 'auto' };
+
+function cardSelect(role) {
+  return document.getElementById('card-' + role + '-model');
+}
+
+// Grouped /api/routing-models payload → pin entries (value = wire assignment).
+// Cloud ids use the qualified `cloud/<provider>/<id>` form when the deployment
+// has more than one cloud provider, and the unqualified `cloud/<id>` form when
+// there is exactly one — that is what existing cards store, so their values
+// map back onto a real option instead of "pinned (unknown)". Peer models are
+// always qualified (their ids are peer-scoped).
+function cardPinEntries(catalog) {
+  const seen = new Set();
+  const entries = [];
+  const add = (value, label) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    entries.push({ value: value, label: label });
+  };
+  for (const id of ((catalog && catalog.local && catalog.local.models) || [])) {
+    add(id, 'local · ' + id);
+  }
+  const cloudRows = ((catalog && catalog.cloud_entries) || []).filter(row => row && row.provider && row.id);
+  const cloudProviders = new Set(cloudRows.map(row => row.provider));
+  const qualified = cloudProviders.size > 1;
+  for (const row of cloudRows) {
+    add(qualified ? 'cloud/' + row.provider + '/' + row.id : 'cloud/' + row.id,
+      'cloud · ' + row.provider + ' · ' + row.id);
+  }
+  for (const peer of ((catalog && catalog.peers) || [])) {
+    for (const model of (peer.models || [])) {
+      add('cloud/' + peer.provider + '/' + model,
+        'peer · ' + peer.provider + ' · ' + model + (peer.healthy === false ? ' (unhealthy)' : ''));
+    }
+  }
+  return entries;
+}
+
+// Render one card picker. `assignment` omitted = keep the select's current
+// value (catalog refresh must never clobber an unsaved edit). An assignment
+// the catalog cannot describe is preserved as an explicit "pinned (unknown
+// model)" option instead of being silently rewritten to `cloud`.
+function fillCardSelect(sel, assignment) {
+  if (!sel) return;
+  const value = (assignment == null ? sel.value : assignment) || 'auto';
+  const pins = cardPinEntries(routingCatalog);
+  let html = '<optgroup label="Selector">'
+    + '<option value="auto">auto</option>'
+    + '<option value="local">local (backend default)</option>'
+    + '<option value="cloud">cloud (pool)</option>'
+    + '</optgroup>';
+  if (pins.length) {
+    html += '<optgroup label="Pin exactly this model…">'
+      + pins.map(p => '<option value="' + escHtml(p.value) + '">' + escHtml(p.label) + '</option>').join('')
+      + '</optgroup>';
+  }
+  if (!['auto', 'local', 'cloud'].includes(value) && !pins.some(p => p.value === value)) {
+    html += '<optgroup label="Pinned (unknown model)">'
+      + '<option value="' + escHtml(value) + '">pinned · ' + escHtml(value) + '</option>'
+      + '</optgroup>';
+  }
+  sel.innerHTML = html;
+  sel.value = value;
+}
+
+function renderCardSelects() {
+  for (const role of CARD_ROLES) fillCardSelect(cardSelect(role));
+}
+
 async function loadRoleCards() {
   try {
     const data = await routingFetch('/api/roles');
     const scope = currentScope();
     for (const role of CARD_ROLES) {
       const rec = (data.assignments || []).find(a => a.role === role && a.scope === scope);
-      const sel = document.getElementById('card-' + role);
-      const model = document.getElementById('card-model');
-      const value = rec ? rec.assignment : 'auto';
-      const known = ['auto', 'local', 'cloud'];
-      if (sel) sel.value = known.includes(value) ? value : 'cloud';
-      if (model) {
-        if (known.includes(value)) { model.value = ''; model.placeholder = 'optional: cloud/vendor/id or a local key'; }
-        else if (value.startsWith('cloud/')) { model.value = value.slice('cloud/'.length); model.placeholder = 'cloud/<id>'; }
-        else { model.value = value; model.placeholder = 'bare local model key'; }
-      }
+      cardAssignments[role] = rec ? rec.assignment : 'auto';
     }
     // Scope dropdown: global + every project scope present on cards.
     const sel = document.getElementById('role-scope');
@@ -2730,20 +2798,18 @@ async function loadRoleCards() {
     const btn = document.getElementById('save-cards');
     if (btn) btn.disabled = true;
     renderPolicy(data.policy || []);
-    loadRoleModels();
+    // Catalog first, then the stored assignments — so every card (including
+    // cloud/... and peer pins) maps back onto its own option.
+    await loadRoleModels();
+    for (const role of CARD_ROLES) fillCardSelect(cardSelect(role), cardAssignments[role]);
   } catch (error) {
     setRolesMessage('Cannot load cards: ' + error.message);
   }
 }
 
 function cardAssignment(role) {
-  const sel = document.getElementById('card-' + role);
-  const model = document.getElementById('card-model');
-  let value = sel ? sel.value : 'auto';
-  const extra = model ? model.value.trim() : '';
-  if (value === 'cloud' && extra) value = 'cloud/' + extra;
-  if (value === 'cloud' && !extra && sel && sel.dataset.pinnedBare) value = sel.dataset.pinnedBare;
-  return value;
+  const sel = cardSelect(role);
+  return sel && sel.value ? sel.value : 'auto';
 }
 
 async function saveRoleCards() {
@@ -2793,14 +2859,14 @@ function renderPolicy(records) {
   }
 }
 
+// Grouped catalog for the card pickers (peers carry the health flag; pins from
+// unhealthy peers stay listed and labelled). Advisory: a failed fetch keeps the
+// previous catalog so the pickers never lose their options.
 async function loadRoleModels() {
   try {
-    const data = await routingFetch('/api/routing-models');
-    const list = document.getElementById('routing-models-list');
-    if (!list) return;
-    const models = [...(data.local?.models || []), ...(data.cloud?.models || [])];
-    list.innerHTML = models.map(m => `<option value="${escHtml(m)}">`).join('');
-  } catch (e) { /* lists are advisory */ }
+    routingCatalog = await routingFetch('/api/routing-models');
+  } catch (e) { /* advisory: keep the last catalog */ }
+  renderCardSelects();
 }
 
 function esc(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
@@ -3042,6 +3108,61 @@ async function loadProviderModelGroups() {
     if (!(data.providers || []).length) box.innerHTML = '<div class="muted" style="font-size:12px">no providers registered</div>';
   } catch (e) {
     box.innerHTML = '<div class="muted" style="font-size:12px">provider models unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+// P5 Part A2.3: Providers & peers table with a Health column. Records come
+// from /api/providers (kind, base_url, breaker, declared models); the live
+// peer verdict — breaker AND the liveness probe — plus last_seen come from the
+// additive /api/routing-models `peers` field (Part A server change).
+async function loadPeerHealth() {
+  const box = document.getElementById('ops-peers');
+  if (!box) return;
+  try {
+    const [catalog, providersData] = await Promise.all([
+      routingFetch('/api/routing-models'),
+      routingFetch('/api/providers'),
+    ]);
+    const peerById = new Map(((catalog && catalog.peers) || []).map(p => [p.provider, p]));
+    const entriesById = new Map();
+    for (const entry of ((catalog && catalog.cloud_entries) || [])) {
+      if (!entriesById.has(entry.provider)) entriesById.set(entry.provider, []);
+      const ids = entriesById.get(entry.provider);
+      if (!ids.includes(entry.id)) ids.push(entry.id);
+    }
+    const providers = providersData.providers || [];
+    box.replaceChildren();
+    for (const p of providers) {
+      const peer = peerById.get(p.id);
+      const breaker = p.breaker || 'healthy';
+      const health = peer
+        ? (peer.healthy ? 'up' : 'down')
+        : (breaker === 'open' || breaker === 'broken' ? 'down' : (breaker === 'degraded' ? 'degraded' : 'up'));
+      const healthColor = health === 'up' ? 'var(--green)' : health === 'degraded' ? 'var(--amber)' : 'var(--red)';
+      const breakerColor = (breaker === 'open' || breaker === 'broken') ? 'var(--red)' : breaker === 'degraded' ? 'var(--amber)' : 'var(--green)';
+      const ids = peer ? (peer.models || []) : (entriesById.get(p.id) || (p.models || []).map(m => m.id));
+      const qualified = p.lan_peer || entriesById.has(p.id)
+        ? ids.map(id => 'cloud/' + p.id + '/' + id)
+        : ids;
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12px';
+      row.innerHTML = '<span style="color:' + healthColor + '">●</span>'
+        + '<b>' + esc(p.id) + '</b>'
+        + providerBadge('lane', p.lan_peer ? 'peer' : 'cloud', p.lan_peer ? 'var(--cyan)' : 'var(--textMute)')
+        + providerBadge('health', health, healthColor)
+        + providerBadge('breaker', breaker, breakerColor)
+        + (peer ? providerBadge('probe', peer.reachable ? 'answered' : 'no answer', peer.reachable ? 'var(--green)' : 'var(--red)') : '')
+        + (p.enabled ? '' : providerBadge('disabled', 'off', 'var(--amber)'))
+        + '<span class="muted">' + esc(p.kind || 'openai-compatible') + ' · ' + esc(p.base_url || '') + '</span>'
+        + '<span style="flex:1"></span>'
+        + (peer && peer.last_seen ? '<span class="muted" style="font-size:11px">last seen ' + esc(peer.last_seen) + '</span>' : '')
+        + '<div style="flex-basis:100%;font-size:11px;color:var(--textDim);font-family:\'JetBrains Mono\',monospace">'
+        + (qualified.length ? qualified.map(esc).join(' · ') : 'no models discovered') + '</div>';
+      box.appendChild(row);
+    }
+    if (!providers.length) box.innerHTML = '<div class="muted" style="font-size:12px">no providers registered</div>';
+  } catch (e) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">peers unavailable: ' + esc(e.message) + '</div>';
   }
 }
 
@@ -3659,7 +3780,7 @@ function renderToolboxDownloadJobRow(job) {
 function scheduleToolboxModelsPoll() {
   if (toolboxModelsPollTimer) { clearTimeout(toolboxModelsPollTimer); toolboxModelsPollTimer = null; }
   const active = toolboxDownloadJobs.some(j => j.status === 'queued' || j.status === 'downloading' || j.status === 'running' || j.status === 'verifying');
-  if (active && activeView === 'toolbox-models') {
+  if (active && activeView === 'ops') {
     toolboxModelsPollTimer = setTimeout(loadToolboxModels, 3000);
   }
 }
@@ -4221,6 +4342,9 @@ async function refreshSlow() {
   renderPosture();
   renderHealthPill();
   if (catalogRes || containersRes || cockpitConfigRes) { renderToolboxes(); }
+  // P5 Part A1: keep the card pickers' pin menu (peers included) current on
+  // the existing slow cadence; selections survive the refresh.
+  loadRoleModels();
 }
 
 // ─── In-flight requests (llama-swap parity) ─────────────────────────────────
@@ -4460,7 +4584,7 @@ async function enginesPost(path, body) {
   return { ok: r.ok, body: j };
 }
 async function loadEngines() {
-  const view = document.getElementById('engines-view');
+  const view = document.getElementById('ops-view');
   if (!view) return;
   try {
     const [pr, er] = await Promise.all([fetch('/api/platform'), fetch('/api/engines')]);

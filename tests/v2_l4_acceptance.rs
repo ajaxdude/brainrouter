@@ -1263,9 +1263,11 @@ async fn l4_dashboard_platform_token_and_engines_tab() {
         "dashboard does not carry the probed platform id `{id}` (L4 spec); body excerpt: {}",
         &html[html.find("CURRENT_PLATFORM_ID").unwrap_or(0)..][..200.min(html.len().saturating_sub(html.find("CURRENT_PLATFORM_ID").unwrap_or(0)))]
     );
+    // P5 Part A2: the Engines tab became the resident-first section of the
+    // single Ops view (Models + Engines consolidated).
     assert!(
-        html.contains("nav-engines") && html.contains("engines-view"),
-        "Engines tab missing from the dashboard (L4 spec §Routing + dashboard: Engines tab)"
+        html.contains("nav-ops") && html.contains("ops-view") && html.contains("engines-list"),
+        "Ops view with the engines lifecycle section missing from the dashboard (P5 A2)"
     );
 }
 

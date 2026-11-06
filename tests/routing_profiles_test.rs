@@ -651,6 +651,16 @@ async fn discovery_is_authenticated_metadata_only_and_failure_is_explicit() {
     assert_eq!(catalog["local"]["models"], json!(["model-a", "model-b"]));
     assert_eq!(catalog["cloud"]["models"], json!(["model-a", "model-b"]));
     assert_eq!(catalog["cloud"]["error"], Value::Null);
+    // P5 Part A: the same discovery also attributes each cloud id to its
+    // provider for the per-role card pickers.
+    assert_eq!(
+        catalog["cloud_entries"],
+        json!([
+            {"provider": "manifest", "id": "model-a"},
+            {"provider": "manifest", "id": "model-b"},
+        ])
+    );
+    assert_eq!(catalog["peers"], json!([]), "no LAN peer configured");
     assert!(upstream.calls().is_empty());
     let seen = upstream.seen.lock().unwrap().clone();
     assert_eq!(
@@ -668,6 +678,115 @@ async fn discovery_is_authenticated_metadata_only_and_failure_is_explicit() {
         .unwrap_err()
         .to_string()
         .contains("503"));
+}
+
+/// P5 Part A (docs/design/p5-ops-redesign.md): `/api/routing-models` carries a
+/// `peers` group for the role-card pickers and the Ops providers/peers table.
+/// Registry models merge with the persisted peer-info cache (deduped), and
+/// `healthy` is the breaker AND the live `/models` probe.
+#[tokio::test]
+async fn catalog_peers_report_health_and_merged_models() {
+    use brainrouter::providers::{
+        PeerInfoCache, ProviderKind, ProviderModel, ProviderRecord, ProviderStore,
+    };
+
+    fn model(id: &str) -> ProviderModel {
+        ProviderModel {
+            id: id.into(),
+            alias: None,
+            ctx: 0,
+            tools: true,
+            tier: brainrouter::providers::ModelTier::Balanced,
+            price: None,
+        }
+    }
+
+    let upstream = SyntheticProviders::start().await;
+    let mut args = router_args(&upstream, true, false);
+    args.providers = Arc::new(ProviderStore::in_memory_with(vec![
+        ProviderRecord {
+            id: "manifest".into(),
+            kind: ProviderKind::Manifest,
+            base_url: format!("{}/cloud/v1", upstream.url),
+            credential_id: Some("synthetic-test-key".into()),
+            auto: true,
+            models: vec![model("declared-cloud")],
+            lan_peer: false,
+            enabled: true,
+            monthly_budget_usd: None,
+            budget_mode: brainrouter::providers::BudgetMode::Warn,
+            peer_info: None,
+        },
+        ProviderRecord {
+            id: "fedora1".into(),
+            kind: ProviderKind::OpenaiCompatible,
+            // Any response proves the listener is alive; this fake answers
+            // `<base>/models` with a model list.
+            base_url: format!("{}/peer", upstream.url),
+            credential_id: None,
+            auto: false,
+            models: vec![model("swift-1.5-qwen3.8-27b.mq4")],
+            lan_peer: true,
+            enabled: true,
+            monthly_budget_usd: None,
+            budget_mode: brainrouter::providers::BudgetMode::Warn,
+            peer_info: Some(PeerInfoCache {
+                host_id: "fedora1".into(),
+                version: "test".into(),
+                models: vec![
+                    json!({"id": "swift-1.5-qwen3.8-27b.mq4"}),
+                    json!({"id": "qwen3.8-flash-next"}),
+                ],
+                last_seen: "2026-11-04T12:00:00Z".into(),
+            }),
+        },
+    ]));
+    let router = Arc::new(Router::new(args).with_cards(cards()));
+    let catalog = router.model_catalog().await;
+
+    // Registry + peer-info models, deduped, registry order first.
+    assert_eq!(
+        catalog["peers"],
+        json!([{
+            "provider": "fedora1",
+            "models": ["swift-1.5-qwen3.8-27b.mq4", "qwen3.8-flash-next"],
+            "healthy": true,
+            "breaker": "healthy",
+            "reachable": true,
+            "last_seen": "2026-11-04T12:00:00Z",
+        }])
+    );
+    // The peer is never part of the cloud pool or its entries.
+    assert_eq!(catalog["cloud"]["models"], json!(["declared-cloud", "model-a", "model-b"]));
+    assert!(
+        catalog["cloud_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["provider"] == json!("manifest")),
+        "LAN peers must stay out of cloud_entries: {}",
+        catalog["cloud_entries"]
+    );
+    // Dead peer: the same record pointed at a closed port reads unhealthy.
+    let mut dead_args = router_args(&upstream, true, false);
+    dead_args.providers = Arc::new(ProviderStore::in_memory_with(vec![ProviderRecord {
+        id: "offline-peer".into(),
+        kind: ProviderKind::OpenaiCompatible,
+        base_url: "http://127.0.0.1:1".into(),
+        credential_id: None,
+        auto: false,
+        models: Vec::new(),
+        lan_peer: true,
+        enabled: true,
+        monthly_budget_usd: None,
+        budget_mode: brainrouter::providers::BudgetMode::Warn,
+        peer_info: None,
+    }]));
+    let dead = Arc::new(Router::new(dead_args).with_cards(cards()));
+    let dead_catalog = dead.model_catalog().await;
+    assert_eq!(dead_catalog["peers"][0]["healthy"], json!(false));
+    assert_eq!(dead_catalog["peers"][0]["reachable"], json!(false));
+    assert_eq!(dead_catalog["peers"][0]["last_seen"], Value::Null);
 }
 
 #[tokio::test]

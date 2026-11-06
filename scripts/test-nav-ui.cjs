@@ -44,38 +44,50 @@ class Element {
 function sandboxFor(functionNames, extra = {}) {
   const elements = new Map();
   for (const id of ids()) if (!id.includes('${')) elements.set(id, new Element(id));
+  const consts = [...html.matchAll(/^const OPS_LEGACY_VIEWS = \[[^\]]*\];$/gm)].map(m => m[0]).join('\n');
   const sandbox = {
     document: { getElementById: id => elements.get(id) || null },
     healthData: {}, nudgeData: null, codeReviewEnabled: null, prGuidelinesEnabled: null, hankndoryEnabled: null,
-    activeView: 'stream', loadConfig(){}, loadModels(){}, loadToolboxModels(){ sandbox.downloadGate = (sandbox.downloadGate || 0) + 1; }, loadServerMode(){}, escHtml: s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
+    activeView: 'stream', loadConfig(){}, loadPlugins(){},
+    opsLoads: [], loadEngines(){ sandbox.opsLoads.push('engines'); }, loadModels(){ sandbox.opsLoads.push('models'); },
+    loadProviderModelGroups(){ sandbox.opsLoads.push('providers'); }, loadPeerHealth(){ sandbox.opsLoads.push('peers'); },
+    loadRoleModels(){ sandbox.opsLoads.push('roles'); },
+    loadToolboxModels(){ sandbox.opsLoads.push('downloads'); }, loadServerMode(){ sandbox.opsLoads.push('serving'); },
+    escHtml: s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
     ...extra,
   };
   vm.createContext(sandbox);
-  vm.runInContext(functionNames.map(extractFn).join('\n'), sandbox, { filename: 'nav-ui.js' });
+  vm.runInContext(consts + '\n' + functionNames.map(extractFn).join('\n'), sandbox, { filename: 'nav-ui.js' });
   sandbox.__elements = elements;
   return sandbox;
 }
 
-test('primary nav has four destinations plus Models subtabs and external Model activity', () => {
-  for (const id of ['nav-stream','nav-models','nav-benchmarks','nav-config','models-subnav','models-tab-local','models-tab-downloads','models-tab-serving','models-activity-link']) requireOneId(id);
+test('primary nav has four destinations plus the Ops page and external Model activity', () => {
+  for (const id of ['nav-stream','nav-ops','nav-benchmarks','nav-config','ops-view','models-activity-link']) requireOneId(id);
   assertOnclick('nav-stream', "switchView('stream')");
-  assertOnclick('nav-models', "switchView('models')");
+  assertOnclick('nav-ops', "switchView('ops')");
   assertOnclick('nav-config', "switchView('config')");
   assert.ok(tagForId('nav-benchmarks').includes('href="/benchmarks"'));
   assert.ok(tagForId('models-activity-link').includes('href="/models"'));
-  assertOnclick('models-tab-local', "switchView('models')");
-  assertOnclick('models-tab-downloads', "switchView('toolbox-models')");
-  assertOnclick('models-tab-serving', "switchView('server-mode')");
+  // P5 Part A2: Models + Engines are one Ops view now; the old per-tab subnav
+  // and its views are gone, Downloads/Serving live inside #ops-view.
+  for (const gone of ['nav-models','nav-engines','models-subnav','models-tab-local','models-tab-downloads','models-tab-serving']) {
+    assert.equal(count(new RegExp(`id="${gone}"`, 'g')), 0, `#${gone} must not remain after the Ops consolidation`);
+  }
   assert.equal(count(/id="nav-toolbox-models"/g), 0, 'Downloads must not remain a primary nav item');
   assert.equal(count(/id="nav-server-mode"/g), 0, 'Server Mode must not remain a primary nav item');
+  for (const absorbed of ['toolbox-models-list','server-mode-backend-tabs','engines-list','models-list','ops-peers']) {
+    requireOneId(absorbed);
+  }
 });
+
 
 // v2 L3 retarget (spec: "Removals: routing_profile … dashboard role-chooser/
 // preset widgets" + "Add: role cards panel (3 cards selector pickers +
 // per-project) … policy chips"): the relocated strip controls are now the
 // card strip + policy chips; the nudge/review/bridge controls are unchanged.
 test('relocated controls retain ids and onclick handlers', () => {
-  for (const id of ['role-scope','card-main','card-review','card-subagent','card-model','save-cards','roles-message',
+  for (const id of ['role-scope','card-main-model','card-review-model','card-subagent-model','save-cards','roles-message',
     'chip-privacy-cloud-ok','chip-privacy-local-only','chip-quality-fast','chip-quality-balanced','chip-quality-maximum',
     'credentials-panel','decision-panel']) requireOneId(id);
   assertOnclick('save-cards', 'saveRoleCards()');
@@ -106,19 +118,27 @@ test('no duplicate concrete ids', () => {
   assert.deepEqual(dup, []);
 });
 
-test('switchView keeps Models parent active across subtabs and fires downloads gate', () => {
-  const s = sandboxFor(['isModelsView','switchView']);
-  s.switchView('models');
-  assert.equal(s.__elements.get('nav-models').classList.contains('active'), true);
-  assert.equal(s.__elements.get('models-tab-local').attrs['aria-selected'], 'true');
-  s.switchView('toolbox-models');
-  assert.equal(s.activeView, 'toolbox-models');
-  assert.equal(s.downloadGate, 1);
-  assert.equal(s.__elements.get('nav-models').classList.contains('active'), true);
-  assert.equal(s.__elements.get('models-tab-downloads').attrs['aria-selected'], 'true');
-  s.switchView('server-mode');
-  assert.equal(s.__elements.get('nav-models').classList.contains('active'), true);
-  assert.equal(s.__elements.get('models-tab-serving').attrs['aria-selected'], 'true');
+test('switchView keeps one active nav entry and funnels retired views into Ops', () => {
+  const s = sandboxFor(['canonicView','switchView','loadOps']);
+  s.switchView('ops');
+  assert.equal(s.activeView, 'ops');
+  assert.equal(s.__elements.get('nav-ops').classList.contains('active'), true);
+  assert.equal(s.__elements.get('nav-stream').classList.contains('active'), false);
+  assert.equal(s.__elements.get('ops-view').style.display, 'block');
+  assert.deepEqual([...s.opsLoads].sort(), ['downloads', 'engines', 'models', 'peers', 'providers', 'roles', 'serving'].sort());
+  // Retired tab names still resolve to the single Ops page (no dead views).
+  s.opsLoads.length = 0;
+  for (const legacy of ['models', 'toolbox-models', 'server-mode', 'engines', 'models-parent']) {
+    s.switchView(legacy);
+    assert.equal(s.activeView, 'ops', `${legacy} must map onto ops`);
+    assert.equal(s.__elements.get('nav-ops').classList.contains('active'), true);
+    assert.equal(s.__elements.get('ops-view').style.display, 'block');
+  }
+  s.switchView('stream');
+  assert.equal(s.activeView, 'stream');
+  assert.equal(s.__elements.get('ops-view').style.display, 'none');
+  assert.equal(s.__elements.get('nav-ops').classList.contains('active'), false);
+  assert.equal(s.__elements.get('nav-stream').classList.contains('active'), true);
 });
 
 test('renderPosture maps existing sources and loading states', () => {

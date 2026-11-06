@@ -558,6 +558,64 @@ mod tests {
         assert!(!html.contains("body: JSON.stringify({ session_id: sessionId })"));
         assert!(html.contains("if (!response.ok) throw new Error"));
     }
+
+    /// P5 Part A1 (docs/design/p5-ops-redesign.md): three true role cards, each
+    /// with its own model picker. The shared input is deleted, not repurposed.
+    #[test]
+    fn dashboard_role_cards_are_per_role_model_pickers() {
+        let html = include_str!("templates/main_dashboard.html");
+        for role in ["main", "review", "subagent"] {
+            let id = format!("id=\"card-{role}-model\"");
+            assert_eq!(
+                html.matches(&id).count(),
+                1,
+                "each role must own exactly one picker (#card-{role}-model)"
+            );
+        }
+        // `concat!` keeps the retired id out of this file's own text so the
+        // grep-level proof stays clean.
+        let legacy_input = concat!("card-", "model");
+        assert!(
+            !html.contains(legacy_input),
+            "the shared {legacy_input} input must stay deleted"
+        );
+        assert!(
+            !html.contains("routing-models-list"),
+            "the shared picker datalist must go with the shared input"
+        );
+        assert!(
+            html.contains("Pin exactly this model"),
+            "exact-model pinning stays an explicit affordance"
+        );
+        assert!(
+            html.contains("cloud/<provider>/<id>") || html.contains("cloud/&lt;provider&gt;/&lt;id&gt;"),
+            "the pin grammar must stay documented for operators"
+        );
+    }
+
+    /// P5 Part A2: Models + Engines collapse into ONE resident-first Ops view,
+    /// which absorbs Downloads and Serving.
+    #[test]
+    fn dashboard_single_ops_view_absorbs_models_and_engines() {
+        let html = include_str!("templates/main_dashboard.html");
+        assert!(html.contains("id=\"nav-ops\""), "Ops nav entry missing");
+        assert_eq!(html.matches("id=\"ops-view\"").count(), 1, "exactly one Ops view");
+        for gone in ["id=\"nav-models\"", "id=\"nav-engines\"", "id=\"models-subnav\""] {
+            assert!(!html.contains(gone), "`{gone}` must not survive the consolidation");
+        }
+        // The absorbed sections still render into the Ops page.
+        for kept in [
+            "id=\"engines-list\"",
+            "id=\"engines-budget\"",
+            "id=\"models-list\"",
+            "id=\"ops-peers\"",
+            "id=\"models-provider-groups\"",
+            "id=\"toolbox-models-list\"",
+            "id=\"server-mode-backend-tabs\"",
+        ] {
+            assert!(html.contains(kept), "Ops section `{kept}` missing");
+        }
+    }
 }
 
 // ─── Response helpers ────────────────────────────────────────────────────────
